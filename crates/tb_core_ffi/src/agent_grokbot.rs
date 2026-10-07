@@ -972,14 +972,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let credentials =
-            load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |data| match data {
+        let credentials = load_credentials_from_sources(
+            &desktop_path,
+            &cursor_path,
+            &|| true,
+            |data| match data {
                 b"active-token" => Ok("desktop-test-token".to_string()),
                 b"active-team" => Ok("42".to_string()),
                 _ => panic!("must read only the active access token and its team"),
-            })
-            .unwrap()
-            .expect("standalone login must supply quota credentials");
+            },
+        )
+        .unwrap()
+        .expect("standalone login must supply quota credentials");
         let request = usage_request(&reqwest::Client::new(), &credentials)
             .build()
             .unwrap();
@@ -1011,11 +1015,12 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let credentials = load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| {
-            Ok("native".to_string())
-        })
-        .unwrap()
-        .unwrap();
+        let credentials =
+            load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| {
+                Ok("native".to_string())
+            })
+            .unwrap()
+            .unwrap();
         assert!(matches!(credentials, GrokBotCredentials::Desktop { .. }));
         let error = load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| {
             Err("Keychain denied".to_string())
@@ -1024,10 +1029,13 @@ mod tests {
         .unwrap();
         assert_eq!(error, "Keychain denied");
         std::fs::write(&desktop_path, "invalid JSON").unwrap();
-        assert!(
-            load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| unreachable!())
-                .is_err()
-        );
+        assert!(load_credentials_from_sources(
+            &desktop_path,
+            &cursor_path,
+            &|| true,
+            |_| unreachable!()
+        )
+        .is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1102,7 +1110,8 @@ mod tests {
             "dev-token"
         );
         assert!(
-            decode_desktop_secret("scoped:v1:invalid:abc", &|| true, &mut |_| unreachable!()).is_err()
+            decode_desktop_secret("scoped:v1:invalid:abc", &|| true, &mut |_| unreachable!())
+                .is_err()
         );
 
         let (dir, _) = temp_state_db("invalid_team", &[]);
@@ -1122,8 +1131,10 @@ mod tests {
 
     /// Writes an encrypted (non-`plaintext:v1:`) desktop login — the shape that
     /// needs the Keychain — and returns (dir, desktop path, cursor path).
-    fn temp_encrypted_desktop_login(tag: &str, rows: &[(&str, &str)]) -> (PathBuf, PathBuf, PathBuf)
-    {
+    fn temp_encrypted_desktop_login(
+        tag: &str,
+        rows: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf, PathBuf) {
         let (dir, cursor_path) = temp_state_db(tag, rows);
         let desktop_path = dir.join("sand-secrets.json");
         std::fs::write(
@@ -1158,12 +1169,13 @@ mod tests {
     fn consented_desktop_login_still_decrypts() {
         let (dir, desktop_path, cursor_path) = temp_encrypted_desktop_login("consent", &[]);
         let mut decrypts = 0;
-        let credentials = load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| {
-            decrypts += 1;
-            Ok("granted-token".to_string())
-        })
-        .unwrap()
-        .expect("a consented desktop login must still load");
+        let credentials =
+            load_credentials_from_sources(&desktop_path, &cursor_path, &|| true, |_| {
+                decrypts += 1;
+                Ok("granted-token".to_string())
+            })
+            .unwrap()
+            .expect("a consented desktop login must still load");
         assert!(matches!(credentials, GrokBotCredentials::Desktop { .. }));
         assert!(decrypts > 0, "the fixture never reached the decrypt");
         std::fs::remove_dir_all(dir).unwrap();
@@ -1186,9 +1198,12 @@ mod tests {
         // in the way, so the assertion below is about the gate and not about a
         // fixture that could never have produced credentials.
         assert!(
-            load_credentials_from_sources(&dir.join("missing.json"), &cursor_path, &|| false, |_| {
-                unreachable!()
-            })
+            load_credentials_from_sources(
+                &dir.join("missing.json"),
+                &cursor_path,
+                &|| false,
+                |_| { unreachable!() }
+            )
             .unwrap()
             .is_some(),
             "the Cursor fixture must be loadable for this test to mean anything"
@@ -1217,11 +1232,12 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let credentials = load_credentials_from_sources(&desktop_path, &cursor_path, &|| false, |_| {
-            unreachable!("a plaintext secret must not reach the Keychain either")
-        })
-        .unwrap()
-        .expect("a plaintext desktop login must load without consent");
+        let credentials =
+            load_credentials_from_sources(&desktop_path, &cursor_path, &|| false, |_| {
+                unreachable!("a plaintext secret must not reach the Keychain either")
+            })
+            .unwrap()
+            .expect("a plaintext desktop login must load without consent");
         assert!(matches!(credentials, GrokBotCredentials::Desktop { .. }));
         std::fs::remove_dir_all(dir).unwrap();
     }

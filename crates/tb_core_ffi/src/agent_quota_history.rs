@@ -1381,15 +1381,14 @@ fn close_superseded_cycle(
     // irregular reset begins before it. Reading the distinction from the
     // successor rather than from `now` is what lets a stale caller be wrong
     // about the time without re-opening a cycle that already finished.
-    let handover_was_on_time = match successor_duration
-        .and_then(|duration| successor_reset.checked_sub(duration))
-    {
-        Some(start) => start >= old_reset.saturating_sub(duration_quantum(old_duration)),
-        // Nothing says where the successor began, so the conservative reading
-        // stands and a coverage-complete group counts as finished. Closing on
-        // a guess would restamp healthy cycles.
-        None => true,
-    };
+    let handover_was_on_time =
+        match successor_duration.and_then(|duration| successor_reset.checked_sub(duration)) {
+            Some(start) => start >= old_reset.saturating_sub(duration_quantum(old_duration)),
+            // Nothing says where the successor began, so the conservative reading
+            // stands and a coverage-complete group counts as finished. Closing on
+            // a guess would restamp healthy cycles.
+            None => true,
+        };
     if group_already_closed(&old_samples, now, handover_was_on_time) {
         return false;
     }
@@ -2506,9 +2505,7 @@ fn retain_series(series: &mut SeriesState, now: i64) {
     let mut keep_records = retainable_groups(series, now)
         .into_iter()
         .filter(|(reset_at, samples)| {
-            !modelable.contains(reset_at)
-                && *reset_at >= cutoff
-                && group_holds_substance(samples)
+            !modelable.contains(reset_at) && *reset_at >= cutoff && group_holds_substance(samples)
         })
         .map(|(reset_at, _)| reset_at)
         .collect::<Vec<_>>();
@@ -4206,7 +4203,10 @@ mod recovery {
         // Controls: the fixture is invalid for the reason claimed, and the two
         // bucket-0 samples really do collide, or the assertion below passes on
         // a fixture that never exercised the path.
-        assert!(!validate_store_at(&store, now), "fixture must start invalid");
+        assert!(
+            !validate_store_at(&store, now),
+            "fixture must start invalid"
+        );
         let short = sample(R - 50, SHORT, R - 17_800, 99.0);
         let long = sample(R - 20, LONG, R - 299_000, 98.0);
         assert_eq!(
@@ -4401,8 +4401,7 @@ mod recovery {
         let live_raw = std::fs::read_to_string(&live_path).expect("read live");
         let quarantine_raw = std::fs::read_to_string(&quarantine_path).expect("read quarantine");
         let mut live: Store = serde_json::from_str(&live_raw).expect("parse live");
-        let quarantined: Store =
-            serde_json::from_str(&quarantine_raw).expect("parse quarantined");
+        let quarantined: Store = serde_json::from_str(&quarantine_raw).expect("parse quarantined");
         let before = live.series.iter().map(|s| s.samples.len()).sum::<usize>();
 
         let mut added = 0usize;
@@ -4444,8 +4443,7 @@ mod recovery {
                     // sample predated the live series' activity, which is the
                     // kind of luck that hides a defect rather than removing
                     // it.
-                    target.last_activity_at =
-                        target.last_activity_at.max(sample.sampled_at);
+                    target.last_activity_at = target.last_activity_at.max(sample.sampled_at);
                 } else {
                     refused += 1;
                 }
@@ -7448,8 +7446,7 @@ mod tests {
         assert!(validate_store_at(&on_disk, upper_bound));
         assert_eq!(on_disk.series.len(), 1, "the series survives on disk");
         assert_eq!(
-            on_disk.series[0].samples,
-            kept,
+            on_disk.series[0].samples, kept,
             "every reading at or below the ceiling survives on disk"
         );
 
@@ -8673,7 +8670,14 @@ mod tests {
         // That is the only state where the two budgets differ, and it is where
         // a real store lives: `claude/session.v1` on the store behind #370
         // holds 133 groups against a cap of 128.
-        let mut without = seeded_series("provider", "scope", "window.v1", current_reset, duration, 12);
+        let mut without = seeded_series(
+            "provider",
+            "scope",
+            "window.v1",
+            current_reset,
+            duration,
+            12,
+        );
         let mut with = without.clone();
 
         // Newer than the oldest cycle the budget keeps, so a shared budget
@@ -8681,15 +8685,19 @@ mod tests {
         // buckets — and unmodellable, because it stops at phase 0.75 and
         // `cycle_meets_retention_coverage` wants the last reading past 0.90.
         let partial_reset = current_reset - duration * 3 / 2;
-        with.samples.extend([0.01, 0.10, 0.25, 0.40, 0.60, 0.75].into_iter().map(|phase| {
-            quota_sample(
-                partial_reset,
-                duration,
-                phase,
-                40.0 * phase + 1.0,
-                SampleOrigin::LiveV3,
-            )
-        }));
+        with.samples.extend(
+            [0.01, 0.10, 0.25, 0.40, 0.60, 0.75]
+                .into_iter()
+                .map(|phase| {
+                    quota_sample(
+                        partial_reset,
+                        duration,
+                        phase,
+                        40.0 * phase + 1.0,
+                        SampleOrigin::LiveV3,
+                    )
+                }),
+        );
 
         retain_series(&mut without, now);
         retain_series(&mut with, now);

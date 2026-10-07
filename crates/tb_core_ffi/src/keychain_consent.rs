@@ -71,8 +71,8 @@ pub(crate) fn allowed(client_id: &str) -> bool {
 /// sends the user's stored answer verbatim, and "no" is a legitimate answer.
 /// Only an unrecognised client id is rejected.
 pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
-    let input: std::collections::BTreeMap<String, bool> = serde_json::from_str(raw)
-        .map_err(|e| format!("invalid Keychain consent JSON: {}", e))?;
+    let input: std::collections::BTreeMap<String, bool> =
+        serde_json::from_str(raw).map_err(|e| format!("invalid Keychain consent JSON: {}", e))?;
 
     let mut granted: BTreeSet<String> = BTreeSet::new();
     let mut rejected: Vec<serde_json::Value> = Vec::new();
