@@ -4,23 +4,23 @@ id: vendor-readme
 kind: reference
 scope: repository
 read_when: advancing or auditing the vendor/tokscale-core consumer pin
-last_verified: 2026-10-03
+last_verified: 2026-10-08
 sources: [".gitmodules", "vendor/tokscale-core", "docs/knowledge/vendor-tokscale.md"]
 ---
 
 # Shared Rust core pin
 
-TokenBar consumes the public
-[`Nanako0129/tokscale-core`](https://github.com/Nanako0129/tokscale-core)
-repository as a Git submodule. Consumer integration rules are documented in
+TokenBar consumes a pinned shared engine as a Git submodule. This branch uses
+a reviewed local fork; the existing configured remote is unchanged.
+Consumer integration rules are documented in
 [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md).
 
 | Field | Value |
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `726efd7038727055bf8915d98939b973c3db17fe` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/726efd7038727055bf8915d98939b973c3db17fe/UPSTREAM.md) |
+| Reviewed pin | `3c9c31314e137b22c9bfca932abb9c7e0c9ee155` |
+| Upstream and local-patch ledger | Pinned [`UPSTREAM.md`](tokscale-core/UPSTREAM.md) |
 
 ## Ownership
 
@@ -34,6 +34,11 @@ engine changes in `tokscale-core`, then advance this pin to the reviewed engine
 commit and run the TokenBar consumer gates.
 
 ## Checkout
+
+This local fork commit has not been published to the configured remote.
+The current checkout has its objects; a fresh recursive clone cannot fetch
+this pin until the fork is published and its remote is configured. No push,
+PR, remote change, release, or Windows runtime verification is implied.
 
 Clone recursively:
 

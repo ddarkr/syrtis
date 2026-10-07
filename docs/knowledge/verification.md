@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-05
+last_verified: 2026-10-08
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -136,13 +136,26 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 
 ### Phase 1 證據與未通過的 gate
 
-Pending engine 的 macOS Rust 1.96.1 formatting、locked／offline release build、1,851 tests（1 ignored）與 strict all-targets／all-features Clippy 已通過；app FFI 在隔離 dependency manifest 指向該 pending source 的 formatting checks、579 tests（5 ignored）、canonical non-strict Clippy 與 release library build 亦通過。Strict FFI Clippy 與 immutable baseline 有相同 warning debt，未加 lint allows，不能把它寫成 strict gate 通過。
+先前 Phase 1 pending source 的 macOS Rust 1.96.1 formatting、locked／offline release build、1,851 tests（1 ignored）與 strict all-targets／all-features Clippy 已通過；app FFI 當時在隔離 dependency manifest 指向該 pending source 的 formatting checks、579 tests（5 ignored）、canonical non-strict Clippy 與 release library build 亦通過。這是歷史外部-manifest 證據，不當作下面 ordinary local fork checkout 的結果。Strict FFI Clippy 與 immutable baseline 有相同 warning debt，未加 lint allows，不能把它寫成 strict gate 通過。
 
 Real C ABI synthetic OpenCode v1／v2／hybrid 的 cold／warm graph、model、hourly、Agents、rate、trace、exclusions 與 compact quota attribution 已驗證；WAL-only update／delete／insert 在 main DB bytes、mtime、size 不變時仍更新 reports，並覆蓋 partial failure／last-good、retention 與 pointer ownership。實際 Swift → C ABI → Rust scheduler smoke 驗證各 report、exact scope、cost、rate／trace clock、source-free quota、watch manifest、warm lease identity、forced synchronization、release 與 `tb_free` decoding。Fresh pending-source static library 的隔離 debug `.app --selftest` 已通過完整 suite；較早的 debug／release bare selftest 是 Phase 1 歷史證據，不代替目前 bundled release gate。
 
 Native demo popover 已實際開啟並檢視；own-process accessibility 在無 graph demand 的 rate／quota title 得到 `25.5K/m`／`16%`，static cat／sand 的 hidden title 均為空。Menu extra 位於螢幕外，裁切圖沒有可見 icon，因此不宣稱 tray icon pixel appearance 已驗證。這些 deterministic 初始狀態不取代 shipping-identifier preference persistence 或 bundled selftest。
 
-上述是 pending-source integration 證據，**不是 reviewed pin 普通 checkout 的 full gate**。Windows Rust 1.96.1 runtime gate 因無可用 runtime 而 blocked，macOS 證據不能代替。Reviewed pin 未推進；Phase 2–4 的 disk store、compact wire、scheduler 與 native hints 已在 pending source 實作，但實際 current-corpus 冷／暖／升級輸出比較、四對 old／new 資源量測、release app 60 分鐘 steady-state 與 memory／CPU／I/O 目標仍未驗收。Safe fixture 的短程 app smoke 不得視為這些資源目標的證據。`last_verified` 記錄本次文件條目核對日期，不代表未執行的 product gates 已通過。
+上述 Phase 1 是先前 pending-source integration 的歷史證據，不代替 ordinary checkout gate。現在 local fork pin 的實測另記如下；Windows Rust 1.96.1 runtime 尚未執行，macOS 證據不能代替。實際 current-corpus 冷／暖／升級輸出比較、四對 old／new 資源量測、release app 60 分鐘 steady-state 與 memory／CPU／I/O 目標仍未驗收。Safe fixture 的短程 app smoke 不得視為這些資源目標的證據。`last_verified` 記錄本次核對日期，不代表未執行的 product gates 已通過。
+
+### Local fork ordinary checkout verification
+
+Local fork 的 exact pin 與 publication 限制見 [`vendor/README.md`](../../vendor/README.md)。Engine code 已在獨立 branch 提交，ledger／README 是其後的 docs-only commit；consumer 只推進 gitlink。MacOS Rust 1.96.1 engine locked／offline tests 有 1,879 passes、1 ignored，release build、60 task-owned Rust files 的 scoped formatting 與 strict all-targets／all-features Clippy 通過。Real parser／cache regressions 覆蓋 bare↔split 的 materialized-first／streaming-first、changed／warm／compaction、format-3/4 retained history、non-retaining old SQLite cold miss、concurrent live authority 及 Cursor JSON read-failure propagation。
+
+Ordinary root checkout 的 `cargo +1.96.1 test --workspace --locked --offline` 有 2,458 passes、6 ignored；canonical `cargo +1.96.1 clippy --workspace --locked --offline --all-targets --all-features` 通過但仍有既有 FFI warning debt（15 library／22 test-target warnings），不宣稱 strict FFI gate。`RUSTUP_TOOLCHAIN=1.96.1 make selftest` 與 `make selftest-bundled` 都輸出 `selftest passed`；後者使用 default throwaway `com.nyanako.tokenbar.selftest`，不是 shipping-identifier preference persistence 驗收。
+
+以實際 ordinary-build static archive、TokenBarCore module 與 Swift decoder 執行 hermetic Swift → C ABI → Rust smoke，驗證 graph／models／hourly／Agents、cost `0.05425`、recent clock expiry、producing client-scope rejection、warm lease reuse、forced source change tokens `38→78`、replaced-generation rejection、compact quota half-open boundary／catalog、quota release 不影響 report query，以及 report release 後明確失敗。Fixture roots／pricing cache 隔離，沒有 provider quota authentication 或 Keychain 授權。
+
+Actual `AppDelegate` demo 建立 popover；因本機 menu-extra anchor 在螢幕外，只移動 own-process panel 到可見區，再檢視其 bitmap，見 `25.5K tok/min` header 與 demo chart。這是實際 native view 的短程證據，不驗證 tray icon pixels、compositor glass/background appearance 或 shipping preferences。Windows runtime／downstream coordinated decoder、fork publication、current-corpus 對拍與完整資源 acceptance 仍未執行；沒有 push／PR／release。
+
+`make check-docs` 通過 53 checker tests 與實際 knowledge validation。Reachability 只遞迴 Markdown files，directory／binary-asset links 仍檢查 existence，但不當作 Markdown 讀取；regression 同時覆蓋有效與 missing targets。這讓 pinned local engine ledger／routing 的 relative links 不再因 fixture directory 而 crash。
+
 
 
 ## Local build and UX acceptance
