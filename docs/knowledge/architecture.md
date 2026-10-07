@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-03
+last_verified: 2026-10-05
 sources: [".gitmodules", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public tokscale-core commit bb9a2a9", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -114,6 +114,40 @@ The local streaming path is a cache-aware, per-file pass. Each client lane parse
 | Report fold | Feed filtered, deduped, priced messages into report-specific sinks | All report consumers need a documented arithmetic and client-set contract |
 
 A parser that reads a secondary file must update all four related seams together: fingerprint, active lane, latest-mtime probe, and mtime pruning. SQLite lanes also probe the WAL. This is the sibling rule captured in [`verification.md`](verification.md) and [`vendor-tokscale.md`](vendor-tokscale.md).
+
+### 本機 source lane 與 one-shot diagnostics（pending engine integration）
+
+Blocking one-shot graph、model／hourly／Agents、source probe 與 source synchronization 仍以單一 process-local `Mutex` 協調本機讀取；mutex 不保證 FIFO 或公平性。正常 app 的 source ownership 則由下述 `LocalUsageScheduler` 統一管理，clock-only aggregate query 不拿 source lane。Provider quota 網路維持獨立 publication／provider 路徑，不佔 source lane；同步時明確要求的 pricing refresh 仍可能在 lane 內執行。
+
+Graph 的 fresh cache hit 不拿 source mutex、也不掃 source。Aged hit 先釋放 cache lock，再等 lane；進 lane 後重新讀 cache，若前一個工作已更新便直接重用，否則以同一 `LocalSourceContext` 的 topology／WAL-aware change token 決定 restamp 或重算。同 year、同 root generation 的普通請求可 single-flight；排隊期間 flight 已結束的普通請求仍會重新檢查已發布 cache，避免重複 compute。`tb_refresh_graph` 則不 join 舊 flight、不重用排隊後 cache，必須在請求之後取得 lane 並獨立開始 scan，才能看到較新的輸入。
+
+Extra roots／Claude account exclusions 取代時先推進 root generation，再清 graph／window／tail 狀態。工作取得 lane 後才捕捉 generation 與 source scope；scope 在掃描中改變時，publisher 在其 publication lock 內重新比對，拒絕把舊 scope 結果放回 cache。原請求仍可收到自己開始時的結果，拒絕的是後續 cache／tail freshness publication，不是取消已在執行的 blocking FFI。
+
+Recent tail 現在持有 pending engine 的 disk snapshot handle，不再持有最近一小時的 raw-event vector；rate／trace 以目前時間直接查詢已發布 generation，source sync 失敗不更新 freshness stamp。尚無已發布 snapshot、root 改變或 handle stale／evicted 時回傳錯誤，不把不可用資料改成成功零值。此 source 尚需新 engine API，reviewed pin 的普通 checkout gate **尚未通過**；依賴與平台 gate 見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
+
+### Compact usage store（pending engine integration）
+
+Shared engine 將 file-cache／OpenCode facts、Claude retained-only history 與 Codex verified resume membership 放在同一 SQLite backend，只有完整 source scope 才原子發布 generation；partial read、來源不可讀、disk failure 或未完成 reconciliation 不覆蓋 last-good scope。Snapshot 同時綁定持久的 store instance epoch，刪除並重建 cache 時不能因 integer generation 重用而讓舊 handle 讀到新資料。Query 先在 transaction 內準備 file-backed facts／aliases，再釋放 transaction 執行 caller predicate／sink；callback 可以同步另一 scope，而舊 prepared output 保持完整。
+
+Producer decoded batches 以 1,024 rows 或 8 MiB 先到者 flush；單一 oversized record 與既有 unrelated per-file parser buffer 是明示例外，16 MiB SQLite page-cache 設定不是 process RAM 上限。Authority／dedup、source traversal、filter-dependent OpenCode fallback、f64 fingerprint 與 pricing provenance 不移到 Swift。Readable zero-byte SQLite WAL 與 absent WAL 都代表無未 checkpoint frames；不可讀 sidecar 仍失敗，非空 WAL 與 primary DB 分別驗證。LocalClients 每個完整 generation 保存 selected-row references，而非第二份 message payload；range query 用 timestamp index 只準備該範圍 facts／aliases。Initial selection、full-domain catalog／undated 與 filter-dependent Report preparation 仍可能隨 history 增長；materialized compatibility APIs 仍可回傳 vectors，不宣稱 app 資源目標已達成。
+
+Pure graph／model／hourly／Agents helper 重用既有 folds，不 rediscover source 或發 pricing HTTP；必須使用 exact producing scan-client scope 的 unpruned Report snapshot，不能先用更廣 scope 決定 ownership 再移除混合貢獻。既有 dashboard restart snapshot 不等於此 engine store。實際 current-corpus、steady-state 資源驗收、Windows runtime 與 reviewed-pin integration 仍是獨立 gate，不能由 macOS local-source tests 代替。
+
+### App-owned demand scheduler 與 native hints
+
+`AppDelegate` 擁有一個 concrete `LocalUsageScheduler`，popover、Settings、tray graph／rate、Discord graph 與 quota-window attribution 以 session 登記目前需要的 scope。Graph／models、client-filtered hourly／Agents、recent、primary／extra-account quota 分別在 producer 端捕捉正確 scope；popover／Settings 關閉或最小化釋放 session，重新打開建立新 owner，舊 view 的 late disappearance 不得關閉 replacement 的 demand。只有實際展開的 model rows 才要求額外 model report。
+
+`tb_local_usage_sync` 只負責 source verification／ingestion、選定 pricing snapshot、發布 opaque native lease 與 watch manifest；`tb_local_usage_query` 只查已捕捉的 generation，`tb_release_local_usage` 釋放 owner。Manifest 的 wire keys 明確為 `sourceRootURL`、`watchRootURL`、`parentURL` 與 `ignoredFileURLs`，不得依賴 acronym 的自動 camel-case 轉換。Native leases／aggregate caches 同時按 bytes 與 entry count 限制；query admission 使用 capture-time 的 conservative manifest capacity，不在 clock query 重新拿 known-source verification 的 SQLite mutex。
+
+Scheduler 保留一個 source worker 與一個 coalesced pure-query worker。Source mount 阻塞時，已捕捉的 recent scope 仍能按 wall clock 過期；monotonic clock 管理 deadlines。Active demand 的 known-input／WAL verification 是 30 秒、closed graph demand 是 5 分鐘，topology fallback 5 分鐘，完整 verification 遵守使用者的 refresh interval。FSEvents 僅作 advisory hint，以 250 ms dirty deadline 合併；事件遺失、unmount、root recovery、unsupported native path 或 stream failure 必須回到 authoritative verification，不能把缺少 event 當作 source unchanged。沒有 local demand 時不啟動 source verification。
+
+`LocalSourceHints` 僅訂閱 native manifest 的 source／nearest-existing recovery roots；broad recovery parent 中的 unrelated sibling events 不建立 demand。Parser dependencies、SQLite WAL、symlink／mount／extra roots 都參與 known-input identity；owned store、page sidecars、pricing、migration、recovery 與 dashboard snapshot 的已知 basename grammar 只在 exact owned parent 下排除，不能忽略整個可能含來源的目錄。Manifest 在完整 discovery／ingestion 前捕捉，再驗證 known inputs，避免 scan 中新寫入的檔案被誤認為已納入。
+
+Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Scope／root revision、source／price generation、owner 與 quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。
+
+`tb_window_usage` 已 clean-cutover 為 compact `WindowUsageBatch`：request 傳 confirmed attribution declarations、account/model scope 與 exact half-open inference／current／zone／cycle jobs，response 保留 assigned／excluded／unassigned、undated／turn counts、coverage 與 source／root／price identity，不再回傳 message arrays。`DashboardModel` 不保留 raw union scans，provider quota policy 仍在 Swift／app FFI 而非 shared engine。此 wire change 需要 downstream decoder 同步遷移；詳見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
+
+
 
 ### Kiro globalStorage precedence
 
@@ -261,6 +295,11 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 ## Swift presentation layer
 
 SwiftUI owns the seven dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. A process-lifetime `@MainActor` publication coordinator applies the Rust `publicationGeneration` guard across the popover and Settings models, snapshot restore, and TrayAnimator's independent poller before any payload or scalar is stored. Dashboard polling reconciles the accepted payload into the shared scalar, while TrayAnimator's payload getter prefers the coordinator's latest generated payload over an older result from its own poller. The persistent scalar participates in the tray icon signature, so that write triggers immediate gauge rendering and the app-level defaults observer refreshes the title; missing generations remain direct demo/legacy values and are not persisted. Settings reconciliation is keyed by generation plus selection/exclusions, or by generated timestamp plus resolved-scalar fingerprint for legacy payloads, so distinct payloads cannot collide on `generatedAt` alone. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
+
+選單列 rate 的唯一 owner 是 `TrayAnimator`；AppDelegate 只讀它的 last-good `tokensPerMinRate`，不另發 rate FFI。Demand 為 tokens/min title、sand icon（即使 animation 關閉仍需要 rate）或非 quota icon 的啟用動畫；沒有 demand 時停止 reader，重新啟用立即讀取。Rate replacement／取消先推進 generation，完成時同時檢查 generation、demand 與 cancellation，舊結果不得發布。失敗與移除 demand 保留 last-good 值，不製造零值。
+
+Tray graph demand 為需要 graph 的 title mode、至少一個未隱藏的 enabled client item，或允許連線的 Discord；動畫／rate 不替 graph 建立額外 demand。停止 graph task 後，blocking FFI 可能繼續完成，但 cancelled／已無 demand 的結果不得套用。獨立的 30 秒輕量 render clock 只重畫 cached menu-bar state 與 quota staleness，讓沒有 graph／rate demand 時 title 與 gauge 仍同步變灰；它不讀本機 source，也不取代獨立 quota network poll。這些 demand predicate 保留 static sand、動畫、Discord 與 individual client items 的既有功能。
+
 
 Individual client status items remain an app-owned presentation layer. `ClientTray` reads exactly two bounded defaults (`tokenbar.tray.clients.enabled` and `tokenbar.tray.clients.quotaSelections`), derives shell existence from the last successful graph's canonical clients plus tab visibility and loadable official-brand assets, and resolves display values only from `TrayAnimator.quota`'s latest accepted payload. Settings pins its independent `DashboardModel` to the all-time graph (`initialYear: nil`), matching AppDelegate's tray-reconciliation universe even when the dashboard's persisted year is scoped；it treats an agent entry in the quota payload as the capability signal even when the current snapshot contains only an error and zero windows, so supported clients remain configurable during a temporary provider outage and show `—%`. The one explicit quota lookup alias maps the `antigravity-cli` usage identity to the shared `antigravity` provider snapshot; process identity, tab visibility, route, placement, preference key, and icon identity remain the exact `antigravity-cli` ID. Shell existence is deliberately independent from quota success: a temporarily missing client snapshot or explicit card keeps the enabled item and displays `—%`; no per-client scalar, provider fetch, timer, animator, popover, or `DashboardModel` is created. Auto selection is scoped to one mapped provider snapshot, while an explicit stable `cardId` may use that same binding's fallback window and never falls back to Auto or a legacy label；when that fallback comes from an error snapshot, runtime status, tooltip, and accessibility copy identify the percentage as last-known rather than current.
 

@@ -4,7 +4,7 @@ id: kb-vendor-tokscale
 kind: canonical
 scope: repository
 read_when: assessing upstream commits, changing shared-engine code or its consumer pin, or changing parser output
-last_verified: 2026-10-03
+last_verified: 2026-10-05
 sources: [".gitmodules", "vendor/README.md", "public tokscale-core UPSTREAM at bb9a2a9", "public tokscale-core PR #2 and commit fd2f916", "public tokscale-core PR #3 and commit 84e0d66", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45", "public issue #118", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -33,6 +33,19 @@ The engine's true baseline is recorded in `tokscale-core/UPSTREAM.md`; the Cargo
 > **不要在 consumer branch 直接改 submodule source。** Shared Rust changes first land and pass review in `tokscale-core`; Syrtis then advances only the reviewed gitlink and runs its consumer gates. A clean build alone cannot prove that streaming or cache semantics were preserved.
 
 Native 現在 pin reviewed engine commit `726efd7038727055bf8915d98939b973c3db17fe`，即 engine 的 `main`。自上一個發版 pin `319ffa8` 起的推進（18 個 first-parent merge、共 60 個 engine commit）大多來自 2026-10-02 的上游同步，逐項處置與實測記在 engine 的 `UPSTREAM.md`。
+
+### Resource redesign pending integration boundary
+
+Resource redesign 的 app-owned source 已使用新的 engine required-field projection、compact usage snapshot／query 與 source-watch manifest API；該 engine source **尚未整合進 reviewed pin**。`726efd7038727055bf8915d98939b973c3db17fe` 保持不變，沒有 engine commit／consumer gitlink 推進；因此目前普通 checkout 仍缺所需 API，不能宣稱 reviewed-pin build／consumer gate 已通過。外部 pending source 的驗證不構成 pin 授權或替代 reviewed integration。
+
+Pending engine 的 macOS Rust 1.96.1 build／tests／strict Clippy、app FFI／C ABI synthetic smoke、實際 Swift native bridge 與隔離 debug bundled selftest 已有證據，範圍與 UI 限制見 [`verification.md`](verification.md#phase-1-證據與未通過的-gate)。Source-only review 已完成；reviewed integration 仍必須通過 **macOS 與 Windows 兩個 Rust 1.96.1 平台 gate**。Windows runtime 目前無可用執行環境而 blocked，不以 cross-compile 或 macOS runtime 代替；ordinary reviewed checkout 與 bundled release consumer gates 仍未通過。既有 shared-engine ownership、consumer review 與授權規則不變，沒有 remote push／PR。
+
+Pending source 已以 disk-backed store／selection 取代歷史 parser cache 與 recent raw-event live set，app 以 compact aggregate wire 與 demand scheduler／native hints 消費捕捉的 generation。Clock-only query 不需 source rediscovery；source lane 與 provider quota request 分離。大型 scope preparation 仍有 history-scaled I/O，pricing synchronization 仍可能佔 local lane；current-corpus 冷／暖／升級比較、paired resource measurements 與 app steady-state 資源目標尚未驗收，不宣稱固定 process memory 或已達成 CPU／I/O 改善。
+
+**Downstream contract notice（待 coordinated migration，未發送 remote 通知）：** app-owned `tb_window_usage` 已從 full-message arrays 改為 compact per-window／cycle aggregates，Swift caller 同時遷移；其他 consumer 必須更新 request declarations／scope、response decoder、coverage／failure 與 source／price generation handling，不能留下舊 message-array decoder。新增 `tb_local_usage_sync`、`tb_local_usage_query`、`tb_local_usage_release` 的 lease ownership 契約；watch manifest 保留 acronym 的明確 `sourceRootURL`／`watchRootURL`／`parentURL`／`ignoredFileURLs` keys。Shared engine 只提供 source／query／pricing primitives，不接收 provider quota policy 或 account payload；Windows consumer 的 caller／decoder 與 native runtime gate 必須在 pin adoption 前同步驗證。
+
+下方 pin adoption 表格與量測敘述維持該 reviewed-pin checkpoint 的歷史範圍；其中 `usage_tail` 走 materialized path 的描述指 reviewed pin 時的 consumer，並非上方 pending source 的 recent visitor 路徑。
+
 
 | 類別 | engine PR | 內容 | 快取 |
 |---|---|---|---|
