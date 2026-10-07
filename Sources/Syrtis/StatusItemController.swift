@@ -22,6 +22,11 @@ final class StatusItemController: NSObject {
     private var lastClientPresentations: [String: ClientTray.Presentation] = [:]
     private var lastClientTextColors: [String: NSColor] = [:]
     private let routeMemory: StatusItemRouteMemory
+    private let scheduler: LocalUsageScheduler
+    private let source: any UsageDataSource
+    private var popoverSession: LocalUsageScheduler.Session?
+    private var seriesSession: LocalUsageScheduler.Session?
+    private var nativeSessionGeneration: UInt64 = 0
     private var popoverAnchorIdentity: String?
     /// Non-nil on macOS 27+, where it replaces the popover.
     private var glassPanel: GlassPanelPresenter?
@@ -33,7 +38,9 @@ final class StatusItemController: NSObject {
 
     private var isShown: Bool { glassPanel?.isShown ?? popover.isShown }
 
-    override init() {
+    init(scheduler: LocalUsageScheduler, source: any UsageDataSource) {
+        self.scheduler = scheduler
+        self.source = source
         let defaults = UserDefaults.standard
         routeMemory = StatusItemRouteMemory(
             mainClient: defaults.string(forKey: ClientTray.activeTabKey)
@@ -45,7 +52,8 @@ final class StatusItemController: NSObject {
         super.init()
 
         popover.behavior = .transient
-        let host = NSHostingController(rootView: AnyView(PopoverView(routeMemory: routeMemory).environmentObject(chrome)))
+        let host = NSHostingController(rootView: AnyView(
+            Color.clear.frame(width: chrome.width, height: chrome.minHeight)))
         self.host = host
         // The SwiftUI root has a fixed frame; let the popover keep our size
         // instead of chasing intrinsic-size updates. The real size is set per
@@ -56,6 +64,8 @@ final class StatusItemController: NSObject {
             let presenter = GlassPanelPresenter(contentViewController: host)
             presenter.onHidden = { [weak self] in
                 guard let self else { return }
+                guard !self.isShown else { return }
+                self.releasePopoverDemand()
                 self.host?.rootView = AnyView(
                     Color.clear.frame(width: self.chrome.width, height: self.chrome.minHeight))
             }
@@ -75,13 +85,15 @@ final class StatusItemController: NSObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                let closingSession = self.popoverSession
                 // didCloseNotification fires on a later runloop turn (after the
                 // ~200ms close animation), by which point a fast close→reopen
                 // may already have reinstalled the live view. Re-check on the
                 // next turn and only blank if the popover is still closed, so a
                 // reopen that landed meanwhile isn't swapped to the placeholder.
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, !self.popover.isShown else { return }
+                    guard let self, !self.popover.isShown, self.popoverSession == closingSession else { return }
+                    self.releasePopoverDemand()
                     self.popoverAnchorIdentity = nil
                     self.host?.rootView = AnyView(
                         Color.clear.frame(width: self.chrome.width, height: self.chrome.minHeight))
@@ -248,8 +260,21 @@ final class StatusItemController: NSObject {
     }
 
     private func liveRoot() -> AnyView {
-        let view = PopoverView(routeMemory: routeMemory).environmentObject(chrome)
+        releasePopoverDemand()
+        let session = scheduler.openSession()
+        let seriesSession = scheduler.openSession()
+        popoverSession = session
+        self.seriesSession = seriesSession
+        let view = PopoverView(
+            routeMemory: routeMemory, scheduler: scheduler, source: source,
+            localSession: session, seriesSession: seriesSession).environmentObject(chrome).id(session)
         return glassPanel == nil ? AnyView(view) : AnyView(view.modifier(GlassPanelSurface()))
+    }
+
+    private func releasePopoverDemand() {
+        if let popoverSession { scheduler.release(popoverSession) }
+        if let seriesSession { scheduler.release(seriesSession) }
+        popoverSession = nil; seriesSession = nil
     }
 
     private func presentPopover(from button: NSStatusBarButton, identity: String) {
@@ -406,6 +431,7 @@ final class StatusItemController: NSObject {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
         if isShown { closePopover() }
+        releasePopoverDemand()
         glassPanel?.tearDown()
         for clientId in Array(clientStatusItems.keys) {
             removeClientItem(clientId)
@@ -522,6 +548,7 @@ final class StatusItemController: NSObject {
 extension StatusItemController: @preconcurrency NSStatusItemExpandedInterfaceDelegate {
     func statusItem(_ item: NSStatusItem, didBegin session: NSStatusItemExpandedInterfaceSession) {
         guard let glassPanel else { return session.cancel() }
+        nativeSessionGeneration &+= 1
         // Opened without a session (`--open-popover`): a click closes it.
         if glassPanel.isShown, !glassPanel.hasSession {
             session.cancel()
@@ -550,9 +577,15 @@ extension StatusItemController: @preconcurrency NSStatusItemExpandedInterfaceDel
     }
 
     func statusItemDidEndExpandedInterfaceSession(_ item: NSStatusItem, animated: Bool) {
-        guard let glassPanel else { return }
-        let wasShown = glassPanel.isShown
-        glassPanel.sessionDidEnd(for: item)
-        if wasShown, !glassPanel.isShown { popoverAnchorIdentity = nil }
+        let generation = nativeSessionGeneration
+        let owner = popoverSession
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let glassPanel = self.glassPanel,
+                  item.expandedInterfaceSession == nil,
+                  self.nativeSessionGeneration == generation, self.popoverSession == owner else { return }
+            let wasShown = glassPanel.isShown
+            glassPanel.sessionDidEnd(for: item)
+            if wasShown, !glassPanel.isShown { self.popoverAnchorIdentity = nil }
+        }
     }
 }

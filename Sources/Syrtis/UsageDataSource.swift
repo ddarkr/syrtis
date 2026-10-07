@@ -1,12 +1,25 @@
 import Foundation
 import TokenBarCore
 
+enum LocalUsageValue: Sendable {
+    case graph(UsagePayload)
+    case models(ModelReport)
+    case hourly(HourlyReport)
+    case agents(AgentsReport)
+    case rate(Double)
+    case trace([TraceBucket])
+}
+
 /// App-level source of usage data. Every usage consumer depends on this
 /// contract so `--demo` can replace the complete usage surface without
 /// allowing live FFI calls to leak into the demo path.
 protocol UsageDataSource: Sendable {
     /// Whether this source may read/write the persistent last-good quota cache.
     var allowsQuotaCachePersistence: Bool { get }
+    var usesNativeLocalUsage: Bool { get }
+    func localUsageSync(_ request: LocalUsageSyncRequest) async throws -> LocalUsageSyncResult
+    func localUsageQuery(_ request: LocalUsageQueryRequest) async throws -> LocalUsageValue
+    func releaseLocalUsage(_ token: String) async
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload
     func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload
@@ -20,14 +33,10 @@ protocol UsageDataSource: Sendable {
     func agentUsage() async throws -> AgentUsagePayload
     func usageTrace(windowSecs: Int64) async throws -> [TraceBucket]
     func tokensPerMin() async throws -> Double
-    /// `accountKey` selects whose transcripts are folded into the window —
-    /// nil is the primary account, an extra Claude account passes its config
-    /// directory. Required for the same reason `quotaCurve`'s is: a window is
-    /// one account's, and a caller that omitted it would measure every
-    /// account's usage against one account's allowance.
-    func windowUsage(
-        accountKey: String?, from: Int64, until: Int64
-    ) async throws -> WindowUsage
+    /// The request carries the exact account, confirmed declarations and compact
+    /// jobs. Follow-up queries use its native snapshot lease, never raw rows.
+    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch
+    func releaseWindowUsage(_ snapshotToken: String) async
     /// `accountKey` selects which account of `clientId` to read — nil is the
     /// primary account. Required (not defaulted) so a conformer that forgets
     /// it fails to compile against the protocol instead of silently falling
@@ -44,15 +53,45 @@ protocol UsageDataSource: Sendable {
 }
 
 extension UsageDataSource {
-    /// Defaulted so the pre-existing test doubles keep compiling. They answer
-    /// "no window data", which the card renders as its unavailable state —
-    /// asserting the card through a double that predates it would test the
-    /// double. The live and demo sources both override.
-    func windowUsage(
-        accountKey: String?, from: Int64, until: Int64
-    ) async throws -> WindowUsage {
-        WindowUsage(messages: [], undatedCount: 0, processingTimeMs: 0)
+    var usesNativeLocalUsage: Bool { false }
+
+    /// Existing injected sources remain complete deterministic backends. No
+    /// default implementation reaches native code, credentials or disk caches.
+    func localUsageSync(_ request: LocalUsageSyncRequest) async throws -> LocalUsageSyncResult {
+        let token = (request.force ? "forced:" : "injected:") + UUID().uuidString
+        let generation = DispatchTime.now().uptimeNanoseconds
+        return LocalUsageSyncResult(
+            leaseToken: token, rootGeneration: 0, priceGeneration: "injected",
+            verifiedAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+            scopes: request.scopes.map {
+                LocalUsageScopeSnapshot(id: $0.id, sourceGeneration: generation, quotaSnapshotToken: nil)
+            }, watchManifest: LocalSourceWatchManifest(roots: [], ignoredFileURLs: []), changed: true)
     }
+
+    func localUsageQuery(_ request: LocalUsageQueryRequest) async throws -> LocalUsageValue {
+        switch request.kind {
+        case "graph":
+            return .graph(try await (request.leaseToken.hasPrefix("forced:")
+                ? refreshGraph(year: request.year, priority: .userInitiated)
+                : graph(year: request.year, priority: .userInitiated)))
+        case "models": return .models(try await modelReport(year: request.year, priority: .userInitiated))
+        case "hourly": return .hourly(try await hourlyReport(year: request.year, clients: request.clients, priority: .userInitiated))
+        case "agents": return .agents(try await agentsReport(year: request.year, clients: request.clients, priority: .userInitiated))
+        case "rate": return .rate(try await tokensPerMin())
+        case "trace": return .trace(try await usageTrace(windowSecs: request.windowSecs ?? 600))
+        default: throw NSError(domain: "LocalUsageQuery", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown local query kind"])
+        }
+    }
+
+    func releaseLocalUsage(_ token: String) async {}
+
+    /// Pure test sources have no local usage or native snapshot lease.
+    /// Native-backed wrappers must forward both query and release explicitly.
+    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+        .empty(for: request)
+    }
+
+    func releaseWindowUsage(_ snapshotToken: String) async {}
 
     func quotaCurve(
         clientId: String, accountKey: String?, windowKey: String, generation: UInt64
@@ -168,13 +207,41 @@ actor AgentUsageThrottle {
 
 struct LiveUsageDataSource: UsageDataSource {
     let allowsQuotaCachePersistence = true
+    let usesNativeLocalUsage = true
 
-    func windowUsage(
-        accountKey: String?, from: Int64, until: Int64
-    ) async throws -> WindowUsage {
-        try await Task.detached(priority: .userInitiated) {
-            try TBCore.windowUsage(accountKey: accountKey, from: from, until: until)
-        }.value
+    func localUsageSync(_ request: LocalUsageSyncRequest) async throws -> LocalUsageSyncResult {
+        try await TBCore.localUsageSync(request)
+    }
+
+    func localUsageQuery(_ request: LocalUsageQueryRequest) async throws -> LocalUsageValue {
+        switch request.kind {
+        case "graph": return .graph(try await TBCore.localUsageQuery(request, as: UsagePayload.self))
+        case "models": return .models(try await TBCore.localUsageQuery(request, as: ModelReport.self))
+        case "hourly": return .hourly(try await TBCore.localUsageQuery(request, as: HourlyReport.self))
+        case "agents": return .agents(try await TBCore.localUsageQuery(request, as: AgentsReport.self))
+        case "rate": return .rate(try await TBCore.localUsageQuery(request, as: Double.self))
+        case "trace": return .trace(try await TBCore.localUsageQuery(request, as: [TraceBucket].self))
+        default: throw NSError(domain: "LocalUsageQuery", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown local query kind"])
+        }
+    }
+
+    func releaseLocalUsage(_ token: String) async {
+        do { try await TBCore.releaseLocalUsage(token) }
+        catch { FileHandle.standardError.write(Data("local usage release failed: \(error)\n".utf8)) }
+    }
+
+    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+        try await TBCore.windowUsage(request)
+    }
+
+    func releaseWindowUsage(_ snapshotToken: String) async {
+        do {
+            try await TBCore.releaseWindowUsage(snapshotToken)
+        } catch {
+            // Release cannot turn an already-read result into a failed read.
+            // Native leases are also bounded and expire on invalidation.
+            FileHandle.standardError.write(Data("window usage release failed: \(error)\n".utf8))
+        }
     }
 
     func quotaCurve(
@@ -254,6 +321,11 @@ struct LiveUsageDataSource: UsageDataSource {
 /// deterministic fixtures in `DemoData`; it has no dependency on `TBCore`.
 struct DemoUsageDataSource: UsageDataSource {
     let allowsQuotaCachePersistence = false
+
+    /// Demo quota curves intentionally have no corresponding local usage.
+    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+        .empty(for: request)
+    }
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         _ = priority

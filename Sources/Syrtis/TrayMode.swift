@@ -20,6 +20,13 @@ enum TrayMode: String, CaseIterable {
             .flatMap(TrayMode.init(rawValue:)) ?? .todayTokens
     }
 
+    var needsGraph: Bool {
+        switch self {
+        case .todayTokens, .todayCost, .totalTokens, .totalCost: return true
+        case .tokensPerMin, .quotaLeft, .hidden: return false
+        }
+    }
+
     var label: String {
         switch self {
         case .todayTokens: return "Today's tokens (50M)"
@@ -39,6 +46,10 @@ enum TrayMode: String, CaseIterable {
             guard let quotaRemaining else { return "—%" }
             return "\(Int(min(100, max(0, quotaRemaining)).rounded()))%"
         }
+        if self == .tokensPerMin {
+            guard let tokensPerMin else { return "—/m" }
+            return "\(Format.compactTokens(Int64(max(0, tokensPerMin).rounded())))/m"
+        }
         guard self != .hidden, let graph else { return "" }
         /// Hidden clients must not appear in any tray figure. An empty hidden
         /// set is byte-identical to the pre-hide summary/today totals. Computed
@@ -57,10 +68,7 @@ enum TrayMode: String, CaseIterable {
             return Format.compactTokens(totals().totalTokens)
         case .totalCost:
             return Format.usd(totals().totalCost)
-        case .tokensPerMin:
-            guard let tokensPerMin else { return "—/m" }
-            return "\(Format.compactTokens(Int64(max(0, tokensPerMin).rounded())))/m"
-        case .quotaLeft, .hidden:
+        case .tokensPerMin, .quotaLeft, .hidden:
             return ""
         }
     }

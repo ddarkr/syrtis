@@ -4,11 +4,11 @@ import TokenBarCore
 /// The measurement lane behind `--launch-timeline`: when each part of the
 /// dashboard becomes drawable after a cold process start.
 ///
-/// Starts the same tasks the popover starts when it opens (`PopoverView`'s
-/// `.task` modifiers: graph load and poll, quota poll, trace poll, the open
-/// tab's window stages, the attributed series) at the same moment, so they
-/// contend the way they do in the app, and records the first time each
-/// milestone holds. `--refresh-timing` times the stages one after another,
+/// Starts the same scheduler requests and independent provider poll the
+/// popover starts when it opens, alongside the open tab's window stages and
+/// attributed series, so they contend the way they do in the app, and records
+/// the first time each milestone holds. `--refresh-timing` times the stages
+/// one after another,
 /// which says what each costs alone and nothing about the order a user sees.
 ///
 /// Not reachable from the shipping UI: `main.swift` runs it only for the flag
@@ -35,8 +35,17 @@ enum LaunchTimelineProbe {
         func ms() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6 }
 
         let source = TimedSource()
-        let model = DashboardModel(source: source)
-        let series = AttributedSeriesModel()
+        let scheduler = LocalUsageScheduler(source: source, observesSources: false)
+        let modelSession = scheduler.openSession()
+        let seriesSession = scheduler.openSession()
+        let traySession = scheduler.openSession()
+        defer {
+            scheduler.release(modelSession)
+            scheduler.release(seriesSession)
+            scheduler.release(traySession)
+        }
+        let model = DashboardModel(source: source, scheduler: scheduler, localSession: modelSession)
+        let series = AttributedSeriesModel(scheduler: scheduler, localSession: seriesSession)
         let d = UserDefaults.standard
         model.configureQuotaVisibility(
             tabHidden: ClientRegistry.parseIdSet(d.string(forKey: ClientRegistry.tabHiddenKey) ?? ""),
@@ -44,14 +53,15 @@ enum LaunchTimelineProbe {
             orderRaw: d.string(forKey: ClientRegistry.tabOrderKey) ?? "")
         model.windowUsageClient = client
 
-        // `--only graph,quota,...` starts a subset, to find which tasks slow
-        // which. Names: graph (load), quota (poll, which also starts the
-        // window scan), window (the open tab's stages), trace, pollgraph,
-        // series, and tray (opt-in, below). Default: the popover's set.
+        // `--only graph,quota,...` starts a subset to find which tasks slow
+        // which. Names: graph (one-shot scheduler acquire), quota (independent
+        // provider poll), window (the open tab's stages), trace (one-shot),
+        // series, and tray (opt-in forced scheduler acquire).
         let only = args.firstIndex(of: "--only")
             .flatMap { $0 + 1 < args.count ? Set(args[$0 + 1].split(separator: ",").map(String.init)) : nil }
         func wants(_ name: String) -> Bool { only?.contains(name) ?? true }
         var tasks: [Task<Void, Never>] = []
+        var trayRefreshDone = false
         if wants("graph") { tasks.append(Task { await model.load() }) }
         if wants("quota") { tasks.append(Task { await model.pollAgentUsage() }) }
         var windowStagesDone = false
@@ -62,13 +72,17 @@ enum LaunchTimelineProbe {
                 windowStagesDone = true
             })
         }
-        if wants("trace") { tasks.append(Task { await model.pollTrace() }) }
-        if wants("pollgraph") { tasks.append(Task { await model.pollGraph() }) }
-        // Not a popover task: the tray's first title refresh at app launch,
-        // which forces a full re-read (`AppDelegate.startTitleRefresh`,
-        // `lastFullRefresh` starts at `.distantPast`). Opt-in only.
+        if wants("trace") { tasks.append(Task { await model.refreshTraceOnce() }) }
         if only?.contains("tray") == true {
-            tasks.append(Task { _ = try? await source.refreshGraph(year: nil, priority: .utility) })
+            tasks.append(Task {
+                do {
+                    _ = try await scheduler.acquire(
+                        .init(kind: "graph"), session: traySession, force: true)
+                    trayRefreshDone = true
+                } catch {
+                    FileHandle.standardError.write(Data("launch-timeline: tray refresh failed: \(error)\n".utf8))
+                }
+            })
         }
         if wants("series") {
             tasks.append(Task {
@@ -85,16 +99,15 @@ enum LaunchTimelineProbe {
             }
         }
         // One milestone per selected task, so a subset never ends with nothing
-        // to report. Trace and the tray refresh are timed at the source (their
-        // results can legitimately be empty, so the model's state cannot say
-        // they have answered); the window stages by the task finishing.
+        // to report. Trace is timed at the source because an empty result is
+        // still an answer; window and tray stages use task completion.
         let quotaHalf = "\(client) window card: quota half"
         let cardReady = "\(client) window card: ready"
         let cardNoQuota = "\(client) window card: settled without quota (blocked / no history)"
         let cardScanFailed = "\(client) window card: quota half, usage scan failed"
         let cardSkipped = "\(client) window card: not shown (client hidden or not offered)"
         var milestones: [String] = []
-        if wants("graph") || wants("pollgraph") { milestones.append("graph") }
+        if wants("graph") { milestones.append("graph") }
         if wants("quota") { milestones += ["quota payload", quotaHalf, cardReady] }
         if wants("window") { milestones.append("window stages finished") }
         if wants("trace") { milestones.append("trace (first answer)") }
@@ -130,7 +143,7 @@ enum LaunchTimelineProbe {
             }
             mark("window stages finished", windowStagesDone)
             mark("trace (first answer)", source.answered("trace"))
-            mark("tray forced refresh", source.answered("refreshGraph"))
+            mark("tray forced refresh", trayRefreshDone)
             mark("attributed series", series.points != nil)
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -138,16 +151,18 @@ enum LaunchTimelineProbe {
             print("   never  \(name) (within \(Int(deadline / 1000)) s)")
         }
         tasks.forEach { $0.cancel() }
+        source.reportTimings()
     }
 }
 
-/// Forwards to the live source and records which calls have returned at least
-/// once, for milestones the model's own state cannot show.
+/// Forwards the injected source's complete native lease surface and records
+/// both first answers and actual source-sync / compact-query durations.
 private final class TimedSource: UsageDataSource, @unchecked Sendable {
     private let live = LiveUsageDataSource()
     private let lock = NSLock()
     private var returned: Set<String> = []
 
+    private var timings: [String: [Double]] = [:]
     func answered(_ call: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return returned.contains(call)
@@ -157,7 +172,50 @@ private final class TimedSource: UsageDataSource, @unchecked Sendable {
         lock.lock(); returned.insert(call); lock.unlock()
     }
 
+    private func record(_ call: String, since start: DispatchTime) {
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e6
+        lock.lock()
+        returned.insert(call)
+        timings[call, default: []].append(elapsed)
+        lock.unlock()
+    }
+
+    func reportTimings() {
+        lock.lock()
+        let samples = timings
+        lock.unlock()
+        for call in samples.keys.sorted() {
+            let values = samples[call]!
+            print("\(call) (x\(values.count))  "
+                  + values.map { String(format: "%.1f", $0) }.joined(separator: "  ") + " ms")
+        }
+    }
+
     var allowsQuotaCachePersistence: Bool { live.allowsQuotaCachePersistence }
+    var usesNativeLocalUsage: Bool { true }
+    func localUsageSync(_ request: LocalUsageSyncRequest) async throws -> LocalUsageSyncResult {
+        let start = DispatchTime.now()
+        defer { record("source sync", since: start) }
+        return try await live.localUsageSync(request)
+    }
+    func localUsageQuery(_ request: LocalUsageQueryRequest) async throws -> LocalUsageValue {
+        let start = DispatchTime.now()
+        var kind = "failed"
+        defer { record("compact pure query: \(kind)", since: start) }
+        let value = try await live.localUsageQuery(request)
+        switch value {
+        case .graph: kind = "graph"
+        case .models: kind = "models"
+        case .hourly: kind = "hourly"
+        case .agents: kind = "agents"
+        case .rate: kind = "rate"
+        case .trace: kind = "trace"; note("trace")
+        }
+        return value
+    }
+    func releaseLocalUsage(_ token: String) async {
+        await live.releaseLocalUsage(token)
+    }
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         try await live.graph(year: year, priority: priority)
     }
@@ -180,8 +238,11 @@ private final class TimedSource: UsageDataSource, @unchecked Sendable {
         return try await live.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await live.tokensPerMin() }
-    func windowUsage(accountKey: String?, from: Int64, until: Int64) async throws -> WindowUsage {
-        try await live.windowUsage(accountKey: accountKey, from: from, until: until)
+    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+        try await live.windowUsage(request)
+    }
+    func releaseWindowUsage(_ snapshotToken: String) async {
+        await live.releaseWindowUsage(snapshotToken)
     }
     func quotaCurve(clientId: String, accountKey: String?, windowKey: String, generation: UInt64) async throws -> QuotaCurve? {
         try await live.quotaCurve(clientId: clientId, accountKey: accountKey, windowKey: windowKey, generation: generation)

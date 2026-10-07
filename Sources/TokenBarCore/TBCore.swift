@@ -162,9 +162,9 @@ public struct KeychainConsentResult: Decodable, Equatable, Sendable {
     public let rejected: [RejectedKeychainConsent]
 }
 
-/// Thin Swift facade over the tb_core_ffi staticlib. All calls are blocking;
-/// invoke from a background thread/actor in app code. `agentUsage()` is also
-/// network-bound.
+/// Thin Swift facade over the staticlib. Synchronous calls require a background
+/// thread; async calls dispatch their blocking work. `agentUsage()` additionally
+/// performs provider network requests.
 public enum TBCore {
     /// Copy the FFI string out of the heap buffer and free it, so decoding never
     /// races the C allocation. Returns nil for a NULL pointer. This is the single
@@ -328,36 +328,42 @@ public enum TBCore {
         try unwrap(tb_filter_parity_probe())
     }
 
-    /// Read-only quota curve snapshot for one bound series. `generation` must be
-    /// the publication generation the series identity was bound under; a stale
-    /// one, or a series this process never verified, fails closed rather than
-    /// serving a curve.
-    ///
-    /// Returns nil when the series exists but has no stored history yet.
-    /// PROTOTYPE — usage inside an absolute [from, until) window, for one
-    /// account.
-    ///
-    /// `accountKey` is the same value `quotaCurve` takes: `nil` for the primary
-    /// account, an extra Claude account's config directory otherwise. It scopes
-    /// which transcripts are read, so the usage folded into a window and the
-    /// quota that window reports come from one account.
-    ///
-    /// There is no argument for "every account", and no default for this one.
-    /// A window belongs to an account; a total spanning accounts has no quota
-    /// reading to divide by, and a caller that omitted the argument would get
-    /// every account's usage measured against one account's allowance — which
-    /// is the defect in issue #258, and the reason the compiler is made to ask.
+    /// Compact account-scoped aggregates. A first request captures a bounded
+    /// native lease; token followups query that source/pricing generation only.
     public static func windowUsage(
-        accountKey: String?, from: Int64, until: Int64
-    ) throws -> WindowUsage {
-        // `withCString` on an Optional would bind a temporary that dies before
-        // the call; the nil case has to pass a real NULL.
-        if let accountKey {
-            return try accountKey.withCString { account in
-                try unwrap(tb_window_usage(account, from, until))
+        _ request: WindowUsageRequest
+    ) async throws -> WindowUsageBatch {
+        try await Task.detached(priority: .utility) {
+            var bytes = try JSONEncoder().encode(request)
+            bytes.append(0)
+            let batch: WindowUsageBatch = try bytes.withUnsafeBytes { buffer in
+                try unwrap(tb_window_usage(buffer.baseAddress!.assumingMemoryBound(to: CChar.self)))
             }
-        }
-        return try unwrap(tb_window_usage(nil, from, until))
+            do {
+                try batch.validate(request)
+            } catch {
+                if request.snapshotToken == nil {
+                    try? batch.snapshotToken.withCString { token in
+                        let _: WindowUsageReleased = try unwrap(tb_window_usage_release(token))
+                    }
+                }
+                throw error
+            }
+            return batch
+        }.value
+    }
+
+    /// Releases only this owner's native lease, never another account/view's.
+    public static func releaseWindowUsage(_ snapshotToken: String) async throws {
+        try await Task.detached(priority: .utility) {
+            try snapshotToken.withCString { token in
+                let _: WindowUsageReleased = try unwrap(tb_window_usage_release(token))
+            }
+        }.value
+    }
+
+    private struct WindowUsageReleased: Decodable {
+        let released: Bool
     }
 
     /// `accountKey` selects which account's series to read. `nil` is the

@@ -6,12 +6,6 @@ public enum WindowResolution: Equatable, Sendable {
 }
 
 public enum WindowResolver {
-    public static func firstUsageAfterReset(
-        messages: [WindowMessage], resetMs: Int64
-    ) -> Int64? {
-        messages.lazy.map(\.timestamp).filter { $0 >= resetMs }.min()
-    }
-
     public static func resolve(
         resetsAtMs: Int64?,
         durationMs: Int64?,

@@ -91,6 +91,8 @@ struct ExportMeta {
     generated_at: String,
     version: String,
     date_range: DateRange,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pricing_contract: Option<tokscale_core::GraphMetaContract>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +124,23 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
     let payload = map_graph(graph);
     serde_json::to_value(payload).map_err(|e| format!("serialize usage graph: {}", e))
 }
+/// Fold a captured source/price generation; never probe or ingest sources.
+pub(crate) fn run_from_snapshot(
+    snapshot: &tokscale_core::LocalUsageSnapshot,
+    options: tokscale_core::ReportOptions,
+    pricing: Option<&tokscale_core::pricing::PricingService>,
+) -> Result<crate::EncodedLocalPayload, String> {
+    let result = tokscale_core::generate_local_graph_from_snapshot(
+        snapshot,
+        options,
+        pricing,
+        tokscale_core::GraphPricingMode::BestEffort,
+    )?;
+    let (graph, contract) = result.into_parts();
+    let mut payload = map_graph(graph);
+    payload.meta.pricing_contract = Some(contract);
+    crate::encode_local_payload(&payload)
+}
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {
     let trimmed = year.trim();
@@ -144,6 +163,7 @@ fn map_graph(graph: tokscale_core::GraphResult) -> TokenContributionData {
     TokenContributionData {
         meta: ExportMeta {
             generated_at: graph.meta.generated_at,
+            pricing_contract: None,
             version: VERSION.to_string(),
             date_range: DateRange {
                 start: graph.meta.date_range_start,

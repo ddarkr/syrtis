@@ -34,8 +34,8 @@ public struct BarRect: Equatable, Sendable {
     public let x: Double
     public let width: Double
     public let height: Double
-    /// True when the interval held no usage at all. Drawn as a baseline tick so
-    /// "nothing was spent" stays distinguishable from "no data here".
+    /// True when ex-cache-read weight is zero, including cost-only and
+    /// cache-read-only usage. Its compact hover counters remain available.
     public let isEmpty: Bool
 }
 
@@ -146,13 +146,12 @@ public enum WindowCardGeometry {
 
     // MARK: - Geometry
 
-    /// The metric-free half: bars and hit zones. Split out because it is the
-    /// expensive half — O(zones x messages) — and because a function that
-    /// cannot see `metric` cannot leak it into the usage geometry (`V12`).
+    /// The metric-free half: bars and hit zones. Native counters already
+    /// intersect each zone with the half-open current interval.
     /// Compute once per data load, not per body evaluation.
     public static func usageGeometry(
         windowStartMs: Int64, windowEndMs: Int64, nowMs: Int64,
-        samples: [QuotaSample], messages: [WindowMessage]
+        samples: [QuotaSample], zoneCounters: [WindowUsageBatch.Zone]
     ) -> (bars: [BarRect], hits: [HitZone]) {
         let hits = zones(windowStartMs: windowStartMs, windowEndMs: windowEndMs,
                          nowMs: nowMs, samples: samples)
@@ -162,23 +161,10 @@ public enum WindowCardGeometry {
         // Measured discrimination (moved vs still buckets): 4.5x this way,
         // 1.2x with input+output+reasoning alone.
         //
-        // One pass over the messages instead of one per zone: the per-zone
-        // filter was O(zones x messages) and ran on every hover event.
-        // Each zone is closed by the sample that ends it, hence `(lo, hi]` —
-        // except the first, which owns its own lower bound. `UnionScan.slice`
-        // admits a message landing exactly on the window start, and for an
-        // inferred window that message IS the start, so leaving zone 0
-        // exclusive put it in the card's totals and in no bar at all.
-        var weights = [Int64](repeating: 0, count: hits.count)
-        for m in messages {
-            guard let i = hits.indices.first(where: { index in
-                let zone = hits[index]
-                let insideStart = index == 0
-                    ? m.timestamp >= zone.loMs : m.timestamp > zone.loMs
-                return insideStart && m.timestamp <= zone.hiMs
-            }) else { continue }
-            weights[i] = weights[i].saturatingAdding(m.tokensExCacheRead)
-        }
+        let byIndex = Dictionary(
+            zoneCounters.map { ($0.index, $0.tokensExCacheRead) },
+            uniquingKeysWith: { first, _ in first })
+        let weights = hits.map { byIndex[Int64($0.index)] ?? 0 }
         let tallest = max(weights.max() ?? 0, 1)
         let bars = zip(hits, weights).map { zone, w in
             BarRect(x: zone.x, width: zone.width,
@@ -205,12 +191,12 @@ public enum WindowCardGeometry {
     /// `metric` reaches the curve and nothing else.
     public static func chartGeometry(
         windowStartMs: Int64, windowEndMs: Int64, nowMs: Int64,
-        samples: [QuotaSample], messages: [WindowMessage],
+        samples: [QuotaSample], zoneCounters: [WindowUsageBatch.Zone],
         metric: QuotaMetric
     ) -> ChartGeometry {
         let usage = usageGeometry(
             windowStartMs: windowStartMs, windowEndMs: windowEndMs, nowMs: nowMs,
-            samples: samples, messages: messages)
+            samples: samples, zoneCounters: zoneCounters)
         let quota = quotaGeometry(
             windowStartMs: windowStartMs, windowEndMs: windowEndMs, nowMs: nowMs,
             samples: samples, metric: metric)

@@ -12,8 +12,13 @@ struct PopoverView: View {
         return ids.filter { supported.contains($0) }
     }
 
-    init(routeMemory: StatusItemRouteMemory) {
+    init(routeMemory: StatusItemRouteMemory, scheduler: LocalUsageScheduler,
+         source: any UsageDataSource, localSession: LocalUsageScheduler.Session,
+         seriesSession: LocalUsageScheduler.Session) {
         self.routeMemory = routeMemory
+        _model = State(initialValue: DashboardModel(
+            cachesSnapshot: true, source: source, scheduler: scheduler, localSession: localSession))
+        _series = State(initialValue: AttributedSeriesModel(scheduler: scheduler, localSession: seriesSession))
     }
 
     /// Owns the popover's size; the drag handle below writes its height.
@@ -23,8 +28,8 @@ struct PopoverView: View {
 
     // The popover's model owns the shared restore snapshot — its per-open
     // teardown/rebuild is exactly what the cache exists to speed up.
-    @State private var model = DashboardModel(cachesSnapshot: true)
-    @State private var tokensPerMin: Double?
+    @State private var model: DashboardModel
+    private var tokensPerMin: Double? { model.liveRate }
     /// True while Cmd has been held alone for a beat — shows shortcut pins.
     @State private var cmdHeld = false
     @State private var keyMonitor: Any?
@@ -85,7 +90,7 @@ struct PopoverView: View {
     /// Owns the attributed daily series. Mounted here for the reason its own
     /// doc comment gives: its timezone provenance is process-scoped, and the
     /// model expects to be `@State` on this view.
-    @State private var series = AttributedSeriesModel()
+    @State private var series: AttributedSeriesModel
 
     /// How many calendar days the trend covers. Two weeks reads as a rhythm
     /// without turning each column into a sliver at popover width.
@@ -255,6 +260,16 @@ struct PopoverView: View {
                 .id(lensKey)
                 .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
             }
+            if model.payload != nil, model.localError != nil || model.localPending {
+                HStack(spacing: 5) {
+                    Image(systemName: model.localError == nil ? "clock" : "exclamationmark.triangle")
+                    Text(model.localError == nil ? "Checking local usage…" : "Local usage could not be refreshed.")
+                        .font(.caption2)
+                }
+                .foregroundStyle(.secondary)
+                .help(model.localError ?? "")
+                .padding(.bottom, 4)
+            }
             PanelDivider()
             footer
         }
@@ -267,35 +282,8 @@ struct PopoverView: View {
         .animation(.easeOut(duration: 0.16), value: activeTab)
         .background(PopoverBackdrop().ignoresSafeArea())
         .overlay(alignment: .bottom) { resizeHandle }
-        .task { await model.load() }
-        // Keyed on the year AND the client slice: a year switch, a tab switch,
-        // or a hide toggle must re-fetch the active lazy lens (Hourly/Agents)
-        // for the new slice. Without the year in the key, switching years while
-        // parked on Hourly/Agents would keep showing the old year (reload()'s
-        // lazy re-fetch only refreshes an already-loaded lens, so a lens still
-        // nil from the reopen would never reload); without the slice, switching
-        // client tabs would serve the previous tab's FFI-filtered totals.
-        // Keyed on the raw activeViewRaw, not effectiveView: intentional. If a
-        // now-hidden lazy lens (Hourly/Agents) is still the persisted active
-        // view for one frame, this fires an ensureData fetch for it — but
-        // resetViewIfHidden() immediately rewrites activeViewRaw to
-        // "overview" (same onChange pass), which changes this task's id and
-        // cancels the in-flight fetch before it commits. Self-correcting;
-        // switching to effectiveView here isn't needed for correctness.
-        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(lazyClientIds.joined(separator: ","))") {
-            await model.ensureData(for: activeView.wrappedValue, clients: lazyClientIds)
-        }
-        // Model report, keyed on the COMMITTED slice rather than the requested
-        // one. Before any payload lands the key is empty, so this fires as a
-        // no-op; it re-fires the moment apply() commits, which is what keeps
-        // the model scan off the graph's critical path instead of racing it
-        // for the same Rayon pool, and again whenever a refresh moves the
-        // payload. Keying on `model.year` instead looked equivalent but was
-        // not: that changes at the moment of intent, so a slice whose payload
-        // shares the previous generation — an all-years and a current-year
-        // view are both dated today — never re-fired and never fetched.
-        .task(id: "\(activeViewRaw)|\(model.committedSliceKey)") {
-            await model.ensureModelData(for: activeView.wrappedValue)
+        .task(id: "\(effectiveView.rawValue)|\(model.year ?? "")|\(lazyClientIds.joined(separator: ","))|\(hiddenRaw)") {
+            model.configureLocalDemand(view: effectiveView, clients: lazyClientIds)
         }
         // Auto-clear a year filter scoped to a year only hidden clients used —
         // re-checked on a live hide toggle (hiddenRaw) and on each payload load
@@ -304,10 +292,6 @@ struct PopoverView: View {
         .task(id: "\(hiddenRaw)|\(model.payload?.meta.generatedAt ?? "")") {
             await model.clearYearIfHiddenOnly(hidden: ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(hiddenRaw)))
         }
-        // Keyed on the hidden raw so a hide toggle restarts the loop and
-        // re-fetches the filtered rate immediately (badge would otherwise lag
-        // ≤10s). The loop fetches first, then sleeps.
-        .task(id: hiddenRaw) { await pollTokensPerMin() }
         // Keyed on the account generation, not unkeyed. The quota cards come
         // from this loop, and the loop sleeps 60s between fetches — so removing
         // a Claude account cleared the registry immediately while its card sat
@@ -336,13 +320,8 @@ struct PopoverView: View {
         // classification saved in Settings would otherwise reach the daily
         // chart at once (its own task IS keyed on it) while these three kept
         // reporting the previous split until the next minute poll.
-        // And on the scan-root generation, for the reason the series task
-        // below is: `invalidateScanDerivedCaches` clears the static union scan
-        // but not the `windowCards`, `quotaHistory` and `quotaEquivalences`
-        // this model has already published, and nothing else in this identity
-        // moves when a root is added or removed — so every visible quota
-        // surface kept drawing the old root set until a poll happened to call
-        // `refreshWindowUsage` again, up to a minute later.
+        // Root changes supersede local queries; already-published compact card
+        // facts must also be refreshed on this view's demand identity.
         .task(id: quotaRefreshID) {
             model.configureQuotaVisibility(
                 tabHidden: ClientRegistry.parseIdSet(hiddenRaw),
@@ -362,44 +341,9 @@ struct PopoverView: View {
             model.refreshWindowQuotaHalves()   // synchronous: lands this frame
             await model.refreshWindowUsage()
         }
-        .task { await model.pollTrace() }
-        .task { await model.pollGraph() }
-        // Keyed on the declarations too: re-splitting the stack is the whole
-        // point of the card, and a classification saved in Settings has to
-        // reach it without waiting for a poll.
-        // Keyed on the scan roots as well as the declarations. Clearing the
-        // static cache and superseding in-flight loads does not touch the
-        // `points` this model has already published, and this task had no other
-        // reason to restart — so a root added or removed while the popover
-        // stayed open left the trend drawing the old set indefinitely. Exactly
-        // the shape the timezone case below is written for, which is why this
-        // is declarative rather than a second notification: the raw list is
-        // already persisted, so keying on it restarts the load by construction.
-        .task(id: "\(attributionRaw)|\(extraRootsGeneration)") {
-            await series.load(
-                source: UsageDataSources.current,
-                confirmed: UsageAttribution.parseRaw(attributionRaw).records)
-        }
-        // A transition invalidates the model's provenance and its cached rows,
-        // but the `points` it already published are untouched and this task is
-        // keyed on the declarations alone, so nothing restarts it. The trend
-        // chart would keep drawing day buckets and axis labels from the zone
-        // the user just left until the popover was rebuilt.
-        .onReceive(NotificationCenter.default.publisher(
-            for: .NSSystemTimeZoneDidChange)) { _ in
-            // The grids bucket by the current zone too, and only
-            // `refreshWindowQuotaHalves` rebuilds them — so without this the
-            // weekday cells and the observed-day count stay in the zone the
-            // user left until a later successful quota poll, or for ever if
-            // those keep failing. Teaching this handler about one of the two
-            // timezone-dependent folds was the same half-applied rule as the
-            // rest of this round.
-            model.refreshWindowQuotaHalves()
-            Task {
-                await series.load(
-                    source: UsageDataSources.current,
-                    confirmed: UsageAttribution.parseRaw(attributionRaw).records)
-            }
+        .task(id: "\(effectiveView.rawValue)|\(attributionRaw)|\(extraRootsGeneration)") {
+            series.setDemand(wanted: effectiveView == .quota,
+                             confirmed: UsageAttribution.parseRaw(attributionRaw).records)
         }
         .onAppear {
             installKeyMonitors()
@@ -416,7 +360,11 @@ struct PopoverView: View {
             }
             routeMemory.record(clientId: activeTab, view: activeViewRaw)
         }
-        .onDisappear { removeKeyMonitors() }
+        .onDisappear {
+            removeKeyMonitors()
+            model.releaseLocalDemand()
+            series.releaseDemand()
+        }
         // Reset a stale persisted tab whenever the displayed client set changes,
         // so a saved client id that no longer exists (or that the user just hid)
         // can't strand the dashboard on an empty slice with no visible tab row
@@ -434,17 +382,6 @@ struct PopoverView: View {
         //     displayClients is reactive state and deltas the instant the toggle
         //     lands. Without this, a live hide would strand the slice until
         //     reopen.
-        // The graph task is not keyed on the generation and `pollGraph` sleeps
-        // before fetching, so Overview and the model/hourly/agents lenses would
-        // keep drawing the old root set for up to a minute after an apply. This
-        // also supersedes an old-root fetch still in flight: `gatedGraph` bumps
-        // `graphFetchToken`, and a fetch that no longer owns it cannot commit.
-        //
-        // Not `initial: true`: the first value is the launch state, and
-        // `load()` already covers t=0.
-        .onChange(of: extraRootsGeneration) { _, _ in
-            Task { await model.reloadForRootChange() }
-        }
         .onChange(of: model.stats?.presentClients, initial: true) { _, _ in
             resetTabIfHidden()
         }
@@ -848,13 +785,13 @@ struct PopoverView: View {
                     payload: payload, clientIds: clientIds,
                     turnClientIds: turnClientIds,
                     colors: model.colors,
-                    onExpand: { Task { await model.ensureModelColors() } })
+                    onExpandedChanged: { model.setModelRowsExpanded($1, owner: $0) })
             case .monthly:
                 MonthlyView(
                     payload: payload, clientIds: clientIds,
                     turnClientIds: turnClientIds,
                     colors: model.colors,
-                    onExpand: { Task { await model.ensureModelColors() } })
+                    onExpandedChanged: { model.setModelRowsExpanded($1, owner: $0) })
             case .hourly:
                 HourlyView(report: model.hourlyReport(for: clientIds), clientIds: clientIds)
             case .stats:
@@ -1048,16 +985,4 @@ struct PopoverView: View {
         }
     }
 
-    // MARK: - Live rate
-
-    /// Poll the live rate every 10s while the popover content is on screen;
-    /// `.task` cancels this loop when the popover closes.
-    private func pollTokensPerMin() async {
-        while !Task.isCancelled {
-            let rate = await model.tokensPerMin()
-            if Task.isCancelled { break }
-            tokensPerMin = rate
-            try? await Task.sleep(for: .seconds(10))
-        }
-    }
 }

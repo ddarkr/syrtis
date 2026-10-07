@@ -15,9 +15,6 @@ struct WindowUsageCard: View {
     var account: CardAccountContext?
     var onSelectAccount: (String?) -> Void = { _ in }
 
-    /// Set alongside the geometry so the tooltip can slice the same messages
-    /// the bars were built from.
-    private var hoverMessages: [WindowMessage] { state.usageHalf?.mine ?? [] }
     private var hoverSubtitle: String {
         guard let q = state.quotaHalf else { return "" }
         return "\(ClientRegistry.style(q.clientId).displayName) · \(q.windowLabel.localized)"
@@ -165,7 +162,7 @@ struct WindowUsageCard: View {
                     case .numbers:
                         if let usage {
                             equivalenceRow(
-                                quota: quota, mine: usage.mine, interval: interval)
+                                quota: quota, observed: usage.observed, interval: interval)
                         }
                     case .unreadable:
                         // A settled failure, not a slow success. The chart above
@@ -437,18 +434,10 @@ struct WindowUsageCard: View {
     /// from the card's origin and applied from the chart's.
     @ViewBuilder
     private var tooltipLayer: some View {
-        if let zone = hoverZone, cardFrame != .zero {
+        if let zone = hoverZone, cardFrame != .zero,
+           let counter = state.usageHalf?.zones.first(where: { $0.index == Int64(zone.index) })?.counter {
             WindowHoverTooltip(
-                zone: zone, metric: metric,
-                // Zone 0 owns its own lower bound, matching
-                // `WindowCardGeometry.usageGeometry`. Without this the bar
-                // drawn from a window-start message and the tooltip explaining
-                // that bar disagree about whether the message is in it.
-                messages: hoverMessages.filter {
-                    let insideStart = zone.index == 0
-                        ? $0.timestamp >= zone.loMs : $0.timestamp > zone.loMs
-                    return insideStart && $0.timestamp <= zone.hiMs
-                },
+                zone: zone, metric: metric, counter: counter,
                 subtitle: hoverSubtitle,
                 measuredSize: $tooltipSize)
                 .offset(placement(anchor: hoverAnchorInCard, container: cardFrame))
@@ -534,7 +523,7 @@ struct WindowUsageCard: View {
     }
 
     private func equivalenceRow(
-        quota: WindowQuotaHalf, mine: [WindowMessage],
+        quota: WindowQuotaHalf, observed: WindowUsageBatch.Observed?,
         interval: (start: Int64, end: Int64)
     ) -> some View {
         // Restricted to the SETTLED interval, like the chart above it. Once the
@@ -546,7 +535,10 @@ struct WindowUsageCard: View {
         let inWindow = quota.samples.filter {
             $0.atMs >= interval.start && $0.atMs <= interval.end
         }
-        let row = WindowEquivalence.row(samples: inWindow, messages: mine)
+        let row = observed.map {
+            WindowEquivalence.row(
+                samples: inWindow, observedTokens: $0.tokens, observedCost: $0.cost)
+        } ?? .unavailable
         let plain: Bool = { if case .ratio = row { return false }; return true }()
         return Text(WindowEquivalence.text(
             row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
@@ -561,22 +553,19 @@ struct WindowUsageCard: View {
 private struct WindowHoverTooltip: View {
     let zone: HitZone
     let metric: QuotaMetric
-    let messages: [WindowMessage]
+    let counter: WindowUsageBatch.Counter
     let subtitle: String
     @Binding var measuredSize: CGSize
 
-    // Saturating, like every production fold over these counters: the tooltip
-    // reads the same untrusted transcript rows, and a hover must not be able to
-    // do what the chart underneath it no longer can.
-    private var total: Int64 { messages.reduce(0) { $0.saturatingAdding($1.tokens) } }
+    private var total: Int64 { counter.tokens }
 
     private var kinds: [(label: String, color: String, value: Int64)] {
         let sums: [Int64] = [
-            messages.reduce(0) { $0.saturatingAdding($1.input) },
-            messages.reduce(0) { $0.saturatingAdding($1.output) },
-            messages.reduce(0) { $0.saturatingAdding($1.cacheRead) },
-            messages.reduce(0) { $0.saturatingAdding($1.cacheWrite) },
-            messages.reduce(0) { $0.saturatingAdding($1.reasoning) },
+            counter.breakdown.input,
+            counter.breakdown.output,
+            counter.breakdown.cacheRead,
+            counter.breakdown.cacheWrite,
+            counter.breakdown.reasoning,
         ]
         return zip(TokenKindPalette.all, sums)
             .map { (label: $0.label, color: $0.color, value: $1) }
@@ -617,14 +606,14 @@ private struct WindowHoverTooltip: View {
                 // price and no token count, and "0 tokens · $4.10" reads as a
                 // measurement rather than an absence.
                 Text("%@ tokens".localized(Format.tokens(
-                    tokens: total, cost: messages.reduce(0) { $0 + $1.cost })))
+                    tokens: total, cost: counter.cost)))
                 Spacer()
                 // `money`: an all-unpriced interval sums to exactly zero,
                 // which `usdOrBelowCent` renders "$0.00" — it only covers the
                 // sub-cent half. Per-interval this is the likelier case of the
                 // two, not the rarer one.
                 Text(Format.money(
-                    tokens: total, cost: messages.reduce(0) { $0 + $1.cost }))
+                    tokens: total, cost: counter.cost))
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -641,7 +630,7 @@ private struct WindowHoverTooltip: View {
                 }
                 .font(.caption2)
             }
-            if kinds.isEmpty {
+            if kinds.isEmpty && counter.messageCount == 0 {
                 Text("No usage in this interval".localized)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

@@ -31,13 +31,14 @@ mod filter_parity_probe;
 mod hourly_report;
 mod keychain_consent;
 mod kiro_integrations;
+mod local_usage;
 #[cfg(target_os = "macos")]
 mod macos_safe_storage;
-mod window_usage;
 mod model_report;
 mod opencode_integrations;
 mod usage_graph;
 mod usage_tail;
+mod window_usage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_char, CStr, CString};
@@ -47,6 +48,19 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use usage_tail::UsageTailer;
+
+static LOCAL_USAGE_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Serialize local source probes and parsing, never quota-provider requests.
+/// Release cache/flight/tick bookkeeping locks before acquiring this guard;
+/// callers already holding it must use their unlocked inner scan, not re-enter.
+pub(crate) fn local_usage_guard() -> std::sync::MutexGuard<'static, ()> {
+    // ponytail: one process-wide scan lane; split only if independent roots
+    // need throughput and can preserve the shared parser-cache contract.
+    LOCAL_USAGE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn select_user_home(home: Option<PathBuf>, platform_home: Option<PathBuf>) -> Option<PathBuf> {
     home.filter(|path| !path.as_os_str().is_empty())
@@ -132,6 +146,7 @@ impl LocalSourceContext {
 /// Serve `tb_graph` from cache when the last computation is at most this old;
 /// `tb_refresh_graph` always recomputes. Mirrors the Tauri app's oneshot cache.
 const ONESHOT_MAX_AGE_SECS: u64 = 30;
+const GRAPH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Re-parse cadence for the live tail. In the Tauri app a background loop
 /// ticks every 10s; the staticlib spawns no threads, so the tail ticks lazily:
 /// `tb_usage_trace` / `tb_tokens_per_min` re-parse at most once per interval
@@ -268,43 +283,34 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
         .ok();
 });
 
-/// year → (computed-at, source token, mapped graph payload). Same role as
-/// the Tauri AppState cache, plus a change token: when the cache entry ages
-/// past the oneshot window but the topology-sensitive token still matches,
-/// the entry is re-stamped and served — an idle machine never pays for a full
-/// re-aggregation just because time passed.
-type GraphCacheEntry = (Instant, u64, serde_json::Value);
+/// Keep serde's encoded allocation inside the Arc: sharing a payload never
+/// copies its bytes or recreates its JSON tree.
+pub(crate) type EncodedLocalPayload = Arc<Box<serde_json::value::RawValue>>;
+
+/// year → (computed-at, source token, encoded graph payload). An aged requested
+/// entry is verified and re-stamped when its topology-sensitive token matches;
+/// publication expires other aged entries and bounds retained encoded bytes.
+type GraphCacheEntry = (Instant, u64, EncodedLocalPayload);
 static GRAPH_CACHE: LazyLock<Mutex<HashMap<String, GraphCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The graph computes in progress, by year. See `shared_compute`.
 static GRAPH_FLIGHTS: LazyLock<Mutex<HashMap<String, Arc<Flight>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-pub(crate) static WINDOW_USAGE_CACHE: LazyLock<
-    Mutex<HashMap<window_usage::CacheKey, window_usage::CacheEntry>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Bumped every time the extra-scan-paths registry is replaced. A scan reads
-/// the root set when it builds its options — `report_options`/`parse_options`
-/// call `extra_scan_paths::snapshot()` — and publishes minutes of work later,
-/// so clearing the caches is not enough on its own: the in-flight scan would
-/// insert its old-root result *after* the clear and the next reader would
-/// serve it. Every publisher records the generation it started under and
-/// drops its result if the registry moved underneath it.
+/// Bumped whenever extra scan roots or Claude account exclusions are replaced.
+/// A scan snapshots these registries when building its options, then publishes
+/// minutes of work later. Clearing caches alone would let an in-flight scan
+/// insert its old-scope result after the clear, so every publisher records its
+/// starting generation and rejects caching when either registry moved.
 ///
-/// Where that snapshot is taken is load-bearing and this comment used to state
-/// it wrongly, saying the roots were captured with `LocalSourceContext::current()`
-/// at the top of the call. They are not: `LocalSourceContext` carries only
-/// `home_dir`, which no registry replace touches. A reviewer reading the old
-/// wording concluded that a caller queued behind `window_usage::COMPUTE` would
-/// scan with a stale root set while reading a fresh generation. It cannot: the
-/// generation is read after the lock and the roots after that, so a replace
-/// while queued is seen by both, and a replace between them moves the
-/// generation and `publish` refuses. The guard is fail-closed BECAUSE the
-/// snapshot is late, which is the opposite of what the old sentence implied.
+/// The generation is captured after acquiring the local-source guard and the
+/// roots when report/parse options are built after that. A registry replace
+/// while queued is therefore seen by both; a replace during the scan moves
+/// the generation and the publisher refuses to cache the old-root result.
 ///
 /// Checked inside the lock that guards the thing being published, and bumped
-/// before either clear, so "check the generation" and "publish" cannot be
-/// split by a replace landing between them.
+/// before clearing caches, so a registry replace cannot split the generation
+/// check from the publication it authorizes.
 static ROOT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static TAILER: LazyLock<UsageTailer> = LazyLock::new(UsageTailer::new);
@@ -334,6 +340,32 @@ fn envelope(result: Result<serde_json::Value, String>) -> *mut c_char {
         Err(err) => serde_json::json!({"ok": false, "err": err}).to_string(),
     };
     into_raw_json(json)
+}
+
+pub(crate) fn encode_local_payload<T: serde::Serialize>(
+    payload: &T,
+) -> Result<EncodedLocalPayload, String> {
+    serde_json::value::to_raw_value(payload)
+        .map(Arc::new)
+        .map_err(|error| format!("serialize local payload: {error}"))
+}
+
+pub(crate) fn encoded_envelope(result: Result<EncodedLocalPayload, String>) -> *mut c_char {
+    match result {
+        Ok(data) => {
+            const PREFIX: &str = r#"{"data":"#;
+            const SUFFIX: &str = r#","ok":true}"#;
+            // The payload is already valid JSON. Only the caller-owned C
+            // envelope needs an allocation, independent of cache/flight life.
+            let mut json =
+                String::with_capacity(PREFIX.len() + data.get().len() + SUFFIX.len() + 1);
+            json.push_str(PREFIX);
+            json.push_str(data.get());
+            json.push_str(SUFFIX);
+            into_raw_json(json)
+        }
+        Err(error) => envelope(Err(error)),
+    }
 }
 
 /// Run an FFI entry-point body, converting any panic into an error envelope
@@ -435,9 +467,9 @@ fn quota_curve_payload(
             // The store's own predicate, not a re-derivation: it normalizes
             // both sides with the sample's own duration, which is the only
             // comparison that identifies the group correctly.
-            is_active_group: series.active_reset_at.is_some_and(|active| {
-                agent_quota_history::is_active_group_sample(active, &sample)
-            }),
+            is_active_group: series
+                .active_reset_at
+                .is_some_and(|active| agent_quota_history::is_active_group_sample(active, &sample)),
         })
         .collect::<Vec<_>>();
     serde_json::to_value(QuotaCurvePayload {
@@ -587,7 +619,7 @@ fn quota_curve_result(
 }
 
 /// NULL is a legitimate value meaning "not supplied", unlike
-/// `required_string_from` where NULL is a caller error.
+/// `required_str_from` where NULL is a caller error.
 unsafe fn optional_string_from(value: *const c_char) -> Result<Option<String>, String> {
     if value.is_null() {
         return Ok(None);
@@ -598,13 +630,12 @@ unsafe fn optional_string_from(value: *const c_char) -> Result<Option<String>, S
         .map_err(|_| "account_key is not valid UTF-8".to_string())
 }
 
-unsafe fn required_string_from(value: *const c_char, name: &str) -> Result<String, String> {
+unsafe fn required_str_from<'a>(value: *const c_char, name: &str) -> Result<&'a str, String> {
     if value.is_null() {
         return Err(format!("{name} is required"));
     }
     unsafe { CStr::from_ptr(value) }
         .to_str()
-        .map(str::to_string)
         .map_err(|_| format!("{name} is not valid UTF-8"))
 }
 
@@ -645,55 +676,83 @@ unsafe fn clients_from(clients: *const c_char) -> Result<Option<Vec<String>>, St
     Ok(if list.is_empty() { None } else { Some(list) })
 }
 
-fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
-    // Read the entry and release the lock before any filesystem I/O — never hold
-    // GRAPH_CACHE across the source-state probe below (mirrors graph_compute,
-    // which probes outside the lock too), so concurrent tb_graph callers don't
-    // queue behind one another's stat sweep.
-    let (fresh_enough, token, data) = {
+fn graph_cached(year: &str, max_age: Duration) -> Option<EncodedLocalPayload> {
+    // Release GRAPH_CACHE before waiting for the local-source guard or probing
+    // the filesystem. Fresh hits need neither the guard nor a source sweep.
+    let generation = {
         let cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        let (at, token, data) = cache.get(year)?;
-        (at.elapsed() <= max_age, *token, data.clone())
+        let generation = ROOT_GENERATION.load(Ordering::SeqCst);
+        let (at, _, data) = cache.get(year)?;
+        if at.elapsed() <= max_age {
+            return Some(Arc::clone(data));
+        }
+        generation
     };
-    if fresh_enough {
-        return Some(data);
-    }
-    // Aged out — but if no source state changed since the compute, the graph
-    // cannot have changed either. Probe with the lock released, then re-acquire
-    // briefly to re-stamp so the next calls inside the oneshot window skip the
-    // probe entirely. A lost re-stamp (entry evicted/replaced meanwhile) just
-    // degrades to the next call re-probing — benign.
+    #[cfg(test)]
+    tests::pause_graph_at(&tests::AGED_GRAPH_GATE);
+    let _local = local_usage_guard();
+    graph_cached_in_lane(year, max_age, generation)
+}
+
+/// The caller holds the local-source guard. Re-read after queuing: another
+/// graph may have replaced the aged entry and finished its flight meanwhile.
+fn graph_cached_in_lane(
+    year: &str,
+    max_age: Duration,
+    generation: u64,
+) -> Option<EncodedLocalPayload> {
+    let (at, token) = {
+        let cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
+            return None;
+        }
+        let (at, token, data) = cache.get(year)?;
+        if at.elapsed() <= max_age {
+            return Some(Arc::clone(data));
+        }
+        (*at, *token)
+    };
     let context = LocalSourceContext::current();
     let fresh =
         tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = cache.get_mut(year) {
-            entry.0 = Instant::now();
+        if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
+            return None;
         }
-        return Some(data);
+        let entry = cache.get_mut(year)?;
+        // A replacement with the same token still owns its own timestamp and
+        // payload. Never restamp it based on a different entry's verification.
+        if entry.0 != at || entry.1 != token {
+            return None;
+        }
+        entry.0 = Instant::now();
+        return Some(Arc::clone(&entry.2));
     }
     None
 }
 
-fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
+fn graph_compute(year: &str) -> Result<EncodedLocalPayload, String> {
     // Probe before parsing: a source write or topology change that lands
     // mid-compute changes the token, so the next aged-out read recomputes
     // rather than serving a graph that missed it. Keep the same context for
     // both paths so the probe and report scan observe identical source roots.
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
-    let token =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
-    let data = usage_graph::run(&context, year)?;
+    let token = tokscale_core::local_source_change_token(&context.parse_options(None, None))?;
+    #[cfg(test)]
+    tests::GRAPH_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    let data = encode_local_payload(&usage_graph::run(&context, year)?)?;
+    #[cfg(test)]
+    tests::pause_graph_at(&tests::COMPUTED_GRAPH_GATE);
     // The caller still gets this payload even when `publish_graph` refuses it.
     // It answers a request made before the roots changed, and the next call
     // recomputes rather than serving it again.
-    publish_graph(year, generation, (Instant::now(), token, data.clone()));
+    publish_graph(year, generation, (Instant::now(), token, Arc::clone(&data)));
     Ok(data)
 }
 
-/// One graph compute per year at a time.
+/// Same-key graph single-flight, with all local scans sharing one scan lane.
 ///
 /// The cache above answers calls that arrive after a compute has finished;
 /// calls that arrive while one is running all missed it and each computed the
@@ -704,17 +763,36 @@ fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
 /// attributed series beside it (`--launch-timeline`, release build).
 ///
 /// `tb_graph` joins a compute already running for the same year and the same
-/// root generation; `tb_refresh_graph` always runs its own, because it
-/// promises a read that starts after the call. A compute started before the
-/// root registry moved is never joined, so a call after the move still reads
-/// the new roots, as it did before this existed.
-fn graph_shared(year: &str, join: bool) -> Result<serde_json::Value, String> {
+/// root generation; `tb_refresh_graph` always runs its own after acquiring the
+/// scan lane, because it promises a read that starts after the call. It may
+/// queue behind an older compute, but never uses that compute to settle its
+/// freshness. A compute registered before the root registry moved is never
+/// joined by a call made after the move.
+/// A nonforced caller queued for the lane rechecks the published cache, so
+/// work that finished and removed its flight while it waited is reused too.
+fn graph_shared(year: &str, join: bool) -> Result<EncodedLocalPayload, String> {
     shared_compute(
         &GRAPH_FLIGHTS,
         year,
         join,
         ROOT_GENERATION.load(Ordering::SeqCst),
-        || graph_compute(year),
+        || {
+            // A cache miss can queue behind work that finishes before this
+            // flight is registered. Reuse it without re-entering the guard.
+            // Forced requests deliberately bypass this post-queue check.
+            if join {
+                let generation = ROOT_GENERATION.load(Ordering::SeqCst);
+                let cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+                if ROOT_GENERATION.load(Ordering::SeqCst) == generation {
+                    if let Some((at, _, data)) = cache.get(year) {
+                        if at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS) {
+                            return Ok(Arc::clone(data));
+                        }
+                    }
+                }
+            }
+            graph_compute(year)
+        },
     )
 }
 
@@ -722,7 +800,7 @@ fn graph_shared(year: &str, join: bool) -> Result<serde_json::Value, String> {
 /// waiting on it.
 struct Flight {
     generation: u64,
-    result: Mutex<Option<Result<serde_json::Value, String>>>,
+    result: Mutex<Option<Result<EncodedLocalPayload, String>>>,
     done: Condvar,
 }
 
@@ -735,7 +813,7 @@ impl Flight {
         }
     }
 
-    fn wait(&self) -> Result<serde_json::Value, String> {
+    fn wait(&self) -> Result<EncodedLocalPayload, String> {
         let mut slot = self.result.lock().unwrap_or_else(|p| p.into_inner());
         while slot.is_none() {
             slot = self.done.wait(slot).unwrap_or_else(|p| p.into_inner());
@@ -743,7 +821,7 @@ impl Flight {
         slot.clone().expect("checked above")
     }
 
-    fn complete(&self, result: Result<serde_json::Value, String>) {
+    fn complete(&self, result: Result<EncodedLocalPayload, String>) {
         let mut slot = self.result.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
             *slot = Some(result);
@@ -758,13 +836,17 @@ impl Flight {
 /// guard below completes the flight with an error on unwind, because a
 /// waiter left on the condition variable would block its FFI call forever.
 /// The panic itself still reaches the leader's own `guarded`.
+///
+/// Only the leader's actual local work holds `local_usage_guard`; registration,
+/// joining and completion do not. Forced callers register their own flight
+/// before queuing, and always invoke `compute` after acquiring the scan lane.
 fn shared_compute(
     flights: &Mutex<HashMap<String, Arc<Flight>>>,
     key: &str,
     join: bool,
     generation: u64,
-    compute: impl FnOnce() -> Result<serde_json::Value, String>,
-) -> Result<serde_json::Value, String> {
+    compute: impl FnOnce() -> Result<EncodedLocalPayload, String>,
+) -> Result<EncodedLocalPayload, String> {
     let flight = {
         let mut map = flights.lock().unwrap_or_else(|p| p.into_inner());
         if join {
@@ -805,7 +887,10 @@ fn shared_compute(
         key,
         flight,
     };
-    let result = compute();
+    let result = {
+        let _local = local_usage_guard();
+        compute()
+    };
     leader.flight.complete(result.clone());
     drop(leader);
     result
@@ -824,6 +909,29 @@ fn publish_graph(year: &str, generation: u64, entry: GraphCacheEntry) -> bool {
     let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
         return false;
+    }
+    cache.retain(|key, (at, _, _)| {
+        key != year && at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS)
+    });
+    if cache.is_empty() {
+        // Expiry or an oversize replacement can release the last entry too.
+        *cache = HashMap::new();
+    }
+    // Count request keys too: equivalent years may have arbitrarily long
+    // whitespace or numeric spellings, but must not grow resident history.
+    let bytes = year.len().saturating_add(entry.2.get().len());
+    if bytes > GRAPH_CACHE_MAX_BYTES {
+        return false;
+    }
+    let retained_bytes: usize = cache
+        .iter()
+        .map(|(key, (_, _, data))| key.len() + data.get().len())
+        .sum();
+    if retained_bytes > GRAPH_CACHE_MAX_BYTES - bytes {
+        // ponytail: clear-all eviction bounds encoded payloads plus keys to
+        // 16MiB, excluding allocator/map/Arc and caller-owned output overhead;
+        // add LRU only if mixed-year cache churn measurably matters.
+        *cache = HashMap::new();
     }
     cache.insert(year.to_string(), entry);
     true
@@ -865,9 +973,9 @@ impl Drop for TickGuard {
 /// second concurrent poller sees `in_flight` (or a fresh `last`) and serves the
 /// cached window immediately — it neither blocks on the lock nor launches a
 /// duplicate parse that could overwrite a newer one (last-writer-wins). The
-/// heavy `TAILER.tick()` runs with no lock held; the stamp is taken only after
-/// it completes, so a slow (> `TAIL_TICK_SECS`) parse can't be seen as stale
-/// mid-flight, and a tick panic leaves `last` unstamped to retry next call.
+/// heavy `TAILER.tick()` runs with no tick-bookkeeping lock held and takes the
+/// local-source guard itself. The stamp is taken only after it completes, so
+/// a slow parse cannot become stale mid-flight; panic leaves it unstamped.
 fn tail_tick_if_stale() {
     let claimed = {
         let mut st = lock_tick();
@@ -886,8 +994,9 @@ fn tail_tick_if_stale() {
     if claimed {
         let generation = ROOT_GENERATION.load(Ordering::SeqCst);
         let _guard = TickGuard; // clears in_flight on drop (success or panic)
-        TAILER.tick();
-        stamp_tick_if_current(generation); // success only — panic skips this
+        if TAILER.tick().is_ok() {
+            stamp_tick_if_current(generation);
+        }
     }
 }
 
@@ -897,6 +1006,7 @@ fn tail_tick_if_stale() {
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
+        let _local = local_usage_guard();
         let context = LocalSourceContext::current();
         let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
             Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
@@ -916,7 +1026,7 @@ pub extern "C" fn tb_probe() -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
     guarded("tb_graph", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| {
+        encoded_envelope(unsafe { year_from(year) }.and_then(|year| {
             if let Some(data) = graph_cached(&year, Duration::from_secs(ONESHOT_MAX_AGE_SECS)) {
                 return Ok(data);
             }
@@ -926,15 +1036,15 @@ pub unsafe extern "C" fn tb_graph(year: *const c_char) -> *mut c_char {
 }
 
 /// Force-recompute the contribution graph for `year`, bypassing the cache. It
-/// never joins a compute already in progress; calls to `tb_graph` made while
-/// it runs join it.
+/// never joins a compute already in progress, even when it queues behind the
+/// local scan lane; calls to `tb_graph` made while it runs join its own flight.
 ///
 /// # Safety
 /// `year` must be NULL or a valid NUL-terminated string.
 #[no_mangle]
 pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
     guarded("tb_refresh_graph", || {
-        envelope(unsafe { year_from(year) }.and_then(|year| graph_shared(&year, false)))
+        encoded_envelope(unsafe { year_from(year) }.and_then(|year| graph_shared(&year, false)))
     })
 }
 
@@ -945,8 +1055,11 @@ pub unsafe extern "C" fn tb_refresh_graph(year: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn tb_model_report(year: *const c_char) -> *mut c_char {
     guarded("tb_model_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| model_report::run(&context, &year)))
+        encoded_envelope(unsafe { year_from(year) }.and_then(|year| {
+            let _local = local_usage_guard();
+            let context = LocalSourceContext::current();
+            model_report::run(&context, &year)
+        }))
     })
 }
 
@@ -963,9 +1076,10 @@ pub unsafe extern "C" fn tb_hourly_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_hourly_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| {
+        encoded_envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
+            let _local = local_usage_guard();
+            let context = LocalSourceContext::current();
             hourly_report::run(&context, &year, clients)
         }))
     })
@@ -985,9 +1099,10 @@ pub unsafe extern "C" fn tb_agents_report(
     clients: *const c_char,
 ) -> *mut c_char {
     guarded("tb_agents_report", || {
-        let context = LocalSourceContext::current();
-        envelope(unsafe { year_from(year) }.and_then(|year| {
+        encoded_envelope(unsafe { year_from(year) }.and_then(|year| {
             let clients = unsafe { clients_from(clients) }?;
+            let _local = local_usage_guard();
+            let context = LocalSourceContext::current();
             agents_report::run(&context, &year, clients)
         }))
     })
@@ -1023,9 +1138,10 @@ pub extern "C" fn tb_filter_parity_probe() -> *mut c_char {
 pub extern "C" fn tb_usage_trace(window_secs: i64) -> *mut c_char {
     guarded("tb_usage_trace", || {
         tail_tick_if_stale();
-        envelope(
-            serde_json::to_value(TAILER.trace(window_secs))
-                .map_err(|e| format!("serialize usage trace: {}", e)),
+        encoded_envelope(
+            TAILER
+                .trace(window_secs)
+                .and_then(|trace| encode_local_payload(&trace)),
         )
     })
 }
@@ -1036,9 +1152,11 @@ pub extern "C" fn tb_usage_trace(window_secs: i64) -> *mut c_char {
 pub extern "C" fn tb_tokens_per_min() -> *mut c_char {
     guarded("tb_tokens_per_min", || {
         tail_tick_if_stale();
-        envelope(Ok(
-            serde_json::json!({"tokensPerMin": TAILER.rate_in_window(600)}),
-        ))
+        envelope(
+            TAILER
+                .rate_in_window(600)
+                .map(|rate| serde_json::json!({"tokensPerMin": rate})),
+        )
     })
 }
 
@@ -1121,9 +1239,9 @@ pub unsafe extern "C" fn tb_quota_curve(
             Ok(account) => account,
             Err(message) => return envelope(Err::<serde_json::Value, String>(message)),
         };
-        let result = unsafe { required_string_from(client_id, "client_id") }.and_then(|client| {
-            unsafe { required_string_from(window_key, "window_key") }.and_then(|window| {
-                quota_curve_result(&client, account.as_deref(), &window, generation)
+        let result = unsafe { required_str_from(client_id, "client_id") }.and_then(|client| {
+            unsafe { required_str_from(window_key, "window_key") }.and_then(|window| {
+                quota_curve_result(client, account.as_deref(), window, generation)
             })
         });
         envelope(result)
@@ -1164,6 +1282,8 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 /// when it is empty, relative, the filesystem root, or a repeat of one already
 /// in the list. Existence is not probed — whether the directory is readable
 /// right now says nothing about which account its credential belongs to.
+/// Replacing this registry also invalidates local usage caches: it changes the
+/// account exclusions used by window scans independently of extra scan roots.
 ///
 /// This is NOT `tb_set_extra_scan_paths`. That one takes the expanded
 /// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides what the
@@ -1311,7 +1431,9 @@ pub unsafe extern "C" fn tb_antigravity_remove(key: *const c_char) -> *mut c_cha
                 .block_on(agent_antigravity::remove(key))
                 .map(|()| serde_json::json!({ "removed": true }))
                 .map_err(|error| error.code().to_string()),
-            None => Err(agent_antigravity::CaptureError::InvalidKey.code().to_string()),
+            None => Err(agent_antigravity::CaptureError::InvalidKey
+                .code()
+                .to_string()),
         })
     })
 }
@@ -1384,7 +1506,11 @@ unsafe fn set_claude_config_dirs_from_c(json: *const c_char) -> Result<serde_jso
     let raw = unsafe { CStr::from_ptr(json) }
         .to_str()
         .map_err(|_| "Claude config dirs payload is not valid UTF-8".to_string())?;
-    claude_config_dirs::set_from_json(raw)
+    let result = claude_config_dirs::set_from_json(raw)?;
+    // Account exclusions affect window scans even before the independently
+    // installed extra-root registry catches up.
+    invalidate_scan_caches();
+    Ok(result)
 }
 
 /// # Safety
@@ -1434,18 +1560,9 @@ fn invalidate_scan_caches() {
     // acquires one afterwards has to observe the new generation for its check
     // to mean anything.
     ROOT_GENERATION.fetch_add(1, Ordering::SeqCst);
-    GRAPH_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
-    // Third cache, same reason as the graph: `window_usage::cached` serves any
-    // entry younger than `ONESHOT_MAX_AGE_SECS` without probing the token, so
-    // the quota lens would keep folding a removed root's messages for up to
-    // half a minute after the edit.
-    WINDOW_USAGE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+    *GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = HashMap::new();
+    window_usage::invalidate();
+    local_usage::invalidate();
     // Unstamping is enough to force the next tick; `in_flight` still guards
     // against a second parse starting while one is running.
     lock_tick().last = None;
@@ -1528,21 +1645,23 @@ mod tests {
     /// carry the generation they started under and drop their result when the
     /// registry moved.
     ///
-    /// Moves the generation with the real `extern "C"` setter rather than
-    /// bumping the counter directly, so the test fails if the setter ever
-    /// stops bumping it.
+    /// Moves the generation with both real `extern "C"` setters rather than
+    /// bumping the counter directly, so omitting either invalidation fails.
     #[test]
     fn a_scan_that_started_before_a_root_change_does_not_publish_its_result() {
         let _g = extra_scan_paths::TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let _accounts = claude_config_dirs::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // What an in-flight scan captured before the user touched Settings.
         let generation_at_scan_start = ROOT_GENERATION.load(Ordering::SeqCst);
         let stale = (
             Instant::now(),
             1234,
-            serde_json::json!({"from": "old roots"}),
+            encode_local_payload(&serde_json::json!({"from": "old roots"})).unwrap(),
         );
 
         let payload = CString::new("{}").expect("payload has no interior NUL");
@@ -1563,21 +1682,6 @@ mod tests {
             "the old-root graph landed in the cache after the replace"
         );
         assert!(
-            !window_usage::publish(
-                (None, 0, 60_000),
-                generation_at_scan_start,
-                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
-            ),
-            "a window scanned under the old roots was cached anyway"
-        );
-        assert!(
-            WINDOW_USAGE_CACHE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty(),
-            "the old-root window landed in the cache after the replace"
-        );
-        assert!(
             !stamp_tick_if_current(generation_at_scan_start),
             "a tick that parsed the old roots stamped the tail as fresh"
         );
@@ -1591,21 +1695,44 @@ mod tests {
         // without this the guard could refuse everything and still pass above.
         let current = ROOT_GENERATION.load(Ordering::SeqCst);
         assert!(
-            publish_graph("2026", current, (Instant::now(), 5678, serde_json::json!({"from": "new roots"}))),
+            publish_graph(
+                "2026",
+                current,
+                (
+                    Instant::now(),
+                    5678,
+                    encode_local_payload(&serde_json::json!({"from": "new roots"})).unwrap()
+                )
+            ),
             "a graph computed under the current roots was refused"
         );
-        assert!(
-            window_usage::publish(
-                (None, 0, 60_000),
-                current,
-                (Instant::now(), 5678, serde_json::json!({"from": "new roots"})),
-            ),
-            "a window scanned under the current roots was refused"
-        );
+        let year = CString::new("2026").unwrap();
+        let graph_pointer = unsafe { tb_graph(year.as_ptr()) };
         assert!(
             stamp_tick_if_current(current),
             "a tick under the current roots failed to stamp"
         );
+
+        // Config-dir replacement independently changes window exclusions.
+        // It must invalidate in-flight windows without relying on a later
+        // extra-root setter call from the consumer.
+        let account = tempfile::tempdir().unwrap();
+        let account_dir = account.path().to_string_lossy().into_owned();
+        let payload = CString::new(serde_json::json!([&account_dir]).to_string())
+            .expect("payload has no interior NUL");
+        let raw = unsafe { tb_set_claude_config_dirs(payload.as_ptr()) };
+        let reply = unsafe { take(raw) };
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(claude_config_dirs::snapshot(), vec![account_dir]);
+        let previous_graph: serde_json::Value =
+            serde_json::from_str(&unsafe { take(graph_pointer) }).unwrap();
+        assert_eq!(
+            previous_graph,
+            serde_json::json!({"ok": true, "data": {"from": "new roots"}}),
+            "the caller's pointer survives a registry clear of its encoded cache"
+        );
+        claude_config_dirs::reset_for_test();
 
         // Leave no state behind for the other tests sharing these statics.
         GRAPH_CACHE
@@ -1634,16 +1761,13 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .insert(
                 "2026".to_string(),
-                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
+                (
+                    Instant::now(),
+                    1234,
+                    encode_local_payload(&serde_json::json!({"from": "old roots"})).unwrap(),
+                ),
             );
         lock_tick().last = Some(Instant::now());
-        WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                (None, 0, 60_000),
-                (Instant::now(), 1234, serde_json::json!({"from": "old roots"})),
-            );
 
         let payload = CString::new("{}").expect("payload has no interior NUL");
         let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
@@ -1665,14 +1789,6 @@ mod tests {
         assert!(
             lock_tick().last.is_none(),
             "live tail is still stamped fresh, so the next tick would skip the reparse"
-        );
-        assert!(
-            WINDOW_USAGE_CACHE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty(),
-            "window-usage cache still holds a scan of the old root set, and it is \
-             served without a token probe for ONESHOT_MAX_AGE_SECS"
         );
     }
 
@@ -1783,7 +1899,10 @@ mod tests {
         let dir = "/Users/someone/.claude-work";
         replace_quota_curve_bindings(
             9,
-            vec![(None, primary.clone()), (Some(dir.to_string()), second.clone())],
+            vec![
+                (None, primary.clone()),
+                (Some(dir.to_string()), second.clone()),
+            ],
         );
 
         let state = QUOTA_CURVE_BINDINGS
@@ -1927,7 +2046,12 @@ mod tests {
         let (directory, path) = quota_curve_temp_path("unbound-generation");
         let now = 9_400_000;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), now + 96, 10.0, now, 96);
-        replace_quota_curve_bindings(4, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            4,
+            vec![quota_curve_key("account-a")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
 
         assert_eq!(
             quota_curve_value_at_path(&path, "__smoke__", "__smoke__", 4, now).unwrap_err(),
@@ -2164,12 +2288,22 @@ mod tests {
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
         record_quota_curve_sample(&path, quota_curve_key("account-b"), reset_at, 80.0, now, 96);
 
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            1,
+            vec![quota_curve_key("account-a")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
         let account_a = quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
             .expect("account A curve");
         assert_eq!(account_a["points"][0]["usedPercent"], 10.0);
 
-        replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            2,
+            vec![quota_curve_key("account-b")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
         let account_b = quota_curve_value_at_path(&path, "codex", "weekly.v1", 2, now)
             .expect("account B curve");
         assert_eq!(account_b["points"][0]["usedPercent"], 80.0);
@@ -2195,10 +2329,11 @@ mod tests {
         let before = quota_curve_value_at_path(&path, "codex", "weekly.v1", 1, now)
             .expect("previous tuple remains available");
 
-        let serialization =
-            serialize_agent_usage_with_bindings(2, vec![(None, quota_curve_key("account-b"))], || {
-                Err("injected serialization failure".to_string())
-            });
+        let serialization = serialize_agent_usage_with_bindings(
+            2,
+            vec![(None, quota_curve_key("account-b"))],
+            || Err("injected serialization failure".to_string()),
+        );
         assert_eq!(
             serialization,
             Err("injected serialization failure".to_string())
@@ -2268,7 +2403,12 @@ mod tests {
         });
         paused_rx.recv().expect("reader reached history boundary");
         let writer = std::thread::spawn(move || {
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
+            replace_quota_curve_bindings(
+                2,
+                vec![quota_curve_key("account-b")]
+                    .into_iter()
+                    .map(|k| (None, k)),
+            );
             committed_tx.send(()).expect("commit binding tuple");
         });
         committed_rx
@@ -2324,7 +2464,12 @@ mod tests {
         inside_rx.recv().expect("reader entered the guarded window");
 
         let writer = std::thread::spawn(move || {
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
+            replace_quota_curve_bindings(
+                2,
+                vec![quota_curve_key("account-b")]
+                    .into_iter()
+                    .map(|k| (None, k)),
+            );
             committed_tx.send(()).expect("commit binding tuple");
         });
         // The publication must NOT complete while the reader holds the guard.
@@ -2364,7 +2509,12 @@ mod tests {
         let reset_at = now + 96;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
         record_quota_curve_sample(&path, quota_curve_key("account-b"), reset_at, 80.0, now, 96);
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            1,
+            vec![quota_curve_key("account-a")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
 
         let (paused_tx, paused_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -2384,7 +2534,12 @@ mod tests {
             )
         });
         paused_rx.recv().expect("reader reached history boundary");
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            1,
+            vec![quota_curve_key("account-b")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
         release_tx.send(()).expect("release history reader");
 
         assert_eq!(
@@ -2405,11 +2560,21 @@ mod tests {
     fn quota_curve_binding_tuple_is_atomically_visible() {
         let _test_guard = quota_curve_test_guard();
         reset_quota_curve_bindings();
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            1,
+            vec![quota_curve_key("account-a")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
         let (start_tx, start_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
             start_rx.recv().expect("start tuple replacement");
-            replace_quota_curve_bindings(2, vec![quota_curve_key("account-b")].into_iter().map(|k| (None, k)));
+            replace_quota_curve_bindings(
+                2,
+                vec![quota_curve_key("account-b")]
+                    .into_iter()
+                    .map(|k| (None, k)),
+            );
         });
         // Without requiring generation 2 to actually be observed, every read can
         // land on generation 1 and the loop proves nothing about the interval
@@ -2531,27 +2696,60 @@ mod tests {
         let now = 9_500_000;
         let reset_at = now + 96;
         record_quota_curve_sample(&path, quota_curve_key("account-a"), reset_at, 10.0, now, 96);
-        replace_quota_curve_bindings(1, vec![quota_curve_key("account-a")].into_iter().map(|k| (None, k)));
+        replace_quota_curve_bindings(
+            1,
+            vec![quota_curve_key("account-a")]
+                .into_iter()
+                .map(|k| (None, k)),
+        );
         let (empty_directory, empty_path) = quota_curve_temp_path("c-abi-empty");
         set_test_quota_curve_history_path(Some(empty_path));
         let client = CString::new("codex").expect("client id");
         let window = CString::new("weekly.v1").expect("window key");
-        let no_history = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 1)) };
+        let no_history = unsafe {
+            take(tb_quota_curve(
+                client.as_ptr(),
+                std::ptr::null(),
+                window.as_ptr(),
+                1,
+            ))
+        };
         let no_history_json: serde_json::Value =
             serde_json::from_str(&no_history).expect("decode C ABI no-history result");
         assert_eq!(no_history_json["ok"], true);
         assert!(no_history_json["data"].is_null());
 
         set_test_quota_curve_history_path(Some(path.clone()));
-        let success = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 1)) };
+        let success = unsafe {
+            take(tb_quota_curve(
+                client.as_ptr(),
+                std::ptr::null(),
+                window.as_ptr(),
+                1,
+            ))
+        };
         let success_json: serde_json::Value =
             serde_json::from_str(&success).expect("decode C ABI success");
         assert_eq!(success_json["ok"], true);
         assert_eq!(success_json["data"]["points"][0]["usedPercent"], 10.0);
 
-        let expired = unsafe { take(tb_quota_curve(client.as_ptr(), std::ptr::null(), window.as_ptr(), 0)) };
+        let expired = unsafe {
+            take(tb_quota_curve(
+                client.as_ptr(),
+                std::ptr::null(),
+                window.as_ptr(),
+                0,
+            ))
+        };
         assert!(expired.contains("quota curve generation is expired"));
-        let null_client = unsafe { take(tb_quota_curve(std::ptr::null(), std::ptr::null(), window.as_ptr(), 1)) };
+        let null_client = unsafe {
+            take(tb_quota_curve(
+                std::ptr::null(),
+                std::ptr::null(),
+                window.as_ptr(),
+                1,
+            ))
+        };
         assert!(null_client.contains("client_id is required"));
         let invalid_client = [0xff_u8, 0];
         let invalid_utf8 = unsafe {
@@ -2645,14 +2843,12 @@ mod tests {
     // reports that it has started and then blocks until released, so the
     // other callers provably arrive while it runs.
     //
-    // Every case must FAIL rather than hang when the property breaks: a caller
-    // that should compute on its own but joins instead would wait for a release
-    // that only comes after it returns. So such callers run on their own thread
-    // with a bounded wait, and `Release` frees the leader on every exit path,
-    // an unwinding assertion included.
-    struct Gate {
+    // Bound the registration wait and free the held computation on every exit.
+    // Different keys, generations and forced requests register their own
+    // flight, but now queue for the same local-source guard before computing.
+    pub(super) struct Gate {
         started: std::sync::mpsc::Sender<()>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
     struct Release(std::sync::mpsc::Sender<()>);
@@ -2668,25 +2864,291 @@ mod tests {
         (
             Gate {
                 started: started_tx,
-                release: Mutex::new(release_rx),
+                release: parking_lot::Mutex::new(release_rx),
             },
             started_rx,
             Release(release_tx),
         )
     }
 
+    pub(super) static GRAPH_COMPUTES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    thread_local! {
+        pub(super) static AGED_GRAPH_GATE: std::cell::RefCell<Option<Gate>> =
+            const { std::cell::RefCell::new(None) };
+        pub(super) static COMPUTED_GRAPH_GATE: std::cell::RefCell<Option<Gate>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pause_graph_at(
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<Gate>>>,
+    ) {
+        if let Some(gate) = slot.with(|slot| slot.borrow_mut().take()) {
+            gate.started.send(()).unwrap();
+            gate.release.lock().recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn graph_readers_reuse_completed_work_after_waiting_for_scan_lane() {
+        let home = tempfile::tempdir().unwrap();
+        // Keep process-local pricing, roots, registries and parser caches out
+        // of the test runner and the developer's real sources.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::graph_queue_child", "--nocapture"])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("APPDATA", home.path().join("appdata"))
+            .env("LOCALAPPDATA", home.path().join("localappdata"))
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TOKSCALE_CONFIG_DIR", home.path().join(".tokscale-config"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .env("TOKENBAR_GRAPH_QUEUE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "graph child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn graph_fixture_message(id: &str, input: i64) {
+        let sessions = user_home_dir().unwrap().join(".jcode/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join(format!("session_{id}.json")),
+            serde_json::json!({
+                "id": id, "provider_key": "openai", "model": "gpt-5",
+                "messages": [{"id": id, "role": "assistant",
+                    "timestamp": "2026-06-16T12:00:01Z",
+                    "token_usage": {"input_tokens": input, "output_tokens": 0}}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn graph_abi_value(force: bool) -> serde_json::Value {
+        let reply = unsafe {
+            take(if force {
+                tb_refresh_graph(std::ptr::null())
+            } else {
+                tb_graph(std::ptr::null())
+            })
+        };
+        let mut envelope: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(envelope["ok"], true, "{reply}");
+        envelope["data"].take()
+    }
+
+    fn encoded_abi_value(result: Result<EncodedLocalPayload, String>) -> serde_json::Value {
+        serde_json::from_str(&unsafe { take(encoded_envelope(result)) }).unwrap()
+    }
+
+    fn age_graph_fixture() {
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut("")
+            .expect("the real graph published")
+            .0 = Instant::now() - Duration::from_secs(ONESHOT_MAX_AGE_SECS + 1);
+    }
+
+    #[test]
+    fn graph_queue_child() {
+        if std::env::var_os("TOKENBAR_GRAPH_QUEUE_CHILD").is_none() {
+            return;
+        }
+        graph_fixture_message("initial", 10);
+        assert_eq!(graph_abi_value(false)["summary"]["totalTokens"], 10);
+        assert_eq!(GRAPH_COMPUTES.load(Ordering::SeqCst), 1);
+        let retained_pointer = unsafe { tb_graph(std::ptr::null()) };
+        let separate_pointer = unsafe { tb_graph(std::ptr::null()) };
+        assert_ne!(
+            retained_pointer, separate_pointer,
+            "each caller owns its C allocation"
+        );
+        let separate: serde_json::Value =
+            serde_json::from_str(&unsafe { take(separate_pointer) }).unwrap();
+        assert_eq!(separate["ok"], true);
+        assert_eq!(separate["data"]["summary"]["totalTokens"], 10);
+        age_graph_fixture();
+        graph_fixture_message("changed", 20);
+
+        let (computed_gate, computed, release_compute) = gate();
+        let (aged_gate, aged, release_reader) = gate();
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(move || {
+                COMPUTED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(computed_gate));
+                graph_abi_value(false)
+            });
+            computed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let reader = scope.spawn(move || {
+                AGED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(aged_gate));
+                graph_abi_value(false)
+            });
+            aged.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The reader captured an aged entry while the real graph held
+            // the lane. Finish and remove that flight before it acquires it.
+            drop(release_compute);
+            let updated = leader.join().unwrap();
+            assert!(GRAPH_FLIGHTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty());
+            drop(release_reader);
+            let queued = reader.join().unwrap();
+            assert_eq!(updated["summary"]["totalTokens"], 30);
+            assert_eq!(queued, updated, "reuse the replacement, not the old graph");
+        });
+        assert_eq!(
+            GRAPH_COMPUTES.load(Ordering::SeqCst),
+            2,
+            "one recomputation"
+        );
+
+        // A forced request queued behind an already-read graph must still
+        // read the subsequently changed source, even though the cache is fresh.
+        let (computed_gate, computed, release_compute) = gate();
+        std::thread::scope(|scope| {
+            let older = scope.spawn(move || {
+                COMPUTED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(computed_gate));
+                graph_abi_value(true)
+            });
+            computed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let previous = Arc::clone(
+                GRAPH_FLIGHTS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get("")
+                    .unwrap(),
+            );
+            let forced = scope.spawn(|| graph_abi_value(true));
+            let registered = newer_flight_registered(
+                &GRAPH_FLIGHTS,
+                "",
+                &previous,
+                ROOT_GENERATION.load(Ordering::SeqCst),
+            );
+            graph_fixture_message("post-request", 40);
+            drop(release_compute);
+            assert!(registered, "the forced request owns a separate flight");
+            assert_eq!(older.join().unwrap()["summary"]["totalTokens"], 30);
+            assert_eq!(forced.join().unwrap()["summary"]["totalTokens"], 70);
+        });
+        assert_eq!(GRAPH_COMPUTES.load(Ordering::SeqCst), 4);
+
+        // A registry replacement while both readers are queued must reject
+        // publication and reuse of the old generation, not restamp it.
+        age_graph_fixture();
+        graph_fixture_message("before-registry-change", 80);
+        let (computed_gate, computed, release_compute) = gate();
+        let (aged_gate, aged, release_reader) = gate();
+        std::thread::scope(|scope| {
+            let older = scope.spawn(move || {
+                COMPUTED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(computed_gate));
+                graph_abi_value(false)
+            });
+            computed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let reader = scope.spawn(move || {
+                AGED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(aged_gate));
+                graph_abi_value(false)
+            });
+            aged.recv_timeout(Duration::from_secs(5)).unwrap();
+            let roots = CString::new("{}").unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(&unsafe { take(tb_set_extra_scan_paths(roots.as_ptr())) })
+                    .unwrap();
+            assert_eq!(reply["ok"], true);
+            graph_fixture_message("after-registry-change", 160);
+            drop(release_compute);
+            assert_eq!(older.join().unwrap()["summary"]["totalTokens"], 150);
+            assert!(
+                GRAPH_CACHE
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty(),
+                "old scope did not publish",
+            );
+            drop(release_reader);
+            assert_eq!(reader.join().unwrap()["summary"]["totalTokens"], 310);
+        });
+        assert_eq!(GRAPH_COMPUTES.load(Ordering::SeqCst), 6);
+        let calls = GRAPH_COMPUTES.load(Ordering::SeqCst);
+        assert_eq!(graph_abi_value(false)["summary"]["totalTokens"], 310);
+        assert_eq!(
+            GRAPH_COMPUTES.load(Ordering::SeqCst),
+            calls,
+            "fresh cache hit"
+        );
+        age_graph_fixture();
+        assert_eq!(graph_abi_value(false)["summary"]["totalTokens"], 310);
+        assert_eq!(
+            GRAPH_COMPUTES.load(Ordering::SeqCst),
+            calls,
+            "an unchanged aged graph is verified and restamped, not recomputed"
+        );
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        let (computed_gate, computed, release_compute) = gate();
+        std::thread::scope(|scope| {
+            let leader = scope.spawn(move || {
+                COMPUTED_GRAPH_GATE.with(|slot| *slot.borrow_mut() = Some(computed_gate));
+                graph_abi_value(false)
+            });
+            computed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let joiners: Vec<_> = (0..3)
+                .map(|_| scope.spawn(|| graph_abi_value(false)))
+                .collect();
+            let parked = waiters_parked(&GRAPH_FLIGHTS, "", 3);
+            drop(release_compute);
+            assert!(
+                parked,
+                "real ABI readers joined the same encoded graph flight"
+            );
+            let leader = leader.join().unwrap();
+            assert_eq!(leader["summary"]["totalTokens"], 310);
+            for joiner in joiners {
+                assert_eq!(joiner.join().unwrap(), leader);
+            }
+        });
+        assert_eq!(GRAPH_COMPUTES.load(Ordering::SeqCst), calls + 1);
+        let retained: serde_json::Value =
+            serde_json::from_str(&unsafe { take(retained_pointer) }).unwrap();
+        assert_eq!(retained["ok"], true);
+        assert_eq!(
+            retained["data"]["summary"]["totalTokens"], 10,
+            "caller-owned output outlives refresh, root replacement and cache eviction"
+        );
+    }
+
     fn gated<'a>(
         calls: &'a std::sync::atomic::AtomicUsize,
         gate: Option<&'a Gate>,
         value: i64,
-    ) -> impl FnOnce() -> Result<serde_json::Value, String> + Send + 'a {
+    ) -> impl FnOnce() -> Result<EncodedLocalPayload, String> + Send + 'a {
         move || {
+            assert!(
+                matches!(
+                    LOCAL_USAGE_MUTEX.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "local work must run under the shared source guard"
+            );
             calls.fetch_add(1, Ordering::SeqCst);
             if let Some(gate) = gate {
                 gate.started.send(()).unwrap();
-                gate.release.lock().unwrap().recv().unwrap();
+                gate.release.lock().recv().unwrap();
             }
-            Ok(serde_json::json!({ "v": value }))
+            encode_local_payload(&serde_json::json!({ "v": value }))
         }
     }
 
@@ -2709,23 +3171,53 @@ mod tests {
         false
     }
 
-    /// Runs a second caller while the gated leader holds `key`, and returns what
-    /// it got and whether it answered before the leader was released. A caller
-    /// that joined cannot answer before the release.
+    fn newer_flight_registered(
+        flights: &Mutex<HashMap<String, Arc<Flight>>>,
+        key: &str,
+        previous: &Arc<Flight>,
+        generation: u64,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(key)
+                .is_some_and(|flight| {
+                    !Arc::ptr_eq(flight, previous) && flight.generation == generation
+                })
+            {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    /// Observe the second flight while the first holds the local-source guard.
+    /// This distinguishes independent work from joining without requiring
+    /// the second computation to run in parallel.
     fn second_caller_while_leading(
         key_leader: &str,
         key: &str,
         join: bool,
         generation: u64,
-    ) -> (usize, Result<serde_json::Value, String>, bool) {
+    ) -> (usize, Result<EncodedLocalPayload, String>, bool) {
         let flights = Mutex::new(HashMap::new());
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let (g, started, release) = gate();
-        let (result, independent) = std::thread::scope(|scope| {
+        let (result, registered) = std::thread::scope(|scope| {
             let leader = scope.spawn(|| {
                 shared_compute(&flights, key_leader, true, 1, gated(&calls, Some(&g), 1))
             });
             started.recv().unwrap();
+            let previous = Arc::clone(
+                flights
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(key_leader)
+                    .unwrap(),
+            );
             let (tx, rx) = std::sync::mpsc::channel();
             let (flights, calls) = (&flights, &calls);
             scope.spawn(move || {
@@ -2738,15 +3230,16 @@ mod tests {
                 ))
                 .unwrap();
             });
-            let early = rx.recv_timeout(Duration::from_secs(2));
+            let registered = newer_flight_registered(flights, key, &previous, generation);
             drop(release);
             leader.join().unwrap().unwrap();
-            match early {
-                Ok(result) => (result, true),
-                Err(_) => (rx.recv().unwrap(), false),
-            }
+            (
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("the queued compute completed"),
+                registered,
+            )
         });
-        (calls.load(Ordering::SeqCst), result, independent)
+        (calls.load(Ordering::SeqCst), result, registered)
     }
 
     #[test]
@@ -2777,9 +3270,17 @@ mod tests {
             1,
             "one compute for five callers"
         );
-        assert!(results
-            .iter()
-            .all(|r| r == &Ok(serde_json::json!({ "v": 7 }))));
+        let pointers: Vec<_> = results.into_iter().map(encoded_envelope).collect();
+        for (index, pointer) in pointers.iter().enumerate() {
+            assert!(
+                !pointers[..index].contains(pointer),
+                "C allocations are caller-owned"
+            );
+        }
+        for pointer in pointers {
+            let reply: serde_json::Value = serde_json::from_str(&unsafe { take(pointer) }).unwrap();
+            assert_eq!(reply, serde_json::json!({"ok": true, "data": {"v": 7}}));
+        }
         assert!(
             flights.lock().unwrap().is_empty(),
             "the finished flight is removed"
@@ -2787,34 +3288,200 @@ mod tests {
     }
 
     #[test]
-    fn shared_compute_refresh_runs_its_own_compute() {
-        let (calls, result, independent) = second_caller_while_leading("", "", false, 1);
-        assert!(independent, "a refresh never waits on a running compute");
-        assert_eq!(calls, 2);
-        assert_eq!(result, Ok(serde_json::json!({ "v": 2 })));
+    fn graph_cache_evicts_at_its_byte_bound_and_returns_oversize_payloads_whole() {
+        let _roots = extra_scan_paths::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _accounts = claude_config_dirs::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        let generation = root_generation();
+        // A JSON string occupies its content plus two quote bytes. At the
+        // exact bound it remains cacheable and the real ABI serves it whole.
+        let bounded = encode_local_payload(&"x".repeat(GRAPH_CACHE_MAX_BYTES - 2)).unwrap();
+        assert!(publish_graph("", generation, (Instant::now(), 1, bounded)));
+        let retained_pointer = unsafe { tb_graph(std::ptr::null()) };
+        assert!(publish_graph(
+            "2026",
+            generation,
+            (
+                Instant::now(),
+                1,
+                encode_local_payload(&serde_json::json!({"v": 2})).unwrap()
+            )
+        ));
+        assert!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("")
+                .is_none(),
+            "a second entry cannot push total retained bytes past the bound"
+        );
+        let year = CString::new("2026").unwrap();
+        let small: serde_json::Value =
+            serde_json::from_str(&unsafe { take(tb_graph(year.as_ptr())) }).unwrap();
+        assert_eq!(small, serde_json::json!({"ok": true, "data": {"v": 2}}));
+        let retained: serde_json::Value =
+            serde_json::from_str(&unsafe { take(retained_pointer) }).unwrap();
+        assert_eq!(retained["ok"], true);
+        assert_eq!(
+            retained["data"].as_str().unwrap().len(),
+            GRAPH_CACHE_MAX_BYTES - 2
+        );
+        assert!(retained["data"]
+            .as_str()
+            .unwrap()
+            .bytes()
+            .all(|byte| byte == b'x'));
+        drop(retained);
+
+        // A replacement above the bound must remove the prior same-year
+        // entry, without truncating the computed result sent to its caller.
+        let oversized = encode_local_payload(&"y".repeat(GRAPH_CACHE_MAX_BYTES - 1)).unwrap();
+        assert!(!publish_graph(
+            "2026",
+            generation,
+            (Instant::now(), 1, Arc::clone(&oversized))
+        ));
+        assert!(GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty());
+        let whole = encoded_abi_value(Ok(oversized));
+        assert_eq!(whole["ok"], true);
+        assert_eq!(
+            whole["data"].as_str().unwrap().len(),
+            GRAPH_CACHE_MAX_BYTES - 1
+        );
+        assert!(whole["data"]
+            .as_str()
+            .unwrap()
+            .bytes()
+            .all(|byte| byte == b'y'));
+        drop(whole);
+
+        // Publication drops unused aged years; a still-requested aged year
+        // is separately covered by the real token-restamp queue fixture.
+        assert!(publish_graph(
+            "2025",
+            generation,
+            (
+                Instant::now() - Duration::from_secs(ONESHOT_MAX_AGE_SECS + 1),
+                1,
+                encode_local_payload(&serde_json::json!({"v": 1})).unwrap()
+            )
+        ));
+        assert!(publish_graph(
+            "2026",
+            generation,
+            (
+                Instant::now(),
+                1,
+                encode_local_payload(&serde_json::json!({"v": 2})).unwrap()
+            )
+        ));
+        let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            cache.get("2025").is_none(),
+            "unused old-year output expires"
+        );
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+    }
+
+    #[test]
+    fn shared_compute_refresh_serializes_and_reads_after_its_request() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        fs::write(&source, "before request").unwrap();
+        let flights = Mutex::new(HashMap::new());
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let (g, started, release) = gate();
+
+        let (older, refreshed, registered) = std::thread::scope(|scope| {
+            let older = scope.spawn(|| {
+                shared_compute(&flights, "", true, 1, || {
+                    assert!(matches!(
+                        LOCAL_USAGE_MUTEX.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "no scan overlap");
+                    let value = fs::read_to_string(&source).unwrap();
+                    g.started.send(()).unwrap();
+                    g.release.lock().recv().unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    encode_local_payload(&serde_json::json!({ "source": value }))
+                })
+            });
+            started.recv().unwrap();
+            let previous = Arc::clone(
+                flights
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get("")
+                    .unwrap(),
+            );
+            let refreshed = scope.spawn(|| {
+                shared_compute(&flights, "", false, 1, || {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "no scan overlap");
+                    let value = fs::read_to_string(&source).unwrap();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    encode_local_payload(&serde_json::json!({ "source": value }))
+                })
+            });
+            let registered = newer_flight_registered(&flights, "", &previous, 1);
+            // The forced request is now queued behind a computation that has
+            // already read. Only its own post-request read can see this write.
+            fs::write(&source, "after request").unwrap();
+            drop(release);
+            (older.join().unwrap(), refreshed.join().unwrap(), registered)
+        });
+
+        assert!(registered, "the forced request owns a new flight");
+        assert_eq!(
+            encoded_abi_value(older),
+            serde_json::json!({"ok": true, "data": {"source": "before request"}})
+        );
+        assert_eq!(
+            encoded_abi_value(refreshed),
+            serde_json::json!({"ok": true, "data": {"source": "after request"}})
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[test]
     fn shared_compute_does_not_join_across_a_root_generation_change() {
-        let (calls, result, independent) = second_caller_while_leading("", "", true, 2);
+        let (calls, result, registered) = second_caller_while_leading("", "", true, 2);
         assert!(
-            independent,
-            "a call after the roots moved does not wait on the old compute"
+            registered,
+            "new roots get a new flight before the old one finishes"
         );
         assert_eq!(calls, 2);
         assert_eq!(
-            result,
-            Ok(serde_json::json!({ "v": 2 })),
+            encoded_abi_value(result),
+            serde_json::json!({"ok": true, "data": {"v": 2}}),
             "the new roots are read, not the old compute's"
         );
     }
 
     #[test]
     fn shared_compute_different_years_do_not_join() {
-        let (calls, result, independent) = second_caller_while_leading("2025", "2026", true, 1);
-        assert!(independent, "another year's compute is not joined");
+        let (calls, result, registered) = second_caller_while_leading("2025", "2026", true, 1);
+        assert!(registered, "another year's computation owns its own flight");
         assert_eq!(calls, 2);
-        assert_eq!(result, Ok(serde_json::json!({ "v": 2 })));
+        assert_eq!(
+            encoded_abi_value(result),
+            serde_json::json!({"ok": true, "data": {"v": 2}})
+        );
     }
 
     #[test]
@@ -2826,23 +3493,26 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new()));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (leader_tx, leader_rx) = std::sync::mpsc::channel();
         let leader_flights = Arc::clone(&flights);
         std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                shared_compute(&leader_flights, "", true, 1, || {
+            let pointer = guarded("tb_test_graph", || {
+                encoded_envelope(shared_compute(&leader_flights, "", true, 1, || {
                     started_tx.send(()).unwrap();
                     let _ = release_rx.recv();
                     panic!("boom")
-                })
-            }));
+                }))
+            });
+            let _ = leader_tx.send(unsafe { take(pointer) });
         });
         started_rx.recv().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter_flights = Arc::clone(&flights);
         std::thread::spawn(move || {
-            let _ = tx.send(shared_compute(&waiter_flights, "", true, 1, || {
-                Ok(serde_json::json!(0))
-            }));
+            let result = shared_compute(&waiter_flights, "", true, 1, || {
+                encode_local_payload(&serde_json::json!(0))
+            });
+            let _ = tx.send(encoded_abi_value(result));
         });
         let parked = waiters_parked(&flights, "", 1);
         release_tx.send(()).unwrap();
@@ -2850,9 +3520,20 @@ mod tests {
         let waited = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the waiter was released");
-        assert!(
-            waited.is_err(),
-            "the waiter sees the leader's failure, got {waited:?}"
+        assert_eq!(
+            waited,
+            serde_json::json!({"ok": false, "err": "graph compute panicked"}),
+            "a panicked leader releases its waiter with failure, never zero data"
+        );
+        let leader: serde_json::Value = serde_json::from_str(
+            &leader_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the leader was released"),
+        )
+        .unwrap();
+        assert_eq!(
+            leader,
+            serde_json::json!({"ok": false, "err": "tb_test_graph panicked: boom"})
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !flights.lock().unwrap().is_empty() {
@@ -2862,14 +3543,50 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The unwound compute poisoned the source mutex; future local work
+        // must still acquire it rather than panic or strand another flight.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(
+            encoded_abi_value(shared_compute(
+                &flights,
+                "",
+                true,
+                1,
+                gated(&calls, None, 9)
+            )),
+            serde_json::json!({"ok": true, "data": {"v": 9}})
+        );
     }
 
     #[test]
     fn guarded_passes_success_through() {
-        let p = guarded("tb_test", || envelope(Ok(serde_json::json!({"v": 1}))));
-        let s = unsafe { take(p) };
-        assert!(s.contains(r#""ok":true"#), "got: {s}");
-        assert!(s.contains(r#""v":1"#), "got: {s}");
+        let data = serde_json::json!({
+            "v": 1, "escaped": "雪\n\"\\\0", "nested": [null, {"rate": 1.5}]
+        });
+        let original = unsafe { take(guarded("tb_test", || envelope(Ok(data.clone())))) };
+        let encoded = unsafe {
+            take(guarded("tb_test", || {
+                encoded_envelope(encode_local_payload(&data))
+            }))
+        };
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(
+            decoded, original,
+            "both envelopes decode to the same consumer result"
+        );
+        assert_eq!(decoded, serde_json::json!({"ok": true, "data": data}));
+        let invalid = BTreeMap::from([((1, 2), 3)]);
+        let failed = encoded_abi_value(encode_local_payload(&invalid));
+        assert_eq!(
+            failed["ok"], false,
+            "serialization failure cannot become successful empty data"
+        );
+        assert!(failed.get("data").is_none());
+        assert!(failed["err"]
+            .as_str()
+            .unwrap()
+            .starts_with("serialize local payload: "));
     }
 
     #[test]
@@ -2890,8 +3607,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = agent_antigravity::captured_key("sub-a");
-        let json =
-            CString::new(format!(r#"[{{"key":"{key}","label":"a@example.com"}}]"#)).unwrap();
+        let json = CString::new(format!(r#"[{{"key":"{key}","label":"a@example.com"}}]"#)).unwrap();
         let s = unsafe { take(tb_set_antigravity_accounts(json.as_ptr())) };
         assert!(
             s.contains(r#""ok":true"#) && s.contains(r#""registeredCount":1"#),
@@ -3135,46 +3851,87 @@ mod tests {
     fn trace_rejects_nonpositive_window() {
         // window_secs <= 0 yields no buckets instead of an overflowed cutoff.
         let tail = UsageTailer::new();
-        assert!(tail.trace(0).is_empty());
-        assert!(tail.trace(-5).is_empty());
-        // A pathological window must saturate, not panic/overflow.
-        assert!(tail.trace(i64::MAX).is_empty());
+        assert!(tail.trace(0).unwrap().is_empty());
+        assert!(tail.trace(-5).unwrap().is_empty());
+        // No published snapshot must remain an error, even for a saturated window.
+        assert!(tail.trace(i64::MAX).is_err());
     }
 }
 
-/// Usage inside an absolute [from_ms, until_ms) window, for one account.
-///
-/// `until_ms` is quantised to the minute by `window_usage::cache_key`, so the
-/// answer can be up to a minute short of the requested end when an earlier call
-/// in the same minute already scanned. See the header for why that is the
-/// deliberate trade.
-///
-/// `account_key` is NULL for the primary account and an extra Claude account's
-/// `CLAUDE_CONFIG_DIR` otherwise — the same value `tb_quota_curve` takes, so
-/// the usage and the quota it is divided against are scoped to one account by
-/// one string. Passing NULL where an extra account was meant returns the
-/// primary's usage, not everybody's; there is no "all accounts" argument,
-/// because a window belongs to an account and a total across accounts has no
-/// quota to divide by.
-///
-/// Claude accounts only. A captured Antigravity account's key is not a config
-/// directory and has no local logs; the app does not pass it (see
-/// `window_usage::Account`).
+/// Compact account-scoped window/cycle aggregates from a coherent native lease.
+/// First requests synchronize their exact account scope under the local lane;
+/// token followups are pure store queries using the captured pricing service.
 ///
 /// # Safety
-/// `account_key` must be NULL or a valid NUL-terminated string.
+/// `request_json` must be a valid NUL-terminated UTF-8 JSON object.
 #[no_mangle]
-pub unsafe extern "C" fn tb_window_usage(
-    account_key: *const c_char,
-    from_ms: i64,
-    until_ms: i64,
-) -> *mut c_char {
+pub unsafe extern "C" fn tb_window_usage(request_json: *const c_char) -> *mut c_char {
     guarded("tb_window_usage", || {
-        let account = match unsafe { optional_string_from(account_key) } {
-            Ok(account) => account,
+        let request = match unsafe { required_str_from(request_json, "request_json") } {
+            Ok(request) => request,
             Err(message) => return envelope(Err::<serde_json::Value, String>(message)),
         };
-        let context = LocalSourceContext::current();
-        envelope(window_usage::cached(&context, &account, from_ms, until_ms))
+        encoded_envelope(window_usage::run(request))
+    })
+}
+
+/// Release only the specified account/view's lease.
+///
+/// # Safety
+/// `snapshot_token` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_window_usage_release(snapshot_token: *const c_char) -> *mut c_char {
+    guarded("tb_window_usage_release", || {
+        let token = match unsafe { required_str_from(snapshot_token, "snapshot_token") } {
+            Ok(token) => token,
+            Err(message) => return envelope(Err::<serde_json::Value, String>(message)),
+        };
+        envelope(window_usage::release(token))
+    })
+}
+
+/// Synchronize exact scheduler scopes; provider transport remains separate.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn tb_local_usage_sync(request_json: *const c_char) -> *mut c_char {
+    guarded("tb_local_usage_sync", || {
+        let request = match unsafe { required_str_from(request_json, "request_json") } {
+            Ok(request) => request,
+            Err(message) => return encoded_envelope(Err(message)),
+        };
+        let _local_usage = local_usage_guard();
+        encoded_envelope(local_usage::synchronize(request))
+    })
+}
+
+/// Query one captured generation without source discovery or pricing HTTP.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn tb_local_usage_query(request_json: *const c_char) -> *mut c_char {
+    guarded("tb_local_usage_query", || {
+        let request = match unsafe { required_str_from(request_json, "request_json") } {
+            Ok(request) => request,
+            Err(message) => return encoded_envelope(Err(message)),
+        };
+        encoded_envelope(local_usage::query(request))
+    })
+}
+
+/// Release only this scheduler owner's lease; repeated release is harmless.
+///
+/// # Safety
+/// `lease_token` must be a valid NUL-terminated UTF-8 string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn tb_local_usage_release(lease_token: *const c_char) -> *mut c_char {
+    guarded("tb_local_usage_release", || {
+        let token = match unsafe { required_str_from(lease_token, "lease_token") } {
+            Ok(token) => token,
+            Err(message) => return encoded_envelope(Err(message)),
+        };
+        encoded_envelope(local_usage::release(token))
     })
 }

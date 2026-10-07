@@ -8,7 +8,6 @@
 //! result onto a camelCase JSON shape the frontend consumes directly.
 
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,7 +43,7 @@ pub(crate) fn run(
     context: &crate::LocalSourceContext,
     year: &str,
     clients: Option<Vec<String>>,
-) -> Result<Value, String> {
+) -> Result<crate::EncodedLocalPayload, String> {
     let year = normalize_year(year)?;
     let options = context.report_options(year, clients);
 
@@ -55,7 +54,15 @@ pub(crate) fn run(
     let report = runtime.block_on(tokscale_core::get_hourly_report(options))?;
 
     let data = map_report(report);
-    serde_json::to_value(data).map_err(|e| format!("serialize hourly report: {}", e))
+    crate::encode_local_payload(&data)
+}
+pub(crate) fn run_from_snapshot(
+    snapshot: &tokscale_core::LocalUsageSnapshot,
+    options: tokscale_core::ReportOptions,
+    pricing: Option<&tokscale_core::pricing::PricingService>,
+) -> Result<crate::EncodedLocalPayload, String> {
+    let report = tokscale_core::get_hourly_report_from_snapshot(snapshot, options, pricing)?;
+    crate::encode_local_payload(&map_report(report))
 }
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {
@@ -113,7 +120,13 @@ mod tests {
     /// #766 clamps corrupt Antigravity varints to `i64::MAX` per bucket. Two
     /// such buckets in one hourly entry must saturate the mapped `total`, not
     /// overflow it (a plain `+` panics in debug / wraps in release).
-    fn entry(input: i64, output: i64, cache_read: i64, cache_write: i64, reasoning: i64) -> tokscale_core::HourlyUsage {
+    fn entry(
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> tokscale_core::HourlyUsage {
         tokscale_core::HourlyUsage {
             hour: "2026-07-12 00:00".to_string(),
             clients: vec!["antigravity_cli".to_string()],

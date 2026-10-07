@@ -1,23 +1,17 @@
-//! Window usage for the quota lens: per-message rows inside an absolute interval.
-//!
-//! Returns the messages inside an absolute [from, until) window, one row each.
-//! No bucketing: a quota window is a tiny slice of history, so the consumer
-//! folds it however the UI wants without another round trip. Attribution is a
-//! Swift-side declaration, so it is deliberately NOT applied here.
-//!
-//! **Scoped to one account.** A quota window belongs to one account, so the
-//! usage divided against it has to come from that account's transcripts and no
-//! others. With a second Claude account configured the roots are disjoint on
-//! disk, so the scope is applied by narrowing the scan rather than by tagging
-//! each message with an owner — see [`account_options`]. That keeps the wire
-//! model, and therefore the source-message cache's bincode layout, untouched.
+//! Compact quota folds over one account's pinned disk generation.
+//! Swift owns window policy, model admission and confirmed attribution.
 
-use serde::Serialize;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
+use tokscale_core::{LocalUsageQuery, LocalUsageSnapshot, UnifiedMessage};
 
 /// `None` is the primary account. An extra Claude account is keyed by its
 /// `CLAUDE_CONFIG_DIR`, the same string its card and its quota curve are keyed
@@ -29,22 +23,9 @@ use std::time::{Duration, Instant};
 /// it builds a request. A key passed anyway matches no registered root and
 /// gets `NO_REGISTERED_ROOTS`.
 pub(crate) type Account = Option<String>;
-pub(crate) type CacheKey = (Account, i64, i64);
-pub(crate) type CacheEntry = (Instant, u64, Value);
-
-const MINUTE_MS: i64 = 60_000;
 const CLAUDE: &str = "claude";
+#[cfg(test)]
 static SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn cache_key(account: &Account, from_ms: i64, until_ms: i64) -> CacheKey {
-    // Saturation keeps the extreme negative i64 input from overflowing while
-    // preserving the minute floor for normal timestamps.
-    (
-        account.clone(),
-        from_ms,
-        until_ms.saturating_sub(until_ms.rem_euclid(MINUTE_MS)),
-    )
-}
 
 /// The scan roots the extra config directory `dir` owns, taken from the
 /// registry the scanner actually walks rather than re-derived here.
@@ -152,7 +133,8 @@ fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
     // nested only as spelled (`D/.claude` a symlink back to `D` or above)
     // would cover this account's own roots and empty its window. Such an
     // entry is dropped: counted twice beats confidently zero.
-    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let own: Vec<PathBuf> = own.iter().map(|root| canonical(root)).collect();
     excluded.retain(|path| {
         let path = canonical(path);
@@ -258,13 +240,8 @@ fn account_options(
     })
 }
 
-/// The change token that decides whether a cached window is still good, read
-/// through the same account scope the window itself was scanned under.
-///
-/// Sharing one token across accounts would make either account's files moving
-/// invalidate the other's entry, which is the cache thrash this account-keyed
-/// map exists to avoid.
-fn account_parse_options(
+/// Capture the exact same source partition for disk synchronization.
+pub(crate) fn account_parse_options(
     context: &crate::LocalSourceContext,
     account: &Account,
 ) -> Result<tokscale_core::LocalParseOptions, String> {
@@ -278,990 +255,1169 @@ fn account_parse_options(
     })
 }
 
-/// Test instrumentation: the counter exists in every build so `cached` can
-/// increment it, but reading it is only ever a test's business.
-#[cfg(test)]
-pub(crate) fn scan_count() -> usize {
-    SCAN_COUNT.load(Ordering::Relaxed)
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_LEASES: usize = 32;
+const MAX_LEASE_BYTES: usize = 16 * 1024 * 1024;
+const EXPIRED: &str = "Quota usage snapshot expired; request a new snapshot.";
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+type LeaseEntry = (String, Arc<Lease>);
+static LEASES: LazyLock<Mutex<VecDeque<LeaseEntry>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+struct Lease {
+    account: Account,
+    snapshot: LocalUsageSnapshot,
+    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    root_generation: u64,
+    lease_id: u64,
+    price_generation: u64,
+    undated_count: u32,
+    bytes: usize,
 }
 
-pub(crate) fn cached(
-    context: &crate::LocalSourceContext,
-    account: &Account,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Request {
+    account_key: Account,
     from_ms: i64,
     until_ms: i64,
-) -> Result<Value, String> {
-    let key = cache_key(account, from_ms, until_ms);
-    let cached = {
-        let cache = crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.get(&key).map(|(at, token, data)| {
-            (
-                at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS),
-                *token,
-                data.clone(),
-            )
-        })
-    };
-    let Some((fresh_enough, token, data)) = cached else {
-        return compute(context, account, from_ms, until_ms, key);
-    };
-    if fresh_enough {
-        return Ok(data);
-    }
-
-    // Probe with the cache lock released, matching graph_cached. An unchanged
-    // source only refreshes the timestamp; it does not re-run the scan.
-    if let Ok(probe_token) = account_parse_options(context, account)
-        .and_then(|options| tokscale_core::local_source_change_token(&options))
-    {
-        if probe_token == token {
-            let mut cache = crate::WINDOW_USAGE_CACHE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = cache.get_mut(&key) {
-                entry.0 = Instant::now();
-            }
-            return Ok(data);
-        }
-    }
-
-    compute(context, account, from_ms, until_ms, key)
+    snapshot_token: Option<String>,
+    #[serde(default)]
+    include_model_catalog: bool,
+    #[serde(default)]
+    attribution: Vec<Attribution>,
+    #[serde(default)]
+    model_groups: Vec<ModelGroup>,
+    #[serde(default)]
+    inference: Vec<InferenceJob>,
+    #[serde(default)]
+    windows: Vec<WindowJob>,
+    diagnostics: Option<DiagnosticJobs>,
 }
 
-/// Held across a scan so overlapping callers share one, instead of each
-/// starting its own.
-///
-/// `PopoverView`'s keyed window task and `pollAgentUsage` can both reach
-/// `refreshWindowUsage`, and the Swift scan token only discards an overtaken
-/// RESULT — it does not stop the duplicate work. Two 4-to-67 second scans then
-/// run at once and contend for the same parser pool, which is the opposite of
-/// what a cache in front of them is for.
-///
-/// A plain mutex rather than a per-key future: the second caller waits, then
-/// re-checks the cache and finds what the first published. Scans are CPU-bound
-/// and already serialise on the parser pool, so making them queue costs nothing
-/// that running them concurrently was buying.
-static COMPUTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn compute(
-    context: &crate::LocalSourceContext,
-    account: &Account,
-    from_ms: i64,
-    until_ms: i64,
-    key: CacheKey,
-) -> Result<Value, String> {
-    let _serialised = COMPUTE.lock().unwrap_or_else(|p| p.into_inner());
-    // Re-check under the lock. A caller that queued behind another's scan is
-    // asking a question that scan may have just answered; running a second one
-    // to produce the same bytes is the duplicate this lock exists to remove.
-    {
-        let cache = crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((at, _, data)) = cache.get(&key) {
-            if at.elapsed() <= Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS) {
-                return Ok(data.clone());
-            }
-        }
-    }
-    let generation = crate::root_generation();
-    let token = account_parse_options(context, account)
-        .and_then(|options| tokscale_core::local_source_change_token(&options))
-        .unwrap_or(0);
-    let data = run(context, account, from_ms, until_ms)?;
-    // The caller still gets this payload when `publish` refuses it: it answers
-    // a question asked before the roots changed, and the next call recomputes.
-    publish(key, generation, (Instant::now(), token, data.clone()));
-    Ok(data)
-}
-
-/// Cache a freshly scanned window unless the root registry moved while the scan
-/// was running.
-///
-/// Same lock discipline as `publish_graph`: the generation is re-read inside
-/// the lock `invalidate_scan_caches` clears under, so a replace cannot land
-/// between the check and the insert. A window scan runs for tens of seconds on
-/// a large store, which makes that interleaving ordinary rather than exotic
-/// here — and the entry it would leave behind is served without a token probe
-/// for `ONESHOT_MAX_AGE_SECS`.
-///
-/// The insert clears first: one entry per account, not a history. The key
-/// carries `until_ms` floored to the minute and the consumer polls every 60s
-/// with `until = now`, so each poll mints a key that will never be asked for
-/// again — and this map is a process-lifetime static with no eviction anywhere
-/// on the production path. Every minute the Quota lens stayed open therefore
-/// left a whole window's messages resident for the life of the app.
-///
-/// **Per account**, not the whole map. That rationale is about one account's
-/// own keys going stale each minute; it says nothing about another account's,
-/// and a whole-map clear makes two configured accounts evict each other on
-/// every poll. The result is still correct — a miss recomputes — so nothing
-/// comparing totals can see it. It shows up only as a scan count.
-///
-/// Measured on the shipping build: ~39 MB per minute with the lens open, and
-/// none of it returned when it closed — 507 MB before opening, 1451 MB after
-/// ten minutes and a close. Clearing keeps the hit that matters (a second call
-/// inside the same minute still finds this entry) and drops the ones that
-/// cannot be hit again by construction.
-///
-/// Returns whether the entry was published, which is what the tests assert on.
-pub(crate) fn publish(key: CacheKey, generation: u64, entry: CacheEntry) -> bool {
-    let mut cache = crate::WINDOW_USAGE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if crate::root_generation() != generation {
-        return false;
-    }
-    cache.retain(|(account, _, _), _| account != &key.0);
-    cache.insert(key, entry);
-    true
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Message {
-    timestamp: i64,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Attribution {
     client: String,
-    provider_id: String,
+    provider: String,
+    model: Option<String>,
+    state: AttributionState,
+    target: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+enum AttributionState {
+    Assigned,
+    Excluded,
+    Unassigned,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelGroup {
     model_id: String,
+    group_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InferenceJob {
+    id: String,
+    subscription: Option<String>,
+    from_ms: i64,
+    until_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowJob {
+    id: String,
+    subscription: String,
+    admitted_model_ids: Option<Vec<String>>,
+    current: Option<CurrentJob>,
+    #[serde(default)]
+    cycles: Vec<CycleJob>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentJob {
+    from_ms: i64,
+    until_ms: i64,
+    observed: Option<Span>,
+    #[serde(default)]
+    zones: Vec<ZoneJob>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Span {
+    from_ms: i64,
+    until_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ZoneJob {
+    index: i64,
+    lo_ms: i64,
+    hi_ms: i64,
+    include_lo: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CycleJob {
+    reset_at_ms: i64,
+    evidence_start_ms: i64,
+    first_sample_ms: i64,
+    last_sample_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiagnosticJobs {
+    #[serde(default)]
+    intervals: Vec<DiagnosticJob>,
+    #[serde(default)]
+    buckets: Vec<BucketJob>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiagnosticJob {
+    id: String,
+    from_ms: i64,
+    until_ms: i64,
+    include_from: bool,
+    include_until: bool,
+    subscription: Option<String>,
+    admitted_model_ids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BucketJob {
+    id: String,
+    from_ms: i64,
+    until_ms: i64,
+    bucket_ms: i64,
+    count: i64,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Breakdown {
     input: i64,
     output: i64,
     cache_read: i64,
     cache_write: i64,
     reasoning: i64,
-    cost: f64,
-    is_turn_start: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WindowData {
-    messages: Vec<Message>,
-    undated_count: u32,
-    processing_time_ms: u32,
+struct Counter {
+    message_count: i64,
+    turn_count: i64,
+    tokens: i64,
+    tokens_ex_cache_read: i64,
+    breakdown: Breakdown,
+    cost: f64,
 }
 
-pub(crate) fn run(
-    context: &crate::LocalSourceContext,
-    account: &Account,
+// Swift's per-row reporting overflow chooses MAX even for negative overflow.
+fn row_sum(lanes: &[i64]) -> i64 {
+    lanes
+        .iter()
+        .try_fold(0i64, |sum, lane| sum.checked_add(*lane))
+        .unwrap_or(i64::MAX)
+}
+
+impl Breakdown {
+    fn add(&mut self, row: &UnifiedMessage) {
+        self.input = self.input.saturating_add(row.tokens.input);
+        self.output = self.output.saturating_add(row.tokens.output);
+        self.cache_read = self.cache_read.saturating_add(row.tokens.cache_read);
+        self.cache_write = self.cache_write.saturating_add(row.tokens.cache_write);
+        self.reasoning = self.reasoning.saturating_add(row.tokens.reasoning);
+    }
+}
+
+impl Counter {
+    fn add(&mut self, row: &UnifiedMessage, full: i64, fresh: i64) {
+        self.message_count = self.message_count.saturating_add(1);
+        self.turn_count = self.turn_count.saturating_add(i64::from(row.is_turn_start));
+        self.tokens = self.tokens.saturating_add(full);
+        self.tokens_ex_cache_read = self.tokens_ex_cache_read.saturating_add(fresh);
+        self.breakdown.add(row);
+        self.cost += row.cost;
+    }
+}
+
+#[derive(Default, Serialize)]
+struct Observed {
+    tokens: i64,
+    cost: f64,
+}
+impl Observed {
+    fn add(&mut self, row: &UnifiedMessage, full: i64) {
+        self.tokens = self.tokens.saturating_add(full);
+        self.cost += row.cost;
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Coverage {
     from_ms: i64,
     until_ms: i64,
-) -> Result<Value, String> {
-    let options = account_options(context, account)?;
+    state: &'static str,
+}
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Batch {
+    snapshot_token: String,
+    source_generation: u64,
+    root_generation: u64,
+    price_generation: u64,
+    model_catalog: Option<Vec<String>>,
+    coverage: Coverage,
+    undated_count: u32,
+    processing_time_ms: u32,
+    inference: Vec<InferenceResult>,
+    windows: Vec<WindowResult>,
+    diagnostics: Option<Diagnostics>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InferenceResult {
+    id: String,
+    state: &'static str,
+    first_assigned_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct WindowResult {
+    id: String,
+    current: Option<CurrentResult>,
+    cycles: Vec<CycleResult>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentResult {
+    state: &'static str,
+    unscoped_assigned_message_count: i64,
+    scope_matched_nothing: bool,
+    mine: Counter,
+    observed: Option<Observed>,
+    zones: Vec<ZoneResult>,
+}
+
+#[derive(Serialize)]
+struct ZoneResult {
+    index: i64,
+    #[serde(flatten)]
+    counter: Counter,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelResult {
+    provider_id: String,
+    model_id: String,
+    tokens: i64,
+    breakdown: Breakdown,
+    cost: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CycleResult {
+    reset_at_ms: i64,
+    state: &'static str,
+    mine_tokens: i64,
+    mine_tokens_ex_cache_read: i64,
+    mine_breakdown: Breakdown,
+    mine_cost: f64,
+    mine_message_count: i64,
+    mine_turn_count: i64,
+    span_tokens: i64,
+    span_cost: f64,
+    other_tokens: i64,
+    other_cost: f64,
+    other_has_assigned: bool,
+    other_has_excluded: bool,
+    other_has_unattributed: bool,
+    models: Vec<ModelResult>,
+}
+
+struct CycleFold {
+    mine: Counter,
+    span: Observed,
+    other: Observed,
+    assigned: bool,
+    excluded: bool,
+    unassigned: bool,
+    models: BTreeMap<String, BTreeMap<String, ModelResult>>,
+}
+
+impl CycleFold {
+    fn new() -> Self {
+        Self {
+            mine: Counter::default(),
+            span: Observed::default(),
+            other: Observed::default(),
+            assigned: false,
+            excluded: false,
+            unassigned: false,
+            models: BTreeMap::new(),
+        }
+    }
+    fn finish(self, reset_at_ms: i64) -> CycleResult {
+        let mut models: Vec<_> = self
+            .models
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .collect();
+        models.sort_by(|a, b| {
+            b.tokens
+                .cmp(&a.tokens)
+                .then_with(|| {
+                    b.cost
+                        .partial_cmp(&a.cost)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.provider_id.cmp(&b.provider_id))
+                .then_with(|| a.model_id.cmp(&b.model_id))
+        });
+        CycleResult {
+            reset_at_ms,
+            state: "covered",
+            mine_tokens: self.mine.tokens,
+            mine_tokens_ex_cache_read: self.mine.tokens_ex_cache_read,
+            mine_breakdown: self.mine.breakdown,
+            mine_cost: self.mine.cost,
+            mine_message_count: self.mine.message_count,
+            mine_turn_count: self.mine.turn_count,
+            span_tokens: self.span.tokens,
+            span_cost: self.span.cost,
+            other_tokens: self.other.tokens,
+            other_cost: self.other.cost,
+            other_has_assigned: self.assigned,
+            other_has_excluded: self.excluded,
+            other_has_unattributed: self.unassigned,
+            models,
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticComponents {
+    input_output_reasoning: f64,
+    ex_cache_read: f64,
+    full: f64,
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+    reasoning: f64,
+    cost: f64,
+    input_output_reasoning_cache_write: f64,
+    incremental_input_output_reasoning: i64,
+    incremental_ex_cache_read: i64,
+    input_output_reasoning_tokens: i64,
+}
+
+impl DiagnosticComponents {
+    fn add(&mut self, row: &UnifiedMessage, full: i64, fresh: i64) {
+        let t = &row.tokens;
+        let a = t.input.saturating_add(t.output).saturating_add(t.reasoning);
+        self.input_output_reasoning += a as f64;
+        self.input_output_reasoning_cache_write += a.saturating_add(t.cache_write) as f64;
+        self.ex_cache_read += fresh as f64;
+        self.full += full as f64;
+        self.input += t.input as f64;
+        self.output += t.output as f64;
+        self.cache_read += t.cache_read as f64;
+        self.cache_write += t.cache_write as f64;
+        self.reasoning += t.reasoning as f64;
+        self.cost += row.cost;
+        self.incremental_input_output_reasoning = self
+            .incremental_input_output_reasoning
+            .saturating_add(t.input)
+            .saturating_add(t.output)
+            .saturating_add(t.reasoning);
+        self.incremental_ex_cache_read = self
+            .incremental_ex_cache_read
+            .saturating_add(t.input)
+            .saturating_add(t.output)
+            .saturating_add(t.reasoning)
+            .saturating_add(t.cache_write);
+        self.input_output_reasoning_tokens = self.input_output_reasoning_tokens.saturating_add(a);
+    }
+}
+
+#[derive(Serialize)]
+struct AssignedResult {
+    target: String,
+    counter: Counter,
+}
+
+#[derive(Serialize)]
+struct DiagnosticInterval {
+    id: String,
+    all: Counter,
+    mine: Counter,
+    assigned: Vec<AssignedResult>,
+    excluded: Counter,
+    unassigned: Counter,
+    components: DiagnosticComponents,
+}
+
+struct DiagnosticFold {
+    all: Counter,
+    mine: Counter,
+    assigned: BTreeMap<String, Counter>,
+    excluded: Counter,
+    unassigned: Counter,
+    components: DiagnosticComponents,
+}
+
+impl DiagnosticFold {
+    fn new() -> Self {
+        Self {
+            all: Counter::default(),
+            mine: Counter::default(),
+            assigned: BTreeMap::new(),
+            excluded: Counter::default(),
+            unassigned: Counter::default(),
+            components: DiagnosticComponents::default(),
+        }
+    }
+    fn finish(self, id: String) -> DiagnosticInterval {
+        let mut assigned: Vec<_> = self
+            .assigned
+            .into_iter()
+            .map(|(target, counter)| AssignedResult { target, counter })
+            .collect();
+        assigned.sort_by(|a, b| {
+            b.counter
+                .tokens
+                .cmp(&a.counter.tokens)
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        DiagnosticInterval {
+            id,
+            all: self.all,
+            mine: self.mine,
+            assigned,
+            excluded: self.excluded,
+            unassigned: self.unassigned,
+            components: self.components,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BucketResult {
+    id: String,
+    tokens: Vec<i64>,
+    remainder_tokens: i64,
+}
+
+#[derive(Serialize)]
+struct Diagnostics {
+    intervals: Vec<DiagnosticInterval>,
+    buckets: Vec<BucketResult>,
+}
+
+fn half_open(t: i64, from: i64, until: i64) -> bool {
+    t >= from && t < until
+}
+fn observed(t: i64, span: &Span) -> bool {
+    t > span.from_ms && t <= span.until_ms
+}
+
+fn classify<'a>(
+    rules: &'a [Attribution],
+    row: &UnifiedMessage,
+    model: &str,
+) -> (AttributionState, Option<&'a str>) {
+    let source =
+        |rule: &&Attribution| rule.client == row.client && rule.provider == row.provider_id;
+    let rule = rules
+        .iter()
+        .filter(source)
+        .find(|rule| rule.model.as_deref() == Some(model))
+        .or_else(|| {
+            rules
+                .iter()
+                .filter(source)
+                .find(|rule| rule.model.is_none())
+        });
+    rule.map(|rule| (rule.state, rule.target.as_deref()))
+        .unwrap_or((AttributionState::Unassigned, None))
+}
+
+impl Request {
+    fn validate(&self) -> Result<(), String> {
+        let range = |from: i64, until: i64, inclusive: bool| {
+            if from > until
+                || from < self.from_ms
+                || until > self.until_ms
+                || (inclusive && until == self.until_ms && from < until)
+            {
+                Err("quota job range is not covered by the request".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        if self.from_ms > self.until_ms {
+            return Err("quota request range is reversed".into());
+        }
+        if self.attribution.len() > 128 {
+            return Err("too many quota attribution records".into());
+        }
+        let mut keys = BTreeSet::new();
+        for rule in &self.attribution {
+            if !keys.insert((&rule.client, &rule.provider, &rule.model))
+                || (rule.state == AttributionState::Assigned
+                    && rule.target.as_deref().is_none_or(str::is_empty))
+                || (rule.state != AttributionState::Assigned && rule.target.is_some())
+            {
+                return Err("invalid quota attribution record".into());
+            }
+        }
+        let mut groups = BTreeSet::new();
+        if self
+            .model_groups
+            .iter()
+            .any(|group| group.group_id.is_empty() || !groups.insert(&group.model_id))
+        {
+            return Err("invalid quota model group mapping".into());
+        }
+        let mut ids = BTreeSet::new();
+        for job in &self.inference {
+            if !ids.insert(&job.id) {
+                return Err("duplicate quota inference id".into());
+            }
+            range(job.from_ms, job.until_ms, false)?;
+        }
+        ids.clear();
+        for window in &self.windows {
+            if !ids.insert(&window.id) {
+                return Err("duplicate quota window id".into());
+            }
+            if let Some(current) = &window.current {
+                range(current.from_ms, current.until_ms, false)?;
+                if let Some(span) = &current.observed {
+                    if span.from_ms > span.until_ms {
+                        return Err("quota observed range is reversed".into());
+                    }
+                }
+                let mut indexes = BTreeSet::new();
+                for zone in &current.zones {
+                    if zone.lo_ms > zone.hi_ms || !indexes.insert(zone.index) {
+                        return Err("invalid quota zone".into());
+                    }
+                }
+            }
+            let mut resets = BTreeSet::new();
+            for cycle in &window.cycles {
+                if !resets.insert(cycle.reset_at_ms) {
+                    return Err("duplicate quota cycle reset".into());
+                }
+                range(cycle.evidence_start_ms, cycle.reset_at_ms, false)?;
+                range(cycle.first_sample_ms, cycle.last_sample_ms, true)?;
+            }
+        }
+        if let Some(jobs) = &self.diagnostics {
+            ids.clear();
+            for job in &jobs.intervals {
+                if !ids.insert(&job.id) {
+                    return Err("duplicate quota diagnostic id".into());
+                }
+                range(job.from_ms, job.until_ms, job.include_until)?;
+            }
+            ids.clear();
+            let mut bucket_bytes = 0usize;
+            for job in &jobs.buckets {
+                if !ids.insert(&job.id) || job.bucket_ms <= 0 || !(0..=16384).contains(&job.count) {
+                    return Err("invalid quota diagnostic buckets".into());
+                }
+                range(job.from_ms, job.until_ms, false)?;
+                bucket_bytes = bucket_bytes.saturating_add(
+                    (job.count as usize).saturating_mul(std::mem::size_of::<i64>()),
+                );
+                if bucket_bytes > MAX_LEASE_BYTES {
+                    return Err("quota diagnostic buckets exceed byte limit".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// The shared LocalClients visitor admits cc-mirror/* when "claude" is
+// requested. Quota accounts retain the legacy report filter's literal client
+// membership: mirrors may contribute to primary declarations, never extras.
+fn account_client_passes(account: &Account, row: &UnifiedMessage) -> bool {
+    account.is_none() || row.client == CLAUDE
+}
+
+fn capture(context: &crate::LocalSourceContext, account: &Account) -> Result<Lease, String> {
+    let root_generation = crate::root_generation();
+    let options = account_parse_options(context, account)?;
+    let resolved = tokscale_core::ResolvedLocalSourceContext::capture(
+        account
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| context.home_dir.clone()),
+        options.use_env_roots,
+        options.scanner_settings.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
+    let snapshot = tokscale_core::synchronize_local_usage(
+        &resolved,
+        options,
+        tokscale_core::LocalUsageSelection::LocalClients,
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("build runtime: {}", e))?;
-    SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
-    let usage = runtime.block_on(tokscale_core::get_window_usage(options, from_ms, until_ms))?;
-
-    let data = WindowData {
-        messages: usage
-            .messages
-            .into_iter()
-            .map(|m| Message {
-                timestamp: m.timestamp,
-                client: m.client,
-                provider_id: m.provider_id,
-                model_id: m.model_id,
-                input: m.input,
-                output: m.output,
-                cache_read: m.cache_read,
-                cache_write: m.cache_write,
-                reasoning: m.reasoning,
-                cost: m.cost,
-                is_turn_start: m.is_turn_start,
-            })
-            .collect(),
-        undated_count: usage.undated_count,
-        processing_time_ms: usage.processing_time_ms,
-    };
-    serde_json::to_value(data).map_err(|e| format!("serialize window usage: {}", e))
+        .map_err(|error| format!("build runtime: {error}"))?;
+    let pricing = runtime.block_on(tokscale_core::capture_local_usage_pricing(&resolved));
+    build_lease(account, snapshot, pricing, root_generation, None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::{Path, PathBuf};
-    use std::sync::{LazyLock, Mutex};
-
-    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    /// The primary account, spelled out so a call site reads as a choice
-    /// rather than as a `None` nobody thought about.
-    const PRIMARY: Account = None;
-
-    /// Hold every lock guarding state a per-account window scan reads.
-    ///
-    /// The registries are process-wide statics with their own module-local test
-    /// locks, and `cargo test` runs modules concurrently: a test here that
-    /// installed roots while holding only this module's lock raced
-    /// `extra_scan_paths::tests`, and both sides saw the other's fixture. Taken
-    /// in a fixed order — this module, then the scan registry, then the config
-    /// dirs — because two tests acquiring the same pair in opposite orders is
-    /// the other way to make a suite hang.
-    fn lock_registries() -> (
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        (
-            TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-            crate::extra_scan_paths::TEST_LOCK
+fn build_lease(
+    account: &Account,
+    snapshot: LocalUsageSnapshot,
+    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    root_generation: u64,
+    price_generation: Option<u64>,
+) -> Result<Lease, String> {
+    let mut undated_count = 0u32;
+    tokscale_core::visit_local_usage_snapshot(
+        &snapshot,
+        LocalUsageQuery {
+            until_ms: Some(1),
+            hydrate_opencode_aliases: false,
+            ..Default::default()
+        },
+        &|row| account_client_passes(account, row),
+        &mut |_| undated_count = undated_count.saturating_add(1),
+    )?;
+    if root_generation != crate::root_generation() {
+        return Err(EXPIRED.into());
+    }
+    let lease_id = NEXT_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| "quota snapshot generation exhausted")?;
+    let price_generation = price_generation.unwrap_or_else(|| {
+        pricing.as_ref().map_or(0, |pricing| {
+            LEASES
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            crate::claude_config_dirs::TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-    }
+                .iter()
+                .find_map(|(_, lease)| {
+                    lease
+                        .pricing
+                        .as_ref()
+                        .filter(|previous| Arc::ptr_eq(previous, pricing))
+                        .map(|_| lease.price_generation)
+                })
+                .unwrap_or(lease_id)
+        })
+    });
+    let bytes = snapshot.metadata_bytes()
+        + account.as_ref().map_or(0, String::capacity)
+        + std::mem::size_of::<Lease>()
+        + 64;
+    Ok(Lease {
+        account: account.clone(),
+        snapshot,
+        pricing,
+        root_generation,
+        lease_id,
+        price_generation,
+        undated_count,
+        bytes,
+    })
+}
 
-    #[test]
-    fn quantised_window_calls_scan_once() {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let from_ms = 1_700_000_000_000;
-        let until_a = 1_700_000_060_001;
-        let until_b = 1_700_000_060_999;
-        let key = cache_key(&PRIMARY, from_ms, until_a);
-        crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&key);
-        let before = scan_count();
-        let context = crate::LocalSourceContext::for_home(PathBuf::from("/private/tmp"));
+/// Register the scheduler's already-synchronized facts and shared price Arc.
+/// No source discovery or pricing request is performed here.
+pub(crate) fn register_for_scheduler(
+    account: &Account,
+    snapshot: LocalUsageSnapshot,
+    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    root_generation: u64,
+    price_generation: u64,
+) -> Result<String, String> {
+    let lease = Arc::new(build_lease(
+        account,
+        snapshot,
+        pricing,
+        root_generation,
+        Some(price_generation),
+    )?);
+    let token = format!("quota-{:016x}", lease.lease_id);
+    retain_lease(&token, &lease, true)?;
+    Ok(token)
+}
 
-        cached(&context, &PRIMARY, from_ms, until_a).expect("first window scan");
-        cached(&context, &PRIMARY, from_ms, until_b).expect("quantised cache hit");
+pub(crate) fn is_live(token: &str) -> bool {
+    LEASES
+        .lock()
+        .iter()
+        .any(|(key, lease)| key == token && lease.root_generation == crate::root_generation())
+}
 
-        assert_eq!(
-            cache_key(&PRIMARY, from_ms, until_a),
-            cache_key(&PRIMARY, from_ms, until_b)
-        );
-        assert_eq!(scan_count(), before + 1);
-        // If until_ms is no longer quantised, these two calls use different
-        // keys and this assertion catches the accidental 0%-hit-rate change.
-    }
-
-    #[test]
-    fn cache_keeps_only_the_newest_window() {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let context = crate::LocalSourceContext::for_home(PathBuf::from("/private/tmp"));
-        let from_ms = 1_700_000_000_000;
-        crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-
-        // Three different minutes: exactly what a poll every 60s produces, and
-        // what used to leave three whole scans resident for ever.
-        for minute in 0..3 {
-            cached(&context, &PRIMARY, from_ms, from_ms + 60_000 * (minute + 1))
-                .expect("window scan");
-        }
-        let cache = crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            cache.len(),
-            1,
-            "the map is a process-lifetime static with no eviction, so anything \
-             this account keeps beyond its newest entry is kept until the app exits"
-        );
-    }
-
-    /// One assistant turn with a distinct id, so a root's contribution is
-    /// identifiable by its token count alone.
-    fn turn(id: &str, output: i64) -> String {
-        format!(
-            r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","requestId":"req_{id}","message":{{"id":"msg_{id}","model":"claude-3-5-sonnet","usage":{{"input_tokens":0,"output_tokens":{output}}}}}}}"#
-        )
-    }
-
-    fn write_session(root: &Path, id: &str, output: i64) {
-        let dir = root.join("projects").join("proj");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{id}.jsonl")), turn(id, output)).unwrap();
-    }
-
-    fn output_tokens(payload: &Value) -> i64 {
-        payload["messages"]
-            .as_array()
-            .expect("messages array")
-            .iter()
-            .map(|message| message["output"].as_i64().unwrap_or(0))
-            .sum()
-    }
-
-    /// Primary at 1000, `work-d` at 7000 reachable by both the scan registry
-    /// and a `.cc-mirror` variant, `work-e` at 500 reachable by the registry
-    /// alone, `work-d/sub` at 90 reachable only by its own variant.
-    ///
-    /// Two extra accounts rather than one because a directory reachable two
-    /// ways collapses into a single scan task and cannot tell the routes apart:
-    /// `work-e` leaking is unambiguous evidence about the registry route.
-    struct AccountFixture {
-        _dir: tempfile::TempDir,
-        home: PathBuf,
-        d: PathBuf,
-        e: PathBuf,
-    }
-
-    const PRIMARY_OUTPUT: i64 = 1_000;
-    const D_OUTPUT: i64 = 7_000;
-    const E_OUTPUT: i64 = 500;
-    const SUB_OUTPUT: i64 = 90;
-
-    fn account_fixture() -> AccountFixture {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let d = home.join("work-d");
-        let e = home.join("work-e");
-        let sub = d.join("sub");
-        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
-        write_session(&d, "d", D_OUTPUT);
-        write_session(&e, "e", E_OUTPUT);
-        write_session(&sub, "sub", SUB_OUTPUT);
-        for (name, config_dir) in [("v1", &d), ("v2", &sub)] {
-            let variant = home.join(".cc-mirror").join(name);
-            std::fs::create_dir_all(&variant).unwrap();
-            std::fs::write(
-                variant.join("variant.json"),
-                serde_json::json!({ "configDir": config_dir.to_string_lossy() }).to_string(),
-            )
-            .unwrap();
-        }
-        // Both registries, installed through the real setters, because the
-        // primary's exclusion is built from both and a test that populated one
-        // would pass while the other went unread.
-        let roots: Vec<String> = [&d, &e]
-            .iter()
-            .flat_map(|dir| {
-                [
-                    dir.join("projects").display().to_string(),
-                    dir.join("transcripts").display().to_string(),
-                ]
-            })
-            .collect();
-        crate::extra_scan_paths::set_from_json(
-            &serde_json::json!({ "claude": roots }).to_string(),
-        )
-        .unwrap();
-        crate::claude_config_dirs::set_from_json(
-            &serde_json::json!([d.display().to_string(), e.display().to_string()]).to_string(),
-        )
-        .unwrap();
-        AccountFixture {
-            _dir: dir,
-            home,
-            d,
-            e,
-        }
-    }
-
-    fn reset_registries() {
-        crate::extra_scan_paths::reset_for_test();
-        crate::claude_config_dirs::reset_for_test();
-        crate::WINDOW_USAGE_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-
-    const WINDOW_FROM: i64 = 1_767_225_600_000;
-    const WINDOW_UNTIL: i64 = 1_767_312_000_000;
-
-    fn scan(context: &crate::LocalSourceContext, account: &Account) -> Value {
-        run(context, account, WINDOW_FROM, WINDOW_UNTIL).expect("window scan")
-    }
-
-    /// The defect issue #258 reports: with a second Claude account configured,
-    /// the primary's window folds both accounts' transcripts.
-    ///
-    /// Asserted on both routes separately. `work-e` is reachable only through
-    /// the scan registry and `work-d/sub` only through a `.cc-mirror` variant
-    /// naming a directory below every registry entry, so a fix that closed one
-    /// route and not the other fails here rather than passing on a machine
-    /// that happens to have no mirrors.
-    #[test]
-    fn primary_window_excludes_every_configured_extra_account() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-
-        let primary = scan(&context, &PRIMARY);
-
-        assert_eq!(
-            output_tokens(&primary),
-            PRIMARY_OUTPUT,
-            "the primary window folded another account's transcripts: {primary}"
-        );
-        reset_registries();
-    }
-
-    /// The control for the test above: without the exclusion the fixture really
-    /// does deliver all four roots, so a green result there is the exclusion
-    /// working rather than the fixture being inert.
-    #[test]
-    fn the_fixture_delivers_every_root_before_the_exclusion_is_applied() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-
-        let wide = run(
-            &context,
-            &PRIMARY,
-            WINDOW_FROM,
-            WINDOW_UNTIL,
-        );
-        let _ = wide;
-        // Read the roots the way the shipping primary selector does NOT: the
-        // unnarrowed options every caller used before this change.
-        let options = context.report_options(None, None);
-        let usage = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(tokscale_core::get_window_usage(
-                options,
-                WINDOW_FROM,
-                WINDOW_UNTIL,
-            ))
-            .expect("wide scan");
-        let total: i64 = usage.messages.iter().map(|message| message.output).sum();
-
-        assert_eq!(
-            total,
-            PRIMARY_OUTPUT + D_OUTPUT + E_OUTPUT + SUB_OUTPUT,
-            "the fixture does not reach every root, so the exclusion test above \
-             could pass without excluding anything"
-        );
-        reset_registries();
-    }
-
-    /// The two registries are installed by separate FFI calls, and
-    /// `ClaudeExtraRoots.install` discards the first call's result, so they can
-    /// disagree: a directory can reach `tb_set_extra_scan_paths` while
-    /// `tb_set_claude_config_dirs` still holds the previous list.
-    ///
-    /// The primary must still refuse it. Without the registry half of
-    /// `primary_exclusions` this is the shape that leaks — and it is the only
-    /// shape that does, which is why it needs its own fixture rather than
-    /// riding on the one above where both registries agree.
-    #[test]
-    fn primary_window_excludes_a_root_the_config_dir_registry_never_heard_of() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let orphan = home.join("work-orphan");
-        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
-        write_session(&orphan, "orphan", E_OUTPUT);
-
-        // Scan registry knows the account; identity registry does not.
-        crate::extra_scan_paths::set_from_json(
-            &serde_json::json!({
-                "claude": [orphan.join("projects").display().to_string()]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        assert!(
-            crate::claude_config_dirs::snapshot().is_empty(),
-            "the fixture is meant to leave the identity registry empty"
-        );
-
-        let context = crate::LocalSourceContext::for_home(home);
-        let primary = scan(&context, &PRIMARY);
-
-        assert_eq!(
-            output_tokens(&primary),
-            PRIMARY_OUTPUT,
-            "a scan root absent from the config-dir registry was folded into \
-             the primary's window: {primary}"
-        );
-        reset_registries();
-    }
-
-    /// Each extra account's window is its own transcripts and nothing else —
-    /// not the primary's, and not the other extra account's.
-    #[test]
-    fn an_extra_account_window_is_exactly_that_account() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-
-        let d = scan(&context, &Some(fixture.d.display().to_string()));
-        let e = scan(&context, &Some(fixture.e.display().to_string()));
-
-        assert_eq!(
-            output_tokens(&d),
-            D_OUTPUT,
-            "account D's window is not its own registered roots: {d}"
-        );
-        // `work-d/sub` belongs to neither window, and that is the intended
-        // answer rather than a leak in the other direction. It is a config
-        // directory of its own, discovered through a `.cc-mirror` variant and
-        // never configured in Syrtis, so it is not the primary's usage and
-        // not D's — it is a third account nobody registered. Today it silently
-        // inflates the primary's window; counting it for no quota is the honest
-        // result, because there is no quota reading to divide it against.
-        assert!(
-            output_tokens(&d) != D_OUTPUT + SUB_OUTPUT,
-            "an unregistered nested account was folded into D's window: {d}"
-        );
-        assert_eq!(
-            output_tokens(&e),
-            E_OUTPUT,
-            "account E's window is not its own roots: {e}"
-        );
-        reset_registries();
-    }
-
-    /// Restores `TOKSCALE_EXTRA_DIRS` on drop, so a panicking assertion cannot
-    /// leave the variable set for whatever test runs next.
-    struct ExtraDirsGuard(Option<std::ffi::OsString>);
-
-    impl ExtraDirsGuard {
-        fn set(value: &str) -> Self {
-            let guard = Self(std::env::var_os("TOKSCALE_EXTRA_DIRS"));
-            unsafe { std::env::set_var("TOKSCALE_EXTRA_DIRS", value) };
-            guard
-        }
-    }
-
-    impl Drop for ExtraDirsGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(previous) => unsafe {
-                    std::env::set_var("TOKSCALE_EXTRA_DIRS", previous)
-                },
-                None => unsafe { std::env::remove_var("TOKSCALE_EXTRA_DIRS") },
+// Count the captured catalog once per distinct service; its lazy lookup cache
+// can grow during reads, so admission re-measures after every use.
+fn retained_bytes(leases: &VecDeque<(String, Arc<Lease>)>) -> usize {
+    let mut bytes = 0usize;
+    for (index, (_, lease)) in leases.iter().enumerate() {
+        bytes = bytes.saturating_add(lease.bytes);
+        if let Some(pricing) = &lease.pricing {
+            if !leases.iter().take(index).any(|(_, prior)| {
+                prior
+                    .pricing
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(p, pricing))
+            }) {
+                bytes = bytes.saturating_add(pricing.retained_bytes());
             }
         }
     }
-
-    /// `TOKSCALE_EXTRA_DIRS` names `claude:` roots of its own, and an extra
-    /// account's window must not absorb them.
-    ///
-    /// This is the only property `use_env_roots: false` buys on this path, and
-    /// it is worth pinning precisely because the flag reads as if it bought
-    /// more: Claude's declared root is `PathRoot::Home`, which the flag does
-    /// not gate at all.
-    #[test]
-    fn an_extra_account_window_ignores_env_named_roots() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let stray = fixture.home.join("stray");
-        write_session(&stray, "stray", SUB_OUTPUT);
-        let _env = ExtraDirsGuard::set(&format!(
-            "claude:{}",
-            stray.join("projects").display()
-        ));
-
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-        let d = scan(&context, &Some(fixture.d.display().to_string()));
-
-        assert_eq!(
-            output_tokens(&d),
-            D_OUTPUT,
-            "an environment-named root was folded into account D's window: {d}"
-        );
-        reset_registries();
-    }
-
-    /// Two CONFIGURED accounts where one directory sits inside the other.
-    ///
-    /// Settings permits it — `isRejectedRoot` refuses only the empty path, `/`
-    /// and the home directory — so `/work` and `/work/sub` can both be real
-    /// accounts with real credentials. Selecting an account's roots by prefix
-    /// would give the outer one the inner one's transcripts, which is this
-    /// issue's defect reappearing on the selection side after being fixed on
-    /// the exclusion side.
-    ///
-    /// Distinct from the nested case in `an_extra_account_window_is_exactly_that_account`:
-    /// there the inner directory is registered with neither registry and
-    /// belongs to no window, and it takes the other branch entirely.
-    #[test]
-    fn a_nested_configured_account_is_not_folded_into_the_outer_one() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let outer = home.join("work");
-        let inner = outer.join("sub");
-        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
-        write_session(&outer, "outer", D_OUTPUT);
-        write_session(&inner, "inner", E_OUTPUT);
-
-        let roots: Vec<String> = [&outer, &inner]
-            .iter()
-            .flat_map(|d| {
-                [
-                    d.join("projects").display().to_string(),
-                    d.join("transcripts").display().to_string(),
-                ]
-            })
-            .collect();
-        crate::extra_scan_paths::set_from_json(
-            &serde_json::json!({ "claude": roots }).to_string(),
-        )
-        .unwrap();
-        crate::claude_config_dirs::set_from_json(
-            &serde_json::json!([
-                outer.display().to_string(),
-                inner.display().to_string()
-            ])
-            .to_string(),
-        )
-        .unwrap();
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let outer_window = scan(&context, &Some(outer.display().to_string()));
-        let inner_window = scan(&context, &Some(inner.display().to_string()));
-        let primary = scan(&context, &PRIMARY);
-
-        assert_eq!(
-            output_tokens(&outer_window),
-            D_OUTPUT,
-            "the outer account folded the nested account's transcripts: {outer_window}"
-        );
-        assert_eq!(
-            output_tokens(&inner_window),
-            E_OUTPUT,
-            "the nested account's window is not its own roots: {inner_window}"
-        );
-        assert_eq!(
-            output_tokens(&primary),
-            PRIMARY_OUTPUT,
-            "the primary folded a configured account: {primary}"
-        );
-        reset_registries();
-    }
-
-    const INNER_OUTPUT: i64 = 3_000;
-
-    fn claude_roots(dirs: &[&PathBuf]) -> Vec<String> {
-        dirs.iter()
-            .flat_map(|d| {
-                [
-                    d.join("projects").display().to_string(),
-                    d.join("transcripts").display().to_string(),
-                ]
-            })
-            .collect()
-    }
-
-    fn install(roots: &[String], config_dirs: &[&PathBuf]) {
-        crate::extra_scan_paths::set_from_json(
-            &serde_json::json!({ "claude": roots }).to_string(),
-        )
-        .unwrap();
-        crate::claude_config_dirs::set_from_json(
-            &serde_json::json!(config_dirs
-                .iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>())
-            .to_string(),
-        )
-        .unwrap();
-    }
-
-    /// An account configured at `D/.claude` beside `D` itself. `D`'s window is
-    /// scanned with `D` as home, and the engine resolves `D/.claude/projects`
-    /// on its own, so before the nested-account exclusion `D` read 10,000:
-    /// its own 7,000 and the inner account's 3,000, which the inner window
-    /// also counted.
-    #[test]
-    fn an_account_nested_at_dot_claude_is_not_counted_in_the_outer_window() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let d = home.join("work-d");
-        let inner = d.join(".claude");
-        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
-        write_session(&d, "d", D_OUTPUT);
-        write_session(&inner, "inner", INNER_OUTPUT);
-        install(&claude_roots(&[&d, &inner]), &[&d, &inner]);
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let outer = scan(&context, &Some(d.display().to_string()));
-        let nested = scan(&context, &Some(inner.display().to_string()));
-        let primary = scan(&context, &PRIMARY);
-
-        assert_eq!(
-            output_tokens(&outer),
-            D_OUTPUT,
-            "the outer account counted the account nested at .claude: {outer}"
-        );
-        assert_eq!(output_tokens(&nested), INNER_OUTPUT, "{nested}");
-        assert_eq!(output_tokens(&primary), PRIMARY_OUTPUT, "{primary}");
-        reset_registries();
-    }
-
-    /// The other half of the nested exclusion: an account at `D/.claude`
-    /// whose roots reached the scan registry while its directory did not reach
-    /// the config-dir registry. `ClaudeExtraRoots.install` sets the two
-    /// separately and the lists can disagree (`primary_exclusions`), so the
-    /// config-dir half alone would leave this one counted in D.
-    #[test]
-    fn a_nested_account_known_only_by_its_roots_is_excluded_too() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let d = home.join("work-d");
-        let inner = d.join(".claude");
-        write_session(&d, "d", D_OUTPUT);
-        write_session(&inner, "inner", INNER_OUTPUT);
-        install(&claude_roots(&[&d, &inner]), &[&d]);
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let outer = scan(&context, &Some(d.display().to_string()));
-
-        assert_eq!(output_tokens(&outer), D_OUTPUT, "{outer}");
-        reset_registries();
-    }
-
-    /// A configured `D/.claude` that is a symlink back to `D` is nested only as
-    /// spelled. The engine canonicalises exclusions, so listing it would cover
-    /// D's own roots and read D as zero; it is left out instead.
-    #[cfg(unix)]
-    #[test]
-    fn a_nested_path_that_resolves_to_the_account_itself_is_not_excluded() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let d = home.join("work-d");
-        write_session(&d, "d", D_OUTPUT);
-        let alias = d.join(".claude");
-        std::os::unix::fs::symlink(&d, &alias).unwrap();
-        install(&claude_roots(&[&d, &alias]), &[&d, &alias]);
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let outer = scan(&context, &Some(d.display().to_string()));
-
-        assert_eq!(output_tokens(&outer), D_OUTPUT, "D's own roots were excluded: {outer}");
-        reset_registries();
-    }
-
-    /// A `.cc-mirror` variant under an extra account's directory may name a
-    /// directory anywhere; its rows carry `cc-mirror/<variant>`, and a usage
-    /// attribution declaring that id against Claude would put them on this
-    /// account's card. The account window asks for exactly `claude`.
-    #[test]
-    fn an_extra_account_window_reads_only_the_claude_client() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let d = home.join("work-d");
-        let elsewhere = home.join("elsewhere");
-        write_session(&d, "d", D_OUTPUT);
-        write_session(&elsewhere, "mirror", SUB_OUTPUT);
-        let variant = d.join(".cc-mirror").join("v");
-        std::fs::create_dir_all(&variant).unwrap();
-        std::fs::write(
-            variant.join("variant.json"),
-            serde_json::json!({ "configDir": elsewhere.to_string_lossy() }).to_string(),
-        )
-        .unwrap();
-        install(&claude_roots(&[&d]), &[&d]);
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let window = scan(&context, &Some(d.display().to_string()));
-
-        assert_eq!(output_tokens(&window), D_OUTPUT, "{window}");
-        assert!(
-            window["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|m| m["client"] == CLAUDE),
-            "a non-Claude client reached the account window: {window}"
-        );
-        reset_registries();
-    }
-
-    /// With nothing nested and no other client under the account, the window
-    /// is exactly what the options before the nested-account exclusion
-    /// produced: same messages, same undated count.
-    #[test]
-    fn an_unnested_account_window_is_unchanged_by_the_exclusion() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-        for account in [&fixture.d, &fixture.e] {
-            let dir = account.display().to_string();
-            let before = tokscale_core::ReportOptions {
-                home_dir: Some(dir.clone()),
-                use_env_roots: false,
-                scanner_settings: tokscale_core::scanner::ScannerSettings {
-                    extra_scan_paths: BTreeMap::from([(
-                        CLAUDE.to_string(),
-                        registered_roots_under(&dir),
-                    )]),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let old = runtime
-                .block_on(tokscale_core::get_window_usage(before, WINDOW_FROM, WINDOW_UNTIL))
-                .unwrap();
-            let now = scan(&context, &Some(dir.clone()));
-            let old_messages: Vec<(i64, String, i64)> = old
-                .messages
-                .iter()
-                .map(|m| (m.timestamp, m.client.clone(), m.output))
-                .collect();
-            let new_messages: Vec<(i64, String, i64)> = now["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|m| {
-                    (
-                        m["timestamp"].as_i64().unwrap(),
-                        m["client"].as_str().unwrap().to_string(),
-                        m["output"].as_i64().unwrap(),
-                    )
-                })
-                .collect();
-            assert!(!old_messages.is_empty(), "{dir}: the control read nothing");
-            assert_eq!(old_messages, new_messages, "{dir}");
-            assert_eq!(
-                i64::from(old.undated_count),
-                now["undatedCount"].as_i64().unwrap(),
-                "{dir}"
-            );
-        }
-        reset_registries();
-    }
-
-    /// A configured account whose roots are not registered yet gets a failure,
-    /// not an empty window.
-    ///
-    /// `ClaudeExtraRoots.install` installs the two registries in separate FFI
-    /// calls and wakes the quota pollers between them, so a just-added account
-    /// is briefly in `claude_config_dirs` and absent from `extra_scan_paths`;
-    /// an account whose roots the scan setter refused outright stays that way.
-    /// Rendering the empty scan would state that the account used nothing,
-    /// which is the same class of wrong answer this file exists to remove.
-    #[test]
-    fn an_account_with_no_registered_roots_fails_rather_than_reporting_zero() {
-        let _guards = lock_registries();
-        reset_registries();
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_path_buf();
-        let pending = home.join("work-pending");
-        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
-        write_session(&pending, "pending", D_OUTPUT);
-
-        // The account is configured; its scan roots have not landed.
-        crate::claude_config_dirs::set_from_json(
-            &serde_json::json!([pending.display().to_string()]).to_string(),
-        )
-        .unwrap();
-        assert!(
-            crate::extra_scan_paths::snapshot().is_empty(),
-            "the fixture is meant to leave the scan registry empty"
-        );
-
-        let context = crate::LocalSourceContext::for_home(home.clone());
-        let account = Some(pending.display().to_string());
-        let refused = run(&context, &account, WINDOW_FROM, WINDOW_UNTIL);
-
-        assert!(
-            refused.is_err(),
-            "an unscannable account reported a window instead of failing: {refused:?}"
-        );
-
-        // The control: once the roots are registered the same account answers,
-        // so the refusal above is about the missing registry entry and not
-        // about the account being unreadable in general.
-        crate::extra_scan_paths::set_from_json(
-            &serde_json::json!({
-                "claude": [pending.join("projects").display().to_string()]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let answered = run(&context, &account, WINDOW_FROM, WINDOW_UNTIL).expect("registered");
-        assert_eq!(output_tokens(&answered), D_OUTPUT);
-        reset_registries();
-    }
-
-    /// One account's cached window must never answer a request for another's.
-    #[test]
-    fn a_cached_window_does_not_answer_for_another_account() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-        let d = Some(fixture.d.display().to_string());
-
-        let first = cached(&context, &PRIMARY, WINDOW_FROM, WINDOW_UNTIL).expect("primary");
-        let second = cached(&context, &d, WINDOW_FROM, WINDOW_UNTIL).expect("account D");
-
-        assert_eq!(output_tokens(&first), PRIMARY_OUTPUT);
-        assert_eq!(
-            output_tokens(&second),
-            D_OUTPUT,
-            "account D was served the primary's cached window: {second}"
-        );
-        reset_registries();
-    }
-
-    /// Two configured accounts polled in the same minute must cost two scans,
-    /// not one per call.
-    ///
-    /// A counter rather than a comparison, deliberately. Clearing the whole map
-    /// on every publish evicts but never lies — the re-scan returns correct
-    /// data — so no assertion on tokens can see it, and the cost lands on a
-    /// scan measured in seconds on a real store.
-    #[test]
-    fn two_accounts_polled_in_one_minute_cost_two_scans() {
-        let _guards = lock_registries();
-        reset_registries();
-        let fixture = account_fixture();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
-        let d = Some(fixture.d.display().to_string());
-
-        let before = scan_count();
-        cached(&context, &PRIMARY, WINDOW_FROM, WINDOW_UNTIL).expect("primary");
-        cached(&context, &d, WINDOW_FROM, WINDOW_UNTIL).expect("account D");
-        cached(&context, &PRIMARY, WINDOW_FROM, WINDOW_UNTIL).expect("primary again");
-
-        assert_eq!(
-            scan_count() - before,
-            2,
-            "the second account's publish evicted the first account's entry, so \
-             re-asking for it paid a whole scan again"
-        );
-        reset_registries();
-    }
-
-    #[test]
-    fn different_minute_uses_different_key() {
-        assert_ne!(
-            cache_key(&PRIMARY, 1_700_000_000_000, 1_700_000_060_001),
-            cache_key(&PRIMARY, 1_700_000_000_000, 1_700_000_120_001)
-        );
-    }
+    bytes
 }
+
+pub(crate) fn invalidate() {
+    LEASES.lock().clear();
+}
+
+pub(crate) fn release(snapshot_token: &str) -> Result<Value, String> {
+    let mut leases = LEASES.lock();
+    let before = leases.len();
+    leases.retain(|(token, _)| token != snapshot_token);
+    Ok(serde_json::json!({"released": leases.len() != before}))
+}
+
+/// Only a new capture enters the source lane; pinned quota queries stay pure.
+pub(crate) fn run(request_json: &str) -> Result<crate::EncodedLocalPayload, String> {
+    run_with_context(None, request_json)
+}
+
+fn run_with_context(
+    context: Option<&crate::LocalSourceContext>,
+    request_json: &str,
+) -> Result<crate::EncodedLocalPayload, String> {
+    let started = Instant::now();
+    if request_json.len() > MAX_REQUEST_BYTES {
+        return Err("quota request exceeds byte limit".into());
+    }
+    let request: Request = serde_json::from_str(request_json)
+        .map_err(|error| format!("invalid quota request: {error}"))?;
+    request.validate()?;
+    let (token, lease, is_new) = if let Some(token) = &request.snapshot_token {
+        let leases = LEASES.lock();
+        let lease = leases
+            .iter()
+            .find(|(key, _)| key == token)
+            .map(|(_, lease)| Arc::clone(lease))
+            .ok_or(EXPIRED)?;
+        if lease.account != request.account_key || lease.root_generation != crate::root_generation()
+        {
+            return Err(EXPIRED.into());
+        }
+        (token.clone(), lease, false)
+    } else {
+        let _local_usage = crate::local_usage_guard();
+        let current;
+        let context = match context {
+            Some(context) => context,
+            None => {
+                current = crate::LocalSourceContext::current();
+                &current
+            }
+        };
+        let lease = Arc::new(capture(context, &request.account_key)?);
+        let token = format!("quota-{:016x}", lease.lease_id);
+        (token, lease, true)
+    };
+    let mut batch = fold(&request, &lease, token.clone())?;
+    batch.processing_time_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+    let value = crate::encode_local_payload(&batch)?;
+    retain_lease(&token, &lease, is_new)?;
+    Ok(value)
+}
+
+fn retain_lease(token: &str, lease: &Arc<Lease>, is_new: bool) -> Result<(), String> {
+    let mut leases = LEASES.lock();
+    if lease.root_generation != crate::root_generation() {
+        return Err(EXPIRED.into());
+    }
+    if lease
+        .bytes
+        .saturating_add(lease.pricing.as_ref().map_or(0, |p| p.retained_bytes()))
+        > MAX_LEASE_BYTES
+    {
+        leases.retain(|(key, _)| key != token);
+        while retained_bytes(&leases) > MAX_LEASE_BYTES {
+            leases.pop_front();
+        }
+        return Err("quota snapshot metadata exceeds byte limit".into());
+    }
+    if is_new {
+        leases.push_back((token.to_owned(), Arc::clone(lease)));
+    } else if !leases.iter().any(|(key, _)| key == token) {
+        return Err(EXPIRED.into());
+    }
+    while leases.len() > MAX_LEASES || retained_bytes(&leases) > MAX_LEASE_BYTES {
+        if leases.len() == 1 {
+            leases.clear();
+            return Err("quota snapshot metadata exceeds byte limit".into());
+        }
+        // Preserve this caller; only older independent leases can be evicted.
+        let victim = leases
+            .iter()
+            .position(|(key, _)| key != token)
+            .ok_or(EXPIRED)?;
+        leases.remove(victim);
+    }
+    Ok(())
+}
+
+fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String> {
+    let scopes: Vec<Option<BTreeSet<&str>>> = request
+        .windows
+        .iter()
+        .map(|w| {
+            w.admitted_model_ids
+                .as_ref()
+                .map(|ids| ids.iter().map(String::as_str).collect())
+        })
+        .collect();
+    let diagnostic_scopes: Vec<Option<BTreeSet<&str>>> = request
+        .diagnostics
+        .as_ref()
+        .map(|d| {
+            d.intervals
+                .iter()
+                .map(|job| {
+                    job.admitted_model_ids
+                        .as_ref()
+                        .map(|ids| ids.iter().map(String::as_str).collect())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let groups: BTreeMap<&str, &str> = request
+        .model_groups
+        .iter()
+        .map(|g| (g.model_id.as_str(), g.group_id.as_str()))
+        .collect();
+    let mut inference: Vec<_> = request
+        .inference
+        .iter()
+        .map(|job| InferenceResult {
+            id: job.id.clone(),
+            state: "covered",
+            first_assigned_ms: None,
+        })
+        .collect();
+    let mut currents: Vec<_> = request
+        .windows
+        .iter()
+        .map(|window| {
+            window.current.as_ref().map(|job| CurrentResult {
+                state: "covered",
+                unscoped_assigned_message_count: 0,
+                scope_matched_nothing: false,
+                mine: Counter::default(),
+                observed: job.observed.as_ref().map(|_| Observed::default()),
+                zones: job
+                    .zones
+                    .iter()
+                    .map(|z| ZoneResult {
+                        index: z.index,
+                        counter: Counter::default(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    let mut cycles: Vec<Vec<_>> = request
+        .windows
+        .iter()
+        .map(|window| window.cycles.iter().map(|_| CycleFold::new()).collect())
+        .collect();
+    let mut diagnostic_folds: Vec<_> = request
+        .diagnostics
+        .as_ref()
+        .map(|jobs| {
+            jobs.intervals
+                .iter()
+                .map(|_| DiagnosticFold::new())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut buckets: Vec<_> = request
+        .diagnostics
+        .as_ref()
+        .map(|jobs| {
+            jobs.buckets
+                .iter()
+                .map(|job| BucketResult {
+                    id: job.id.clone(),
+                    tokens: vec![0; job.count as usize],
+                    remainder_tokens: 0,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    tokscale_core::visit_priced_local_usage_snapshot(
+        &lease.snapshot,
+        lease.pricing.as_deref(),
+        LocalUsageQuery {
+            from_ms: Some(request.from_ms.max(1)),
+            until_ms: Some(request.until_ms.max(1)),
+            chronological: true,
+            hydrate_opencode_aliases: false,
+        },
+        &|row| account_client_passes(&lease.account, row),
+        &mut |row| {
+            let model = tokscale_core::canonical_model_id(&row.model_id);
+            let (state, target) = classify(&request.attribution, row, &model);
+            let t = &row.tokens;
+            let full = row_sum(&[t.input, t.output, t.cache_read, t.cache_write, t.reasoning]);
+            let fresh = row_sum(&[t.input, t.output, t.cache_write, t.reasoning]);
+            for (job, result) in request.inference.iter().zip(&mut inference) {
+                if result.first_assigned_ms.is_none()
+                    && half_open(row.timestamp, job.from_ms, job.until_ms)
+                    && (job.subscription.is_none()
+                        || (state == AttributionState::Assigned
+                            && target == job.subscription.as_deref()))
+                {
+                    result.first_assigned_ms = Some(row.timestamp);
+                }
+            }
+            for (index, window) in request.windows.iter().enumerate() {
+                let mine = state == AttributionState::Assigned
+                    && target == Some(window.subscription.as_str());
+                let admitted = scopes[index]
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(model.as_str()));
+                if let (Some(job), Some(result)) = (&window.current, &mut currents[index]) {
+                    if mine && half_open(row.timestamp, job.from_ms, job.until_ms) {
+                        result.unscoped_assigned_message_count =
+                            result.unscoped_assigned_message_count.saturating_add(1);
+                        if admitted {
+                            result.mine.add(row, full, fresh);
+                            if let (Some(span), Some(value)) = (&job.observed, &mut result.observed)
+                            {
+                                if observed(row.timestamp, span) {
+                                    value.add(row, full);
+                                }
+                            }
+                            for (zone, value) in job.zones.iter().zip(&mut result.zones) {
+                                if (row.timestamp > zone.lo_ms
+                                    || (zone.include_lo && row.timestamp == zone.lo_ms))
+                                    && row.timestamp <= zone.hi_ms
+                                {
+                                    value.counter.add(row, full, fresh);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !admitted {
+                    continue;
+                }
+                for (job, result) in window.cycles.iter().zip(&mut cycles[index]) {
+                    if mine
+                        && row.timestamp > job.first_sample_ms
+                        && row.timestamp <= job.last_sample_ms
+                    {
+                        result.span.add(row, full);
+                    }
+                    if !half_open(row.timestamp, job.evidence_start_ms, job.reset_at_ms) {
+                        continue;
+                    }
+                    if mine {
+                        result.mine.add(row, full, fresh);
+                        let group = groups
+                            .get(model.as_str())
+                            .copied()
+                            .unwrap_or(model.as_str());
+                        if !result.models.contains_key(row.provider_id.as_str()) {
+                            result
+                                .models
+                                .insert(row.provider_id.clone(), BTreeMap::new());
+                        }
+                        let models = result
+                            .models
+                            .get_mut(row.provider_id.as_str())
+                            .expect("inserted provider");
+                        if !models.contains_key(group) {
+                            models.insert(
+                                group.to_string(),
+                                ModelResult {
+                                    provider_id: row.provider_id.clone(),
+                                    model_id: group.to_string(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        let entry = models.get_mut(group).expect("inserted model");
+                        entry.tokens = entry.tokens.saturating_add(full);
+                        entry.breakdown.add(row);
+                        entry.cost += row.cost;
+                    } else {
+                        result.other.add(row, full);
+                        match state {
+                            AttributionState::Assigned => result.assigned = true,
+                            AttributionState::Excluded => result.excluded = true,
+                            AttributionState::Unassigned => result.unassigned = true,
+                        }
+                    }
+                }
+            }
+            if let Some(jobs) = &request.diagnostics {
+                for (index, (job, result)) in
+                    jobs.intervals.iter().zip(&mut diagnostic_folds).enumerate()
+                {
+                    if (row.timestamp < job.from_ms
+                        || (!job.include_from && row.timestamp == job.from_ms))
+                        || (row.timestamp > job.until_ms
+                            || (!job.include_until && row.timestamp == job.until_ms))
+                        || !diagnostic_scopes[index]
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(model.as_str()))
+                    {
+                        continue;
+                    }
+                    result.all.add(row, full, fresh);
+                    match state {
+                        AttributionState::Assigned => {
+                            if let Some(target) = target {
+                                if !result.assigned.contains_key(target) {
+                                    result
+                                        .assigned
+                                        .insert(target.to_string(), Counter::default());
+                                }
+                                result
+                                    .assigned
+                                    .get_mut(target)
+                                    .expect("inserted target")
+                                    .add(row, full, fresh);
+                            }
+                        }
+                        AttributionState::Excluded => result.excluded.add(row, full, fresh),
+                        AttributionState::Unassigned => result.unassigned.add(row, full, fresh),
+                    }
+                    if job.subscription.is_none()
+                        || (state == AttributionState::Assigned
+                            && target == job.subscription.as_deref())
+                    {
+                        result.mine.add(row, full, fresh);
+                        result.components.add(row, full, fresh);
+                    }
+                }
+                for (job, result) in jobs.buckets.iter().zip(&mut buckets) {
+                    if !half_open(row.timestamp, job.from_ms, job.until_ms) {
+                        continue;
+                    }
+                    let index = (i128::from(row.timestamp) - i128::from(job.from_ms))
+                        / i128::from(job.bucket_ms);
+                    if index < i128::from(job.count) {
+                        result.tokens[index as usize] =
+                            result.tokens[index as usize].saturating_add(full);
+                    } else {
+                        result.remainder_tokens = result.remainder_tokens.saturating_add(full);
+                    }
+                }
+            }
+        },
+    )?;
+    let model_catalog = if request.include_model_catalog {
+        let mut catalog = BTreeSet::new();
+        tokscale_core::visit_local_usage_snapshot(
+            &lease.snapshot,
+            LocalUsageQuery {
+                hydrate_opencode_aliases: false,
+                ..Default::default()
+            },
+            &|row| account_client_passes(&lease.account, row),
+            &mut |row| {
+                catalog.insert(tokscale_core::canonical_model_id(&row.model_id));
+            },
+        )?;
+        Some(catalog.into_iter().collect())
+    } else {
+        None
+    };
+    let windows = request
+        .windows
+        .iter()
+        .zip(currents)
+        .zip(cycles)
+        .map(|((job, current), cycles)| {
+            let current = current.map(|mut result| {
+                result.scope_matched_nothing = job.admitted_model_ids.is_some()
+                    && result.mine.message_count == 0
+                    && result.unscoped_assigned_message_count > 0;
+                result
+            });
+            WindowResult {
+                id: job.id.clone(),
+                current,
+                cycles: job
+                    .cycles
+                    .iter()
+                    .zip(cycles)
+                    .map(|(job, fold)| fold.finish(job.reset_at_ms))
+                    .collect(),
+            }
+        })
+        .collect();
+    Ok(Batch {
+        snapshot_token: token,
+        source_generation: lease.snapshot.generation(),
+        root_generation: lease.root_generation,
+        price_generation: lease.price_generation,
+        model_catalog,
+        coverage: Coverage {
+            from_ms: request.from_ms,
+            until_ms: request.until_ms,
+            state: "complete",
+        },
+        undated_count: lease.undated_count,
+        processing_time_ms: 0,
+        inference,
+        windows,
+        diagnostics: request.diagnostics.as_ref().map(|jobs| Diagnostics {
+            intervals: jobs
+                .intervals
+                .iter()
+                .zip(diagnostic_folds)
+                .map(|(job, fold)| fold.finish(job.id.clone()))
+                .collect(),
+            buckets,
+        }),
+    })
+}
+
+#[cfg(test)]
+#[path = "window_usage_tests.rs"]
+mod aggregate_tests;

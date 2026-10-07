@@ -7,28 +7,8 @@ import Foundation
 /// be one: the same subscription measured 21x apart between its session window
 /// and its weekly window on the same day.
 public enum WindowEquivalence {
-    /// The token count a quota ratio may divide, for ONE message.
-    ///
-    /// A function rather than a convention, because this ratio is computed in
-    /// two places — `row` for the live window and `QuotaHistoryFold.spanTotals`
-    /// for the pooled history — and they are rendered one above the other in
-    /// `QuotaView`. When the basis was a convention rather than a name, the two
-    /// disagreed: fixing the pooled path alone left the card on top showing the
-    /// old inflated price beside the corrected history directly below it.
-    ///
-    /// The FULL count, cache reads included, because the cost it is divided
-    /// into is `message.cost` — the message's whole priced cost — and that
-    /// cannot be narrowed to match a smaller count: `WindowMessage` carries one
-    /// cost, not one per token class. Excluding cache reads therefore priced
-    /// one set of tokens and counted another, and on a Claude Code workload the
-    /// excluded share is most of the volume (issue #237).
-    ///
-    /// Deliberately NOT the bars' basis. `WindowCardGeometry` sizes bars from
-    /// `tokensExCacheRead` because including cache reads decouples them from
-    /// the quota line. Different question, different basis — but each stated
-    /// where it is used, so a third caller has something to call rather than a
-    /// precedent to copy.
-    public static func ratioTokens(_ message: WindowMessage) -> Int64 { message.tokens }
+    /// Equivalence uses full observed tokens and full priced cost. Bars use
+    /// ex-cache-read weight instead; those counters answer a different question.
 
     /// The provider reports whole percents, so a measured Δ carries ±0.5.
     static let quantisationHalfStep = 0.5
@@ -194,14 +174,12 @@ public enum WindowEquivalence {
         return Int64(value)
     }
 
-    /// `messages` must already be filtered to this subscription's attributed
-    /// usage. `samples` must be the ones inside the window, in time order.
+    /// `samples` are the settled window's readings, in time order. The compact
+    /// numerator covers `(firstSample, lastSample]`, clipped to current usage.
     public static func row(
-        samples: [QuotaSample], messages: [WindowMessage]
+        samples: [QuotaSample], observedTokens tokens: Int64, observedCost cost: Double
     ) -> Row {
-        guard let first = samples.first, let last = samples.last,
-              samples.count >= 2
-        else { return .unavailable }
+        guard samples.count >= 2 else { return .unavailable }
 
         // The distance the readings travelled, not `last - first`. A reset
         // inside the span returns them to zero, and the displacement then
@@ -221,21 +199,9 @@ public enum WindowEquivalence {
         // fell short, presented as one that did not.
         let runs = QuotaHistoryFold.risingRuns(readings)
 
-        // Numerator and denominator must cover the same interval or the ratio
-        // means nothing — hence the span between samples, not the whole window.
-        //
-        // Held exactly at the ends and approximately in the middle: a
-        // declining interval inside the span contributes to the numerator and
-        // not to `consumed`. See `QuotaHistoryFold.consumed` for why that is
-        // not fixed here — briefly, dropping those messages is right for a
-        // reset and wrong for a correction, and the readings do not say which
-        // — and for the measured size of it, which is 0.9% of the span on the
-        // group that produced the defect this function was rewritten for.
-        let inSpan = messages.filter {
-            $0.timestamp > first.atMs && $0.timestamp <= last.atMs
-        }
-        let tokens = inSpan.reduce(Int64(0)) { $0.saturatingAdding(ratioTokens($1)) }
-        let cost = inSpan.reduce(0.0) { $0 + $1.cost }
+        // The producer returns the full-token/full-cost observed numerator.
+        // It includes declining intervals, like the historical observed fold:
+        // quota readings alone cannot distinguish resets from corrections.
         let error = Int((quantisationHalfStep * Double(runs) / delta * 100).rounded())
 
         // "Recorded" means either kind of evidence. A provider row can carry a

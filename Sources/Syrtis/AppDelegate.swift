@@ -5,10 +5,18 @@ import TokenBarCore
 /// the status-item controller, and the tray-title refresh loop.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let defaultRefreshSecs = 300
     private static let intervalKey = "tokenbar.refresh.intervalMin"
 
-    private let usageSource: any UsageDataSource = UsageDataSources.current
+    private let usageSource: any UsageDataSource
+    private lazy var localScheduler = LocalUsageScheduler(source: usageSource)
+    private var trayGraphSession: LocalUsageScheduler.Session?
+    private var discordGraphSession: LocalUsageScheduler.Session?
+    private var installedRootGeneration = UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey)
+
+    init(source: any UsageDataSource = UsageDataSources.current) {
+        usageSource = source
+        super.init()
+    }
     private var statusController: StatusItemController?
     private var trayAnimator: TrayAnimator?
     private var titleRefreshTask: Task<Void, Never>?
@@ -16,21 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var defaultsApplyScheduled = false
     // Last good fetches — a failed refresh keeps showing these.
     private var lastGraph: UsagePayload?
-    private var lastRate: Double?
-    // Forced-refresh clock. An instance property (not a Task-local) so a loop
-    // restart to pick up a new interval does NOT reset it to distantPast and
-    // force an immediate uncached re-parse — that turned every settings write
-    // into a full log re-read (the CPU regression Codex/the review flagged).
-    private var lastFullRefresh = Date.distantPast
-    // The interval the refresh loop is currently running with. The defaults
-    // observer compares against it so the loop is restarted only when the
-    // interval actually changes, not on every unrelated UserDefaults write.
     private var refreshIntervalMin = AppDelegate.readIntervalMin()
-    // Snapshot of the tab-hidden raw string. The defaults observer compares
-    // against it so a visibility change fires ONE off-main filtered-rate fetch
-    // (updating the tokens/min title + animated-icon speed at once) and only
-    // then — never on the flood of unrelated writes. Same value-gating
-    // discipline as refreshIntervalMin, to avoid the CPU-regression storm.
+    // Value gate for immediate filtered-rate replacement. Unrelated defaults
+    // writes do not restart the local-source reader.
     private var lastHiddenRaw = UserDefaults.standard.string(forKey: ClientRegistry.tabHiddenKey) ?? ""
     // Value gate for the Claude extra-scan-roots list, same discipline as
     // lastHiddenRaw: didChangeNotification fires for every unrelated write,
@@ -74,8 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // staying at the pre-migration default until the next defaults write.
         refreshIntervalMin = AppDelegate.readIntervalMin()
         _ = UpdaterService.shared // arm Sparkle when bundled
-        // Record the timezone the (still empty) graph cache will be filled
-        // under, before the title-refresh loop below starts warming it.
+        // Retain launch timezone provenance for one-shot diagnostic graph APIs.
         AttributedSeriesModel.captureLaunchTimeZone()
         // Push any configured Claude extra scan roots. The FFI registry starts
         // empty every process launch (it's an in-memory RwLock, not persisted
@@ -105,15 +100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // old bundle file name. Background queue; a no-op unless it matches.
         DockPinRepair.runIfNeeded()
 
-        let controller = StatusItemController()
+        localScheduler.fullVerificationInterval = Double(refreshIntervalMin) * 60
+        SettingsWindowController.shared.configure(scheduler: localScheduler, source: usageSource)
+        let controller = StatusItemController(scheduler: localScheduler, source: usageSource)
         statusController = controller
-        let animator = TrayAnimator(controller: controller, source: usageSource)
+        let animator = TrayAnimator(controller: controller, source: usageSource, scheduler: localScheduler)
         trayAnimator = animator
         controller.quotaPayloadProvider = { [weak animator] in animator?.quota }
         // A fresh quota or rate fetch re-renders the title right away.
         animator.onQuotaUpdated = { [weak self] in self?.applyMenuBarState() }
         animator.start()
         startTitleRefresh()
+        reconcileGraphDemand()
 
         // didChangeNotification carries no key and fires for EVERY write — the
         // popover height slider mid-drag, active tab, lens, quota cache. Coalesce
@@ -372,8 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let next = AppDelegate.readIntervalMin()
             if next != self.refreshIntervalMin {
                 self.refreshIntervalMin = next
-                self.titleRefreshTask?.cancel()
-                self.startTitleRefresh()
+                self.localScheduler.fullVerificationInterval = Double(next) * 60
             }
 
             // A visibility change alters the filtered live rate, which applyMenuBarState
@@ -384,7 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let hiddenChanged = hiddenRaw != self.lastHiddenRaw
             if hiddenChanged {
                 self.lastHiddenRaw = hiddenRaw
-                self.refreshFilteredRate()
+                self.trayAnimator?.refreshFilteredRate()
             }
 
             // Settings added/removed/edited a Claude config dir — push the
@@ -395,6 +392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastExtraRootsRaw = extraRootsRaw
                 ClaudeExtraRoots.apply()
             }
+
+            let installed = UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey)
+            if installed != self.installedRootGeneration {
+                self.installedRootGeneration = installed
+                self.localScheduler.rootsChanged()
+            }
+            self.reconcileGraphDemand()
 
             // Hiding a client has to leave the published presence in the SAME
             // turn — waiting for the next refresh cycle would keep that client
@@ -450,9 +454,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// updater startup, defaults observers, and all polling while preserving the
     /// shipping status-item controller, assets, renderer, and teardown ownership.
     private func startTrayAnimationCPUTest() {
-        let controller = StatusItemController()
+        let controller = StatusItemController(scheduler: localScheduler, source: usageSource)
         statusController = controller
-        let animator = TrayAnimator(controller: controller, source: usageSource)
+        let animator = TrayAnimator(controller: controller, source: usageSource, scheduler: localScheduler)
         trayAnimator = animator
         controller.updateTitle("1.0M/min")
         animator.start()
@@ -461,6 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         titleRefreshTask?.cancel()
+        localScheduler.stop()
         trayAnimator?.stop()
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
         // Remove the status item / close the popover so ControlCenter tears
@@ -499,17 +504,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Re-derive every menu-bar surface from the cached data and the current
-    /// settings: the main item's title plus the individual client items. The
-    /// rate prefers the animator's 30s-fresh value over lastRate (which is only
-    /// updated on the 5-minute title-refresh cycle). Both halves recompute from
-    /// cache and the item pass is diffed, so calling this often is cheap.
+    /// settings: the main item's title plus the individual client items.
+    /// The rate comes only from the animator's demand-driven 30s reader.
+    /// Both halves recompute from cache and the item pass is diffed, so calling
+    /// this often is cheap.
     private func applyMenuBarState() {
         let mode = TrayMode.current
         let quotaRemaining = trayAnimator?.quotaRemaining
         // Before the title, so a gauge drawn fresh minutes ago turns grey on
         // the same pass as the title beside it (#420).
         trayAnimator?.syncStaleGauge()
-        let rate = trayAnimator?.tokensPerMinRate ?? lastRate
+        let rate = trayAnimator?.tokensPerMinRate
         statusController?.updateTitle(
             mode.title(graph: lastGraph, tokensPerMin: rate, quotaRemaining: quotaRemaining),
             color: mode.titleColor(quotaRemaining: quotaRemaining),
@@ -525,67 +530,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             officialClients: AgentIconView.availableOfficialClientIDs()))
     }
 
-    /// The hidden-tabs set changed: fetch the filtered live rate once, off the
-    /// main actor, and push it into the animator (spin speed + cached rate),
-    /// which re-renders the title via onQuotaUpdated. No loop restart, no graph
-    /// refetch — mirrors the 30s poll's delivery so the tokens/min mode and the
-    /// animated-icon speed react to a visibility toggle immediately.
-    private func refreshFilteredRate() {
-        // Reserve a fresh generation up front so this refetch wins over any 30s
-        // poll fetch still in flight (which carries an older generation).
-        guard let generation = trayAnimator?.nextRateGeneration() else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            let rate = try? await LiveRate.current(source: self.usageSource)
-            guard let rate else { return }
-            self.lastRate = rate
-            self.trayAnimator?.applyRate(rate, generation: generation)
-        }
+    nonisolated static func needsGraph(
+        mode: TrayMode, enabledClients: Set<String>, hiddenClients: Set<String>,
+        discordEnabled: Bool
+    ) -> Bool {
+        mode.needsGraph || !enabledClients.subtracting(hiddenClients).isEmpty || discordEnabled
     }
 
-    /// Background graph refresh: serves the graph-based title modes (today's
-    /// tokens/cost, total tokens/cost). The rate and quota title modes are
-    /// covered by TrayAnimator's load/quota polling via onQuotaUpdated.
-    /// A full log re-read (tb_refresh_graph) is forced every "Data refresh"
-    /// interval from settings; between forced refreshes the cheap mtime-aware
-    /// cached graph() path re-reads on the loop cadence (capped at
-    /// defaultRefreshSecs so graph-mode titles stay fresh even when the user's
-    /// interval is long).
+
+    private func reconcileGraphDemand() {
+        let trayNeedsGraph = TrayMode.current.needsGraph
+            || !ClientTray.enabled().subtracting(ClientRegistry.hiddenTabClients()).isEmpty
+        let discordNeedsGraph = DiscordPresence.mayConnect(
+            arguments: CommandLine.arguments, enabled: DiscordPresence.enabled())
+        trayGraphSession = reconcileGraphSession(trayGraphSession, wanted: trayNeedsGraph)
+        discordGraphSession = reconcileGraphSession(discordGraphSession, wanted: discordNeedsGraph)
+    }
+
+    private func reconcileGraphSession(
+        _ existing: LocalUsageScheduler.Session?, wanted: Bool
+    ) -> LocalUsageScheduler.Session? {
+        guard wanted else {
+            if let existing { localScheduler.release(existing) }
+            return nil
+        }
+        let session = existing ?? localScheduler.openSession()
+        localScheduler.update(session, queries: [.init(kind: "graph")], active: false) { [weak self] _, result in
+            guard let self, case .success(.graph(let graph)) = result else { return }
+            self.lastGraph = graph
+            self.applyMenuBarState()
+            self.applyDiscordPresence()
+        }
+        return session
+    }
+
+    /// Stale quota rendering has its own cheap cadence, even when no local
+    /// rate or graph consumer exists. Quota network polling stays independent.
     private func startTitleRefresh() {
         titleRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self else { break }
-                let mode = TrayMode.current
-                let intervalMin = self.refreshIntervalMin
-                let forceRefresh = Date().timeIntervalSince(self.lastFullRefresh) >= Double(intervalMin) * 60
-                let graph: UsagePayload?
-                if forceRefresh {
-                    graph = try? await self.usageSource.refreshGraph(
-                        year: nil, priority: .utility)
-                } else {
-                    graph = try? await self.usageSource.graph(
-                        year: nil, priority: .utility)
-                }
-                if forceRefresh && graph != nil { self.lastFullRefresh = Date() }
-                // Failed refreshes keep the last good numbers — the title
-                // must never blank/zero out on a transient error.
-                if let graph { self.lastGraph = graph }
-                if mode == .tokensPerMin {
-                    let rate = try? await LiveRate.current(source: self.usageSource)
-                    if let rate { self.lastRate = rate }
-                }
-                guard !Task.isCancelled else { break }
-                self.applyMenuBarState()
-                // Republish on the same cadence the tray title refreshes on.
-                // The client coalesces an unchanged payload, so a cycle that
-                // moved no numbers costs nothing on the wire.
-                self.applyDiscordPresence()
-                // Wake at least as often as the force interval (so a short
-                // interval is honored) but never sleep longer than the 5-min
-                // cached-refresh cap (so graph titles don't lag a long interval).
-                let sleepSecs = max(60, min(intervalMin * 60, Self.defaultRefreshSecs))
-                try? await Task.sleep(for: .seconds(Double(sleepSecs)))
+                self?.applyMenuBarState()
+                self?.applyDiscordPresence()
+                try? await Task.sleep(for: .seconds(30))
             }
         }
     }
+
 }

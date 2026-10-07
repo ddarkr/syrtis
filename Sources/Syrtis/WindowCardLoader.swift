@@ -1,33 +1,8 @@
 import Foundation
 import TokenBarCore
 
-/// Everything `WindowUsageCard` needs, resolved once per load.
-struct WindowCardData: Sendable {
-    let clientId: String
-    let windowLabel: String
-    let resolution: WindowResolution
-    let samples: [QuotaSample]
-    /// Already filtered to this subscription's attributed usage, and already
-    /// turned into bars and hit zones. Both are metric-free and O(messages),
-    /// so they are computed once here rather than on every hover event — the
-    /// per-body version pegged a CPU on a window holding a few thousand rows.
-    let mine: [WindowMessage]
-    let bars: [BarRect]
-    let hits: [HitZone]
-    /// Every window this client offers, so the card can switch between them.
-    /// `cardId` is the stable identity; `label` is what the provider calls it.
-    let candidates: [(cardId: String, label: String)]
-    let cardId: String
-    let nowMs: Int64
-    /// Set when no session window could be found but one is expected to come
-    /// back — a provider whose fetch failed. Vanishing silently in that case is
-    /// indistinguishable from "you have no such subscription", which is the one
-    /// reading the user cannot correct.
-    var blockedBy: String?
-}
 
-/// Turns the selected quota window into card data: resolve the window, then —
-/// and only then — ask the engine for the messages inside it.
+/// Resolves provider policy in Swift, then requests compact native usage jobs.
 enum WindowCardLoader {
     /// "<clientId>|<cardId>" — the same shape QuotaResolver uses for its own
     /// canonical selection, so the two cannot drift into different vocabularies.
@@ -231,9 +206,8 @@ enum WindowCardLoader {
             modelScope: window.modelScope), scanFailed: false)
     }
 
-    /// The earliest interval start across every candidate window of every
-    /// displayed agent. See `UnionScan` for why this one bound covers all
-    /// three window states.
+    /// The earliest valid provider interval across candidate windows. It
+    /// covers active ranges and the unscoped post-reset inference probe.
     static func unionStart(
         payload: AgentUsagePayload?, clients: [String], nowMs: Int64
     ) -> Int64? {
@@ -268,70 +242,124 @@ enum WindowCardLoader {
         return earliest
     }
 
-    /// Stage 2, per client, from the one scan.
-    static func usageHalf(
-        quota: WindowQuotaHalf, scan: UnionScan, confirmed: [UsageAttribution.Record]
-    ) -> (WindowQuotaHalf, WindowUsageHalf)? {
-        // One predicate, used twice. The usage this card DISPLAYS is filtered
-        // to messages declared against this subscription; the window it infers
-        // was anchored to the earliest message in the whole union scan, so
-        // another subscription's work could set this one's start — or invent an
-        // active window for a subscription that has done nothing since its
-        // reset. The chart would then begin before any usage it goes on to
-        // count as this client's.
-        func isMine(_ message: WindowMessage) -> Bool {
-            UsageAttribution.resolve(
-                client: message.client, provider: message.providerId,
-                model: message.modelId, records: confirmed) == .assigned(quota.clientId)
-        }
+    /// Inference is assigned-subscription presence, deliberately without model
+    /// scope. Scope affects presentation, never where a window is placed.
+    static func inferenceJob(
+        quota: WindowQuotaHalf, id: String
+    ) -> WindowUsageRequest.Inference? {
+        guard quota.placementPending, let reset = quota.resetMs else { return nil }
+        return WindowUsageRequest.Inference(
+            id: id, subscription: quota.clientId, fromMs: reset, untilMs: quota.nowMs)
+    }
 
-        // Refine `.idle` now that usage is known: the same resolver, this time
-        // with the first usage after the reset.
+    static func settledQuota(
+        quota: WindowQuotaHalf, inference: WindowUsageBatch.Inference?
+    ) -> WindowQuotaHalf? {
         var resolved = quota.resolution
-        if quota.placementPending, let reset = quota.resetMs {
+        if quota.placementPending {
+            guard let inference, inference.state == "covered" else { return nil }
+            if let first = inference.firstAssignedMs {
+                guard let reset = quota.resetMs, first >= reset, first < quota.nowMs
+                else { return nil }
+            }
             resolved = WindowResolver.resolve(
-                resetsAtMs: reset, durationMs: quota.durationMs, now: quota.nowMs,
-                firstUsageAfterReset: WindowResolver.firstUsageAfterReset(
-                    messages: scan.slice(from: reset, to: quota.nowMs).filter(isMine),
-                    resetMs: reset))
+                resetsAtMs: quota.resetMs, durationMs: quota.durationMs,
+                now: quota.nowMs, firstUsageAfterReset: inference.firstAssignedMs)
         }
-        let settled = WindowQuotaHalf(
+        return WindowQuotaHalf(
             clientId: quota.clientId, cardId: quota.cardId,
             windowLabel: quota.windowLabel, candidates: quota.candidates,
             resolution: resolved, samples: quota.samples,
             resetMs: quota.resetMs, durationMs: quota.durationMs,
-            placementPending: false, nowMs: quota.nowMs,
-            modelScope: quota.modelScope)
+            placementPending: false, nowMs: quota.nowMs, modelScope: quota.modelScope)
+    }
 
-        guard let (start, end) = interval(resolved) else {
-            return (settled, WindowUsageHalf(mine: [], bars: [], hits: []))
+    /// Nil means unscoped; an empty nonnil result means a real scoped miss.
+    static func admittedModelIds(scope: String?, catalog: [String]) -> [String]? {
+        guard let scope else { return nil }
+        return catalog.filter { ModelScope.covers(scope, modelId: $0) }
+    }
+
+    static func modelGroups(catalog: [String]) -> [WindowUsageRequest.ModelGroup] {
+        catalog.map {
+            WindowUsageRequest.ModelGroup(modelId: $0, groupId: ModelGrouping.groupID($0))
         }
-        // A scan that starts after this window did cannot answer for it.
-        guard scan.covers(start: start) else { return nil }
+    }
 
-        // Two predicates, applied to different questions on purpose.
-        //
-        // `isMine` answers "is this the subscription's usage" and decides where
-        // the window IS — it is what `firstUsageAfterReset` above consumes.
-        // `inScope` answers "is this the model the allowance counts" and
-        // decides only what the card DISPLAYS.
-        //
-        // The scope is deliberately NOT applied to placement. A scoped weekly
-        // window is anchored by the provider's own reset, so narrowing the
-        // placement probe buys no accuracy — while a scope join that matches
-        // nothing would turn the card blank instead of merely empty, which
-        // moves a naming mismatch from "we found no usage" to "there is no
-        // window". The blast radius of the heuristic stays inside the totals.
-        let subscription = scan.slice(from: start, to: min(end, quota.nowMs)).filter(isMine)
-        let mine = QuotaHistoryFold.inScope(subscription, quota.modelScope)
+    static func windowJob(
+        quota: WindowQuotaHalf, id: String, catalog: [String], cycles: [QuotaCycle] = []
+    ) -> WindowUsageRequest.Window {
+        var current: WindowUsageRequest.Current?
+        if let (start, end) = interval(quota.resolution) {
+            let until = min(end, quota.nowMs)
+            let hits = WindowCardGeometry.zones(
+                windowStartMs: start, windowEndMs: end, nowMs: until, samples: quota.samples)
+            let samples = quota.samples.filter { $0.atMs >= start && $0.atMs <= end }
+            let observed: WindowUsageRequest.Observed?
+            if samples.count >= 2, let first = samples.first, let last = samples.last {
+                observed = WindowUsageRequest.Observed(fromMs: first.atMs, untilMs: last.atMs)
+            } else {
+                observed = nil
+            }
+            current = WindowUsageRequest.Current(
+                fromMs: start, untilMs: until, observed: observed,
+                zones: hits.map {
+                    WindowUsageRequest.Zone(
+                        index: Int64($0.index), loMs: $0.loMs, hiMs: $0.hiMs,
+                        includeLo: $0.index == 0)
+                })
+        }
+        return WindowUsageRequest.Window(
+            id: id, subscription: quota.clientId,
+            admittedModelIds: admittedModelIds(scope: quota.modelScope, catalog: catalog),
+            current: current,
+            cycles: cycles.map {
+                WindowUsageRequest.Cycle(
+                    resetAtMs: $0.resetAtMs, evidenceStartMs: $0.evidenceStartMs,
+                    firstSampleMs: $0.firstSampleMs, lastSampleMs: $0.lastSampleMs)
+            })
+    }
+
+    /// Accept only a complete, explicitly requested current result. The caller
+    /// validates the batch against its exact request before publication.
+    static func usageHalf(
+        quota: WindowQuotaHalf, batch: WindowUsageBatch, id: String
+    ) -> (WindowQuotaHalf, WindowUsageHalf)? {
+        guard !quota.placementPending, batch.coverage.state == "complete",
+              batch.windows.filter({ $0.id == id }).count == 1,
+              let result = batch.windows.first(where: { $0.id == id })
+        else { return nil }
+        guard let (start, end) = interval(quota.resolution) else {
+            guard result.current == nil else { return nil }
+            return (quota, WindowUsageHalf(
+                counter: WindowUsageBatch.Counter(), observed: nil, zones: [], bars: [], hits: [],
+                undatedCount: Int(batch.undatedCount)))
+        }
+        let until = min(end, quota.nowMs)
+        guard start < until, batch.coverage.fromMs <= start, batch.coverage.untilMs >= until,
+              let current = result.current, current.state == "covered"
+        else { return nil }
+        let hits = WindowCardGeometry.zones(
+            windowStartMs: start, windowEndMs: end, nowMs: until, samples: quota.samples)
+        guard current.zones.count == hits.count,
+              Set(current.zones.map(\.index)) == Set(hits.map { Int64($0.index) })
+        else { return nil }
+        let samples = quota.samples.filter { $0.atMs >= start && $0.atMs <= end }
+        if samples.count >= 2, let first = samples.first, let last = samples.last {
+            guard current.observed != nil, batch.coverage.fromMs <= first.atMs,
+                  last.atMs < batch.coverage.untilMs
+                    || last.atMs == .max && batch.coverage.untilMs == .max
+            else { return nil }
+        } else if current.observed != nil {
+            return nil
+        }
         let geo = WindowCardGeometry.usageGeometry(
-            windowStartMs: start, windowEndMs: end, nowMs: min(quota.nowMs, end),
-            samples: quota.samples, messages: mine)
-        return (settled, WindowUsageHalf(
-            mine: mine, bars: geo.bars, hits: geo.hits,
-            undatedCount: scan.undatedCount,
-            scopeMatchedNothing: quota.modelScope != nil
-                && mine.isEmpty && !subscription.isEmpty))
+            windowStartMs: start, windowEndMs: end, nowMs: until,
+            samples: quota.samples, zoneCounters: current.zones)
+        return (quota, WindowUsageHalf(
+            counter: current.mine, observed: current.observed, zones: current.zones,
+            bars: geo.bars, hits: geo.hits, undatedCount: Int(batch.undatedCount),
+            scopeMatchedNothing: current.scopeMatchedNothing))
     }
 
     static func interval(_ s: WindowResolution) -> (start: Int64, end: Int64)? {

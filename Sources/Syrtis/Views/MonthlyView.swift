@@ -16,10 +16,10 @@ struct MonthlyView: View {
     var clientIds: [String] = []
     var turnClientIds: [String] = []
     let colors: ModelColorMap
-    /// See `DailyView.onExpand`.
-    var onExpand: (() -> Void)?
+    var onExpandedChanged: ((UUID, Bool) -> Void)?
 
     @State private var openMonth: String?
+    @State private var expansionOwner = UUID()
     @State private var hover: HoverState?
     @State private var tooltipSize: CGSize = .zero
     @Environment(\.popoverScrollViewport) private var popoverScrollViewport
@@ -150,6 +150,8 @@ struct MonthlyView: View {
             }
         }
         .zIndex(hover == nil ? 0 : 1)
+        .onChange(of: openMonth) { _, month in onExpandedChanged?(expansionOwner, month != nil) }
+        .onDisappear { onExpandedChanged?(expansionOwner, false) }
     }
 
     @ViewBuilder private func monthItem(_ row: MonthRow) -> some View {
@@ -157,7 +159,6 @@ struct MonthlyView: View {
         VStack(spacing: 4) {
             Button {
                 hover = nil
-                if !isOpen { onExpand?() }
                 withAnimation(.easeOut(duration: 0.15)) {
                     openMonth = isOpen ? nil : row.month
                 }
