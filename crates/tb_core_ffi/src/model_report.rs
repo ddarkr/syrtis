@@ -9,7 +9,6 @@
 //! result onto a camelCase JSON shape the frontend consumes directly.
 
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,7 +73,10 @@ fn model_report_options(
 }
 
 /// Build the per-model report for `year` (empty string = all time).
-pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
+pub(crate) fn run(
+    context: &crate::LocalSourceContext,
+    year: &str,
+) -> Result<crate::EncodedLocalPayload, String> {
     let year = normalize_year(year)?;
     let options = model_report_options(context, year);
 
@@ -91,7 +93,16 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
     let pricing = tokscale_core::pricing::PricingService::load_cached_any_age();
 
     let data = map_report(report, pricing.as_ref());
-    serde_json::to_value(data).map_err(|e| format!("serialize model report: {}", e))
+    crate::encode_local_payload(&data)
+}
+pub(crate) fn run_from_snapshot(
+    snapshot: &tokscale_core::LocalUsageSnapshot,
+    mut options: tokscale_core::ReportOptions,
+    pricing: Option<&tokscale_core::pricing::PricingService>,
+) -> Result<crate::EncodedLocalPayload, String> {
+    options.group_by = tokscale_core::GroupBy::ClientProviderModel;
+    let report = tokscale_core::get_model_report_from_snapshot(snapshot, options, pricing)?;
+    crate::encode_local_payload(&map_report(report, pricing))
 }
 
 /// What the local pricing table would charge for this row's tokens, or `None`
@@ -167,7 +178,8 @@ fn local_cost_estimate(
         // was the part that mattered.
         cache_write_1h: entry.cache_write,
     };
-    let estimate = pricing.calculate_cost_with_provider(&entry.model, Some(&entry.provider), &usage);
+    let estimate =
+        pricing.calculate_cost_with_provider(&entry.model, Some(&entry.provider), &usage);
     (estimate.is_finite() && estimate > 0.0).then_some(estimate)
 }
 
@@ -252,7 +264,11 @@ mod tests {
         let table: serde_json::Value = serde_json::from_str(&text).expect("case table parses");
         let cases = table["cases"].as_array().expect("`cases` is an array");
         // Control: an empty or truncated table must not pass vacuously.
-        assert!(cases.len() >= 17, "case table has {} rows, expected >= 17", cases.len());
+        assert!(
+            cases.len() >= 17,
+            "case table has {} rows, expected >= 17",
+            cases.len()
+        );
         for case in cases {
             let input = case[0].as_str().expect("input is a string");
             let expected = case[1].as_str().expect("expected is a string");
@@ -601,7 +617,13 @@ mod tests {
     /// #766 clamps corrupt Antigravity varints to `i64::MAX` per bucket. Two
     /// such buckets in one model entry must saturate the mapped `total`, not
     /// overflow it (a plain `+` panics in debug / wraps in release).
-    fn entry(input: i64, output: i64, cache_read: i64, cache_write: i64, reasoning: i64) -> tokscale_core::ModelUsage {
+    fn entry(
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> tokscale_core::ModelUsage {
         tokscale_core::ModelUsage {
             client: "antigravity_cli".to_string(),
             merged_clients: None,
@@ -730,10 +752,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let service = tokscale_core::pricing::PricingService::new(
-            litellm,
-            std::collections::HashMap::new(),
-        );
+        let service =
+            tokscale_core::pricing::PricingService::new(litellm, std::collections::HashMap::new());
 
         let mut e = entry(100_000, 0, 0, 10_000_000, 0);
         e.model = "no5m".to_string();

@@ -75,8 +75,8 @@ public struct AccountIdentity: Hashable, Sendable {
     /// Whether this account's usage can be read from local logs. Only the
     /// primary of each client and extra Claude accounts (whose key is a config
     /// directory) qualify; a captured Antigravity account has no local logs,
-    /// and its key passed to `tb_window_usage` would be looked up as a Claude
-    /// config directory.
+    /// and its key in a `WindowUsageRequest` would be looked up as a Claude
+    /// config directory instead of joining that captured account.
     public var hasLocalUsage: Bool { accountKey == nil || clientId == "claude" }
 
     public static let antigravityClientId = "antigravity"

@@ -27,12 +27,11 @@ struct DailyView: View {
     var clientIds: [String] = []
     var turnClientIds: [String] = []
     let colors: ModelColorMap
-    /// Called when a row opens its per-model drill-down. Daily does not fetch
-    /// the model report to render its list, so the colour map is only needed
-    /// once a row is actually expanded — see `DashboardModel.ensureModelColors`.
-    var onExpand: (() -> Void)?
+    /// Expanded rows are an actual model-color consumer, not sticky demand.
+    var onExpandedChanged: ((UUID, Bool) -> Void)?
 
     @State private var openDate: String?
+    @State private var expansionOwner = UUID()
     @State private var hover: HoverState?
     @State private var tooltipSize: CGSize = .zero
     @Environment(\.popoverScrollViewport) private var popoverScrollViewport
@@ -148,6 +147,8 @@ struct DailyView: View {
             }
         }
         .zIndex(hover == nil ? 0 : 1)
+        .onChange(of: openDate) { _, date in onExpandedChanged?(expansionOwner, date != nil) }
+        .onDisappear { onExpandedChanged?(expansionOwner, false) }
     }
 
     @ViewBuilder private func dayItem(_ row: DayRow) -> some View {
@@ -155,7 +156,6 @@ struct DailyView: View {
         VStack(spacing: 4) {
             Button {
                 hover = nil
-                if !isOpen { onExpand?() }
                 withAnimation(.easeOut(duration: 0.15)) {
                     openDate = isOpen ? nil : row.date
                 }

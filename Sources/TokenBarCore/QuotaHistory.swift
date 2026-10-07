@@ -124,11 +124,8 @@ public struct QuotaHistoryRow: Equatable, Sendable, Identifiable {
     public let mineTokensExCacheRead: Int64
     /// `mineTokens` split by token class, for the row's hover breakdown.
     ///
-    /// Five classes, because `WindowMessage.tokens` sums exactly five and
-    /// `mineTokens` is its running total: a four-way split would not add up to
-    /// the number printed beside it, and a breakdown that does not reconcile
-    /// with the figure it explains is worse than none. `TokenBreakdown.total`
-    /// exists so that identity can be asserted rather than assumed.
+    /// Five independently accumulated lanes. The compact producer preserves
+    /// per-row total overflow separately from signed aggregate lane saturation.
     public let mineBreakdown: TokenBreakdown
     public let mineCost: Double
     /// The same two quantities restricted to the cycle's OBSERVED span, which
@@ -138,15 +135,9 @@ public struct QuotaHistoryRow: Equatable, Sendable, Identifiable {
     ///
     /// The FULL token count, cache reads included, and that is the load-bearing
     /// part. These two feed `WindowEquivalence`, which prints them on one line
-    /// as "10% of quota ~ X tokens · $Y API-equivalent" — two descriptions of
-    /// the same work, which a reader divides. `spanCost` is `message.cost`, the
-    /// message's whole priced cost, and a message's cost cannot be decomposed
-    /// here: `WindowMessage` carries one `cost`, not one per token class. So a
-    /// count excluding cache reads beside a cost including them is the one
-    /// pairing that cannot be made consistent, and it inflated the implied
-    /// per-token price by the cache-read share — most of a Claude Code
-    /// workload, which this repo's own bar comment puts at 200x the volume at
-    /// a tenth the price.
+    /// as "10% of quota ~ X tokens · $Y API-equivalent". The compact producer
+    /// supplies the whole priced cost, not a cost decomposed by token class,
+    /// so equivalence must use the full token count beside it.
     ///
     /// Full-and-full is therefore not a preference between two workable
     /// options; it is the only achievable pairing until per-class cost crosses
@@ -210,19 +201,6 @@ public struct QuotaHistoryModel: Equatable, Sendable, Identifiable {
 }
 
 public enum QuotaHistoryFold {
-    /// Grouping key for the model breakdown. The pair, not the model alone:
-    /// the same model id reached through two providers is two rows everywhere
-    /// else in this app, and collapsing them here would make this card the one
-    /// place that disagrees.
-    public struct ModelKey: Hashable {
-        public let providerId: String
-        public let modelId: String
-        public init(providerId: String, modelId: String) {
-            self.providerId = providerId
-            self.modelId = modelId
-        }
-    }
-
     /// Groups curve points into cycles, newest first.
     ///
     /// `durationSeconds` is per point rather than per cycle, so the cycle's
@@ -385,184 +363,75 @@ public enum QuotaHistoryFold {
     /// list, so the cap never reaches it.
     public static let consideredCycles = 32
 
-    /// Joins each cycle to the messages inside it.
-    ///
-    /// `subscription` is the attribution target this history belongs to — the
-    /// subscription whose quota the cycles measure. A message counts as "mine"
-    /// only when the user's own declaration assigns it there; excluded and
-    /// unassigned usage lands in the other column rather than being dropped,
-    /// because an unclassified source still consumed real time in that window.
-    /// `modelScope` narrows the fold to the model a window's allowance counts,
-    /// and has NO DEFAULT on purpose — see the note on `spans`.
-    /// for a provider-scoped window like Claude's "Fable only" weekly limit.
-    /// Nil means the window is not scoped and every model counts.
-    ///
-    /// Applied HERE rather than by the caller, and that is the point of the
-    /// parameter existing. The current-window chart, these history rows and the
-    /// equivalence spans are three surfaces of one quota; narrowing only the
-    /// chart made them disagree about the same window — corrected bars above,
-    /// uncorrected "past windows" underneath. A rule the fold owns cannot be
-    /// applied at two of three call sites.
+    /// Reconstructs presentation rows from complete compact cycle jobs. The
+    /// evidence interval and observed span were folded independently natively.
     public static func rows(
-        cycles: [QuotaCycle], messages: [WindowMessage], subscription: String,
-        modelScope: String?,
-        confirmed: [UsageAttribution.Record]
-    ) -> [QuotaHistoryRow] {
-        // Sorted once, then each cycle takes a contiguous slice: the naive
-        // filter-per-cycle is O(cycles x messages), and on live data that is
-        // 15 x 45,844 walks of the whole array on the main actor.
-        let sorted = inScope(messages, modelScope).sorted { $0.timestamp < $1.timestamp }
-        let stamps = sorted.map(\.timestamp)
-        let spans = spanTotals(
-            cycles: cycles, sorted: sorted, stamps: stamps,
-            subscription: subscription, confirmed: confirmed)
-
-        return zip(cycles, spans).map { cycle, span in
-            // `[evidenceStart, reset)` — inclusive at the start, exclusive at
-            // the reset. The start is `evidenceStartMs` rather than `startMs`
-            // so this column cannot come out SMALLER than the span inside it
-            // when a provider shortens its reported duration; a lengthened
-            // duration still moves `startMs` backwards, which `min` leaves
-            // alone and which no cycle boundary here has ever guarded. The reset instant is when the allowance refills, so work
-            // stamped exactly there was charged to the cycle that instant
-            // OPENS, not the one it closes. Adjacent cycles share that
-            // boundary, so getting it wrong double counts rather than merely
-            // misfiling.
-            let lo = lowerBound(stamps, cycle.evidenceStartMs)
-            let hi = lowerBound(stamps, cycle.resetAtMs)
-            var mine = (tokens: Int64(0), exCacheRead: Int64(0), cost: 0.0)
-            // Per class, alongside the totals rather than derived from them:
-            // `message.tokens` is already a sum, and a split recovered by
-            // subtraction is the mistake `tokensExCacheRead` documents.
-            var split = (input: Int64(0), output: Int64(0), cacheRead: Int64(0),
-                         cacheWrite: Int64(0), reasoning: Int64(0))
-            var other = (tokens: Int64(0), cost: 0.0, hasAssigned: false,
-                         hasExcluded: false, hasUnattributed: false)
-            var byModel: [ModelKey: (tokens: Int64, cost: Double, split: TokenBreakdown)] = [:]
-
-            for message in sorted[lo..<max(lo, hi)] {
-                let state = UsageAttribution.resolve(
-                    client: message.client, provider: message.providerId,
-                    model: message.modelId, records: confirmed)
-                if case let .assigned(target) = state, target == subscription {
-                    // `saturatingAdding`, like every other fold over these
-                    // counters. Saturating per message is not enough: two rows
-                    // that each saturate still trap when added together, and
-                    // the accumulator is where a corrupt transcript would land.
-                    let exCacheRead = message.tokensExCacheRead
-                    mine.tokens = mine.tokens.saturatingAdding(message.tokens)
-                    mine.exCacheRead = mine.exCacheRead.saturatingAdding(exCacheRead)
-                    split.input = split.input.saturatingAdding(message.input)
-                    split.output = split.output.saturatingAdding(message.output)
-                    split.cacheRead = split.cacheRead.saturatingAdding(message.cacheRead)
-                    split.cacheWrite = split.cacheWrite.saturatingAdding(message.cacheWrite)
-                    split.reasoning = split.reasoning.saturatingAdding(message.reasoning)
-                    mine.cost += message.cost
-                    // Display breakdown, so group like every other model
-                    // surface (#118); the attribution match above stayed raw.
-                    let key = ModelKey(
-                        providerId: message.providerId,
-                        modelId: ModelGrouping.groupID(message.modelId))
-                    let current = byModel[key] ?? (0, 0, TokenBreakdown())
-                    byModel[key] = (
-                        current.tokens.saturatingAdding(message.tokens),
-                        current.cost + message.cost,
-                        // Per class here too, accumulated rather than derived,
-                        // for the reason the row's own split states.
-                        TokenBreakdown(
-                            input: current.split.input.saturatingAdding(message.input),
-                            output: current.split.output.saturatingAdding(message.output),
-                            cacheRead: current.split.cacheRead.saturatingAdding(message.cacheRead),
-                            cacheWrite: current.split.cacheWrite
-                                .saturatingAdding(message.cacheWrite),
-                            reasoning: current.split.reasoning
-                                .saturatingAdding(message.reasoning)))
-                } else {
-                    // Three states reach here, and they mean three different
-                    // things to the person reading the line: someone else's
-                    // subscription, a source they excluded, and one they have
-                    // not classified. Only the last is an open question.
-                    switch state {
-                    case .assigned: other.hasAssigned = true
-                    case .excluded: other.hasExcluded = true
-                    case .unassigned: other.hasUnattributed = true
-                    }
-                    other.tokens = other.tokens.saturatingAdding(message.tokens)
-                    other.cost += message.cost
-                }
-            }
-
-            return QuotaHistoryRow(
+        cycles: [QuotaCycle], results: [WindowUsageBatch.Cycle]
+    ) throws -> [QuotaHistoryRow] {
+        let matched = try matchedResults(cycles: cycles, results: results)
+        return zip(cycles, matched).map { cycle, result in
+            QuotaHistoryRow(
                 cycle: cycle,
-                mineTokens: mine.tokens, mineTokensExCacheRead: mine.exCacheRead,
-                mineBreakdown: TokenBreakdown(
-                    input: split.input, output: split.output,
-                    cacheRead: split.cacheRead, cacheWrite: split.cacheWrite,
-                    reasoning: split.reasoning),
-                mineCost: mine.cost,
-                spanTokens: span.tokens, spanCost: span.cost,
-                otherTokens: other.tokens, otherCost: other.cost,
-                otherHasAssigned: other.hasAssigned,
-                otherHasExcluded: other.hasExcluded,
-                otherHasUnattributed: other.hasUnattributed,
-                models: byModel
-                    .map {
-                        QuotaHistoryModel(
-                            providerId: $0.key.providerId, modelId: $0.key.modelId,
-                            tokens: $0.value.tokens, breakdown: $0.value.split,
-                            cost: $0.value.cost)
-                    }
-                    // Tokens, then cost, then the model key. Ordering on
-                    // tokens alone leaves every cost-only model tied at zero,
-                    // so their order came from dictionary iteration while the
-                    // card renders `prefix(4)` — the four shown could reshuffle
-                    // between refreshes and omit the largest recorded spend.
-                    // The key breaks the remaining ties so the order is stable
-                    // rather than merely deterministic-per-run.
-                    .sorted {
-                        if $0.tokens != $1.tokens { return $0.tokens > $1.tokens }
-                        if $0.cost != $1.cost { return $0.cost > $1.cost }
-                        return ($0.providerId, $0.modelId) < ($1.providerId, $1.modelId)
-                    })
+                mineTokens: result.mineTokens,
+                mineTokensExCacheRead: result.mineTokensExCacheRead,
+                mineBreakdown: result.mineBreakdown,
+                mineCost: result.mineCost,
+                spanTokens: result.spanTokens, spanCost: result.spanCost,
+                otherTokens: result.otherTokens, otherCost: result.otherCost,
+                otherHasAssigned: result.otherHasAssigned,
+                otherHasExcluded: result.otherHasExcluded,
+                otherHasUnattributed: result.otherHasUnattributed,
+                models: result.models.map {
+                    QuotaHistoryModel(
+                        providerId: $0.providerId, modelId: $0.modelId,
+                        tokens: $0.tokens, breakdown: $0.breakdown, cost: $0.cost)
+                }.sorted {
+                    if $0.tokens != $1.tokens { return $0.tokens > $1.tokens }
+                    if $0.cost != $1.cost { return $0.cost > $1.cost }
+                    return ($0.providerId, $0.modelId) < ($1.providerId, $1.modelId)
+                })
         }
     }
 
-    /// First index whose value is >= `value`.
-    /// What this subscription spent inside each cycle's OBSERVED span —
-    /// `(firstSampleMs, lastSampleMs]`, the interval between the two readings
-    /// the cycle's `usedPercent` is the difference of.
-    ///
-    /// One statement of that rule, for the two surfaces that need it: the
-    /// history card's per-cycle numbers and the equivalence estimate's
-    /// numerators. It was written twice, and the second copy re-filtered the
-    /// whole message array per cycle on the main actor — the same
-    /// O(cycles x messages) shape the comment in `rows` documents having
-    /// removed, reintroduced by a second implementation of the same fold.
-    ///
-    /// Returned parallel to `cycles`, one entry each, so a caller that already
-    /// has the sorted array pays no second sort.
-    /// Same `modelScope` contract as `rows`: the equivalence estimate divides a
-    /// quota delta by the usage that produced it, so counting a model the
-    /// allowance does not charge inflates the denominator and understates the
-    /// price of the quota.
-    ///
-    /// No default value, and the omission is the safeguard. When this argument
-    /// defaulted to nil, `--window-probe` kept compiling unchanged and silently
-    /// began measuring something the shipping path no longer computes — and
-    /// that probe exists to tune `consideredCycles` against the shipping
-    /// calculation, so a divergence there invalidates the measurement rather
-    /// than merely differing from it. A required argument turns "a caller
-    /// forgot" into a build error, which is the only version of this rule that
-    /// cannot be forgotten again.
-    public static func spans(
-        cycles: [QuotaCycle], messages: [WindowMessage], subscription: String,
-        modelScope: String?,
-        confirmed: [UsageAttribution.Record]
-    ) -> [(tokens: Int64, cost: Double)] {
-        let sorted = inScope(messages, modelScope).sorted { $0.timestamp < $1.timestamp }
-        return spanTotals(
-            cycles: cycles, sorted: sorted, stamps: sorted.map(\.timestamp),
-            subscription: subscription, confirmed: confirmed)
+    /// The estimator consumes only observed full tokens/cost, never the
+    /// evidence-window display totals. Admission and weighting remain Swift.
+    public static func equivalenceCycles(
+        cycles: [QuotaCycle], results: [WindowUsageBatch.Cycle]
+    ) throws -> [WindowEquivalence.Cycle] {
+        let matched = try matchedResults(cycles: cycles, results: results)
+        return zip(cycles, matched).map { cycle, result in
+            WindowEquivalence.Cycle(
+                deltaPercent: cycle.usedPercent,
+                spanTokens: result.spanTokens, spanCost: result.spanCost,
+                observedFraction: cycle.observedFraction, risingRuns: cycle.risingRuns)
+        }
+    }
+
+    private static func matchedResults(
+        cycles: [QuotaCycle], results: [WindowUsageBatch.Cycle]
+    ) throws -> [WindowUsageBatch.Cycle] {
+        var byReset: [Int64: WindowUsageBatch.Cycle] = [:]
+        for result in results {
+            guard result.state == "covered", byReset[result.resetAtMs] == nil else {
+                throw incompleteCycleResults()
+            }
+            byReset[result.resetAtMs] = result
+        }
+        guard results.count == cycles.count,
+              Set(cycles.map(\.resetAtMs)).count == cycles.count
+        else { throw incompleteCycleResults() }
+        return try cycles.map { cycle in
+            guard let result = byReset[cycle.resetAtMs] else {
+                throw incompleteCycleResults()
+            }
+            return result
+        }
+    }
+
+    private static func incompleteCycleResults() -> NSError {
+        NSError(domain: "WindowUsageBatch", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Incomplete quota cycle usage results.",
+        ])
     }
 
     /// How much allowance a run of readings records consuming: the distance
@@ -653,64 +522,4 @@ public enum QuotaHistoryFold {
         return runs
     }
 
-    /// The messages a scoped window may count. One statement of the rule, so
-    /// the three surfaces of a window cannot apply it differently.
-    ///
-    /// One verdict per distinct model id. `ModelScope.covers` tokenizes both
-    /// strings on every call, and this runs over the whole scan on the main
-    /// actor: tens of thousands of messages carrying a handful of model ids.
-    public static func inScope(_ messages: [WindowMessage], _ scope: String?) -> [WindowMessage] {
-        guard let scope else { return messages }
-        var verdicts: [String: Bool] = [:]
-        return messages.filter { message in
-            if let known = verdicts[message.modelId] { return known }
-            let verdict = ModelScope.covers(scope, modelId: message.modelId)
-            verdicts[message.modelId] = verdict
-            return verdict
-        }
-    }
-
-    private static func spanTotals(
-        cycles: [QuotaCycle], sorted: [WindowMessage], stamps: [Int64],
-        subscription: String, confirmed: [UsageAttribution.Record]
-    ) -> [(tokens: Int64, cost: Double)] {
-        cycles.map { cycle in
-            // Bounded by the SPAN, not by `[start, reset)`. The span is what
-            // the denominator measures, and it is not always inside the cycle:
-            // see `evidenceStartMs`. The slice is a superset — the `where`
-            // below states the actual rule — so the bounds only have to be
-            // safe, and `saturatingAdding` keeps the exclusive upper edge from
-            // overflowing on a corrupt timestamp.
-            let lo = lowerBound(stamps, cycle.firstSampleMs)
-            let hi = lowerBound(stamps, cycle.lastSampleMs.saturatingAdding(1))
-            var span = (tokens: Int64(0), cost: 0.0)
-            for message in sorted[lo..<max(lo, hi)]
-            where message.timestamp > cycle.firstSampleMs
-                && message.timestamp <= cycle.lastSampleMs
-            {
-                guard case let .assigned(target) = UsageAttribution.resolve(
-                    client: message.client, provider: message.providerId,
-                    model: message.modelId, records: confirmed), target == subscription
-                else { continue }
-                // Through `WindowEquivalence.ratioTokens`, which is where the
-                // basis is stated. The live-window path in `row` computes the
-                // same ratio and reads the same function, so the two surfaces
-                // cannot drift apart the way they did when each summed for
-                // itself.
-                span.tokens = span.tokens.saturatingAdding(
-                    WindowEquivalence.ratioTokens(message))
-                span.cost += message.cost
-            }
-            return span
-        }
-    }
-
-    public static func lowerBound(_ values: [Int64], _ value: Int64) -> Int {
-        var low = 0, high = values.count
-        while low < high {
-            let mid = (low + high) / 2
-            if values[mid] < value { low = mid + 1 } else { high = mid }
-        }
-        return low
-    }
 }

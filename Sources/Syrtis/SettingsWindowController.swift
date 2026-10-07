@@ -14,6 +14,14 @@ final class SettingsWindowController {
     // AnyView so the live UI can be swapped for a static placeholder on close.
     private var host: NSHostingController<AnyView>?
     private var closeObserver: NSObjectProtocol?
+    private var visibilityObservers: [NSObjectProtocol] = []
+    private var scheduler: LocalUsageScheduler?
+    private var source: (any UsageDataSource)?
+    private var localSession: LocalUsageScheduler.Session?
+
+    func configure(scheduler: LocalUsageScheduler, source: any UsageDataSource) {
+        self.scheduler = scheduler; self.source = source
+    }
 
     /// A place in Settings a caller wants brought into view. The intro card
     /// uses it so "Open Settings" lands on the section it just described
@@ -63,25 +71,22 @@ final class SettingsWindowController {
     }
 
     func show(scrollingTo destination: Destination? = nil) {
+        guard let scheduler, let source else { return }
         let existing = self.window
-        let window = existing ?? makeWindow(destination: destination)
-        self.window = window
-        // Reopening a kept-alive window: reinstall the live settings UI that
-        // the previous close swapped out for a static placeholder. (Closing
-        // only orders the window out; leaving the live content mounted let its
-        // preview TimelineView(.periodic) keep re-rendering off-screen at up
-        // to 40fps and pin a core in the background — the chronic CPU spin.)
-        if existing != nil {
-            // `.id` only when a destination is requested: a fresh identity
-            // re-runs the view's `@State`, which is what selects the page and
-            // fires the scroll — and is exactly what an ordinary reopen must
-            // NOT do, since it would discard the page the user was last on.
-            host?.rootView = destination.map {
-                AnyView(
-                    SettingsWindowView(destination: $0)
-                        .id(($0.anchor ?? $0.page.rawValue) + UUID().uuidString))
-            } ?? AnyView(SettingsWindowView())
+        if let existing, existing.isVisible, !existing.isMiniaturized, localSession != nil, destination == nil {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
         }
+        let window = existing ?? makeWindow()
+        self.window = window
+        if let localSession { scheduler.release(localSession) }
+        let session = scheduler.openSession()
+        localSession = session
+        host?.rootView = AnyView(SettingsWindowView(
+            scheduler: scheduler, source: source, localSession: session, destination: destination)
+            .id(session))
+        if window.isMiniaturized { window.deminiaturize(nil) }
         let firstShow = !window.isVisible
         // Accessory apps are never frontmost; activate or the window opens
         // behind whatever app currently has focus.
@@ -98,6 +103,13 @@ final class SettingsWindowController {
         }
     }
 
+    private func releaseContent() {
+        if let localSession { scheduler?.release(localSession) }
+        localSession = nil
+        host?.rootView = AnyView(Color.clear.frame(
+            width: SettingsWindowView.contentSize.width, height: SettingsWindowView.contentSize.height))
+    }
+
     private func center(_ window: NSWindow) {
         guard let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first
         else { return }
@@ -107,8 +119,10 @@ final class SettingsWindowController {
             y: visible.midY - window.frame.height / 2))
     }
 
-    private func makeWindow(destination: Destination? = nil) -> NSWindow {
-        let host = NSHostingController(rootView: AnyView(SettingsWindowView(destination: destination)))
+    private func makeWindow() -> NSWindow {
+        let host = NSHostingController(rootView: AnyView(
+            Color.clear.frame(width: SettingsWindowView.contentSize.width,
+                              height: SettingsWindowView.contentSize.height)))
         self.host = host
         let window = NSWindow(contentViewController: host)
         // NSWindow(contentViewController:) sizes lazily (the frame is still
@@ -134,13 +148,14 @@ final class SettingsWindowController {
         closeObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: window, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.host?.rootView = AnyView(
-                    Color.clear.frame(
-                        width: SettingsWindowView.contentSize.width,
-                        height: SettingsWindowView.contentSize.height))
-            }
+            MainActor.assumeIsolated { self?.releaseContent() }
         }
+        visibilityObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didMiniaturizeNotification, object: window, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.releaseContent() } })
+        visibilityObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.show() } })
         // The hosting view inflates the frame by the title-bar safe area
         // (580 -> 612) in a layout pass after the first order-front that no
         // amount of layoutIfNeeded forces early — re-center once when it

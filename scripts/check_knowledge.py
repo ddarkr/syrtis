@@ -182,7 +182,7 @@ def validate(root):
         for p in list(reachable):
             if not p.exists(): continue
             for target,_,_ in relative_links(root,p,p.read_text(encoding='utf-8')):
-                if isinstance(target,Path) and target not in reachable: reachable.add(target); changed=True
+                if isinstance(target,Path) and target.is_file() and target.suffix=='.md' and target not in reachable: reachable.add(target); changed=True
     for p,d in meta.items():
         if d.get('kind')=='canonical' and p!=routing and p not in reachable: errors.append(Issue(p.relative_to(root),1,'orphan canonical document; not reachable from docs/knowledge/README.md'))
     owners=defaultdict(list)
@@ -603,6 +603,15 @@ def self_test():
         def test_good(self): self.assertEqual(validate(self.root()),[])
         def append_doc(self,r,extra):
             d=r/'docs/knowledge/vendor-tokscale.md'; d.write_text(d.read_text()+extra); return r
+        def test_directory_and_binary_links_are_valid_without_markdown_traversal(self):
+            r=self.root(); assets=r/'assets'; assets.mkdir()
+            image=assets/'chart.png'; image.write_bytes(b'\x89PNG\r\n\x1a\n')
+            self.append_doc(r,'\n\n[Fixtures](../../assets)\n[Chart](../../assets/chart.png)\n')
+            self.assertEqual(validate(r),[])
+            image.unlink(); assets.rmdir()
+            errors='\n'.join(map(str,validate(r)))
+            self.assertIn('missing link target assets',errors)
+            self.assertIn('missing link target assets/chart.png',errors)
         def test_engine_pin_claim_matching_owner_passes(self):
             self.assertEqual(validate(self.append_doc(self.root(),f'\n\nNative reviewed pin is `{FIXTURE_PIN}`.\n')),[])
         def test_stale_engine_pin_claim_is_reported(self):

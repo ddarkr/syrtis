@@ -184,9 +184,7 @@ mod tests {
     use std::path::Path;
 
     fn reset() {
-        *EXTRA_SCAN_PATHS
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = BTreeMap::new();
+        *EXTRA_SCAN_PATHS.write().unwrap_or_else(|p| p.into_inner()) = BTreeMap::new();
     }
 
     fn write_claude_session(root: &Path, session_name: &str, content: &str) {
@@ -241,10 +239,18 @@ mod tests {
             &turn("msg_primary", "req_primary", 100, 50),
         );
         let extra_root = extra.path().join("projects");
-        write_claude_session(&extra_root, "extra", &turn("msg_extra", "req_extra", 200, 30));
+        write_claude_session(
+            &extra_root,
+            "extra",
+            &turn("msg_extra", "req_extra", 200, 30),
+        );
 
         let context = context_for(primary.path());
-        assert_eq!(total_claude_tokens(&context), 150, "primary alone before setter");
+        assert_eq!(
+            total_claude_tokens(&context),
+            150,
+            "primary alone before setter"
+        );
 
         set_claude_roots(&[&extra_root]);
         assert_eq!(
@@ -266,8 +272,11 @@ mod tests {
         let extra = tempfile::tempdir().unwrap();
         let extra_root = extra.path().join("projects");
         write_claude_session(&extra_root, "extra", &turn("msg_a2", "req_a2", 100, 20));
-        write_claude_session(&primary.path().join(".claude/projects"), "primary",
-            &turn("msg_a2_primary", "req_a2_primary", 5, 5));
+        write_claude_session(
+            &primary.path().join(".claude/projects"),
+            "primary",
+            &turn("msg_a2_primary", "req_a2_primary", 5, 5),
+        );
 
         let context = context_for(primary.path());
         set_claude_roots(&[&extra_root]);
@@ -284,7 +293,10 @@ mod tests {
             &turn("msg_a2_new", "req_a2_new", 900, 900),
         );
         let after = total_claude_tokens(&context);
-        assert_ne!(before, after, "mutated fixture must change the total (red would be: unchanged)");
+        assert_ne!(
+            before, after,
+            "mutated fixture must change the total (red would be: unchanged)"
+        );
         assert_eq!(after, before + 1800);
         reset();
     }
@@ -306,7 +318,10 @@ mod tests {
         let before = total_claude_tokens(&context);
         set_claude_roots(&[&extra_root]);
         let after = total_claude_tokens(&context);
-        assert_eq!(before, after, "duplicate dedup key must not double the total");
+        assert_eq!(
+            before, after,
+            "duplicate dedup key must not double the total"
+        );
         assert_eq!(after, 150);
         reset();
     }
@@ -320,7 +335,11 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
         let extra_root = extra.path().join("projects");
-        write_claude_session(&extra_root, "extra", &turn("msg_dup_path", "req_dup_path", 40, 10));
+        write_claude_session(
+            &extra_root,
+            "extra",
+            &turn("msg_dup_path", "req_dup_path", 40, 10),
+        );
 
         let context = context_for(primary.path());
         set_claude_roots(&[&extra_root, &extra_root]);
@@ -340,7 +359,11 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let valid = tempfile::tempdir().unwrap();
         let valid_root = valid.path().join("projects");
-        write_claude_session(&valid_root, "valid", &turn("msg_valid", "req_valid", 10, 10));
+        write_claude_session(
+            &valid_root,
+            "valid",
+            &turn("msg_valid", "req_valid", 10, 10),
+        );
 
         let missing = primary.path().join("does-not-exist");
         let a_file = primary.path().join("a-file.txt");
@@ -411,7 +434,10 @@ mod tests {
         let baseline = total_claude_tokens(&context);
 
         let result = set_claude_roots_result(&[&file_root]);
-        assert_eq!(result["registeredCount"], 0, "a file root is never registered");
+        assert_eq!(
+            result["registeredCount"], 0,
+            "a file root is never registered"
+        );
         assert_eq!(result["unreadable"].as_array().unwrap().len(), 0);
         assert_eq!(
             result["rejected"].as_array().unwrap().len(),
@@ -445,7 +471,10 @@ mod tests {
 
         let context = context_for(primary.path());
         let result = set_claude_roots_result(&[&extra_root]);
-        assert_eq!(result["registeredCount"], 1, "the not-yet-existing root is still registered");
+        assert_eq!(
+            result["registeredCount"], 1,
+            "the not-yet-existing root is still registered"
+        );
         assert_eq!(
             result["unreadable"].as_array().unwrap().len(),
             1,
@@ -455,7 +484,11 @@ mod tests {
 
         // The root "mounts": the directory and a session file now exist.
         // Crucially, the setter is NOT called again here.
-        write_claude_session(&extra_root, "now-mounted", &turn("msg_a4c", "req_a4c", 60, 40));
+        write_claude_session(
+            &extra_root,
+            "now-mounted",
+            &turn("msg_a4c", "req_a4c", 60, 40),
+        );
 
         assert_eq!(
             total_claude_tokens(&context),
@@ -485,10 +518,17 @@ mod tests {
         reset();
         let primary = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
-        write_claude_session(&primary.path().join(".claude/projects"), "primary",
-            &turn("msg_a5", "req_a5", 5, 5));
+        write_claude_session(
+            &primary.path().join(".claude/projects"),
+            "primary",
+            &turn("msg_a5", "req_a5", 5, 5),
+        );
         let extra_root = extra.path().join("projects");
-        write_claude_session(&extra_root, "extra", &turn("msg_a5_extra", "req_a5_extra", 5, 5));
+        write_claude_session(
+            &extra_root,
+            "extra",
+            &turn("msg_a5_extra", "req_a5_extra", 5, 5),
+        );
 
         let context = context_for(primary.path());
         let before_token =
@@ -498,7 +538,10 @@ mod tests {
         let after_token =
             tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
 
-        assert_ne!(before_token, after_token, "change token must move once a new root's files enter the scan set");
+        assert_ne!(
+            before_token, after_token,
+            "change token must move once a new root's files enter the scan set"
+        );
         reset();
     }
 
@@ -529,8 +572,16 @@ mod tests {
         let extra = tempfile::tempdir().unwrap();
         let projects_root = extra.path().join("projects");
         let transcripts_root = extra.path().join("transcripts");
-        write_claude_session(&projects_root, "projects-session", &turn("msg_proj", "req_proj", 40, 10));
-        write_claude_session(&transcripts_root, "transcripts-session", &turn("msg_tr", "req_tr", 25, 5));
+        write_claude_session(
+            &projects_root,
+            "projects-session",
+            &turn("msg_proj", "req_proj", 40, 10),
+        );
+        write_claude_session(
+            &transcripts_root,
+            "transcripts-session",
+            &turn("msg_tr", "req_tr", 25, 5),
+        );
 
         let context = context_for(primary.path());
         set_claude_roots(&[&projects_root, &transcripts_root]);
@@ -551,10 +602,14 @@ mod tests {
 
         // "crush" is excluded by upstream's supports_extra_dir_scanning() —
         // any client id not in SUPPORTED_CLIENTS exercises the same path.
-        let payload = serde_json::json!({ "crush": [valid_root.display().to_string()] }).to_string();
+        let payload =
+            serde_json::json!({ "crush": [valid_root.display().to_string()] }).to_string();
         let result = set_from_json(&payload).unwrap();
 
-        assert_eq!(result["registeredCount"], 0, "unsupported client contributes nothing to the registry");
+        assert_eq!(
+            result["registeredCount"], 0,
+            "unsupported client contributes nothing to the registry"
+        );
         assert_eq!(result["unreadable"].as_array().unwrap().len(), 0);
         let rejected = result["rejected"].as_array().unwrap();
         assert_eq!(rejected.len(), 1);

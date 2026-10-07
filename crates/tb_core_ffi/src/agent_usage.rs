@@ -1048,7 +1048,6 @@ impl UsageWindow {
     pub(crate) fn pace_window_key_for_test(&self) -> Option<&str> {
         self.pace_status.window_key.as_deref()
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -1438,9 +1437,7 @@ fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
         | ProviderId::Copilot
         | ProviderId::Antigravity
         | ProviderId::Kiro
-        | ProviderId::OpenCode => {
-            !snapshot.windows.is_empty()
-        }
+        | ProviderId::OpenCode => !snapshot.windows.is_empty(),
         #[cfg(test)]
         ProviderId::Test(_) => false,
     }
@@ -1676,7 +1673,9 @@ pub(crate) const QUOTA_PROVIDERS: &[QuotaProvider] = &[
     // OpenCode Go only appears when opencode auth.json holds an "opencode-go" api key.
     QuotaProvider {
         id: ProviderId::OpenCode,
-        fetch: |id| provider_fetch(async move { fetch_opencode_go(id).await.into_iter().collect() }),
+        fetch: |id| {
+            provider_fetch(async move { fetch_opencode_go(id).await.into_iter().collect() })
+        },
     },
 ];
 
@@ -2013,8 +2012,7 @@ fn captured_antigravity_outcome(
 async fn fetch_codex(id: ProviderId) -> AgentUsageSnapshot {
     let outcome = fetch_codex_inner().await;
     let source = required_card_source(&outcome, CODEX_UNCONFIGURED_ERROR);
-    apply_provider_outcome(id, None, source, outcome)
-        .expect("Codex is a required provider card")
+    apply_provider_outcome(id, None, source, outcome).expect("Codex is a required provider card")
 }
 
 /// The `source` a required provider card reports for a failed fetch.
@@ -2200,9 +2198,7 @@ async fn fetch_claude_accounts(id: ProviderId) -> Vec<AgentUsageSnapshot> {
 /// work is entirely network wait.
 const MAX_ACCOUNT_FETCHES_IN_FLIGHT: usize = 4;
 
-async fn join_local_ordered<T: 'static>(
-    futures: Vec<Pin<Box<dyn Future<Output = T>>>>,
-) -> Vec<T> {
+async fn join_local_ordered<T: 'static>(futures: Vec<Pin<Box<dyn Future<Output = T>>>>) -> Vec<T> {
     tokio::task::LocalSet::new()
         .run_until(async move {
             let mut slots: Vec<Option<T>> = (0..futures.len()).map(|_| None).collect();
@@ -2211,11 +2207,15 @@ async fn join_local_ordered<T: 'static>(
             let mut queued = 0usize;
             loop {
                 while queued < MAX_ACCOUNT_FETCHES_IN_FLIGHT {
-                    let Some((index, future)) = pending.next() else { break };
+                    let Some((index, future)) = pending.next() else {
+                        break;
+                    };
                     tasks.spawn_local(async move { (index, future.await) });
                     queued += 1;
                 }
-                let Some(joined) = tasks.join_next().await else { break };
+                let Some(joined) = tasks.join_next().await else {
+                    break;
+                };
                 queued -= 1;
                 // A panicking fetch drops that one result rather than taking
                 // the whole publication down. Every real provider failure
@@ -2612,12 +2612,12 @@ where
             history_scope: claude_history_scope_with(None, resolve),
         };
     };
-    let history_scope = if credentials.scope_slot.semantic_source == CLAUDE_CONFIG_DIR_KEYCHAIN_SOURCE
-    {
-        claude_history_scope_with(Some(dir), resolve)
-    } else {
-        Err(AccountScopeError::NoTrustedEvidence)
-    };
+    let history_scope =
+        if credentials.scope_slot.semantic_source == CLAUDE_CONFIG_DIR_KEYCHAIN_SOURCE {
+            claude_history_scope_with(Some(dir), resolve)
+        } else {
+            Err(AccountScopeError::NoTrustedEvidence)
+        };
     ClaudeAccountIdentity {
         account_key: Some(dir.to_string()),
         history_scope,
@@ -4401,10 +4401,11 @@ fn reload_claude_credentials(original: &ClaudeCredentials) -> Result<ClaudeCrede
             let account = claude_keychain_account().ok_or_else(|| {
                 "Claude Keychain account could not be captured during refresh.".to_string()
             })?;
-            let raw =
-                load_claude_credentials_from_keychain_item(CLAUDE_KEYCHAIN_SERVICE, Some(&account))?.ok_or_else(|| {
-                    "Claude Keychain credentials disappeared during refresh.".to_string()
-                })?;
+            let raw = load_claude_credentials_from_keychain_item(
+                CLAUDE_KEYCHAIN_SERVICE,
+                Some(&account),
+            )?
+            .ok_or_else(|| "Claude Keychain credentials disappeared during refresh.".to_string())?;
             let mut credentials =
                 parse_claude_credentials_data(&raw, ClaudeCredentialSource::Keychain)?;
             credentials.keychain_account = Some(account);
@@ -4713,8 +4714,11 @@ fn validate_claude_keychain_target(
         credentials,
         || Ok(claude_keychain_account()),
         |captured_account| {
-            load_claude_credentials_from_keychain_item(CLAUDE_KEYCHAIN_SERVICE, Some(captured_account))
-                .map_err(|_| ())
+            load_claude_credentials_from_keychain_item(
+                CLAUDE_KEYCHAIN_SERVICE,
+                Some(captured_account),
+            )
+            .map_err(|_| ())
         },
     )
     .map(|_| ())
@@ -4743,8 +4747,11 @@ fn save_claude_credentials_to_keychain(
         credentials,
         || Ok(claude_keychain_account()),
         |captured_account| {
-            load_claude_credentials_from_keychain_item(CLAUDE_KEYCHAIN_SERVICE, Some(captured_account))
-                .map_err(|_| ())
+            load_claude_credentials_from_keychain_item(
+                CLAUDE_KEYCHAIN_SERVICE,
+                Some(captured_account),
+            )
+            .map_err(|_| ())
         },
     )?;
 
@@ -4903,9 +4910,7 @@ fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: i64) {
 /// See the guard in `enrich_snapshot_with`.
 fn history_scope_unavailable_reason(error: &AccountScopeError) -> &'static str {
     match error {
-        AccountScopeError::NoTrustedEvidence | AccountScopeError::InvalidEvidence => {
-            "accountScope"
-        }
+        AccountScopeError::NoTrustedEvidence | AccountScopeError::InvalidEvidence => "accountScope",
         _ => "history",
     }
 }
@@ -6174,10 +6179,7 @@ mod tests {
                     peak.set(peak.get().max(live.get()));
                     // Later entries finish FIRST, so input order and completion
                     // order disagree for every pair.
-                    tokio::time::sleep(Duration::from_millis(
-                        ((total - index) * 10) as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(Duration::from_millis(((total - index) * 10) as u64)).await;
                     live.set(live.get() - 1);
                     index
                 }));
@@ -6661,18 +6663,24 @@ mod tests {
             publication_generation: 1,
             agents: vec![
                 cache_test_snapshot(ProviderId::Codex, Ok(trusted.clone()), now),
-                cache_test_snapshot(ProviderId::Claude, Err(AccountScopeError::NoTrustedEvidence), now),
+                cache_test_snapshot(
+                    ProviderId::Claude,
+                    Err(AccountScopeError::NoTrustedEvidence),
+                    now,
+                ),
                 // Trusted scope, but the provider failed and these windows are
                 // its last-good replay — the identity was not confirmed by this
                 // run, so it must not become a binding.
                 {
-                    let mut stale = cache_test_snapshot(ProviderId::Copilot, Ok(trusted.clone()), now);
+                    let mut stale =
+                        cache_test_snapshot(ProviderId::Copilot, Ok(trusted.clone()), now);
                     stale.error = Some("Copilot is unavailable.".to_string());
                     stale
                 },
                 // Trusted scope, degraded transport — same reasoning.
                 {
-                    let mut degraded = cache_test_snapshot(ProviderId::Grok, Ok(trusted.clone()), now);
+                    let mut degraded =
+                        cache_test_snapshot(ProviderId::Grok, Ok(trusted.clone()), now);
                     degraded.transport_diagnostic =
                         Some(SafeTransportDiagnostic::server_error(503));
                     degraded
@@ -6744,16 +6752,21 @@ mod tests {
 
         assert_eq!(
             payload.quota_curve_series(),
-            ["session.v1", "weekly.v1", "sonnet.weekly.v1", "weekly_scoped.fable.v1"]
-                .map(|window_key| (
-                    None,
-                    SeriesKey::new(
-                        "claude",
-                        &HistoryScope::for_test(trusted.as_str()),
-                        window_key
-                    )
-                ))
-                .to_vec()
+            [
+                "session.v1",
+                "weekly.v1",
+                "sonnet.weekly.v1",
+                "weekly_scoped.fable.v1"
+            ]
+            .map(|window_key| (
+                None,
+                SeriesKey::new(
+                    "claude",
+                    &HistoryScope::for_test(trusted.as_str()),
+                    window_key
+                )
+            ))
+            .to_vec()
         );
         scope.cleanup();
     }
@@ -6789,7 +6802,11 @@ mod tests {
     fn claude_test_success_outcome() -> ProviderFetchOutcome {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         ProviderFetchOutcome::Success {
-            snapshot: cache_test_snapshot(ProviderId::Claude, Err(AccountScopeError::NoTrustedEvidence), now),
+            snapshot: cache_test_snapshot(
+                ProviderId::Claude,
+                Err(AccountScopeError::NoTrustedEvidence),
+                now,
+            ),
             cache_binding: None,
         }
     }
@@ -7403,7 +7420,11 @@ mod tests {
             "oauth",
             fresh_at,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot(ProviderId::Copilot, Ok(account_scope.clone()), fresh_at),
+                snapshot: cache_test_snapshot(
+                    ProviderId::Copilot,
+                    Ok(account_scope.clone()),
+                    fresh_at,
+                ),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
@@ -7444,15 +7465,24 @@ mod tests {
             },
             Err(failure) => ProviderFetchOutcome::Failure(failure),
         };
-        let snapshot =
-            apply_provider_outcome_with(&cache, ProviderId::Copilot, None, "oauth", response_at, outcome, |_| {})
-                .unwrap();
+        let snapshot = apply_provider_outcome_with(
+            &cache,
+            ProviderId::Copilot,
+            None,
+            "oauth",
+            response_at,
+            outcome,
+            |_| {},
+        )
+        .unwrap();
 
         assert!(snapshot.error.is_none());
         assert_eq!(snapshot.windows.len(), 1);
         assert!((snapshot.windows[0].remaining_percent - 60.0).abs() < 0.01);
         assert!(snapshot.windows[0].resets_at.is_none());
-        let cached = lock_last_good(&cache).entries[&account_slot(ProviderId::Copilot, None)].snapshot.clone();
+        let cached = lock_last_good(&cache).entries[&account_slot(ProviderId::Copilot, None)]
+            .snapshot
+            .clone();
         assert_eq!(cached.updated_at, snapshot.updated_at);
         assert_eq!(cached.windows.len(), 1);
         assert!(cached.error.is_none());
@@ -7591,7 +7621,9 @@ mod tests {
         // Control: every other terminal failure keeps the old source, so this
         // test cannot pass by mapping everything to the new marker.
         let broken = grokbot_outcome(
-            Err(ProviderFetchFailure::terminal("Could not read the Grok Bot login.")),
+            Err(ProviderFetchFailure::terminal(
+                "Could not read the Grok Bot login.",
+            )),
             now,
         );
         assert_eq!(grokbot_failure_source(&broken), "oauth");
@@ -7893,7 +7925,9 @@ mod tests {
             )
             .unwrap();
             assert!(result.windows.is_empty());
-            assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Codex, None)));
+            assert!(!lock_last_good(&cache)
+                .entries
+                .contains_key(&account_slot(ProviderId::Codex, None)));
         }
 
         let cache = Mutex::new(ProviderLastGoodCache::default());
@@ -7919,7 +7953,9 @@ mod tests {
             |_| panic!("absent must not enrich"),
         )
         .is_none());
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Codex, None)));
+        assert!(!lock_last_good(&cache)
+            .entries
+            .contains_key(&account_slot(ProviderId::Codex, None)));
         scope.cleanup();
     }
 
@@ -7940,7 +7976,11 @@ mod tests {
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now),
+                snapshot: cache_test_snapshot(
+                    ProviderId::Antigravity,
+                    Ok(account_scope.clone()),
+                    now,
+                ),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
@@ -7963,7 +8003,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(anonymous.windows.len(), 1);
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
+        assert!(!lock_last_good(&cache)
+            .entries
+            .contains_key(&account_slot(ProviderId::Antigravity, None)));
 
         apply_provider_outcome_with(
             &cache,
@@ -7972,12 +8014,17 @@ mod tests {
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now),
+                snapshot: cache_test_snapshot(
+                    ProviderId::Antigravity,
+                    Ok(account_scope.clone()),
+                    now,
+                ),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
         );
-        let mut empty = cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now);
+        let mut empty =
+            cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now);
         empty.windows.clear();
         let live_empty = apply_provider_outcome_with(
             &cache,
@@ -7993,7 +8040,9 @@ mod tests {
         )
         .unwrap();
         assert!(live_empty.windows.is_empty());
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
+        assert!(!lock_last_good(&cache)
+            .entries
+            .contains_key(&account_slot(ProviderId::Antigravity, None)));
 
         apply_provider_outcome_with(
             &cache,
@@ -8027,7 +8076,9 @@ mod tests {
         .unwrap();
         assert!(invalid.windows.is_empty());
         assert_eq!(enrich_calls.get(), 0);
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
+        assert!(!lock_last_good(&cache)
+            .entries
+            .contains_key(&account_slot(ProviderId::Antigravity, None)));
         scope.cleanup();
     }
 
@@ -8210,7 +8261,16 @@ mod tests {
         let ids: Vec<&str> = QUOTA_PROVIDERS.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["codex", "claude", "antigravity", "copilot", "grok", "grok-bot", "kiro", "opencode"]
+            [
+                "codex",
+                "claude",
+                "antigravity",
+                "copilot",
+                "grok",
+                "grok-bot",
+                "kiro",
+                "opencode"
+            ]
         );
     }
 
@@ -8220,7 +8280,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             vec![table_test_snapshot(ProviderId::Test("a"))]
         });
-        let out = fetch_in_order(vec![slow_first, stub(vec![table_test_snapshot(ProviderId::Test("b"))])]).await;
+        let out = fetch_in_order(vec![
+            slow_first,
+            stub(vec![table_test_snapshot(ProviderId::Test("b"))]),
+        ])
+        .await;
         assert_eq!(ids(&out), ["a", "b"]);
     }
 
@@ -8229,7 +8293,10 @@ mod tests {
         let out = fetch_in_order(vec![
             stub(vec![table_test_snapshot(ProviderId::Test("a"))]),
             stub(Vec::new()),
-            stub(vec![table_test_snapshot(ProviderId::Test("c1")), table_test_snapshot(ProviderId::Test("c2"))]),
+            stub(vec![
+                table_test_snapshot(ProviderId::Test("c1")),
+                table_test_snapshot(ProviderId::Test("c2")),
+            ]),
         ])
         .await;
         assert_eq!(ids(&out), ["a", "c1", "c2"]);
@@ -8266,12 +8333,25 @@ mod tests {
         // exactly the ids `fetch_table` passed in.
         fn echo(id: ProviderId) -> ProviderFetch {
             provider_fetch(async move {
-                vec![empty_error_snapshot(id, None, "fixture", Utc::now(), String::new(), None)]
+                vec![empty_error_snapshot(
+                    id,
+                    None,
+                    "fixture",
+                    Utc::now(),
+                    String::new(),
+                    None,
+                )]
             })
         }
         let table = [
-            QuotaProvider { id: ProviderId::Test("first"), fetch: echo },
-            QuotaProvider { id: ProviderId::Test("second"), fetch: echo },
+            QuotaProvider {
+                id: ProviderId::Test("first"),
+                fetch: echo,
+            },
+            QuotaProvider {
+                id: ProviderId::Test("second"),
+                fetch: echo,
+            },
         ];
         assert_eq!(ids(&fetch_table(&table).await), ["first", "second"]);
     }
@@ -8308,7 +8388,9 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.client_id, ProviderId::Kiro);
         let cache = lock_last_good(&cache);
-        assert!(cache.entries.contains_key(&account_slot(ProviderId::Kiro, None)));
+        assert!(cache
+            .entries
+            .contains_key(&account_slot(ProviderId::Kiro, None)));
     }
 
     #[test]
@@ -8316,7 +8398,10 @@ mod tests {
         // A missing arm no longer compiles (the match is exhaustive); this
         // checks that each arm accepts its provider's success shape.
         let base = table_test_snapshot(ProviderId::Test("any")).windows[0].clone();
-        let card = |id: &str| base.clone().with_identity(id, Some(id.to_string()), None, None);
+        let card = |id: &str| {
+            base.clone()
+                .with_identity(id, Some(id.to_string()), None, None)
+        };
         for provider in QUOTA_PROVIDERS {
             let mut snapshot = table_test_snapshot(provider.id);
             snapshot.windows = vec![
@@ -12929,8 +13014,14 @@ mod tests {
             Ok(Vec::new())
         });
         assert_eq!(calls.get(), 0);
-        assert_eq!(snapshot.windows[0].pace_status.reason.as_deref(), Some("history"));
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Unavailable);
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("history")
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
         scope.cleanup();
     }
 
@@ -12965,8 +13056,14 @@ mod tests {
             Ok(Vec::new())
         });
         assert_eq!(calls.get(), 0);
-        assert_eq!(snapshot.windows[0].pace_status.reason.as_deref(), Some("accountScope"));
-        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Unavailable);
+        assert_eq!(
+            snapshot.windows[0].pace_status.reason.as_deref(),
+            Some("accountScope")
+        );
+        assert_eq!(
+            snapshot.windows[0].pace_status.state,
+            PaceState::Unavailable
+        );
         scope.cleanup();
     }
 
@@ -13204,10 +13301,14 @@ mod tests {
         // Clearing one account must not evict the other.
         lock_last_good(&cache).clear(&second);
         assert!(
-            lock_last_good(&cache).clean_for(&primary, &binding).is_some(),
+            lock_last_good(&cache)
+                .clean_for(&primary, &binding)
+                .is_some(),
             "clearing the second account evicted the primary"
         );
-        assert!(lock_last_good(&cache).clean_for(&second, &binding).is_none());
+        assert!(lock_last_good(&cache)
+            .clean_for(&second, &binding)
+            .is_none());
         scope.cleanup();
     }
 
@@ -13330,7 +13431,9 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|entry| entry["providerId"] == "claude" && entry["accountScope"] == account_scope)
+            .filter(|entry| {
+                entry["providerId"] == "claude" && entry["accountScope"] == account_scope
+            })
             .cloned()
             .collect()
     }
@@ -13350,15 +13453,17 @@ mod tests {
             scope.resolve_history(provider, authoritative)
         };
 
-        let primary =
-            claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
+        let primary = claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
         let extra = claude_account_identity_with(
             Some(G_TEST_CONFIG_DIR),
             &claude_config_dir_test_credentials(G_TEST_CONFIG_DIR),
             resolve,
         );
 
-        assert_eq!(primary.account_key, None, "the primary publishes no accountKey");
+        assert_eq!(
+            primary.account_key, None,
+            "the primary publishes no accountKey"
+        );
         assert_eq!(extra.account_key.as_deref(), Some(G_TEST_CONFIG_DIR));
 
         let primary_scope = primary
@@ -13399,8 +13504,7 @@ mod tests {
             .resolve_current("fixture", "g3-account", b"g3-marker")
             .unwrap();
 
-        let primary =
-            claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
+        let primary = claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
         let extra = claude_account_identity_with(
             Some(G_TEST_CONFIG_DIR),
             &claude_config_dir_test_credentials(G_TEST_CONFIG_DIR),
@@ -13420,7 +13524,8 @@ mod tests {
                 &history_path,
             )
         });
-        let after_primary: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
+        let after_primary: Value =
+            serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
         let primary_series_before = claude_series_for(&after_primary, &primary_scope);
         assert_eq!(
             primary_series_before.len(),
@@ -13430,14 +13535,18 @@ mod tests {
 
         let mut extra_snapshot =
             claude_identity_test_snapshot(&extra, account_scope.clone(), 77.0, now + 600);
-        enrich_snapshot_with(&mut extra_snapshot, now + 600, |active, observations, at| {
-            crate::agent_quota_history::record_observations_at_path_and_evaluate(
-                active,
-                observations,
-                at,
-                &history_path,
-            )
-        });
+        enrich_snapshot_with(
+            &mut extra_snapshot,
+            now + 600,
+            |active, observations, at| {
+                crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                    active,
+                    observations,
+                    at,
+                    &history_path,
+                )
+            },
+        );
         let after_extra: Value = serde_json::from_slice(&fs::read(&history_path).unwrap()).unwrap();
 
         assert_eq!(
@@ -13483,8 +13592,7 @@ mod tests {
             .unwrap();
 
         let now = 1_800_000_000_i64;
-        let primary =
-            claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
+        let primary = claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
         let mut primary_snapshot =
             claude_identity_test_snapshot(&primary, account_scope.clone(), 20.0, now);
         enrich_snapshot_with(&mut primary_snapshot, now, |active, observations, at| {
@@ -13515,15 +13623,19 @@ mod tests {
         let writes = std::cell::Cell::new(0);
         let mut extra_snapshot =
             claude_identity_test_snapshot(&extra, account_scope, 77.0, now + 600);
-        enrich_snapshot_with(&mut extra_snapshot, now + 600, |active, observations, at| {
-            writes.set(writes.get() + 1);
-            crate::agent_quota_history::record_observations_at_path_and_evaluate(
-                active,
-                observations,
-                at,
-                &history_path,
-            )
-        });
+        enrich_snapshot_with(
+            &mut extra_snapshot,
+            now + 600,
+            |active, observations, at| {
+                writes.set(writes.get() + 1);
+                crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                    active,
+                    observations,
+                    at,
+                    &history_path,
+                )
+            },
+        );
         assert_eq!(writes.get(), 0, "it opened a history transaction anyway");
         assert_eq!(
             fs::read(&history_path).unwrap(),
@@ -13559,8 +13671,7 @@ mod tests {
             .unwrap();
 
         let now = 1_800_000_000_i64;
-        let primary =
-            claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
+        let primary = claude_account_identity_with(None, &claude_test_login_credentials(), resolve);
         let mut primary_snapshot =
             claude_identity_test_snapshot(&primary, account_scope.clone(), 20.0, now);
         enrich_snapshot_with(&mut primary_snapshot, now, |active, observations, at| {
@@ -13609,7 +13720,11 @@ mod tests {
                     &history_path,
                 )
             });
-            assert_eq!(writes.get(), 0, "{semantic_source} opened a history transaction");
+            assert_eq!(
+                writes.get(),
+                0,
+                "{semantic_source} opened a history transaction"
+            );
         }
 
         assert_eq!(
@@ -13643,11 +13758,22 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let loaded = load_claude_config_dir_credentials_with(G_TEST_CONFIG_DIR, |dir| {
             reads.set(reads.get() + 1);
-            assert_eq!(dir, Some(G_TEST_CONFIG_DIR), "it read another account's item");
+            assert_eq!(
+                dir,
+                Some(G_TEST_CONFIG_DIR),
+                "it read another account's item"
+            );
             Ok(None)
         });
-        assert!(loaded.is_err(), "a missing item must not fall back to the primary's credential");
-        assert_eq!(reads.get(), 1, "one configured account costs exactly one read");
+        assert!(
+            loaded.is_err(),
+            "a missing item must not fall back to the primary's credential"
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "one configured account costs exactly one read"
+        );
         // ...and there are no configured directories until the setter is called.
         assert!(crate::claude_config_dirs::snapshot().is_empty());
 
@@ -13705,7 +13831,8 @@ mod tests {
         let round_three = round_two + chrono::Duration::seconds(60);
         let cache = Mutex::new(ProviderLastGoodCache::default());
 
-        let primary_snapshot = cache_test_snapshot(ProviderId::Claude, Ok(primary_scope.clone()), round_one);
+        let primary_snapshot =
+            cache_test_snapshot(ProviderId::Claude, Ok(primary_scope.clone()), round_one);
         let primary_updated_at = primary_snapshot.updated_at.clone();
         apply_provider_outcome_with(
             &cache,
@@ -13766,14 +13893,18 @@ mod tests {
             recovered.account_key, None,
             "the recovered card is not the primary's"
         );
-        assert!(recovered.error.is_some(), "a failed round must still report the failure");
+        assert!(
+            recovered.error.is_some(),
+            "a failed round must still report the failure"
+        );
 
         // The extra account kept its own entry through all three rounds.
-        assert!(
-            lock_last_good(&cache)
-                .clean_for(&account_slot(ProviderId::Claude, Some(G_TEST_CONFIG_DIR)), &extra_binding)
-                .is_some()
-        );
+        assert!(lock_last_good(&cache)
+            .clean_for(
+                &account_slot(ProviderId::Claude, Some(G_TEST_CONFIG_DIR)),
+                &extra_binding
+            )
+            .is_some());
         scope.cleanup();
     }
 

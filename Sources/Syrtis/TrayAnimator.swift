@@ -39,6 +39,8 @@ final class TrayAnimator {
 
     private weak var controller: StatusItemController?
     private let source: any UsageDataSource
+    private let scheduler: LocalUsageScheduler
+    private var rateSession: LocalUsageScheduler.Session?
 #if DEBUG
     private let cpuTest = TrayAnimationCPUTestConfiguration.current
 #endif
@@ -47,7 +49,6 @@ final class TrayAnimator {
     /// (`loadSandFramesIfNeeded`), since 1,152 frames are wasted on everyone
     /// who never picks the style.
     private var frames: [String: [NSImage]]
-    private var loadTask: Task<Void, Never>?
     private var quotaTask: Task<Void, Never>?
     private var presentedAnimationKey: String?
     private var isStopped = true
@@ -68,10 +69,12 @@ final class TrayAnimator {
 
     init(
         controller: StatusItemController,
-        source: any UsageDataSource = UsageDataSources.current
+        source: any UsageDataSource = UsageDataSources.current,
+        scheduler: LocalUsageScheduler
     ) {
         self.controller = controller
         self.source = source
+        self.scheduler = scheduler
         self.cachedQuotaRemaining = source.allowsQuotaCachePersistence
             ? UserDefaults.standard.object(forKey: Self.lastRemainingKey) as? Double
             : nil
@@ -138,6 +141,7 @@ final class TrayAnimator {
         let animate = d.object(forKey: animateKey).map { String(describing: $0) } ?? ""
         let quotaSource = d.string(forKey: quotaSourceKey) ?? ""
         let lastRemaining = d.object(forKey: lastRemainingKey).map { String(describing: $0) } ?? ""
+        let titleMode = d.string(forKey: TrayMode.storageKey) ?? ""
         let iconColor = d.string(forKey: IconColoring.storageKey) ?? ""
             // The Auto gauge value now depends on the exclusion set, so a hide
             // toggle must re-render (and re-resolve) the gauge — renderGaugeIcon
@@ -148,7 +152,7 @@ final class TrayAnimator {
         let tabHidden = d.string(forKey: ClientRegistry.tabHiddenKey) ?? ""
         let limitsHidden = d.string(forKey: ClientRegistry.limitsHiddenKey) ?? ""
         let pace = d.string(forKey: AnimationPace.storageKey) ?? ""
-        return [style, animate, quotaSource, lastRemaining, iconColor, tabHidden, limitsHidden, pace]
+        return [style, animate, quotaSource, lastRemaining, iconColor, tabHidden, limitsHidden, pace, titleMode]
             .joined(separator: "|")
     }
 
@@ -188,19 +192,21 @@ final class TrayAnimator {
                     self.reconcileQuotaRemaining(with: payload)
                 }
                 self.refreshIcon()
+                self.reconcileLoadDemand()
             }
         }
         refreshIcon()
-        startLoadPolling()
+        reconcileLoadDemand()
         startQuotaPolling()
     }
 
     func stop() {
         isStopped = true
-        loadTask?.cancel()
+        rateGeneration += 1
         quotaTask?.cancel()
-        loadTask = nil
         quotaTask = nil
+        if let rateSession { scheduler.release(rateSession) }
+        rateSession = nil
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
         defaultsObserver = nil
         controller?.setAppearanceChangeHandler(nil)
@@ -662,48 +668,46 @@ final class TrayAnimator {
     /// tray title can display it without its own FFI call.
     private(set) var tokensPerMinRate: Double?
 
-    // Monotonic rate-fetch generation. Every rate fetch reserves a token at
-    // START via `nextRateGeneration()`; `applyRate` discards a result whose
-    // token is older than the last applied one. This stops a slow 30s-poll
-    // fetch (unfiltered rate) that was in flight during a hide toggle from
-    // landing AFTER — and clobbering — the observer's fresh filtered refetch.
+    /// Invalidated on cancellation and every replacement fetch, before any
+    /// await. An old result cannot land even while its replacement is pending.
     private var rateGeneration = 0
-    private var lastAppliedRateGen = 0
 
-    /// Reserve the next rate-fetch generation token (call on the main actor,
-    /// before launching the detached fetch).
-    func nextRateGeneration() -> Int {
-        rateGeneration += 1
-        return rateGeneration
+    nonisolated static func needsLocalRate(style: String, animated: Bool, mode: TrayMode) -> Bool {
+        mode == .tokensPerMin || style == sandStyle
+            || (QuotaIconStyle(rawValue: style) == nil && animated)
     }
 
-    /// Apply a freshly-fetched live rate to the spin speed and cached rate, and
-    /// re-render the title. Shared by the 30s poll and the immediate refresh
-    /// AppDelegate kicks when the hidden-tabs set changes (so the filtered rate
-    /// updates without waiting for the next poll tick). `generation` must be the
-    /// token reserved at that fetch's start; a stale (superseded) result is
-    /// dropped.
-    func applyRate(_ rate: Double, generation: Int) {
-        guard !isStopped, generation >= lastAppliedRateGen else { return }
-        lastAppliedRateGen = generation
+    private var needsLocalRate: Bool {
+        Self.needsLocalRate(style: currentStyle, animated: animateEnabled, mode: .current)
+    }
+
+    /// The animator owns menu-bar publication; the scheduler owns ingestion.
+    private func reconcileLoadDemand() {
+        guard !isStopped else { return }
+        rateGeneration += 1
+        let generation = rateGeneration
+        guard needsLocalRate, let query = LiveRate.query() else {
+            if let rateSession { scheduler.release(rateSession) }
+            rateSession = nil
+            if needsLocalRate { applyRate(0, generation: generation) }
+            return
+        }
+        let session = rateSession ?? scheduler.openSession()
+        rateSession = session
+        scheduler.update(session, queries: [query], active: true) { [weak self] _, result in
+            guard case .success(let value) = result, let rate = LiveRate.rate(from: value) else { return }
+            self?.applyRate(rate, generation: generation)
+        }
+    }
+
+    func refreshFilteredRate() { reconcileLoadDemand() }
+
+    private func applyRate(_ rate: Double, generation: Int) {
+        guard !isStopped, needsLocalRate, generation == rateGeneration else { return }
         load = Self.animationLoad(tokensPerMinute: AnimationPace.current().scaled(rate))
         tokensPerMinRate = rate
         updateAnimationSpeedIfPresented()
         onQuotaUpdated?()
     }
 
-    /// Poll the live rate to feed the spin speed. 30s cadence balances
-    /// animation responsiveness against the rayon wakeup cost of each FFI
-    /// call (the staticlib's mtime check wakes the entire rayon pool).
-    private func startLoadPolling() {
-        loadTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let gen = self?.nextRateGeneration(), let source = self?.source else { break }
-                let rate = try? await LiveRate.current(source: source)
-                guard let self, !Task.isCancelled else { break }
-                if let rate { self.applyRate(rate, generation: gen) }
-                try? await Task.sleep(for: .seconds(30))
-            }
-        }
-    }
 }

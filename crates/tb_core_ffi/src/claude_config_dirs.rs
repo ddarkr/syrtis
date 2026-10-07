@@ -70,8 +70,8 @@ fn normalize(raw: &str) -> Result<String, String> {
 /// answer would go stale the moment a volume mounts. It also keeps this setter
 /// off the `stat` path that made `extra_scan_paths` block its caller.
 pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
-    let input: Vec<String> = serde_json::from_str(raw)
-        .map_err(|e| format!("invalid Claude config dirs JSON: {}", e))?;
+    let input: Vec<String> =
+        serde_json::from_str(raw).map_err(|e| format!("invalid Claude config dirs JSON: {}", e))?;
 
     let mut registered: Vec<String> = Vec::new();
     let mut rejected: Vec<serde_json::Value> = Vec::new();

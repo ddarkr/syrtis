@@ -31,10 +31,11 @@ struct WindowQuotaHalf: Sendable {
     let modelScope: String?
 }
 
-/// Stage 2. The product of the union scan, already attributed and already
-/// turned into geometry.
+/// Stage 2. Compact native counters and Swift-owned presentation geometry.
 struct WindowUsageHalf: Sendable {
-    let mine: [WindowMessage]
+    let counter: WindowUsageBatch.Counter
+    let observed: WindowUsageBatch.Observed?
+    let zones: [WindowUsageBatch.Zone]
     let bars: [BarRect]
     let hits: [HitZone]
     /// Rows the scan could not place in time — a property of the SCAN, not of
@@ -107,55 +108,5 @@ extension WindowCardState {
     var usageHalf: WindowUsageHalf? {
         if case let .ready(_, u) = self { return u }
         return nil
-    }
-}
-
-/// The single scan that serves every card.
-///
-/// `from` is the earliest interval start across all candidate windows, so one
-/// pass covers all three window states: an ACTIVE window starts at `R - D`;
-/// the `.idle` probe needs `[R, now]` and `R >= R - D`; an INFERRED window
-/// starts at `t0`, and `t0 >= R >= R - D` by the filter in
-/// `firstUsageAfterReset`. `t0` being a product of the scan is therefore not a
-/// problem: the range covers it without knowing it.
-struct UnionScan: Sendable {
-    let fromMs: Int64
-    let untilMs: Int64
-    let capturedAt: Date
-    let messages: [WindowMessage]
-    /// Rows the engine could not place in time, carried rather than dropped.
-    ///
-    /// `WindowUsage.undatedCount` exists so consumers cannot hide them — its
-    /// own doc says "counted, never silently dropped, a window total that
-    /// quietly omits rows is worse than one that says so" — and every
-    /// production path discarded it here, leaving `--window-probe` the only
-    /// thing that ever mentioned the omission.
-    var undatedCount: Int = 0
-
-    /// Whether this scan can answer for a window starting at `start`.
-    ///
-    /// Both ends matter, for the same reason. A scan that begins after the
-    /// window did would silently under-count; a scan that ENDED before the
-    /// window began holds nothing from it at all — and every consumer reads a
-    /// non-answer as an answer of zero, which is the "no data" versus "could
-    /// not get data" conflation issue #320 is about. Testing only `fromMs` let
-    /// a scan taken moments ago satisfy this for a window starting tomorrow,
-    /// so the card, the equivalence lens and the history rows each rendered a
-    /// span nothing had looked at as empty. One half-answer, three surfaces.
-    ///
-    /// The upper bound is half-open to match `slice`: a window opening exactly
-    /// at `untilMs` owns no message this scan collected.
-    func covers(start: Int64) -> Bool { start >= fromMs && start < untilMs }
-
-    /// Half-open `[from, to)`, matching the FFI's own interval and
-    /// `QuotaHistoryFold.rows`.
-    ///
-    /// It used to be `(from, to]`, which is wrong at both ends for what it is
-    /// asked. An inferred window's `start` IS the timestamp of the first usage
-    /// after the reset, so an exclusive start dropped the very message that
-    /// established the window; and an inclusive end claimed a message landing
-    /// exactly on a reset for the cycle it ends rather than the one it opens.
-    func slice(from: Int64, to: Int64) -> [WindowMessage] {
-        messages.filter { $0.timestamp >= from && $0.timestamp < to }
     }
 }

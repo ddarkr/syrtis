@@ -41,8 +41,16 @@ struct SettingsWindowView: View {
     // stays all-time even when the dashboard is scoped to one saved year. The
     // model still defaults cachesSnapshot to false: it must never overwrite the
     // popover's restore snapshot with its independently polled data.
-    @State private var model = DashboardModel(initialYear: nil)
-    @State private var tokensPerMin: Double?
+    @State private var model: DashboardModel
+    private var tokensPerMin: Double? { model.liveRate }
+
+    init(scheduler: LocalUsageScheduler, source: any UsageDataSource,
+         localSession: LocalUsageScheduler.Session,
+         destination: SettingsWindowController.Destination? = nil) {
+        _model = State(initialValue: DashboardModel(
+            source: source, scheduler: scheduler, localSession: localSession, initialYear: nil))
+        self.destination = destination
+    }
     /// Set only when a caller asked for a specific place; the intro card is
     /// the one caller today. Nil means an ordinary open, which must land
     /// wherever the user last was.
@@ -143,6 +151,15 @@ struct SettingsWindowView: View {
                 }
                 .scrollIndicators(.never)
                 .frame(width: 354)
+                .safeAreaInset(edge: .bottom) {
+                    if model.localError != nil || model.localPending {
+                        Text(model.localError == nil ? "Checking local usage…" : "Local usage could not be refreshed.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help(model.localError ?? "")
+                            .padding(8)
+                    }
+                }
                 .onChange(of: selectedPage) {
                     proxy.scrollTo(Self.pageTop, anchor: .top)
                 }
@@ -175,24 +192,16 @@ struct SettingsWindowView: View {
         }
         .frame(width: Self.contentSize.width, height: Self.contentSize.height)
         .background(PopoverBackdrop().ignoresSafeArea())
-        .task { await model.load() }
-        // The attribution page is built from the model report, and `load()` is
-        // graph-only since the report came off the critical path. Without this
-        // Settings never asks for one: opened cold — `--settings`, or before the
-        // popover has ever been shown — the page waits for a request nobody
-        // makes, and once `isLoading` clears it reads as permanently
-        // unavailable. Keyed like PopoverView's, on the committed slice rather
-        // than the payload generation, so an all-years and a current-year view
-        // dated the same day still re-fire.
-        .task(id: model.committedSliceKey) {
-            await model.ensureModelData(for: .stats)
+        .task(id: "\(selectedPage.rawValue)|\(tabsHiddenRaw)") {
+            model.configureLocalDemand(view: .daily, clients: [], settings: true,
+                                       models: selectedPage == .usageAttribution)
         }
         // See `PopoverView`: keyed so removing an account takes its card away
         // in the same turn rather than at the poll's convenience.
         .task(id: extraRootsGeneration) { await model.pollAgentUsage() }
         .task(id: quotaReconciliationID) {
             guard let payload = model.agentUsage else { return }
-            let defaults = UsageDataSources.current.allowsQuotaCachePersistence
+            let defaults = model.allowsQuotaCachePersistence
                 ? UserDefaults.standard
                 : nil
             _ = Self.applyQuotaRemaining(
@@ -201,11 +210,6 @@ struct SettingsWindowView: View {
                 excluding: ClientRegistry.quotaExcludedClients(),
                 defaults: defaults)
         }
-        .task { await model.pollTrace() }
-        .task { await model.pollGraph() }
-        // Key the rate poll on the hidden raw so a hide toggle restarts it and
-        // re-fetches the filtered rate immediately, instead of lagging ≤10s.
-        .task(id: tabsHiddenRaw) { await pollTokensPerMin() }
         // The preview card's Chart layout needs quota curves, and nothing here
         // was asking for them — so picking Chart changed the radio button and
         // nothing else, which reads as a broken setting rather than a setting
@@ -235,6 +239,7 @@ struct SettingsWindowView: View {
                 orderRaw: tabsOrderRaw)
             model.refreshWindowQuotaHalves()
         }
+        .onDisappear { model.releaseLocalDemand() }
     }
 
     /// Clients the preview card renders, derived exactly as the card itself
@@ -333,10 +338,12 @@ struct SettingsWindowView: View {
                     VStack(spacing: 6) {
                         MenuBarMock(
                             dark: true, graph: model.payload,
-                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage)
+                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
+                            allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
                         MenuBarMock(
                             dark: false, graph: model.payload,
-                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage)
+                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
+                            allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
                     }
                 }
             }
@@ -365,16 +372,6 @@ struct SettingsWindowView: View {
         }
     }
 
-    /// Same cadence as the popover: the staticlib tail re-parses at most
-    /// every 10s. Feeds the rate tray mode and the preview's spin speed.
-    private func pollTokensPerMin() async {
-        while !Task.isCancelled {
-            let rate = await model.tokensPerMin()
-            if Task.isCancelled { break }
-            tokensPerMin = rate
-            try? await Task.sleep(for: .seconds(10))
-        }
-    }
 }
 
 /// One mock menu-bar strip (dark or light) with the Syrtis status item
@@ -385,6 +382,7 @@ private struct MenuBarMock: View {
     let graph: UsagePayload?
     let tokensPerMin: Double?
     let agentUsage: AgentUsagePayload?
+    let allowsQuotaCachePersistence: Bool
 
     @AppStorage(TrayMode.storageKey) private var trayModeRaw = TrayMode.todayTokens.rawValue
     @AppStorage(AnimationPace.storageKey) private var paceRaw = AnimationPace.default.rawValue
@@ -433,7 +431,7 @@ private struct MenuBarMock: View {
                                     payload: agentUsage,
                                     persistedSelection: quotaSource,
                                     excluding: ClientRegistry.quotaExcludedClients(),
-                                    defaults: UsageDataSources.current.allowsQuotaCachePersistence
+                                    defaults: allowsQuotaCachePersistence
                                         ? .standard : nil,
                                     now: Date()),
                                 quotaRemaining: mode == .quotaLeft ? remaining : nil,
@@ -467,8 +465,7 @@ private struct MenuBarMock: View {
     /// policy. Excludes the tab- and limits-hidden clients from the auto pick,
     /// same as the real tray.
     private var quotaRemaining: Double? {
-        let source = UsageDataSources.current
-        let cachedRemaining: Double? = source.allowsQuotaCachePersistence
+        let cachedRemaining: Double? = allowsQuotaCachePersistence
             ? UserDefaults.standard.object(forKey: TrayAnimator.lastRemainingKey) as? Double
             : nil
         return QuotaSelectionPolicy.resolveRemainingPercent(
@@ -487,7 +484,7 @@ private struct MenuBarMock: View {
                 payload: agentUsage,
                 persistedSelection: quotaSource,
                 excluding: ClientRegistry.quotaExcludedClients(),
-                defaults: UsageDataSources.current.allowsQuotaCachePersistence ? .standard : nil,
+                defaults: allowsQuotaCachePersistence ? .standard : nil,
                 now: Date())
             Image(nsImage: TrayIcons.image(
                 style: gauge, remaining: remaining, dark: dark, coloring: coloring,

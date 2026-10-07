@@ -14,22 +14,9 @@ import TokenBarCore
 /// anything else in the file.
 ///
 /// Not reachable from the shipping UI: `main.swift` runs it only for the flag
-/// and exits. Its attribution folds mirror the production ones deliberately —
-/// a probe that classified usage differently from the app would measure a
-/// different app.
+/// and exits. The cap sweep measures shipping policy; the later measurement
+/// sections deliberately retain their legacy unscoped/unattributed variants.
 enum WindowProbe {
-    /// Saturating fold over untrusted transcript counters, matching the
-    /// production folds rather than diverging from them.
-    ///
-    /// `reduce(0, +)` traps on overflow, and the probe reads the very files
-    /// `WindowMessage.tokens` is deliberately bounded for. A malformed row must
-    /// not be able to kill the instrument — and worse than killing it, an
-    /// unbounded `tokens - cacheRead` can wrap NEGATIVE once `tokens`
-    /// saturates, which is a numerator that flows into a ratio and produces a
-    /// wrong constant instead of a crash.
-    private static func sum(_ values: [Int64]) -> Int64 {
-        values.reduce(Int64(0)) { $0.saturatingAdding($1) }
-    }
 
     private static func fmtDay(_ secs: Int64) -> String {
         let f = DateFormatter()
@@ -38,7 +25,16 @@ enum WindowProbe {
     }
 
     static func run() -> Never {
+        Task {
+            await measure()
+        }
+        RunLoop.main.run()
+        exit(1)
+    }
+
+    private static func measure() async {
         do {
+            try await withSnapshots { snapshots in
             let payload = try TBCore.agentUsage()
 
             // #359. Everything from the history file up through
@@ -99,7 +95,7 @@ enum WindowProbe {
                         w.paceStatus.windowKey.map { (a.clientId, a.accountKey, $0) }
                     }
                 }
-                Thread.sleep(forTimeInterval: 70)
+                try await Task.sleep(for: .seconds(70))
                 let again = try TBCore.agentUsage()
                 let gen1 = again.publicationGeneration
                 print("  70 秒後             = \(gen1.map(String.init) ?? "nil")"
@@ -262,7 +258,7 @@ enum WindowProbe {
                     // "windows the cap currently bites": the constant is set
                     // from where the estimate collapses, which has to stay
                     // measurable while the cap sits above it.
-                    guard full.count >= 8 else { continue }
+                    guard full.count >= 8, agent.accountIdentity.hasLocalUsage else { continue }
                     // `evidenceStartMs` is already milliseconds; `nowS` is not.
                     // This agent's own account, not every account's. The
                     // sweep tunes `consideredCycles` against the shipping
@@ -270,42 +266,47 @@ enum WindowProbe {
                     // account's usage by that account's quota movement; a
                     // wider scan here would tune the constant against a
                     // numerator the app never uses.
-                    guard let messages = try? TBCore.windowUsage(
-                        accountKey: agent.accountKey,
-                        from: oldestUncapped, until: nowS * 1000).messages
-                    else { continue }
                     let confirmed = UsageAttribution.confirmed().records
-                    func estimate(_ set: [QuotaCycle]) -> WindowEquivalence.Row {
+                    let batch = try await snapshots.query(
+                        accountKey: agent.accountKey, fromMs: oldestUncapped,
+                        untilMs: nowS * 1000) { snapshot in
+                        WindowUsageRequest(
+                            accountKey: agent.accountKey, fromMs: oldestUncapped,
+                            untilMs: nowS * 1000, snapshotToken: snapshot.snapshotToken,
+                            confirmed: confirmed,
+                            modelGroups: WindowCardLoader.modelGroups(catalog: snapshot.modelCatalog ?? []),
+                            windows: [.init(
+                                id: "sweep", subscription: agent.clientId,
+                                admittedModelIds: WindowCardLoader.admittedModelIds(
+                                    scope: w.modelScope, catalog: snapshot.modelCatalog ?? []),
+                                cycles: full.map {
+                                    .init(resetAtMs: $0.resetAtMs, evidenceStartMs: $0.evidenceStartMs,
+                                          firstSampleMs: $0.firstSampleMs, lastSampleMs: $0.lastSampleMs)
+                                })])
+                    }
+                    guard let cycleResults = batch.windows.first?.cycles else {
+                        throw ProbeError.missingJob("sweep")
+                    }
+                    func estimate(_ set: [QuotaCycle]) throws -> WindowEquivalence.Row {
                         let admitted = set.filter {
                             WindowEquivalence.deltaQualifies($0.usedPercent, runs: $0.risingRuns)
                                 && $0.observedFraction >= WindowEquivalence.minimumObservedFraction
                         }
-                        let spans = QuotaHistoryFold.spans(
-                            cycles: admitted, messages: messages,
-                            subscription: agent.clientId,
-                            // The probe measures the SHIPPING calculation, so
-                            // it has to narrow the same way. A sweep run on a
-                            // scoped window without this tunes a constant
-                            // against numbers the app never computes.
-                            modelScope: w.modelScope, confirmed: confirmed)
+                        let selected = Set(admitted.map(\.resetAtMs))
+                        let spans = try QuotaHistoryFold.equivalenceCycles(
+                            cycles: admitted, results: cycleResults.filter { selected.contains($0.resetAtMs) })
                         return WindowEquivalence.aggregate(
                             // Same subscription the spans above were narrowed
                             // to; the probe measures the shipping calculation,
                             // so it takes the shipping overload.
                             subscription: agent.clientId, records: confirmed,
-                            cycles: zip(admitted, spans).map { cycle, span in
-                                WindowEquivalence.Cycle(
-                                    deltaPercent: cycle.usedPercent,
-                                    spanTokens: span.tokens, spanCost: span.cost,
-                                    observedFraction: cycle.observedFraction,
-                                    risingRuns: cycle.risingRuns)
-                            })
+                            cycles: spans)
                     }
                     // The sweep that set `consideredCycles`. Re-run it before
                     // moving that constant: the estimate does not degrade
                     // gracefully as the pool shrinks, it stops existing.
                     for cap in [8, 12, 16, 20, 24, 28, 32, full.count] {
-                        print("      上限 \(cap >= full.count ? "無" : String(cap))：\(estimate(Array(full.prefix(cap))))")
+                        print("      上限 \(cap >= full.count ? "無" : String(cap))：\(try estimate(Array(full.prefix(cap))))")
                     }
                 }
             }
@@ -416,11 +417,21 @@ enum WindowProbe {
                     // Only when `pre` is .idle does R1 hold and a usage probe
                     // become legal — .idle means R is past but within one D.
                     var final = pre
-                    if case .idle = pre, let r = resetMs, let d = durMs {
-                        let usage = try TBCore.windowUsage(
-                            accountKey: agent.accountKey, from: r, until: now)
-                        let t0 = WindowResolver.firstUsageAfterReset(
-                            messages: usage.messages, resetMs: r)
+                    if case .idle = pre, let r = resetMs, let d = durMs,
+                       agent.accountIdentity.hasLocalUsage {
+                        // Explicit legacy variant: earliest usage ignores attribution.
+                        let usage = try await snapshots.query(
+                            accountKey: agent.accountKey, fromMs: r, untilMs: now) { snapshot in
+                            WindowUsageRequest(
+                                accountKey: agent.accountKey, fromMs: r, untilMs: now,
+                                snapshotToken: snapshot.snapshotToken,
+                                inference: [.init(id: "legacy-placement", subscription: nil,
+                                                  fromMs: r, untilMs: now)])
+                        }
+                        guard let inference = usage.inference.first else {
+                            throw ProbeError.missingJob("legacy-placement")
+                        }
+                        let t0 = inference.firstAssignedMs
                         final = WindowResolver.resolve(
                             resetsAtMs: r, durationMs: d, now: now,
                             firstUsageAfterReset: t0)
@@ -471,7 +482,9 @@ enum WindowProbe {
                           generation: payload.publicationGeneration ?? 0)) ?? nil
                 else { continue }
                 let lo = (rMs - dS * 1000) / 1000, hi = now / 1000
-                let admitted = c.points.filter { $0.sampledAt >= lo && $0.sampledAt <= hi }
+                let admitted = WindowCardLoader.curveSamples(
+                    payload: payload, clientId: agent.clientId, accountKey: agent.accountKey,
+                    window: w, curve: { _, _, _, _ in c }, nowMs: now) ?? []
                 let timeOnly = c.points.filter { $0.sampledAt >= lo && $0.sampledAt <= hi }
                 print(String(format: "  %-10@ %-20@ 收到 %3d 點（僅時間範圍 %3d）%@",
                              agent.clientId as NSString, w.cardId as NSString,
@@ -570,101 +583,144 @@ enum WindowProbe {
                                 ? "yes" : "no"))
             } }
 
-            // One scan over the widest window, then filter per card in memory.
-            print("=== UNION SCAN（掃一次最寬範圍，各卡自行過濾）===")
+            // The legacy union experiment uses (start,end], intersected with
+            // the original half-open union. Native jobs preserve that variant.
+            print("=== UNION QUERY（同一個 snapshot，各卡精確查詢）===")
+            let localResolved = resolved.filter {
+                AccountIdentity(clientId: $0.0, accountKey: $0.1).hasLocalUsage
+            }
             var widest = now
-            for (_, _, _, st) in resolved { if let (a, _) = interval(st) { widest = min(widest, a) } }
-            // One scan PER ACCOUNT over the widest window, then filter per
-            // card in memory. Not one scan for everybody: a window belongs to
-            // an account, and the app no longer has a scan that spans them.
-            var t0 = Date()
-            var unionMs = 0.0
-            var byAccount: [String: WindowUsage] = [:]
-            for account in Set(resolved.map { $0.1 ?? "" }) {
-                t0 = Date()
-                byAccount[account] = try TBCore.windowUsage(
-                    accountKey: account.isEmpty ? nil : account, from: widest, until: now)
-                unionMs += Date().timeIntervalSince(t0) * 1000
+            for (_, _, _, st) in localResolved { if let (a, _) = interval(st) { widest = min(widest, a) } }
+            if widest < now {
+                var unionMs = 0.0
+                var byAccount: [String: WindowUsageBatch] = [:]
+                for account in Set(localResolved.map { $0.1 ?? "" }) {
+                    let t0 = Date()
+                    let jobs = localResolved.enumerated().compactMap { index, item -> WindowUsageRequest.DiagnosticInterval? in
+                        guard (item.1 ?? "") == account, let (a, b) = interval(item.3) else { return nil }
+                        return .init(id: "card-\(index)", fromMs: a, untilMs: min(b, now),
+                                     includeFrom: false, includeUntil: b < now)
+                    }
+                    byAccount[account] = try await snapshots.query(
+                        accountKey: account.isEmpty ? nil : account, fromMs: widest, untilMs: now
+                    ) { snapshot in
+                        WindowUsageRequest(
+                            accountKey: account.isEmpty ? nil : account,
+                            fromMs: widest, untilMs: now, snapshotToken: snapshot.snapshotToken,
+                            confirmed: confirmed, diagnostics: .init(intervals: [
+                                .init(id: "union", fromMs: widest, untilMs: now,
+                                      includeFrom: true, includeUntil: false)
+                            ] + jobs))
+                    }
+                    unionMs += Date().timeIntervalSince(t0) * 1000
+                }
+                var unionCount: Int64 = 0
+                for batch in byAccount.values {
+                    guard let total = batch.diagnostics?.intervals.first(where: { $0.id == "union" }) else {
+                        throw ProbeError.missingJob("union")
+                    }
+                    unionCount = unionCount.saturatingAdding(total.all.messageCount)
+                }
+                print(String(format: "  查詢 %d 個帳號 × %.0f 分鐘範圍：%ld 筆，%.0f ms",
+                             byAccount.count, Double(now - widest) / 60000, unionCount, unionMs))
+                for (index, item) in localResolved.enumerated() {
+                    guard interval(item.3) != nil else { continue }
+                    guard let sub = byAccount[item.1 ?? ""]?.diagnostics?.intervals
+                        .first(where: { $0.id == "card-\(index)" }) else {
+                        throw ProbeError.missingJob("card-\(index)")
+                    }
+                    print(String(format: "    %-10@ %-22@ 查詢出 %6ld 筆",
+                                 item.0 as NSString, item.2 as NSString, sub.all.messageCount))
+                }
+                print(String(format: "  合計：%.0f ms（native 批次，無 Swift 訊息過濾）", unionMs))
+            } else {
+                print("  無可查詢的已解析區間")
             }
-            let unionCount = byAccount.values.reduce(0) { $0 + $1.messages.count }
-            print(String(format: "  掃描 %d 個帳號 × %.0f 分鐘範圍：%ld 筆，%.0f ms",
-                         byAccount.count, Double(now - widest) / 60000, unionCount, unionMs))
-            var filterTotal = 0.0
-            for (cl, ak, cd, st) in resolved {
-                guard let (a, b) = interval(st),
-                      let all = byAccount[ak ?? ""] else { continue }
-                t0 = Date()
-                let sub = all.messages.filter { $0.timestamp > a && $0.timestamp <= min(b, now) }
-                let ms = Date().timeIntervalSince(t0) * 1000
-                filterTotal += ms
-                print(String(format: "    %-10@ %-22@ 過濾出 %6ld 筆  %.1f ms",
-                             cl as NSString, cd as NSString, sub.count, ms))
-            }
-            print(String(format: "  合計：%.0f ms（vs 逐窗各掃一次）", unionMs + filterTotal))
 
             print("\n=== SCAN COST（每次載入一次，非每次 hover）===")
-            for (client, accountKey, card, state) in resolved {
+            for (client, accountKey, card, state) in localResolved {
                 guard let (start, end) = interval(state) else { continue }
-                var t0 = Date()
-                let usage = try TBCore.windowUsage(
-                    accountKey: accountKey, from: start, until: min(end, now))
-                let scanMs = Date().timeIntervalSince(t0) * 1000
-                let conf = UsageAttribution.confirmed().records
-                t0 = Date()
-                let mineHere = usage.messages.filter {
-                    UsageAttribution.resolve(client: $0.client, provider: $0.providerId,
-                                             model: $0.modelId, records: conf) == .assigned(client)
+                let clip = min(end, now)
+                guard start < clip else { continue }
+                let n = 12
+                let width = max((clip - start) / Int64(n), 1)
+                let bareZones = WindowCardGeometry.zones(
+                    windowStartMs: start, windowEndMs: end, nowMs: clip, samples: [])
+                let t0 = Date()
+                let usage = try await snapshots.query(
+                    accountKey: accountKey, fromMs: start, untilMs: clip
+                ) { snapshot in
+                    WindowUsageRequest(
+                        accountKey: accountKey, fromMs: start, untilMs: clip,
+                        snapshotToken: snapshot.snapshotToken, confirmed: confirmed,
+                        windows: [.init(id: "bare", subscription: client, current: .init(
+                            fromMs: start, untilMs: clip, zones: requestZones(bareZones)))],
+                        diagnostics: .init(intervals: [.init(
+                            id: "attribution", fromMs: start, untilMs: clip,
+                            includeFrom: true, includeUntil: false, subscription: client)],
+                            buckets: [.init(id: "trend", fromMs: start, untilMs: clip,
+                                            bucketMs: width, count: Int64(n))]))
                 }
-                let foldMs = Date().timeIntervalSince(t0) * 1000
-                t0 = Date()
-                let g = WindowCardGeometry.usageGeometry(
-                    windowStartMs: start, windowEndMs: end, nowMs: min(end, now),
-                    samples: [], messages: mineHere)
-                let geoMs = Date().timeIntervalSince(t0) * 1000
-                print(String(format: "  %-10@ %-24@ %6ld 筆  掃描 %7.1f ms  歸屬 %6.1f ms  幾何 %5.1f ms  → 本訂閱 %ld 筆",
-                             client as NSString, card as NSString, usage.messages.count,
-                             scanMs, foldMs, geoMs, mineHere.count))
-                _ = g
-                let (assigned, excluded, unassigned) = usage.totals(confirmed: confirmed)
-                print("\n--- \(client) / \(card)  \(usage.messages.count) 筆"
+                let scanMs = Date().timeIntervalSince(t0) * 1000
+                guard let totals = usage.diagnostics?.intervals.first,
+                      let current = usage.windows.first?.current,
+                      let buckets = usage.diagnostics?.buckets.first else {
+                    throw ProbeError.missingJob("attribution/bare/trend")
+                }
+                let geoStart = Date()
+                _ = WindowCardGeometry.usageGeometry(
+                    windowStartMs: start, windowEndMs: end, nowMs: clip,
+                    samples: [], zoneCounters: current.zones)
+                let geoMs = Date().timeIntervalSince(geoStart) * 1000
+                print(String(format: "  %-10@ %-24@ %6ld 筆  native 查詢/歸屬 %7.1f ms  幾何 %5.1f ms  → 本訂閱 %ld 筆",
+                             client as NSString, card as NSString, totals.all.messageCount,
+                             scanMs, geoMs, totals.mine.messageCount))
+                print("\n--- \(client) / \(card)  \(totals.all.messageCount) 筆"
                       + (usage.undatedCount == 0 ? ""
                          : "（另有 \(usage.undatedCount) 筆無時戳、未計入）"))
-                for t in assigned {
+                for t in totals.assigned {
                     print(String(format: "    %-12@ %14ld token   $%.2f",
-                                 t.target as NSString, t.tokens, t.cost))
+                                 t.target as NSString, t.counter.tokens, t.counter.cost))
                 }
-                for (label, t) in [("excluded", excluded), ("unassigned", unassigned)]
+                for (label, t) in [("excluded", totals.excluded), ("unassigned", totals.unassigned)]
                 where t.tokens != 0 {
                     print(String(format: "    %-12@ %14ld token   $%.2f",
                                  label as NSString, t.tokens, t.cost))
                 }
-                let n = 12
-                let width = max((min(end, now) - start) / Int64(n), 1)
-                let curve = usage.buckets(from: start, bucketMs: width, count: n)
+                let curve = buckets.tokens
                 print("    曲線（\(width / 60000) 分一桶，百萬 token）: "
                       + curve.map { String($0 / 1_000_000) }.joined(separator: " "))
+                print("    桶外餘量：\(buckets.remainderTokens) token")
 
-                // Cost of the two halves, on real data. The old body recomputed
-                // BOTH on every hover event.
+                // Compact native attribution/zone timing replaces the old body
+                // fold timing; do not present it as an in-memory filter proof.
                 if card.hasPrefix("session") {
-                    let confirmed3 = UsageAttribution.confirmed().records
-                    var t0 = Date()
-                    let mineNow = usage.messages.filter {
-                        UsageAttribution.resolve(
-                            client: $0.client, provider: $0.providerId, model: $0.modelId,
-                            records: confirmed3) == .assigned(client)
-                    }
-                    let attrMs = Date().timeIntervalSince(t0) * 1000
                     let qs = (try? TBCore.quotaCurve(
                         clientId: client, accountKey: nil, windowKey: card,
                         generation: payload.publicationGeneration ?? 0))??.points
                         .filter { $0.sampledAt >= start / 1000 && $0.sampledAt <= now / 1000 }
                         .map { QuotaSample(atMs: $0.sampledAt * 1000, usedPercent: $0.usedPercent) }
                         ?? []
-                    t0 = Date()
+                    let hits = WindowCardGeometry.zones(
+                        windowStartMs: start, windowEndMs: end, nowMs: clip, samples: qs)
+                    let nativeStart = Date()
+                    let zones = try await snapshots.query(
+                        accountKey: accountKey, fromMs: start, untilMs: clip
+                    ) { snapshot in
+                        WindowUsageRequest(
+                            accountKey: accountKey, fromMs: start, untilMs: clip,
+                            snapshotToken: snapshot.snapshotToken, confirmed: confirmed,
+                            windows: [.init(id: "sample-zones", subscription: client, current: .init(
+                                fromMs: start, untilMs: clip, zones: requestZones(hits)))])
+                    }
+                    let nativeMs = Date().timeIntervalSince(nativeStart) * 1000
+                    guard let counters = zones.windows.first?.current?.zones else {
+                        throw ProbeError.missingJob("sample-zones")
+                    }
+                    var t0 = Date()
                     let ug = WindowCardGeometry.usageGeometry(
                         windowStartMs: start, windowEndMs: end, nowMs: min(end, now),
-                        samples: qs, messages: mineNow)
+                        samples: qs, zoneCounters: counters)
                     let usageMs = Date().timeIntervalSince(t0) * 1000
                     t0 = Date()
                     for _ in 0..<100 {
@@ -674,9 +730,9 @@ enum WindowProbe {
                     }
                     let quotaMs = Date().timeIntervalSince(t0) * 1000 / 100
                     print(String(format:
-                        "    ⏱ 每次 body 的成本：歸屬 %.1f ms ＋ bars/zones %.1f ms（舊）"
-                        + "  vs  曲線 %.3f ms（新）｜%d 筆訊息、%d 個 zone",
-                        attrMs, usageMs, quotaMs, mineNow.count, ug.hits.count))
+                        "    ⏱ native 歸屬/zones %.1f ms ＋ bars %.1f ms"
+                        + "  vs  曲線 %.3f ms｜%ld 筆訊息、%d 個 zone",
+                        nativeMs, usageMs, quotaMs, totals.mine.messageCount, ug.hits.count))
                 }
 
                 // Does the quota line have real samples inside this window?
@@ -704,18 +760,38 @@ enum WindowProbe {
                     // interval or the ratio is meaningless.
                     let lo = inWindow.first!, hi2 = inWindow.last!
                     let dPct = hi2.usedPercent - lo.usedPercent
-                    let spanMine = usage.messages
-                        .filter { $0.timestamp > lo.sampledAt * 1000
-                                  && $0.timestamp <= hi2.sampledAt * 1000 }
-                        .filter { m in
-                            UsageAttribution.resolve(
-                                client: m.client, provider: m.providerId,
-                                model: m.modelId, records: confirmed) == .assigned(client)
+                    let pairs = Array(zip(inWindow, inWindow.dropFirst()))
+                    let jobs = [sampleInterval(
+                        id: "span", loMs: lo.sampledAt * 1000, hiMs: hi2.sampledAt * 1000,
+                        startMs: start, untilMs: clip, subscription: client)] +
+                        pairs.enumerated().map { index, pair in
+                            sampleInterval(
+                                id: "pair-\(index)", loMs: pair.0.sampledAt * 1000,
+                                hiMs: pair.1.sampledAt * 1000, startMs: start,
+                                untilMs: clip, subscription: client)
                         }
-                    // Everything except cache read: measured to separate moved
-                    // from still buckets 4.5x, vs 1.2x for input+output+reasoning.
-                    let spanFresh = sum(spanMine.map(\.tokensExCacheRead))
-                    let spanCost = spanMine.map(\.cost).reduce(0, +)
+                    let measured = try await snapshots.query(
+                        accountKey: accountKey, fromMs: start, untilMs: clip
+                    ) { snapshot in
+                        WindowUsageRequest(
+                            accountKey: accountKey, fromMs: start, untilMs: clip,
+                            snapshotToken: snapshot.snapshotToken, confirmed: confirmed,
+                            diagnostics: .init(intervals: jobs))
+                    }
+                    guard let intervals = measured.diagnostics?.intervals else {
+                        throw ProbeError.missingJob("sample intervals")
+                    }
+                    func measuredInterval(_ id: String) throws -> WindowUsageBatch.DiagnosticInterval {
+                        guard let result = intervals.first(where: { $0.id == id }) else {
+                            throw ProbeError.missingJob(id)
+                        }
+                        return result
+                    }
+                    let span = try measuredInterval("span")
+                    // Explicit legacy last-first / ex-cache ratio, not shipping
+                    // consumed/rising-runs / full-token equivalence.
+                    let spanFresh = span.mine.tokensExCacheRead
+                    let spanCost = span.mine.cost
                     if dPct <= 0 {
                         print("      等值比：額度未移動（Δ \(dPct)%），無法計算")
                     } else if spanFresh == 0 {
@@ -735,27 +811,19 @@ enum WindowProbe {
                         print("      （Δ=0，跳過等值比與分辨力）")
                         continue
                     }
-                    var fA: Int64 = 0, fB: Int64 = 0, fC: Int64 = 0
-                    for (a, b) in zip(inWindow, inWindow.dropFirst()) {
-                        let l = a.sampledAt * 1000, h = b.sampledAt * 1000
-                        for m in usage.messages
-                            where m.timestamp > l && m.timestamp <= h
-                            && UsageAttribution.resolve(
-                                client: m.client, provider: m.providerId,
-                                model: m.modelId, records: confirmed) == .assigned(client) {
-                            fA = sum([fA, m.input, m.output, m.reasoning])
-                            fB = sum([fB, m.input, m.output, m.reasoning, m.cacheWrite])
-                            fC = fC.saturatingAdding(m.tokens)
-                        }
-                    }
+                    // Fold the full sampled span once: merging saturated pair
+                    // subtotals would change the legacy lane-by-lane arithmetic.
+                    let fA = span.components.incrementalInputOutputReasoning
+                    let fB = span.components.incrementalExCacheRead
+                    let fC = span.mine.tokens
                     print(String(format:
                         "      每 1%% 等值：in+out+reas %10ld  | ＋cacheWrite %10ld  | 全部 %12ld",
                         Int64(Double(fA) / dPct), Int64(Double(fB) / dPct),
                         Int64(Double(fC) / dPct)))
                     print(String(format:
                         "      cacheWrite 佔比 %.1f%% of 新鮮 | cacheRead 佔比 %.0fx 新鮮",
-                        Double(fB - fA) / Double(max(fA, 1)) * 100,
-                        Double(fC - fB) / Double(max(fA, 1))))
+                        (Double(fB) - Double(fA)) / Double(max(fA, 1)) * 100,
+                        (Double(fC) - Double(fB)) / Double(max(fA, 1))))
                     // Decisive test: which quantity separates the buckets where
                     // quota moved from the ones where it did not? A hand-picked
                     // token subset guesses the weights; `cost` already carries
@@ -763,19 +831,12 @@ enum WindowProbe {
                     struct Cand { let name: String; var moved: [Double] = []; var still: [Double] = [] }
                     var cands = [Cand(name: "in+out+reas"), Cand(name: "＋cacheWrite"),
                                  Cand(name: "全部 token"), Cand(name: "成本 $")]
-                    for (a, b) in zip(inWindow, inWindow.dropFirst()) {
-                        let l = a.sampledAt * 1000, h = b.sampledAt * 1000
-                        var v = [0.0, 0.0, 0.0, 0.0]
-                        for m in usage.messages
-                            where m.timestamp > l && m.timestamp <= h
-                            && UsageAttribution.resolve(
-                                client: m.client, provider: m.providerId,
-                                model: m.modelId, records: confirmed) == .assigned(client) {
-                            v[0] += Double(sum([m.input, m.output, m.reasoning]))
-                            v[1] += Double(sum([m.input, m.output, m.reasoning, m.cacheWrite]))
-                            v[2] += Double(m.tokens)
-                            v[3] += m.cost
-                        }
+                    for (index, pair) in pairs.enumerated() {
+                        let (a, b) = pair
+                        let components = try measuredInterval("pair-\(index)").components
+                        let v = [components.inputOutputReasoning,
+                                 components.inputOutputReasoningCacheWrite,
+                                 components.full, components.cost]
                         let moved = b.usedPercent > a.usedPercent
                         for i in 0..<4 { if moved { cands[i].moved.append(v[i]) }
                                          else { cands[i].still.append(v[i]) } }
@@ -797,21 +858,16 @@ enum WindowProbe {
                     // interval, so no number in the mock is ever invented.
                     var gaps: [Int] = [], freshes: [Int64] = [], costs: [Double] = []
                     var kinds: [[Int64]] = []
-                    for (a, b) in zip(inWindow, inWindow.dropFirst()) {
+                    for (index, pair) in pairs.enumerated() {
+                        let (a, b) = pair
                         let l = a.sampledAt * 1000, h = b.sampledAt * 1000
-                        let ms = usage.messages
-                            .filter { $0.timestamp > l && $0.timestamp <= h }
-                            .filter { m in
-                                UsageAttribution.resolve(
-                                    client: m.client, provider: m.providerId,
-                                    model: m.modelId, records: confirmed) == .assigned(client)
-                            }
+                        let counter = try measuredInterval("pair-\(index)").mine
                         gaps.append(Int((h - l) / 60000))
-                        freshes.append(sum(ms.map(\.tokensExCacheRead)))
-                        costs.append(ms.map(\.cost).reduce(0, +))
-                        kinds.append([sum(ms.map(\.input)), sum(ms.map(\.output)),
-                                      sum(ms.map(\.cacheRead)), sum(ms.map(\.cacheWrite)),
-                                      sum(ms.map(\.reasoning))])
+                        freshes.append(counter.tokensExCacheRead)
+                        costs.append(counter.cost)
+                        kinds.append([counter.breakdown.input, counter.breakdown.output,
+                                      counter.breakdown.cacheRead, counter.breakdown.cacheWrite,
+                                      counter.breakdown.reasoning])
                     }
                     print("      JSON: {\"used\":\(inWindow.map { Int($0.usedPercent) }), "
                           + "\"gaps\":\(gaps), \"fresh\":\(freshes), "
@@ -820,31 +876,106 @@ enum WindowProbe {
                           + "\"windowMin\":\((end - start) / 60000), "
                           + "\"elapsedMin\":\((now - start) / 60000)}")
                     print("      配對（相鄰取樣之間：額度 Δ% vs 本訂閱 token）:")
-                    for (a, b) in zip(inWindow, inWindow.dropFirst()) {
+                    for (index, pair) in pairs.enumerated() {
+                        let (a, b) = pair
                         let lo = a.sampledAt * 1000, hi = b.sampledAt * 1000
-                        let mine = usage.messages
-                            .filter { $0.timestamp > lo && $0.timestamp <= hi }
-                            .filter { m in
-                                UsageAttribution.resolve(
-                                    client: m.client, provider: m.providerId,
-                                    model: m.modelId, records: confirmed) == .assigned(client)
-                            }
-                        // Split it: cache reads dwarf everything by volume but
-                        // cost a fraction of the quota, so a bar sized by total
-                        // tokens cannot track the line by construction.
-                        let spent = sum(mine.map(\.tokens))
-                        let fresh = sum(mine.map { sum([$0.input, $0.output, $0.reasoning]) })
-                        let cacheR = sum(mine.map(\.cacheRead))
+                        let measured = try measuredInterval("pair-\(index)")
+                        let spent = measured.mine.tokens
+                        let fresh = measured.components.inputOutputReasoningTokens
+                        let cacheR = measured.mine.breakdown.cacheRead
                         print(String(format: "        +%.3f%%  總 %9ld (新鮮 %8ld, cacheR %9ld)  (%.0f 分)",
                                      b.usedPercent - a.usedPercent, spent, fresh, cacheR,
                                      Double(hi - lo) / 60000))
                     }
                 }
             }
+            }
             exit(0)
         } catch {
             FileHandle.standardError.write(Data("window probe failed: \(error)\n".utf8))
             exit(1)
+        }
+    }
+
+    private static func requestZones(_ zones: [HitZone]) -> [WindowUsageRequest.Zone] {
+        zones.map {
+            .init(index: Int64($0.index), loMs: $0.loMs, hiMs: $0.hiMs,
+                  includeLo: $0.index == 0)
+        }
+    }
+
+    /// Retains the old observed-span experiment's intersection with the scan,
+    /// including its unscoped selection and (sampleA,sampleB] membership.
+    private static func sampleInterval(
+        id: String, loMs: Int64, hiMs: Int64,
+        startMs: Int64, untilMs: Int64, subscription: String
+    ) -> WindowUsageRequest.DiagnosticInterval {
+        guard hiMs >= startMs, loMs < untilMs else {
+            return .init(id: id, fromMs: startMs, untilMs: startMs,
+                         includeFrom: false, includeUntil: false, subscription: subscription)
+        }
+        return .init(id: id, fromMs: max(loMs, startMs), untilMs: min(hiMs, untilMs),
+                     includeFrom: loMs < startMs, includeUntil: hiMs < untilMs,
+                     subscription: subscription)
+    }
+
+    private enum ProbeError: Error {
+        case missingJob(String)
+        case incoherentSnapshot
+    }
+
+    /// Structured asynchronous cleanup: every acquired lease is released before
+    /// this scope returns or throws. No unstructured release task outlives exit.
+    private static func withSnapshots(
+        _ body: (Snapshots) async throws -> Void
+    ) async throws {
+        let snapshots = Snapshots()
+        do {
+            try await body(snapshots)
+            await snapshots.release()
+        } catch {
+            await snapshots.release()
+            throw error
+        }
+    }
+
+    private final class Snapshots {
+        private var accounts: [String: WindowUsageBatch] = [:]
+        private let live = LiveUsageDataSource()
+
+        func query(
+            accountKey: String?, fromMs: Int64, untilMs: Int64,
+            request: (WindowUsageBatch) -> WindowUsageRequest
+        ) async throws -> WindowUsageBatch {
+            let key = accountKey ?? ""
+            let snapshot: WindowUsageBatch
+            if let retained = accounts[key] {
+                snapshot = retained
+            } else {
+                let capture = WindowUsageRequest(
+                    accountKey: accountKey, fromMs: fromMs, untilMs: untilMs,
+                    includeModelCatalog: true)
+                snapshot = try await live.windowUsage(capture)
+                accounts[key] = snapshot
+                try snapshot.validate(capture)
+            }
+            let job = request(snapshot)
+            let result = try await live.windowUsage(job)
+            try result.validate(job)
+            guard result.snapshotToken == snapshot.snapshotToken,
+                  result.sourceGeneration == snapshot.sourceGeneration,
+                  result.rootGeneration == snapshot.rootGeneration,
+                  result.priceGeneration == snapshot.priceGeneration else {
+                throw ProbeError.incoherentSnapshot
+            }
+            return result
+        }
+
+        func release() async {
+            for snapshot in accounts.values {
+                await live.releaseWindowUsage(snapshot.snapshotToken)
+            }
+            accounts.removeAll()
         }
     }
 
@@ -860,7 +991,7 @@ enum WindowProbe {
         case let .active(start, end):
             return "ACTIVE       剩 \((end - now) / 60000) 分  窗長 \((end - start) / 60000) 分"
         case .idle: return "IDLE         窗已結束、其後無用量"
-        case let .inferred(start, end):
+        case let .inferred(_, end):
             return "INFERRED     推得，剩 \((end - now) / 60000) 分"
         case .unavailable: return "UNAVAILABLE  無法判定"
         }

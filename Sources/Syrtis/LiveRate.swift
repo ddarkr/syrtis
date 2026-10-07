@@ -1,24 +1,39 @@
 import Foundation
 import TokenBarCore
 
-/// Shared rate policy for every UI surface. Hidden clients are removed from
-/// the live trace when necessary; otherwise the injected source's raw rate is
-/// used unchanged.
+/// Shared rate policy. A compact per-client trace preserves dynamic clients
+/// when hiding clients, without opening a separate ingestion lane.
 enum LiveRate {
-    /// The rate to display, with hidden clients excluded.
-    ///
-    /// Takes the source's own figure whenever nothing is hidden, which is both
-    /// the common case and the cheap one: `tokensPerMin()` is a single value,
-    /// while excluding a client means pulling a 10-minute trace and re-summing
-    /// it here, because a rate that has already been aggregated cannot have a
-    /// client subtracted from it afterwards.
-    ///
-    /// The hidden set comes from `hiddenTabClients()`, so hiding a grouped tab
-    /// removes every client under it rather than only the id that was stored.
+    /// Unscoped queries preserve unknown and dynamic unhidden client ids.
+    /// A mixed rate is only usable unchanged when no client is hidden.
+    static func query() -> LocalUsageScheduler.Query? {
+        ClientRegistry.hiddenTabClients().isEmpty
+            ? .init(kind: "rate")
+            : .init(kind: "trace", windowSecs: 60)
+    }
+
+    static func rate(
+        from value: LocalUsageValue,
+        hidden: Set<String> = ClientRegistry.hiddenTabClients()
+    ) -> Double? {
+        switch value {
+        case let .rate(rate): return hidden.isEmpty ? rate : nil
+        case let .trace(rows): return TraceBucket.totalRate(rows, hidden: hidden)
+        default: return nil
+        }
+    }
+
+    /// Diagnostic one-shot only; production rate demand uses its shared scheduler.
+    @MainActor
     static func current(source: any UsageDataSource) async throws -> Double {
-        let hidden = ClientRegistry.hiddenTabClients()
-        guard !hidden.isEmpty else { return try await source.tokensPerMin() }
-        let rows = try await source.usageTrace(windowSecs: 600)
-        return TraceBucket.totalRate(rows, hidden: hidden)
+        guard let query = query() else { throw CocoaError(.coderInvalidValue) }
+        let scheduler = LocalUsageScheduler(source: source, observesSources: false)
+        let session = scheduler.openSession()
+        defer { scheduler.release(session) }
+        let value = try await scheduler.acquire(query, session: session)
+        guard let rate = rate(from: value) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return rate
     }
 }

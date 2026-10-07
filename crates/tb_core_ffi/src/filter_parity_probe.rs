@@ -119,15 +119,20 @@ type ReportFn<'a> = dyn FnMut(&LocalSourceContext, Option<&[String]>) -> Result<
 
 /// Run the production parity probe using one context and a fresh graph.
 pub(crate) fn run(context: &LocalSourceContext) -> Result<FilterParityPayload, String> {
+    // One guard for the whole synchronous sequence: the report adapters below
+    // do not acquire it again, and no quota-provider request runs on this path.
+    let _local = crate::local_usage_guard();
     let mut token = |context: &LocalSourceContext| {
         tokscale_core::local_source_change_token(&context.parse_options(None, None))
     };
     let mut graph = |context: &LocalSourceContext| usage_graph::run(context, "");
     let mut hourly = |context: &LocalSourceContext, clients: Option<&[String]>| {
-        hourly_report::run(context, "", clients.map(|values| values.to_vec()))
+        let payload = hourly_report::run(context, "", clients.map(|values| values.to_vec()))?;
+        serde_json::from_str(payload.get()).map_err(|e| format!("decode hourly diagnostic: {e}"))
     };
     let mut agents = |context: &LocalSourceContext, clients: Option<&[String]>| {
-        agents_report::run(context, "", clients.map(|values| values.to_vec()))
+        let payload = agents_report::run(context, "", clients.map(|values| values.to_vec()))?;
+        serde_json::from_str(payload.get()).map_err(|e| format!("decode agents diagnostic: {e}"))
     };
 
     run_with(context, &mut token, &mut graph, &mut hourly, &mut agents)

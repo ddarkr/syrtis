@@ -21,12 +21,12 @@ use crate::agent_account_scope::{
     self, AccountScope, AccountScopeError, AuthoritativeIdKind, HistoryScope, RefreshCheckpoint,
     RefreshScopeTransaction,
 };
+use crate::agent_quota_duration::DurationEvidence;
 use crate::agent_usage::{
     clean_plan, parse_datetime, percent_encode, provider_http_client_builder, read_response_body,
     request_after_verified_binding, AgentIdentity, ProviderCacheBinding, ProviderFetchFailure,
     ResponseReadFailure, SafeTransportDiagnostic, TransportErrorFacts, TransportPhase, UsageWindow,
 };
-use crate::agent_quota_duration::DurationEvidence;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
@@ -289,19 +289,20 @@ where
                     "Antigravity CLI usage is already running.",
                 ));
             }
-            AgyLatch::Failed { marker: failed, retry_at } if *failed == marker => {
-                match retry_at {
-                    Some(at) if now >= *at => *state = AgyLatch::InFlight,
-                    Some(_) => {
-                        return Err(ProviderFetchFailure::terminal(AGY_TIMED_OUT_RETRYING));
-                    }
-                    None => {
-                        return Err(ProviderFetchFailure::terminal(
-                            "Antigravity CLI usage is paused after a failed attempt.",
-                        ));
-                    }
+            AgyLatch::Failed {
+                marker: failed,
+                retry_at,
+            } if *failed == marker => match retry_at {
+                Some(at) if now >= *at => *state = AgyLatch::InFlight,
+                Some(_) => {
+                    return Err(ProviderFetchFailure::terminal(AGY_TIMED_OUT_RETRYING));
                 }
-            }
+                None => {
+                    return Err(ProviderFetchFailure::terminal(
+                        "Antigravity CLI usage is paused after a failed attempt.",
+                    ));
+                }
+            },
             AgyLatch::Idle | AgyLatch::Failed { .. } => *state = AgyLatch::InFlight,
         }
     }
@@ -325,8 +326,7 @@ where
                 // other failure of a run that started may be agy asking for
                 // re-authentication, which can open a browser, so it stays
                 // latched until the login marker changes, as before.
-                let timed_out =
-                    matches!(&failure, ProviderFetchFailure::Terminal { display } if display == AGY_TIMED_OUT);
+                let timed_out = matches!(&failure, ProviderFetchFailure::Terminal { display } if display == AGY_TIMED_OUT);
                 release.next = AgyLatch::Failed {
                     marker,
                     retry_at: timed_out.then(|| now + chrono::Duration::seconds(AGY_RETRY_SECS)),
@@ -355,8 +355,7 @@ enum AgyLatch {
 const AGY_TIMED_OUT: &str = "Antigravity CLI usage timed out.";
 const AGY_NOT_FOUND: &str = "Antigravity CLI was not found.";
 const AGY_NOT_SIGNED_IN: &str = "Antigravity CLI is not signed in.";
-const AGY_TIMED_OUT_RETRYING: &str =
-    "Antigravity CLI usage timed out. Retrying automatically.";
+const AGY_TIMED_OUT_RETRYING: &str = "Antigravity CLI usage timed out. Retrying automatically.";
 /// Cooldown after a timed-out `agy /usage`, three tray cycles.
 const AGY_RETRY_SECS: i64 = 15 * 60;
 
@@ -835,7 +834,12 @@ fn agy_bucket_window(
     window: Option<&str>,
 ) -> Option<UsageWindow> {
     UsageWindow::try_from_provider_fraction(label, fraction, reset, now).map(|usage| {
-        usage.with_identity(card_id.clone(), Some(card_id), None, agy_window_duration(window))
+        usage.with_identity(
+            card_id.clone(),
+            Some(card_id),
+            None,
+            agy_window_duration(window),
+        )
     })
 }
 
@@ -2739,7 +2743,10 @@ where
 /// resetTime, window}}`. Labels and card ids follow the agy route
 /// (`parse_agy_usage`), so a captured card reads like the primary's. `None`
 /// on any failure or an empty answer: the caller falls back to the catalog.
-async fn fetch_quota_summary(context: &RemoteContext, now: DateTime<Utc>) -> Option<Vec<UsageWindow>> {
+async fn fetch_quota_summary(
+    context: &RemoteContext,
+    now: DateTime<Utc>,
+) -> Option<Vec<UsageWindow>> {
     let body = match context.project.as_deref() {
         Some(project) => json!({ "project": project }),
         None => json!({}),
@@ -2771,10 +2778,22 @@ fn windows_from_quota_summary(body: &str, now: DateTime<Utc>) -> Vec<UsageWindow
             .map(str::to_string)
     };
     let mut windows = Vec::new();
-    for group in response.get("groups").and_then(Value::as_array).into_iter().flatten() {
+    for group in response
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let group_name = text(group, "displayName").unwrap_or_else(|| "Antigravity".to_string());
-        for bucket in group.get("buckets").and_then(Value::as_array).into_iter().flatten() {
-            let Some(id) = text(bucket, "bucketId") else { continue };
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = text(bucket, "bucketId") else {
+                continue;
+            };
             let Some(fraction) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
                 continue;
             };
@@ -3292,8 +3311,9 @@ async fn auto_capture_with<I: CapturedIo>(
         Some(SecurityExit {
             code: Some(0),
             stdout,
-        }) => decode_stored(&stdout)
-            .is_some_and(|stored| stored.refresh_token == login.refresh_token),
+        }) => {
+            decode_stored(&stdout).is_some_and(|stored| stored.refresh_token == login.refresh_token)
+        }
         _ => false,
     };
     if unchanged {
@@ -3308,7 +3328,11 @@ async fn auto_capture_with<I: CapturedIo>(
         .get("id_token")
         .and_then(Value::as_str)
         .and_then(jwt_claims);
-    if claims.as_ref().and_then(|claims| non_empty_str(claims, "sub")) != Some(login.sub.as_str()) {
+    if claims
+        .as_ref()
+        .and_then(|claims| non_empty_str(claims, "sub"))
+        != Some(login.sub.as_str())
+    {
         return Err(CaptureError::AccountMismatch);
     }
     let label = claims
@@ -3624,8 +3648,11 @@ mod tests {
               {"id":"odd","name":"Odd Limit Remaining","window":"monthly","remaining_fraction":1,"reset_time":"2026-10-30T00:00:00Z"}
             ]}]}}}"#;
         let fetched = parse_agy_usage(body, now).unwrap();
-        let durations: Vec<Option<i64>> =
-            fetched.windows.iter().map(|w| w.duration_seconds_for_test()).collect();
+        let durations: Vec<Option<i64>> = fetched
+            .windows
+            .iter()
+            .map(|w| w.duration_seconds_for_test())
+            .collect();
         assert_eq!(durations, [Some(7 * 86_400), Some(5 * 3_600), None]);
     }
 
@@ -3871,16 +3898,31 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("Gemini Models · Weekly Limit Remaining", Some("agy.gemini-weekly.v1")),
-                ("Gemini Models · Five Hour Limit Remaining", Some("agy.gemini-5h.v1")),
-                ("Claude and GPT models · Weekly Limit Remaining", Some("agy.3p-weekly.v1")),
+                (
+                    "Gemini Models · Weekly Limit Remaining",
+                    Some("agy.gemini-weekly.v1")
+                ),
+                (
+                    "Gemini Models · Five Hour Limit Remaining",
+                    Some("agy.gemini-5h.v1")
+                ),
+                (
+                    "Claude and GPT models · Weekly Limit Remaining",
+                    Some("agy.3p-weekly.v1")
+                ),
             ]
         );
         assert!((windows[1].remaining_for_test() - 87.99).abs() < 0.01);
         // The declared window becomes the duration, so the card can draw a
         // curve without first learning the length over several resets.
-        let durations: Vec<Option<i64>> = windows.iter().map(|w| w.duration_seconds_for_test()).collect();
-        assert_eq!(durations, [Some(7 * 86_400), Some(5 * 3_600), Some(7 * 86_400)]);
+        let durations: Vec<Option<i64>> = windows
+            .iter()
+            .map(|w| w.duration_seconds_for_test())
+            .collect();
+        assert_eq!(
+            durations,
+            [Some(7 * 86_400), Some(5 * 3_600), Some(7 * 86_400)]
+        );
         assert!(windows_from_quota_summary("not json", now).is_empty());
         assert!(windows_from_quota_summary("{}", now).is_empty());
     }
@@ -5038,7 +5080,10 @@ mod tests {
         })
         .await;
         assert_eq!(runs.get(), 0, "an unreachable endpoint must not spawn agy");
-        assert!(matches!(blocked, Err(ProviderFetchFailure::Terminal { .. })));
+        assert!(matches!(
+            blocked,
+            Err(ProviderFetchFailure::Terminal { .. })
+        ));
 
         // Control. Without it, `runs == 0` above would also hold if the gate
         // rejected every call for an unrelated reason, or if the runner were
@@ -5099,7 +5144,10 @@ mod tests {
 
         let blocked = run_gate(&latch, None, &runs, Ok(())).await;
         assert_eq!(runs.get(), 0, "a signed-out agy must not be spawned");
-        assert!(matches!(blocked, Err(ProviderFetchFailure::Terminal { .. })));
+        assert!(matches!(
+            blocked,
+            Err(ProviderFetchFailure::Terminal { .. })
+        ));
         assert_eq!(latch_state(&latch), AgyLatch::Idle);
 
         // Control: the same gate with a marker does run.
@@ -5117,7 +5165,13 @@ mod tests {
             .await
             .is_err());
         assert_eq!(runs.get(), 1);
-        assert_eq!(latch_state(&latch), AgyLatch::Failed { marker: "m1".to_string(), retry_at: None });
+        assert_eq!(
+            latch_state(&latch),
+            AgyLatch::Failed {
+                marker: "m1".to_string(),
+                retry_at: None
+            }
+        );
 
         let paused = run_gate(&latch, marker("m1"), &runs, Ok(())).await;
         assert_eq!(
@@ -5126,7 +5180,13 @@ mod tests {
             "the same login must not respawn a failed agy"
         );
         assert!(matches!(paused, Err(ProviderFetchFailure::Terminal { .. })));
-        assert_eq!(latch_state(&latch), AgyLatch::Failed { marker: "m1".to_string(), retry_at: None });
+        assert_eq!(
+            latch_state(&latch),
+            AgyLatch::Failed {
+                marker: "m1".to_string(),
+                retry_at: None
+            }
+        );
 
         // A rewritten Keychain item (re-login) re-arms the route.
         assert!(run_gate(&latch, marker("m2"), &runs, Ok(())).await.is_ok());
@@ -5160,14 +5220,28 @@ mod tests {
         assert!(gate(t0, Some(AGY_TIMED_OUT)).await.is_err());
         assert_eq!(runs.get(), 1);
         let early = gate(t0 + chrono::Duration::seconds(AGY_RETRY_SECS - 1), None).await;
-        assert_eq!(runs.get(), 1, "inside the cooldown the same login is not respawned");
-        assert!(matches!(early, Err(ProviderFetchFailure::Terminal { display }) if display == AGY_TIMED_OUT_RETRYING));
-        assert!(gate(t0 + chrono::Duration::seconds(AGY_RETRY_SECS), None).await.is_ok());
-        assert_eq!(runs.get(), 2, "after the cooldown the timed-out route runs again");
+        assert_eq!(
+            runs.get(),
+            1,
+            "inside the cooldown the same login is not respawned"
+        );
+        assert!(
+            matches!(early, Err(ProviderFetchFailure::Terminal { display }) if display == AGY_TIMED_OUT_RETRYING)
+        );
+        assert!(gate(t0 + chrono::Duration::seconds(AGY_RETRY_SECS), None)
+            .await
+            .is_ok());
+        assert_eq!(
+            runs.get(),
+            2,
+            "after the cooldown the timed-out route runs again"
+        );
         assert_eq!(latch_state(latch), AgyLatch::Idle);
 
         // Control: a non-timeout failure stays latched past the cooldown.
-        assert!(gate(t0, Some("Antigravity CLI usage failed.")).await.is_err());
+        assert!(gate(t0, Some("Antigravity CLI usage failed."))
+            .await
+            .is_err());
         assert!(gate(t0 + chrono::Duration::hours(6), None).await.is_err());
         assert_eq!(runs.get(), 3, "a non-timeout failure waits for a new login");
     }
@@ -5176,7 +5250,11 @@ mod tests {
     /// agy missing or signed out keeps the primary's "not logged in".
     #[tokio::test]
     async fn the_agy_failure_replaces_not_logged_in_when_agy_actually_ran() {
-        let unconfigured = || Err(ProviderFetchFailure::terminal(ANTIGRAVITY_UNCONFIGURED_ERROR));
+        let unconfigured = || {
+            Err(ProviderFetchFailure::terminal(
+                ANTIGRAVITY_UNCONFIGURED_ERROR,
+            ))
+        };
         let shown = |r: Result<Fetched, ProviderFetchFailure>| match r {
             Err(ProviderFetchFailure::Terminal { display }) => display,
             _ => String::new(),
@@ -5195,11 +5273,16 @@ mod tests {
         }
         // Control: another primary failure keeps its own message.
         let other = with_agy_fallback(
-            Err(ProviderFetchFailure::terminal("Antigravity loadCodeAssist permission was denied.")),
+            Err(ProviderFetchFailure::terminal(
+                "Antigravity loadCodeAssist permission was denied.",
+            )),
             || async { Err(ProviderFetchFailure::terminal(AGY_TIMED_OUT_RETRYING)) },
         )
         .await;
-        assert_eq!(shown(other), "Antigravity loadCodeAssist permission was denied.");
+        assert_eq!(
+            shown(other),
+            "Antigravity loadCodeAssist permission was denied."
+        );
     }
 
     #[tokio::test]
@@ -5228,7 +5311,10 @@ mod tests {
             0,
             "an overlapping poll must not spawn a second agy"
         );
-        assert!(matches!(blocked, Err(ProviderFetchFailure::Terminal { .. })));
+        assert!(matches!(
+            blocked,
+            Err(ProviderFetchFailure::Terminal { .. })
+        ));
         assert_eq!(latch_state(&latch), AgyLatch::InFlight);
     }
 
@@ -5516,7 +5602,9 @@ pub(crate) mod captured_test_support {
 
         async fn client_artifacts(&self, throttle_login_shell: bool) -> Vec<Vec<u8>> {
             self.artifact_calls.set(self.artifact_calls.get() + 1);
-            self.artifact_throttles.borrow_mut().push(throttle_login_shell);
+            self.artifact_throttles
+                .borrow_mut()
+                .push(throttle_login_shell);
             self.artifacts.clone()
         }
 
@@ -6298,7 +6386,10 @@ mod captured_account_tests {
     async fn auto_capture_requires_googles_id_token_for_the_same_sub() {
         for (tag, extra) in [
             ("auto-no-id-token", json!({})),
-            ("auto-other-sub", json!({ "id_token": jwt(json!({ "sub": "sub-b" })) })),
+            (
+                "auto-other-sub",
+                json!({ "id_token": jwt(json!({ "sub": "sub-b" })) }),
+            ),
             ("auto-bad-id-token", json!({ "id_token": "not-a-jwt" })),
         ] {
             let mut io = auto_io(tag);
@@ -6340,7 +6431,10 @@ mod captured_account_tests {
         assert_eq!(io.security_calls.borrow().len(), 1);
         assert_eq!(io.network_calls(), 0);
         assert_eq!(
-            [CaptureError::Paused.code(), CaptureError::NotSignedIn.code()],
+            [
+                CaptureError::Paused.code(),
+                CaptureError::NotSignedIn.code()
+            ],
             ["paused", "not_signed_in"]
         );
     }

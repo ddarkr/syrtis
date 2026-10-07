@@ -4,6 +4,36 @@ import TokenBarCore
 
 @MainActor @Observable final class AttributedSeriesModel {
     private(set) var points: [AttributedDailySeries.Point]?
+    private let scheduler: LocalUsageScheduler?
+    private let localSession: LocalUsageScheduler.Session?
+    @ObservationIgnored private var displayedTimeZone: String?
+
+    func setDemand(wanted: Bool, confirmed: [UsageAttribution.Record]) {
+        guard let scheduler, let localSession, scheduler.contains(localSession) else { return }
+        scheduler.update(localSession, queries: wanted ? [.init(kind: "graph")] : [], active: true) {
+            [weak self] _, result in
+            guard let self, scheduler.contains(localSession) else { return }
+            switch result {
+            case .success(.graph(let payload)):
+                self.contributions = payload.contributions
+                self.displayedTimeZone = TimeZone.current.identifier
+                self.points = AttributedDailySeries.points(contributions: payload.contributions, confirmed: confirmed)
+            case .failure:
+                if self.displayedTimeZone != TimeZone.current.identifier {
+                    self.contributions = nil; self.points = nil
+                } else {
+                    self.points = self.contributions.map { AttributedDailySeries.points(contributions: $0, confirmed: confirmed) }
+                }
+            default: break
+            }
+        }
+        if !wanted { contributions = nil; points = nil }
+    }
+
+    func releaseDemand() {
+        if let scheduler, let localSession { scheduler.release(localSession) }
+        contributions = nil; points = nil
+    }
 
     /// Folds the previous open's rows at construction, so the card draws on the
     /// FIRST frame of a reopen instead of after one.
@@ -27,7 +57,11 @@ import TokenBarCore
     /// that does not match what the cache was acquired under makes every day
     /// key wrong, and `cacheTrustLost` means a transition is pending; in either
     /// case there is nothing honest to draw yet and the card waits, as before.
-    init(timeZone: String = TimeZone.current.identifier) {
+    init(timeZone: String = TimeZone.current.identifier,
+         scheduler: LocalUsageScheduler? = nil, localSession: LocalUsageScheduler.Session? = nil) {
+        precondition((scheduler == nil) == (localSession == nil), "Local usage owner and session must be paired")
+        self.scheduler = scheduler; self.localSession = localSession
+        if scheduler != nil { return }
         guard !Self.cacheTrustLost, Self.acquiredTimeZone == timeZone,
               let rows = Self.lastRows
         else { return }
@@ -39,15 +73,8 @@ import TokenBarCore
             confirmed: UsageAttribution.confirmed().records)
     }
 
-    /// The timezone whatever is in the graph cache was produced under, scoped
-    /// to the process rather than to one model. Everything it tracks is
-    /// process-scoped: the staticlib's graph cache is a process-lifetime static,
-    /// and AppDelegate's title-refresh loop warms the all-time entry long before
-    /// any popover opens. This model, meanwhile, is mounted the way
-    /// DashboardModel is — `@State` in a PopoverView that StatusItemController
-    /// tears down and rebuilds on every open/close — so an instance-scoped
-    /// baseline would be nil again on each open and the rule below would never
-    /// fire.
+    /// Cache provenance for legacy one-shot diagnostics only. Runtime series
+    /// are rebucketed by their explicit owner and retain no process-wide rows.
     ///
     /// nil means nobody recorded it, so the cache's provenance is unknown and
     /// the next acquisition recomputes rather than trusting it.
@@ -187,6 +214,14 @@ import TokenBarCore
         confirmed: [UsageAttribution.Record],
         timeZone: String = TimeZone.current.identifier
     ) async {
+        if let scheduler, let localSession {
+            guard case .graph(let payload) = try? await scheduler.acquire(.init(kind: "graph"), session: localSession),
+                  scheduler.contains(localSession), !Task.isCancelled else { return }
+            contributions = payload.contributions
+            displayedTimeZone = timeZone
+            points = AttributedDailySeries.points(contributions: payload.contributions, confirmed: confirmed)
+            return
+        }
         Self.installTimeZoneObserver()
         Self.loadToken &+= 1
         let token = Self.loadToken

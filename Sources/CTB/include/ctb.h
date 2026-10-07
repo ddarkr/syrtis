@@ -55,6 +55,14 @@
 // Smoke probe: total locally parsed messages.
 char *tb_probe(void);
 
+// Scheduler-only source synchronization, then pure pinned aggregate queries.
+// Requests/results use the LocalUsage JSON contract. No provider quota calls.
+// force synchronization starts inside the source lane after this request;
+// pure queries do not rediscover sources or refresh pricing.
+char *tb_local_usage_sync(const char *request_json);
+char *tb_local_usage_query(const char *request_json);
+char *tb_local_usage_release(const char *lease_token);
+
 // Contribution graph (UsagePayload). Serves a <=30s-old cached payload.
 char *tb_graph(const char *year);
 // Contribution graph, always recomputed (cache refreshed as a side effect).
@@ -107,24 +115,17 @@ char *tb_agent_usage(void);
 char *tb_quota_curve(const char *client_id, const char *account_key, const char *window_key,
                      uint64_t generation);
 
-/* PROTOTYPE - usage inside an absolute [from_ms, until_ms) window.
- *
- * `until_ms` is quantised to the minute for caching, so two calls sharing a
- * `from_ms` and landing in the same minute are answered from one scan: the
- * later call can be up to a minute short of its own end. Deliberate, and
- * tested (`window_usage::tests::quantised_window_calls_scan_once`) — the sole
- * consumer already serves its own scan for 30s before asking again, so exact
- * ends would buy precision nobody reads at the cost of a 0% hit rate.
- *
- * `account_key` selects whose transcripts are read: NULL for the primary
- * account, an extra Claude account's `CLAUDE_CONFIG_DIR` otherwise — the same
- * value `tb_quota_curve` takes, so a window's usage and the quota it is
- * divided against are scoped by one string. There is no "every account"
- * argument: a quota window belongs to an account, and a total spanning
- * accounts has no quota reading to divide by. Claude accounts only: a
- * captured Antigravity account's key names no config directory, and the app
- * does not pass it. */
-char *tb_window_usage(const char *account_key, int64_t from_ms, int64_t until_ms);
+/* Compact account-scoped aggregates, never raw messages. request_json is a
+ * WindowUsageRequest object: accountKey, exact [fromMs,untilMs), optional
+ * snapshotToken and explicit attribution/scope/window/diagnostic jobs.
+ * A first request captures source/root/pricing generations; token followups
+ * query that lease without source discovery or repricing. Invalid, expired,
+ * replaced or evicted snapshots return an error, not covered zero usage.
+ * Returned strings use the standard envelope and are released with tb_free. */
+char *tb_window_usage(const char *request_json);
+/* Independently release one lease. data:{released:bool}; absent token is false.
+ * snapshot_token must be a valid NUL-terminated string. */
+char *tb_window_usage_release(const char *snapshot_token);
 // Replace the process-wide extra-scan-paths registry used by every
 // subsequent report/parse call (no restart needed). `json` is an object of
 // `{"<public-client-id>": ["<absolute-dir-path>", ...]}`, full-replace

@@ -5,9 +5,8 @@ Read [`vendor/README.md`](README.md) before changing the
 [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md) for
 the shared-engine boundary and
 [`docs/knowledge/verification.md`](../docs/knowledge/verification.md) for
-required consumer evidence. Engine implementation work follows the public
-engine's immutable
-[`AGENTS.md`](https://github.com/Nanako0129/tokscale-core/blob/726efd7038727055bf8915d98939b973c3db17fe/AGENTS.md).
+required consumer evidence. Engine implementation work follows the pinned
+engine's [`AGENTS.md`](tokscale-core/AGENTS.md).
 
 ## Invariants
 
