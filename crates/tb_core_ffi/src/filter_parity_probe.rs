@@ -123,7 +123,7 @@ pub(crate) fn run(context: &LocalSourceContext) -> Result<FilterParityPayload, S
     // do not acquire it again, and no quota-provider request runs on this path.
     let _local = crate::local_usage_guard();
     let mut token = |context: &LocalSourceContext| {
-        tokscale_core::local_source_change_token(&context.parse_options(None, None))
+        syrtis_core::local_source_change_token(&context.parse_options(None, None))
     };
     let mut graph = |context: &LocalSourceContext| usage_graph::run(context, "");
     let mut hourly = |context: &LocalSourceContext, clients: Option<&[String]>| {
@@ -589,14 +589,14 @@ mod tests {
         let source = root.join(".codex/sessions/session.jsonl");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, b"seed\n").unwrap();
-        let options = tokscale_core::LocalParseOptions {
+        let options = syrtis_core::LocalParseOptions {
             home_dir: Some(root.to_string_lossy().into_owned()),
             use_env_roots: false,
             clients: Some(vec!["codex".to_string()]),
             ..Default::default()
         };
         let mut token =
-            |_context: &LocalSourceContext| tokscale_core::local_source_change_token(&options);
+            |_context: &LocalSourceContext| syrtis_core::local_source_change_token(&options);
         let calls = Rc::new(RefCell::new(Vec::new()));
         let graph_calls = Rc::clone(&calls);
         let mut graph_fn = |_context: &LocalSourceContext| {

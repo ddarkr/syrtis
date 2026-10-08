@@ -43,11 +43,11 @@ If you use an automated coding client, it must also follow [`AGENTS.md`](AGENTS.
 | Rust, C ABI, Swift data flow, reports, or filters | [`architecture.md`](docs/knowledge/architecture.md) and [`verification.md`](docs/knowledge/verification.md) |
 | Branches, commits, review, or integration | [`workflow.md`](docs/knowledge/workflow.md) and [`communication.md`](docs/knowledge/communication.md) |
 | Tests, fixtures, cache invalidation, or UX acceptance | [`verification.md`](docs/knowledge/verification.md) |
-| Shared tokscale engine or consumer pin | [`vendor/AGENTS.md`](vendor/AGENTS.md), [`vendor/README.md`](vendor/README.md), and [`vendor-tokscale.md`](docs/knowledge/vendor-tokscale.md) |
+| Syrtis engine, usage persistence, or upstream-derived parsers | [`architecture.md`](docs/knowledge/architecture.md) and [`vendor-tokscale.md`](docs/knowledge/vendor-tokscale.md) |
 | Sparkle, appcast, Homebrew, Pages, or release notes | [`release.md`](docs/knowledge/release.md) and [`workflow.md`](docs/knowledge/workflow.md) |
 | Landing site structure, deployment, or product claims | [`landing/AGENTS.md`](landing/AGENTS.md) and [`release.md`](docs/knowledge/release.md) |
 
-Durable architecture, verification, workflow, and release facts belong in `docs/knowledge/`. The engine's exact upstream baseline and local patch records belong in its pinned [`UPSTREAM.md`](vendor/tokscale-core/UPSTREAM.md); Syrtis's source and pin belong in `vendor/README.md`. A reviewed Native pin advance normally uses only the exact `tokscale-core` gitlink; when it travels with an app-owned C ABI change, as the `tb_window_usage` account parameter does, that change is named and the Windows port is notified under the `ctb.h` signature rule. Consumer gates re-establish build-decoder compatibility, and the engine's LocalOnly, CostCoverage, embedded-cost, and partial-estimation semantics are not claimed to have reached Swift.
+Durable architecture, verification, workflow, and release facts belong in `docs/knowledge/`. The engine lives in [`crates/syrtis_core`](crates/syrtis_core), with its inherited upstream baseline and patch history retained in [`UPSTREAM.md`](crates/syrtis_core/UPSTREAM.md). Engine and app changes are one Syrtis change; there is no separate engine pin or publication gate. Preserve MIT attribution. Name C ABI changes and notify the Windows port under the `ctb.h` signature rule. Consumer gates re-establish build-decoder compatibility, and the engine's LocalOnly, CostCoverage, embedded-cost, and partial-estimation semantics are not claimed to have reached Swift.
 
 ## Development environment
 
@@ -88,7 +88,7 @@ Create a topic branch from the current upstream `main` branch, and keep each bra
 
 > **Pre-aggregation:** Do not try to subtract a client after contributions have been combined into a mixed aggregate. Pass non-empty filters to the producer while client identity is still available, and preserve the documented `nil` or empty-list semantics across Swift, C, and Rust.
 
-> **Shared-engine boundary:** Land shared Rust changes and their ledger updates in `tokscale-core`, then advance Syrtis's submodule only to a reviewed engine commit. Syrtis keeps `tb_core_ffi`, the C header, Swift, root lockfile, and app wiring in this repository.
+> **Engine ownership:** `crates/syrtis_core` is Syrtis-owned source, not a submodule or a separately released dependency. Modify parsers, storage, pricing, and reports here and verify them with `tb_core_ffi` and Swift. Preserve upstream attribution and regression evidence. Do not commit or push without explicit approval.
 
 | Change class | Required evidence or treatment |
 |---|---|

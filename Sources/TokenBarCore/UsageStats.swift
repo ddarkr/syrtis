@@ -2,7 +2,7 @@ import Foundation
 
 // Dashboard stats derived from a UsagePayload, ported from the Tauri app's
 // src/lib/stats.ts + streaks.ts. Day keys are local-timezone `YYYY-MM-DD`
-// strings (tokscale-core's bucketing); day arithmetic uses a civil-date day
+// strings (syrtis-core's bucketing); day arithmetic uses a civil-date day
 // number so no Calendar/timezone is involved.
 
 public struct ISODay: Equatable, Sendable {

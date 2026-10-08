@@ -207,7 +207,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(tokscale_core::get_window_usage(
+            .block_on(syrtis_core::get_window_usage(
                 options,
                 WINDOW_FROM,
                 WINDOW_UNTIL,
@@ -584,10 +584,10 @@ mod tests {
         let context = crate::LocalSourceContext::for_home(fixture.home.clone());
         for account in [&fixture.d, &fixture.e] {
             let dir = account.display().to_string();
-            let before = tokscale_core::ReportOptions {
+            let before = syrtis_core::ReportOptions {
                 home_dir: Some(dir.clone()),
                 use_env_roots: false,
-                scanner_settings: tokscale_core::scanner::ScannerSettings {
+                scanner_settings: syrtis_core::scanner::ScannerSettings {
                     extra_scan_paths: BTreeMap::from([(
                         CLAUDE.to_string(),
                         registered_roots_under(&dir),
@@ -601,7 +601,7 @@ mod tests {
                 .build()
                 .unwrap();
             let old = runtime
-                .block_on(tokscale_core::get_window_usage(
+                .block_on(syrtis_core::get_window_usage(
                     before,
                     WINDOW_FROM,
                     WINDOW_UNTIL,
@@ -770,30 +770,30 @@ mod tests {
             .unwrap();
         }
         drop(db);
-        let options = tokscale_core::LocalParseOptions {
+        let options = syrtis_core::LocalParseOptions {
             home_dir: Some(dir.path().display().to_string()),
             use_env_roots: false,
             clients: Some(vec!["opencode".into()]),
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 opencode_db_paths: vec![db_path],
                 ..Default::default()
             },
             ..Default::default()
         };
-        let context = tokscale_core::ResolvedLocalSourceContext::capture(
+        let context = syrtis_core::ResolvedLocalSourceContext::capture(
             Some(dir.path().to_path_buf()),
             false,
             options.scanner_settings.clone(),
         )
         .unwrap();
-        let snapshot = tokscale_core::synchronize_local_usage(
+        let snapshot = syrtis_core::synchronize_local_usage(
             &context,
             options,
-            tokscale_core::LocalUsageSelection::LocalClients,
+            syrtis_core::LocalUsageSelection::LocalClients,
         )
         .unwrap();
         let mut undated_count = 0u32;
-        tokscale_core::visit_local_usage_snapshot(
+        syrtis_core::visit_local_usage_snapshot(
             &snapshot,
             LocalUsageQuery {
                 until_ms: Some(1),
@@ -1010,7 +1010,7 @@ mod tests {
             "provider",
             "session",
             1000,
-            tokscale_core::TokenBreakdown {
+            syrtis_core::TokenBreakdown {
                 input: i64::MAX,
                 output: 1,
                 cache_read: 1,
@@ -1058,7 +1058,7 @@ mod tests {
             "provider",
             "session",
             1001,
-            tokscale_core::TokenBreakdown {
+            syrtis_core::TokenBreakdown {
                 input: i64::MIN,
                 ..Default::default()
             },
@@ -1140,11 +1140,11 @@ mod tests {
         reset_registries();
     }
 
-    fn fixture_pricing(rate: f64) -> Arc<tokscale_core::pricing::PricingService> {
-        Arc::new(tokscale_core::pricing::PricingService::new(
+    fn fixture_pricing(rate: f64) -> Arc<syrtis_core::pricing::PricingService> {
+        Arc::new(syrtis_core::pricing::PricingService::new(
             std::collections::HashMap::from([(
                 "fixture-model".into(),
-                tokscale_core::pricing::ModelPricing {
+                syrtis_core::pricing::ModelPricing {
                     input_cost_per_token: Some(rate),
                     output_cost_per_token: Some(0.0),
                     cache_creation_input_token_cost: Some(0.0),
@@ -1227,10 +1227,10 @@ mod tests {
         let _guards = lock_registries();
         reset_registries();
         let (dir, mut large) = disk_fixture(&[]);
-        let huge_catalog = Arc::new(tokscale_core::pricing::PricingService::new(
+        let huge_catalog = Arc::new(syrtis_core::pricing::PricingService::new(
             std::collections::HashMap::from([(
                 "x".repeat(MAX_LEASE_BYTES),
-                tokscale_core::pricing::ModelPricing::default(),
+                syrtis_core::pricing::ModelPricing::default(),
             )]),
             std::collections::HashMap::new(),
         ));
@@ -1281,26 +1281,26 @@ mod tests {
         let original = fixture_fold(request(&PRIMARY, 1000, 2000), &lease);
         let db_path = dir.path().join("opencode.db");
         std::fs::write(&db_path, b"not a SQLite database").unwrap();
-        let options = tokscale_core::LocalParseOptions {
+        let options = syrtis_core::LocalParseOptions {
             home_dir: Some(dir.path().display().to_string()),
             use_env_roots: false,
             clients: Some(vec!["opencode".into()]),
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 opencode_db_paths: vec![db_path],
                 ..Default::default()
             },
             ..Default::default()
         };
-        let context = tokscale_core::ResolvedLocalSourceContext::capture(
+        let context = syrtis_core::ResolvedLocalSourceContext::capture(
             Some(dir.path().to_path_buf()),
             false,
             options.scanner_settings.clone(),
         )
         .unwrap();
-        assert!(tokscale_core::synchronize_local_usage(
+        assert!(syrtis_core::synchronize_local_usage(
             &context,
             options,
-            tokscale_core::LocalUsageSelection::LocalClients
+            syrtis_core::LocalUsageSelection::LocalClients
         )
         .is_err());
         let retained = fixture_fold(request(&PRIMARY, 1000, 2000), &lease);

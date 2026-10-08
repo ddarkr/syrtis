@@ -1,22 +1,11 @@
-# Shared-engine task routing
+# Historical vendor routing
 
-Read [`vendor/README.md`](README.md) before changing the
-`vendor/tokscale-core` pin. Then read
-[`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md) for
-the shared-engine boundary and
-[`docs/knowledge/verification.md`](../docs/knowledge/verification.md) for
-required consumer evidence. Engine implementation work follows the pinned
-engine's [`AGENTS.md`](tokscale-core/AGENTS.md).
+The Rust engine is ordinary Syrtis-owned source at `crates/syrtis_core`, not a
+Git submodule. Read [`docs/knowledge/README.md`](../docs/knowledge/README.md),
+[`architecture.md`](../docs/knowledge/architecture.md), and
+[`vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md) before engine or
+usage-storage changes. Verify the engine, C ABI, and Swift consumer together.
 
-## Invariants
-
-| Boundary | Rule |
-|---|---|
-| Pin | `vendor/tokscale-core` must be a clean gitlink at the reviewed engine commit recorded in `vendor/README.md`. |
-| Engine ownership | Do not edit shared Rust source inside the TokenBar submodule. Land and verify the engine change in `tokscale-core`, then update this consumer pin. |
-| Consumer ownership | TokenBar continues to own `crates/tb_core_ffi`, `Sources/CTB/include/ctb.h`, Swift code, build wiring, and the root `Cargo.lock`. |
-| Parity | A pin update must verify materialized and streaming behavior, cache/schema consequences, FFI mappings, and the Rust-to-Swift app gates that the change can affect. |
-| Ledger | The engine's `UPSTREAM.md` owns the exact upstream and local-patch ledger. `vendor/README.md` records only TokenBar's source and pin. |
-
-No shared-engine task may push or merge by implication from a plan. Return the
-diff and verification evidence to the user for authorization.
+This directory preserves historical links only. It does not define a separate
+engine pin, repository, review, publication, or synchronization requirement.
+Do not commit, push, merge, or publish without explicit user authorization.

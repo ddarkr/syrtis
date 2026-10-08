@@ -2,7 +2,7 @@ import Foundation
 
 // GitHub-style contribution grid layout, port of src/lib/grid.ts. Pure
 // civil-date math over ISODay — no Calendar/timezone involvement, matching
-// how tokscale-core buckets days.
+// how syrtis-core buckets days.
 
 public struct GridCell: Sendable {
     public let col: Int

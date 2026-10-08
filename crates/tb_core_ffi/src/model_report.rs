@@ -1,4 +1,4 @@
-//! Per-model usage breakdown for the popover, backed by tokscale-core's
+//! Per-model usage breakdown for the popover, backed by syrtis-core's
 //! `get_model_report`. Mirrors the design of tokscale's TUI "Models" view
 //! (`crates/tokscale-cli/src/tui/ui/models.rs`): one row per model with the
 //! token breakdown, message count, cost, and throughput (ms/1K), sorted by
@@ -60,15 +60,15 @@ struct ModelReportData {
 /// Providers must stay separate. Under tokscale's default `ClientModel`
 /// grouping a model served by two providers folds into ONE row whose
 /// `provider` is a comma-joined string (`"nvidia, deepseek"`) and whose tokens
-/// are summed — see `aggregate_model_usage_entries` in tokscale-core. That
+/// are summed — see `aggregate_model_usage_entries` in syrtis-core. That
 /// merge is lossy: no downstream consumer can split the row back apart, so any
 /// per-provider attribution has to be decided here, at the producer.
 fn model_report_options(
     context: &crate::LocalSourceContext,
     year: Option<String>,
-) -> tokscale_core::ReportOptions {
+) -> syrtis_core::ReportOptions {
     let mut options = context.report_options(year, None);
-    options.group_by = tokscale_core::GroupBy::ClientProviderModel;
+    options.group_by = syrtis_core::GroupBy::ClientProviderModel;
     options
 }
 
@@ -84,24 +84,24 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_model_report(options))?;
+    let report = runtime.block_on(syrtis_core::get_model_report(options))?;
 
     // Read-only, no network: `get_model_report` has already refreshed and
     // written this cache on its own path, and a cold cache (first ever run,
     // offline) simply yields None, which disables the check rather than
     // reporting on a table that isn't there.
-    let pricing = tokscale_core::pricing::PricingService::load_cached_any_age();
+    let pricing = syrtis_core::pricing::PricingService::load_cached_any_age();
 
     let data = map_report(report, pricing.as_ref());
     crate::encode_local_payload(&data)
 }
 pub(crate) fn run_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
-    mut options: tokscale_core::ReportOptions,
-    pricing: Option<&tokscale_core::pricing::PricingService>,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
+    mut options: syrtis_core::ReportOptions,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> Result<crate::EncodedLocalPayload, String> {
-    options.group_by = tokscale_core::GroupBy::ClientProviderModel;
-    let report = tokscale_core::get_model_report_from_snapshot(snapshot, options, pricing)?;
+    options.group_by = syrtis_core::GroupBy::ClientProviderModel;
+    let report = syrtis_core::get_model_report_from_snapshot(snapshot, options, pricing)?;
     crate::encode_local_payload(&map_report(report, pricing))
 }
 
@@ -109,7 +109,7 @@ pub(crate) fn run_from_snapshot(
 /// when it cannot price them.
 ///
 /// This exists because clients that record their own per-message cost
-/// (OpenCode, MiMo Code) have it taken verbatim: tokscale-core's
+/// (OpenCode, MiMo Code) have it taken verbatim: syrtis-core's
 /// `apply_pricing_if_available` returns early on `has_authoritative_cost()`,
 /// so no pricing table ever sees those rows. That default is right — the
 /// client knows its own billing contract — but it also means a unit error
@@ -123,11 +123,11 @@ pub(crate) fn run_from_snapshot(
 /// price these tokens at all, which is not evidence about the reported cost
 /// and must not become a division by zero downstream.
 fn local_cost_estimate(
-    pricing: Option<&tokscale_core::pricing::PricingService>,
-    entry: &tokscale_core::ModelUsage,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
+    entry: &syrtis_core::ModelUsage,
 ) -> Option<f64> {
     let pricing = pricing?;
-    let usage = tokscale_core::TokenBreakdown {
+    let usage = syrtis_core::TokenBreakdown {
         input: entry.input,
         output: entry.output,
         cache_read: entry.cache_read,
@@ -196,8 +196,8 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
 }
 
 fn map_report(
-    report: tokscale_core::ModelReport,
-    pricing: Option<&tokscale_core::pricing::PricingService>,
+    report: syrtis_core::ModelReport,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> ModelReportData {
     ModelReportData {
         entries: report
@@ -238,7 +238,7 @@ fn map_report(
         total_cache_write: report.total_cache_write,
         total_messages: report.total_messages,
         total_cost: report.total_cost,
-        pricing_updated_at: tokscale_core::pricing::pricing_cached_at(),
+        pricing_updated_at: syrtis_core::pricing::pricing_cached_at(),
     }
 }
 
@@ -273,7 +273,7 @@ mod tests {
             let input = case[0].as_str().expect("input is a string");
             let expected = case[1].as_str().expect("expected is a string");
             assert_eq!(
-                tokscale_core::normalize_model_for_grouping(input),
+                syrtis_core::normalize_model_for_grouping(input),
                 expected,
                 "engine grouping for {input}"
             );
@@ -341,8 +341,8 @@ mod tests {
     fn model_report_direct(
         home: &Path,
         client: &str,
-        group_by: Option<tokscale_core::GroupBy>,
-    ) -> tokscale_core::ModelReport {
+        group_by: Option<syrtis_core::GroupBy>,
+    ) -> syrtis_core::ModelReport {
         let context = crate::LocalSourceContext::for_home(home.to_path_buf());
         let mut options = model_report_options(&context, None);
         // report_options defaults to environment roots for production. Tests
@@ -357,7 +357,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(tokscale_core::get_model_report(options))
+            .block_on(syrtis_core::get_model_report(options))
             .unwrap()
     }
 
@@ -371,8 +371,8 @@ mod tests {
             .unwrap_or_default()
             .as_str()
         {
-            "client,model" => Some(tokscale_core::GroupBy::ClientModel),
-            "client,provider,model" => Some(tokscale_core::GroupBy::ClientProviderModel),
+            "client,model" => Some(syrtis_core::GroupBy::ClientModel),
+            "client,provider,model" => Some(syrtis_core::GroupBy::ClientProviderModel),
             _ => None,
         };
         let report = model_report_direct(Path::new(&home), &client, group_by);
@@ -385,7 +385,7 @@ mod tests {
     fn model_report(
         context: &crate::LocalSourceContext,
         client: &str,
-        group_by: Option<tokscale_core::GroupBy>,
+        group_by: Option<syrtis_core::GroupBy>,
     ) -> TestModelReport {
         let fixture_home = context.home_dir.as_ref().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
@@ -453,7 +453,7 @@ mod tests {
         );
         assert_eq!(
             options.group_by,
-            tokscale_core::GroupBy::ClientProviderModel
+            syrtis_core::GroupBy::ClientProviderModel
         );
     }
 
@@ -515,7 +515,7 @@ mod tests {
         );
 
         let merged_report =
-            model_report(&context, "jcode", Some(tokscale_core::GroupBy::ClientModel));
+            model_report(&context, "jcode", Some(syrtis_core::GroupBy::ClientModel));
         assert_eq!(merged_report.entries.len(), 1);
         let merged = &merged_report.entries[0];
         assert_eq!(merged.client, "jcode");
@@ -587,7 +587,7 @@ mod tests {
 
         let provider_grouped = model_report(&context, "jcode", None);
         let client_grouped =
-            model_report(&context, "jcode", Some(tokscale_core::GroupBy::ClientModel));
+            model_report(&context, "jcode", Some(syrtis_core::GroupBy::ClientModel));
         assert_eq!(provider_grouped.entries.len(), 1);
         assert_eq!(client_grouped.entries.len(), 1);
         let provider_entry = &provider_grouped.entries[0];
@@ -623,8 +623,8 @@ mod tests {
         cache_read: i64,
         cache_write: i64,
         reasoning: i64,
-    ) -> tokscale_core::ModelUsage {
-        tokscale_core::ModelUsage {
+    ) -> syrtis_core::ModelUsage {
+        syrtis_core::ModelUsage {
             client: "antigravity_cli".to_string(),
             merged_clients: None,
             workspace_key: None,
@@ -639,12 +639,12 @@ mod tests {
             reasoning,
             message_count: 1,
             cost: 0.0,
-            performance: tokscale_core::ModelPerformance::default(),
+            performance: syrtis_core::ModelPerformance::default(),
         }
     }
 
-    fn wrap(entries: Vec<tokscale_core::ModelUsage>) -> tokscale_core::ModelReport {
-        tokscale_core::ModelReport {
+    fn wrap(entries: Vec<syrtis_core::ModelUsage>) -> syrtis_core::ModelReport {
+        syrtis_core::ModelReport {
             entries,
             total_input: 0,
             total_output: 0,
@@ -690,21 +690,21 @@ mod tests {
     /// $1.00 per 1M input tokens and nothing else, so every estimate below is
     /// a number this test states rather than one the shipping dataset supplies
     /// (which would drift with upstream and make the assertions meaningless).
-    fn priced_service(model: &str) -> tokscale_core::pricing::PricingService {
+    fn priced_service(model: &str) -> syrtis_core::pricing::PricingService {
         let mut litellm = std::collections::HashMap::new();
         litellm.insert(
             model.to_string(),
-            tokscale_core::pricing::litellm::ModelPricing {
+            syrtis_core::pricing::litellm::ModelPricing {
                 input_cost_per_token: Some(1e-6),
                 ..Default::default()
             },
         );
-        tokscale_core::pricing::PricingService::new(litellm, std::collections::HashMap::new())
+        syrtis_core::pricing::PricingService::new(litellm, std::collections::HashMap::new())
     }
 
     /// 1M input tokens, which the table above prices at exactly $1.00 — so
     /// every expected estimate below is a round number this test states.
-    fn priced_entry(model: &str, cost: f64) -> tokscale_core::ModelUsage {
+    fn priced_entry(model: &str, cost: f64) -> syrtis_core::ModelUsage {
         let mut e = entry(1_000_000, 0, 0, 0, 0);
         e.model = model.to_string();
         e.provider = "deepseek".to_string();
@@ -746,14 +746,14 @@ mod tests {
         let mut litellm = std::collections::HashMap::new();
         litellm.insert(
             "no5m".to_string(),
-            tokscale_core::pricing::litellm::ModelPricing {
+            syrtis_core::pricing::litellm::ModelPricing {
                 input_cost_per_token: Some(1e-6),
                 // cache_creation_input_token_cost deliberately absent.
                 ..Default::default()
             },
         );
         let service =
-            tokscale_core::pricing::PricingService::new(litellm, std::collections::HashMap::new());
+            syrtis_core::pricing::PricingService::new(litellm, std::collections::HashMap::new());
 
         let mut e = entry(100_000, 0, 0, 10_000_000, 0);
         e.model = "no5m".to_string();
@@ -772,7 +772,7 @@ mod tests {
         let billed = service.calculate_cost_with_provider(
             "no5m",
             Some("anthropic"),
-            &tokscale_core::TokenBreakdown {
+            &syrtis_core::TokenBreakdown {
                 input: e.input,
                 output: 0,
                 cache_read: 0,

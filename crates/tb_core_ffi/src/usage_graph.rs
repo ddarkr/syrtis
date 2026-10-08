@@ -1,9 +1,9 @@
 //! Contribution-graph payload for the popover.
 //!
-//! Session parsing, dedup, and pricing are delegated to the vendored
-//! `tokscale-core` crate (see `vendor/tokscale-core`), which covers every
+//! Session parsing, dedup, and pricing are delegated to the owned
+//! `syrtis-core` crate (see `crates/syrtis_core`), which covers every
 //! supported agent and ships mature LiteLLM/OpenRouter pricing. This module
-//! is now a thin adapter: it drives `tokscale-core`'s local graph report and
+//! is now a thin adapter: it drives `syrtis-core`'s local graph report and
 //! maps the resulting `GraphResult` back onto the camelCase JSON shape the
 //! frontend already consumes (`src/lib/types.ts` `UsagePayload`).
 
@@ -92,7 +92,7 @@ struct ExportMeta {
     version: String,
     date_range: DateRange,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pricing_contract: Option<tokscale_core::GraphMetaContract>,
+    pricing_contract: Option<syrtis_core::GraphMetaContract>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,22 +119,22 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let graph = runtime.block_on(tokscale_core::generate_local_graph_report(options))?;
+    let graph = runtime.block_on(syrtis_core::generate_local_graph_report(options))?;
 
     let payload = map_graph(graph);
     serde_json::to_value(payload).map_err(|e| format!("serialize usage graph: {}", e))
 }
 /// Fold a captured source/price generation; never probe or ingest sources.
 pub(crate) fn run_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
-    options: tokscale_core::ReportOptions,
-    pricing: Option<&tokscale_core::pricing::PricingService>,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
+    options: syrtis_core::ReportOptions,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> Result<crate::EncodedLocalPayload, String> {
-    let result = tokscale_core::generate_local_graph_from_snapshot(
+    let result = syrtis_core::generate_local_graph_from_snapshot(
         snapshot,
         options,
         pricing,
-        tokscale_core::GraphPricingMode::BestEffort,
+        syrtis_core::GraphPricingMode::BestEffort,
     )?;
     let (graph, contract) = result.into_parts();
     let mut payload = map_graph(graph);
@@ -154,12 +154,12 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Map `tokscale-core`'s `GraphResult` onto the frontend-facing payload.
+/// Map `syrtis-core`'s `GraphResult` onto the frontend-facing payload.
 /// Field renames: tokscale uses flat `date_range_start/end` and
 /// `range_start/end`, the frontend expects nested `{ start, end }`. Extra
 /// tokscale fields (`active_time_ms`, `time_metrics`, `processing_time_ms`)
 /// are intentionally dropped. The reported `version` is branded as tokenbar.
-fn map_graph(graph: tokscale_core::GraphResult) -> TokenContributionData {
+fn map_graph(graph: syrtis_core::GraphResult) -> TokenContributionData {
     TokenContributionData {
         meta: ExportMeta {
             generated_at: graph.meta.generated_at,
@@ -201,7 +201,7 @@ fn map_graph(graph: tokscale_core::GraphResult) -> TokenContributionData {
     }
 }
 
-fn map_contribution(day: tokscale_core::DailyContribution) -> DailyContribution {
+fn map_contribution(day: syrtis_core::DailyContribution) -> DailyContribution {
     DailyContribution {
         date: day.date,
         totals: DailyTotals {
@@ -227,7 +227,7 @@ fn map_contribution(day: tokscale_core::DailyContribution) -> DailyContribution 
     }
 }
 
-fn map_breakdown(breakdown: &tokscale_core::TokenBreakdown) -> TokenBreakdown {
+fn map_breakdown(breakdown: &syrtis_core::TokenBreakdown) -> TokenBreakdown {
     TokenBreakdown {
         input: breakdown.input,
         output: breakdown.output,

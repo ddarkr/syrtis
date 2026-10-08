@@ -116,7 +116,7 @@ make selftest          # = swift run Syrtis --selftest -AppleLanguages "(en)"
 swift run Syrtis --smoke
 ```
 
-`cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates. CI runs a subset on every run that builds Rust (a PR whose Rust inputs or the fixtures its tests read under `Fixtures/` and `Tests/fixtures/` changed, and every push to `main`; a PR that links main's cached library skips them with the build): `cargo test -p tb_core_ffi --locked` — the FFI crate's tests, not the whole workspace's — and `cargo clippy -p tb_core_ffi --all-targets --locked --no-deps`, which fails on error-level lints only (`tb_core_ffi` currently has warnings). CI does not lint `vendor/tokscale-core`: its `#![deny(clippy::all)]` under the floating stable toolchain would let a new Rust release turn every run red, so the workspace-wide Clippy remains a local gate. `--no-deps` is what excludes it; `-p` alone still lints the engine, because a path dependency that is a workspace member gets no lint cap. In the local gate, `--all-targets` is required because `vendor/tokscale-core/src/lib.rs` declares `#![deny(clippy::all)]`, so a test-only lint can fail the gate even when the library target itself is clean. In CI's command, where `--no-deps` leaves the engine out, `--all-targets` makes Clippy check `tb_core_ffi`'s test targets as well as its library.
+`cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates. CI's Rust-build subset runs `cargo test -p tb_core_ffi --locked` and `cargo clippy -p tb_core_ffi --all-targets --locked --no-deps`; neither replaces workspace engine verification. The owned engine retains `#![deny(clippy::all)]` and the repository pins its Rust toolchain. A cached-library PR skips rebuilding unchanged Rust inputs.
 
 Live account-scope smoke必須在hermetic security suite通過後才執行，且每次重新執行都需要當次明確授權。若出現任何Keychain或credential授權視窗，立即停止process並把smoke判為失敗；不得要求輸入登入密碼、讀取secret或用真實credential診斷。
 
@@ -130,9 +130,20 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 | Account-scope storage | Hermetic security tests先證明permission、path、locking、atomicity與recovery；live smoke只驗證shipping data flow不彈授權UI，不取代fixture correctness |
 | Windows secure storage | M19-B0證明Native candidate與核准Windows security/storage semantic source等價；M19-B1又在hosted Windows x64 runtime執行CNG、owner／exact protected DACL、final-component reparse、file identity、exclusive no-delete-share lock、replace、quarantine、legacy upgrade與error-privacy tests。合併後的exact Windows source另在real ARM64 Windows通過351項Rust tests、12-case provider-v3 CrossCheck、ARM64 PE checks與synthetic WinUI startup；macOS tests與GitHub ARM64 cross-package都不取代這些runtime assertions |
 | Relink safety | If Rust changed without Swift source changes, the stale executable is removed before linking |
-| Rust format | For Rust changes, run `cargo fmt --all -- --check` on the touched scope; vendor formatting policy may be intentionally separate |
+| Rust format | Run the repository formatter check on task-owned files; when preserving unrelated dirty source, check exact file text through rustfmt stdin so out-of-line modules are not reformatted |
 | Local Rust tests | `cargo test` passes across workspace crates and test targets |
 | Local Clippy | `cargo clippy --workspace --all-targets` passes, including test-only targets |
+
+
+### Durable usage verification
+
+The actual release static archive was linked into a hermetic Swift C-ABI harness, without provider requests or Keychain reads. Graph and hourly token totals and model and agent message totals agreed through truncation, partial and complete source deletion, a fresh process, restored copied transcripts, and eviction of 40 query scopes. Restored stable identities did not double-count. A legacy SQLite store whose original transcript was already gone migrated successfully; deleting its legacy cache did not change reports. The smoke exposed and fixed missing historical `sq_decisions.cache_format` adoption.
+
+OpenCode WAL-only delete and update scenarios preserved prior rows and reconciled changed observations while the main database bytes and mtime stayed unchanged. Provider-reported costs remained authoritative; complete DB-directory removal preserved 176 tokens, three messages, and cost 0.375. A 20,000-message corpus retained 760,000 tokens across graph, hourly, models, and agents after the source tree was removed. These are correctness checks, not full steady-state resource or Windows acceptance.
+
+The ownership cutover passed 2,486 top-level workspace tests (six ignored), `cargo clippy --workspace --all-targets --locked`, and the release FFI build. The FFI retains warning-level Clippy debt (15 library and 22 test-target warnings); this is not a strict FFI lint gate. Both `make selftest` and `make selftest-bundled` completed with `selftest passed`, using the throwaway bundled identifier. The knowledge checker passed its 19 self-tests and repository validation.
+
+The final release Swift bridge also exercised source-specific boundaries: Droid cumulative rewrites, empty input, restoration, and source removal retained 1,200 tokens and two messages without summing obsolete allocations; Roo UI compaction followed by sibling-only annotation changes and source removal retained 280 tokens and two messages; Kiro execution failure and removal retained eight tokens and one authoritative execution without reviving a second lower-authority snapshot. Fresh processes observed the same totals. The permanent Roo regression additionally distinguishes preserved archived annotations from refreshed live annotations.
 
 ### Phase 1 證據與未通過的 gate
 
@@ -155,6 +166,23 @@ Ordinary root checkout 的 `cargo +1.96.1 test --workspace --locked --offline` �
 Actual `AppDelegate` demo 建立 popover；因本機 menu-extra anchor 在螢幕外，只移動 own-process panel 到可見區，再檢視其 bitmap，見 `25.5K tok/min` header 與 demo chart。這是實際 native view 的短程證據，不驗證 tray icon pixels、compositor glass/background appearance 或 shipping preferences。Windows runtime／downstream coordinated decoder、fork publication、current-corpus 對拍與完整資源 acceptance 仍未執行；沒有 push／PR／release。
 
 `make check-docs` 通過 53 checker tests 與實際 knowledge validation。Reachability 只遞迴 Markdown files，directory／binary-asset links 仍檢查 existence，但不當作 Markdown 讀取；regression 同時覆蓋有效與 missing targets。這讓 pinned local engine ledger／routing 的 relative links 不再因 fixture directory 而 crash。
+
+Source-watch local regressions cover rejected directory candidates and
+symlinked SQLite database/WAL sampling. Per-source publication regressions
+preserve captured values after late source/registry/WAL changes, ingest those
+changes on the next synchronization, and reject missing or corrupt pinned
+generations. The real C ABI regression verifies a late write between ingestion
+and lease acceptance, dirty-baseline refresh, settled warm reuse, and last-good
+queries after unreadable/corrupt-source failures.
+
+macOS Rust 1.96.1 workspace tests passed (2,460 passes, six ignored); strict
+engine Clippy passed, while workspace Clippy retains the existing FFI warnings.
+Both `make selftest` and the isolated `make selftest-bundled` passed.
+The installed release app's `--launch-timeline --only graph` run published its
+real-data dashboard graph in 27.6 seconds without stopping other producers or
+excluding active sources. Native screen capture and accessibility verification
+were unavailable; no visual acceptance is claimed. Windows runtime and sustained
+resource acceptance were not exercised.
 
 
 
@@ -346,15 +374,14 @@ git diff --check origin/main...HEAD
 
 These checks cover frontmatter, relative links, canonical reachability, migration-ledger counts and enums, privacy scans, and repository whitespace. Do not claim runtime PASS for a docs-only change.
 
-Three checks close out #291. The last two read this repository's own history and, like the engine checks, answer "cannot ask" rather than fail when that history is missing; `ci.yml` fetches it before the knowledge step and asserts the checkout is no longer shallow, and the Pages job does not fetch it, so there they are skipped:
+The owned-engine checks run without a separate engine checkout. Repository-diff checks answer "cannot ask" rather than fail when history is missing; `ci.yml` fetches this repository's history before its knowledge step, while Pages may skip those history-dependent questions.
 
 | Check | Rule |
 |---|---|
-| Pin owner contract | `vendor/README.md` carries frontmatter and is held to the same frontmatter, link and privacy checks as the knowledge documents |
-| Current-advance claims | When the current engine pin advance changed `crates/tb_core_ffi` or `Sources/CTB/include/ctb.h`, a clause that says it describes the current advance (這次、本次、this advance、this pin advance、current pin) and claims that path is unchanged fails; quoted text is ignored. The advance is this branch when the gitlink moved since the merge base with `origin/main` (merge base to working tree), otherwise the newest first-parent commit that moved the gitlink. Claims about earlier advances are not checked, and a current-advance claim worded without a marker escapes |
+| Historical provenance | Known inherited ledger references remain checkable against `crates/syrtis_core/UPSTREAM.md`; external commit citations are not current engine pins |
 | `last_verified` moves | A document whose body or `sources` changed since the merge base with `origin/main` must change `last_verified`, unless the old date is already on or after the merge base's commit date, less one day for timezones |
 
-SHA existence is checked only where the repository is known: `check_engine_pin` resolves every 40-hex SHA inside a `tokscale-core/{blob,commit,tree}` URL against the submodule. It needs a complete engine checkout and skips the question ("cannot ask", not a failure) when the submodule is absent or shallow. `ci.yml` unshallows the submodule before its knowledge step, so the check runs there; the Pages job checks out without submodules, so there it is skipped and `ci.yml` is the enforcing gate. A bare 40-hex string in prose is not resolved, because the tree cites commits and tree objects from several repositories (Syrtis, `tokscale-core`, Syrtis-Windows, upstream `tokscale`, CodexBar) and the text alone does not say which. [#295](https://github.com/Nanako0129/syrtis/issues/295) found nine such strings that looked unresolvable and all turned out to be real, just unlabelled. So write a SHA that does not belong to this repository as a link to its repository, or name the repository and, for a tree object, say so next to it.
+The engine is ordinary source, so checks do not fetch or inspect a submodule, require a reviewed pin, or demand separate engine publication. `check_engine_history` verifies inherited ledger availability and revision-label agreement; external SHA citations remain historical references. Cargo metadata and the actual native build verify dependency ownership instead of source-text snapshots. Frontmatter, relative links, privacy, migration-ledger structure, and `last_verified` checks still apply.
 
 ## Failure interpretation
 

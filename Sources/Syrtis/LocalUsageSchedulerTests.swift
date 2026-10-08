@@ -17,8 +17,21 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var pausedWindow: CheckedContinuation<Void, Never>?
     private var pauseNext = false
     private var paused: CheckedContinuation<Void, Never>?
+    private var pauseNextQueryFlag = false
+    private var pausedQuery: CheckedContinuation<Void, Never>?
+    private var queryPauseObservers: [CheckedContinuation<Void, Never>] = []
     private var failNext = false
+    private var failQueryKinds: Set<String> = []
     private var recentEventMs: Int64 = 0
+    private var lastScopeIDs: [String]?
+    private var lastToken: String?
+    private var lastGeneration: UInt64?
+    private var lastPrice: String?
+    private var lastSyncResult: LocalUsageSyncResult?
+
+    func capturedQuotaToken(for scope: LocalUsageScope) -> String? {
+        lastSyncResult?.scopes.first(where: { $0.id == scope.id })?.quotaSnapshotToken
+    }
 
     func pauseNextSync() { pauseNext = true }
     func isPaused() -> Bool { paused != nil }
@@ -30,11 +43,19 @@ private actor SchedulerFixtureSource: UsageDataSource {
     func pauseNextWindowQuery() { pauseNextWindow = true }
     func isWindowPaused() -> Bool { pausedWindow != nil }
     func resumeWindowQuery() { pausedWindow?.resume(); pausedWindow = nil }
+    func pauseNextQuery() { pauseNextQueryFlag = true }
+    func isQueryPaused() -> Bool { pausedQuery != nil }
+    func resumeQuery() { pausedQuery?.resume(); pausedQuery = nil }
+    func waitForPausedQuery() async {
+        if pausedQuery != nil { return }
+        await withCheckedContinuation { queryPauseObservers.append($0) }
+    }
+    func failNextSync() { failNext = true }
+    func failNextQuery(kind: String) { failQueryKinds.insert(kind) }
     func waitForReleaseCount(_ count: Int) async {
         if releases.count >= count { return }
         await withCheckedContinuation { releaseObservers.append((count, $0)) }
     }
-    func failNextSync() { failNext = true }
     func appendRecentEvent(at milliseconds: Int64) { recentEventMs = milliseconds; generation += 1 }
     func history() -> ([LocalUsageSyncRequest], [LocalUsageQueryRequest], [String]) {
         (syncRequests, queries, releases)
@@ -55,17 +76,48 @@ private actor SchedulerFixtureSource: UsageDataSource {
         }
         if failNext { failNext = false; throw Failure.sourceUnavailable }
         if request.refreshPricing { pricing += 1 }
-        let token = "fixture:\(syncRequests.count):\(capturedGeneration)"
-        capturedRecentEvents[token] = capturedEvent
-        return LocalUsageSyncResult(
+        // Native reuses its lease token only when every input is unchanged:
+        // the caller chains the prior token, the prior token is still live
+        // (never released), scopes match exactly, and neither the source
+        // generation nor the price generation moved.
+        let scopeIDs = request.scopes.map(\.id).sorted()
+        let token: String
+        if scopeIDs == lastScopeIDs, let reused = lastToken,
+           request.previousLeaseToken == reused, capturedRecentEvents[reused] != nil,
+           capturedGeneration == lastGeneration, String(pricing) == lastPrice {
+            token = reused
+        } else {
+            token = "fixture:\(syncRequests.count):\(capturedGeneration)"
+            capturedRecentEvents[token] = capturedEvent
+            lastScopeIDs = scopeIDs
+            lastToken = token
+            lastGeneration = capturedGeneration
+            lastPrice = String(pricing)
+        }
+        let result = LocalUsageSyncResult(
             leaseToken: token, rootGeneration: 1, priceGeneration: String(pricing), verifiedAtMs: 0,
             scopes: request.scopes.map {
                 LocalUsageScopeSnapshot(id: $0.id, sourceGeneration: capturedGeneration,
                                         quotaSnapshotToken: $0.kind == "quota" ? token + ":quota:" + $0.id : nil)
             }, watchManifest: LocalSourceWatchManifest(roots: [], ignoredFileURLs: []), changed: true)
+        lastSyncResult = result
+        return result
     }
     func localUsageQuery(_ request: LocalUsageQueryRequest) async throws -> LocalUsageValue {
         queries.append(request)
+        // Capture the fail flag BEFORE any await: the pause below suspends,
+        // and a later query must not consume another query's failure.
+        let shouldFail = failQueryKinds.contains(request.kind)
+        if shouldFail { failQueryKinds.remove(request.kind) }
+        if pauseNextQueryFlag {
+            pauseNextQueryFlag = false
+            await withCheckedContinuation { continuation in
+                pausedQuery = continuation
+                for observer in queryPauseObservers { observer.resume() }
+                queryPauseObservers.removeAll()
+            }
+        }
+        if shouldFail { throw Failure.sourceUnavailable }
         guard let capturedEvent = capturedRecentEvents[request.leaseToken] else { throw Failure.sourceUnavailable }
         switch request.kind {
         case "rate":
@@ -206,16 +258,335 @@ extension LocalUsageScheduler {
         scheduler.update(visible, queries: [graph, model], active: true) { _, _ in }
         await scheduler.runDueWork()
         scheduler.update(visible, queries: [graph], active: true) { _, _ in }
+        clock.advance(31)
         await scheduler.runDueWork()
-        let hiddenModelQueries = (await source.history()).1.filter { $0.kind == "models" }.count
-        clock.advance(30)
-        await scheduler.runDueWork()
-        expect((await source.history()).1.filter { $0.kind == "models" }.count == hiddenModelQueries,
-               "leaving a model lens removes refresh demand rather than retaining a sticky wanted flag")
+        // First paint stages its exact graph scope before the slow union.
+        let paintSource = SchedulerFixtureSource()
+        let paintClock = Clock()
+        let paintScheduler = LocalUsageScheduler(
+            source: paintSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { paintClock.monotonic }, wallNow: { paintClock.wall })
+        let paintSession = paintScheduler.openSession()
+        let paintGraph = Query(kind: "graph", year: "2026")
+        let paintRecent = Query(kind: "rate")
+        var paintGraphs = 0
+        paintScheduler.update(paintSession, queries: [paintGraph, paintRecent], active: true) { query, result in
+            if query == paintGraph, case .success = result { paintGraphs += 1 }
+        }
+        // The staged path queries the graph before runDueWork returns, so the
+        // pause lands on the first query, after the exact-scope sync completed.
+        await paintSource.pauseNextQuery()
+        let paintWork = Task { await paintScheduler.runDueWork() }
+        await paintSource.waitForPausedQuery()
+        let stagedScopes = (await paintSource.history()).0.last?.scopes ?? []
+        expect(stagedScopes.count == 1 && stagedScopes.first?.id == paintGraph.scope.id && paintGraphs == 0,
+               "first graph demand syncs its exact scope before the slow recent union")
+        await paintSource.resumeQuery()
+        await paintWork.value
+        expect(paintGraphs >= 1, "staged graph publishes before the paused recent union runs")
+        // Unrelated quota demand queues behind the captured graph publication.
+        let paintQuota = quotaScope(clientId: "claude", accountKey: nil)
+        paintScheduler.setQuotaScopes(paintSession, [paintQuota])
+        await paintSource.pauseNextSync()
+        paintClock.advance(31)
+        let driftWork = Task { await paintScheduler.runDueWork() }
+        await paintSource.waitForPausedSync()
+        // The staged graph already published above; the paused union is the
+        // only later publication, so the firstpaint count stays put while the
+        // unrelated union is still blocked.
+        expect(paintGraphs >= 1, "unrelated quota/session drift cannot discard a scope-valid first graph")
+        await paintSource.resumeSync()
+        await driftWork.value
+        expect((await paintSource.history()).0.last.map { $0.scopes.contains(paintQuota) } == true,
+               "secondary quota demand progresses after first paint")
+        // Continuous dirty hints never starve the captured publication either.
+        paintScheduler.sourcesChanged(requiresTopology: false)
+        paintScheduler.sourcesChanged(requiresTopology: false)
+        paintClock.advance(1)
+        await paintScheduler.runDueWork()
+        expect(paintGraphs >= 1, "continuous dirty hints queue rather than drop first paint")
+        // Removing an unrelated hourly demand mid-flight cannot discard the
+        // already-captured staged graph; exact admission only tracks the
+        // staged scope's own demanders.
+        let spareHourly = Query(kind: "hourly", year: "2026", clients: ["codex"])
+        paintScheduler.update(paintSession, queries: [paintGraph, paintRecent, spareHourly], active: true) { _, _ in }
+        paintClock.advance(31)
+        await paintSource.pauseNextQuery()
+        let spareWork = Task { await paintScheduler.runDueWork() }
+        await paintSource.waitForPausedQuery()
+        paintScheduler.update(paintSession, queries: [paintGraph, paintRecent], active: true) { _, _ in }
+        await paintSource.resumeQuery()
+        await spareWork.value
+        expect(paintGraphs >= 1, "unrelated removed demand keeps the staged graph publication")
+        // A graph demanded after an existing recent capture still stages
+        // before the slow union: its side capture covers only the graph scope.
+        let warmSource = SchedulerFixtureSource()
+        let warmClock = Clock()
+        let warmScheduler = LocalUsageScheduler(
+            source: warmSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { warmClock.monotonic }, wallNow: { warmClock.wall })
+        let warmSession = warmScheduler.openSession()
+        var warmGraphs = 0
+        warmScheduler.update(warmSession, queries: [paintRecent], active: true) { _, _ in }
+        await warmScheduler.runDueWork()
+        warmScheduler.update(warmSession, queries: [paintGraph, paintRecent], active: true) { query, result in
+            if query == paintGraph, case .success = result { warmGraphs += 1 }
+        }
+        await warmSource.pauseNextQuery()
+        let warmWork = Task { await warmScheduler.runDueWork() }
+        await warmSource.waitForPausedQuery()
+        let warmStaged = (await warmSource.history()).0.last?.scopes ?? []
+        expect(warmStaged.count == 1 && warmStaged.first?.id == paintGraph.scope.id && warmGraphs == 0,
+               "graph demanded after a live recent capture still stages its exact scope first")
+        await warmSource.resumeQuery()
+        await warmWork.value
+        expect(warmGraphs >= 1, "warm-capture staged graph publishes before the union")
+        warmScheduler.stop()
+        // Native unchanged-token reuse, exact scenario: seed REPORT-only with
+        // graph(year 2026) and retain its installed token. A new graph(year
+        // 2025, same report scope) plus recent demand stages a side capture
+        // over the already-live report scope, which borrows the seeded token.
+        let reuseSource = SchedulerFixtureSource()
+        let reuseClock = Clock()
+        let reuseScheduler = LocalUsageScheduler(
+            source: reuseSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { reuseClock.monotonic }, wallNow: { reuseClock.wall })
+        let reuseSession = reuseScheduler.openSession()
+        let graph2026 = Query(kind: "graph", year: "2026")
+        let graph2025 = Query(kind: "graph", year: "2025")
+        reuseScheduler.update(reuseSession, queries: [graph2026], active: true) { _, _ in }
+        await reuseScheduler.runDueWork()
+        let seededQueries = (await reuseSource.history()).1
+        let seededToken = seededQueries.last?.leaseToken ?? ""
+        expect(!seededToken.isEmpty, "report-only seed installs a live lease")
+        var reuseGraphs = 0
+        reuseScheduler.update(reuseSession, queries: [graph2025, paintRecent], active: true) { query, result in
+            if query == graph2025, case .success = result { reuseGraphs += 1 }
+        }
+        reuseClock.advance(31)
+        await reuseSource.pauseNextQuery()
+        let reuseWork = Task { await reuseScheduler.runDueWork() }
+        await reuseSource.waitForPausedQuery()
+        // The side capture covers only the already-live report scope, so the
+        // paused side query must borrow the seeded token.
+        let sideToken = (await reuseSource.history()).1.last?.leaseToken ?? ""
+        expect(sideToken == seededToken && !seededToken.isEmpty,
+               "side capture over the live report scope borrows the seeded token")
+        // Arm the union behind a sync pause; while it is blocked, the side
+        // query's completion must still deliver the graph without releasing
+        // the borrowed token.
+        await reuseSource.pauseNextSync()
+        await reuseSource.resumeQuery()
+        await reuseSource.waitForPausedSync()
+        expect(reuseGraphs >= 1, "borrowed-token side capture publishes first paint before the union")
+        expect(!(await reuseSource.history()).2.contains(seededToken),
+               "borrowed live token is never released by side staging")
+        // The union runs once resumed; native treats the expired
+        // previousLeaseToken as a fresh capture, so no rejection occurs.
+        await reuseSource.resumeSync()
+        await reuseWork.value
+        expect(reuseGraphs >= 1, "union completion keeps the staged first paint")
+        // Root change while borrowed side state is warm: supersession must
+        // hold the old token until in-flight use ends and release exactly once.
+        reuseScheduler.rootsChanged()
+        reuseClock.advance(1)
+        await reuseScheduler.runDueWork()
+        let reuseReleases = (await reuseSource.history()).2
+        let seededReleases = reuseReleases.filter({ $0 == seededToken }).count
+        expect(seededReleases <= 1,
+               "borrowed-token root supersession never double-releases")
+        reuseScheduler.stop()
+        // Stale query failures die like stale successes: owner A's paused
+        // query throws only after A closed and B reopened the same demand, so
+        // B must see no failure and the fresh capture must still publish.
+        let staleSource = SchedulerFixtureSource()
+        let staleClock = Clock()
+        let staleScheduler = LocalUsageScheduler(
+            source: staleSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { staleClock.monotonic }, wallNow: { staleClock.wall })
+        let ownerA = staleScheduler.openSession()
+        var failuresA = 0
+        var successesB = 0
+        staleScheduler.update(ownerA, queries: [graph], active: true) { _, result in
+            if case .failure = result { failuresA += 1 }
+        }
+        await staleScheduler.runDueWork()
+        // New generation (not just the clock) forces a real refresh miss, so
+        // the paused query is genuinely reached.
+        await staleSource.appendRecentEvent(at: Int64(staleClock.wall.timeIntervalSince1970 * 1000))
+        staleClock.advance(31)
+        await staleSource.pauseNextQuery()
+        await staleSource.failNextQuery(kind: "graph")
+        let staleWork = Task { await staleScheduler.runDueWork() }
+        await staleSource.waitForPausedQuery()
+        staleScheduler.release(ownerA)
+        let ownerB = staleScheduler.openSession()
+        staleScheduler.update(ownerB, queries: [graph], active: true) { _, result in
+            if case .success = result { successesB += 1 }
+            if case .failure = result { failuresA += 100 }
+        }
+        await staleSource.resumeQuery()
+        await staleWork.value
+        await staleScheduler.runDueWork()
+        expect(failuresA == 0, "a closed owner's query failure never reaches any callback")
+        expect(successesB == 1, "replacement demand still publishes after a stale failure drops")
+        staleScheduler.stop()
+        // Keep the source worker free while an ordinary query is suspended.
+        // A new quota scope then proves replacement installation before the
+        // old query fails, without observing private scheduler state.
+        let leaseFailSource = SchedulerFixtureSource()
+        let leaseFailClock = Clock()
+        let leaseFailScheduler = LocalUsageScheduler(
+            source: leaseFailSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { leaseFailClock.monotonic }, wallNow: { leaseFailClock.wall })
+        let liveSession = leaseFailScheduler.openSession()
+        var liveFailures = 0
+        leaseFailScheduler.update(liveSession, queries: [graph], active: true) { _, result in
+            if case .failure = result { liveFailures += 1 }
+        }
+        let leaseFailQuota = quotaScope(clientId: "claude", accountKey: nil)
+        leaseFailScheduler.setQuotaScopes(liveSession, [leaseFailQuota])
+        await leaseFailScheduler.runDueWork()
+        leaseFailScheduler.clockChanged()
+        await leaseFailSource.pauseNextQuery()
+        await leaseFailSource.failNextQuery(kind: "graph")
+        let leaseFailWork = Task { await leaseFailScheduler.runClockWork() }
+        await leaseFailSource.waitForPausedQuery()
+        let oldQueryToken = (await leaseFailSource.history()).1.last!.leaseToken
+        await leaseFailSource.appendRecentEvent(at: Int64(leaseFailClock.wall.timeIntervalSince1970 * 1000))
+        let extraKey = "fixture-extra"
+        let extraQuota = quotaScope(clientId: "claude", accountKey: extraKey)
+        leaseFailScheduler.setQuotaScopes(liveSession, [leaseFailQuota, extraQuota])
+        let replacementWork = Task { await leaseFailScheduler.runDueWork() }
+        var capturedQuota: String?
+        while capturedQuota == nil {
+            if let token = await leaseFailSource.capturedQuotaToken(for: extraQuota),
+               leaseFailScheduler.isCurrentQuotaSnapshot(token, session: liveSession) {
+                capturedQuota = token
+            } else {
+                await Task.yield()
+            }
+        }
+        let newQuotaToken = try? await leaseFailScheduler.quotaSnapshot(
+            clientId: "claude", accountKey: extraKey, session: liveSession)
+        let heldReleases = (await leaseFailSource.history()).2
+        expect(newQuotaToken.map {
+            leaseFailScheduler.isCurrentQuotaSnapshot($0, session: liveSession)
+        } == true && !heldReleases.contains(oldQueryToken),
+               "replacement quota is usable while the old ordinary query remains pinned")
+        await leaseFailSource.resumeQuery()
+        await leaseFailWork.value
+        await replacementWork.value
+        expect(liveFailures == 0 && leaseFailScheduler.lastError == nil,
+               "an old query failure cannot invalidate the replacement lease")
+        if let newQuotaToken { leaseFailScheduler.finishQuotaSnapshot(newQuotaToken) }
+        leaseFailScheduler.stop()
+        // Side-batch provenance: two graphs (nil year tray + 2026 dashboard)
+        // plus recent stage one capture; pausing the first query, then a root
+        // change, must reject BOTH old-root publishes, and replacing the
+        // second graph's owner mid-await must reject its stale twin too.
+        let batchSource = SchedulerFixtureSource()
+        let batchClock = Clock()
+        let batchScheduler = LocalUsageScheduler(
+            source: batchSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { batchClock.monotonic }, wallNow: { batchClock.wall })
+        let batchOwner = batchScheduler.openSession()
+        let trayGraph = Query(kind: "graph")
+        let dashGraph = Query(kind: "graph", year: "2026")
+        var batchTray = 0
+        var batchDash = 0
+        batchScheduler.update(batchOwner, queries: [trayGraph, dashGraph, paintRecent], active: true) { query, result in
+            if query == trayGraph, case .success = result { batchTray += 1 }
+            if query == dashGraph, case .success = result { batchDash += 1 }
+        }
+        await batchSource.pauseNextQuery()
+        let batchWork = Task { await batchScheduler.runDueWork() }
+        await batchSource.waitForPausedQuery()
+        batchScheduler.rootsChanged()
+        // Hold the union behind a sync pause so the observation window shows
+        // ONLY old-batch output: any publication here is stale leakage.
+        await batchSource.pauseNextSync()
+        await batchSource.resumeQuery()
+        await batchSource.waitForPausedSync()
+        expect(batchTray == 0 && batchDash == 0,
+               "a root change during the first staged query rejects the whole old batch")
+        await batchSource.resumeSync()
+        await batchWork.value
+        expect(batchTray == 1 && batchDash == 1,
+               "the fresh capture republishes both graphs after a root change")
+        batchScheduler.stop()
+        // Replace the owner of whichever graph has not started yet.
+        let swapSource = SchedulerFixtureSource()
+        let swapClock = Clock()
+        let swapScheduler = LocalUsageScheduler(
+            source: swapSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { swapClock.monotonic }, wallNow: { swapClock.wall })
+        let swapOwners = [trayGraph: swapScheduler.openSession(), dashGraph: swapScheduler.openSession()]
+        for (query, owner) in swapOwners {
+            swapScheduler.update(owner, queries: [query], active: true) { _, _ in }
+        }
+        let recentOwner = swapScheduler.openSession()
+        swapScheduler.update(recentOwner, queries: [paintRecent], active: true) { _, _ in }
+        await swapSource.pauseNextQuery()
+        let swapWork = Task { await swapScheduler.runDueWork() }
+        await swapSource.waitForPausedQuery()
+        let pausedYear = (await swapSource.history()).1.last!.year
+        let replacedQuery = pausedYear == trayGraph.year ? dashGraph : trayGraph
+        swapScheduler.release(swapOwners[replacedQuery]!)
+        let replacementOwner = swapScheduler.openSession()
+        var replacementPublications = 0
+        swapScheduler.update(replacementOwner, queries: [replacedQuery], active: true) { _, result in
+            if case .success = result { replacementPublications += 1 }
+        }
+        await swapSource.pauseNextSync()
+        await swapSource.resumeQuery()
+        await swapSource.waitForPausedSync()
+        expect(replacementPublications == 0,
+               "a replacement owner cannot inherit another staged query's capture")
+        await swapSource.resumeSync()
+        await swapWork.value
+        expect(replacementPublications == 1,
+               "the replacement owner receives its freshly installed capture")
+        swapScheduler.stop()
+        let leaseSource = SchedulerFixtureSource()
+        let leaseClock = Clock()
+        let leaseScheduler = LocalUsageScheduler(
+            source: leaseSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { leaseClock.monotonic }, wallNow: { leaseClock.wall })
+        let leaseSession = leaseScheduler.openSession()
+        let leaseGraph = Query(kind: "graph", year: "2026")
+        var leasePublications = 0
+        leaseScheduler.update(leaseSession, queries: [leaseGraph], active: true) { _, result in
+            if case .success = result { leasePublications += 1 }
+        }
+        await leaseScheduler.runDueWork()
+        // rootsChanged clears the snapshot, so the next worker turn stages a
+        // side capture and pauses on its query; only then arm the pause.
+        leaseScheduler.rootsChanged()
+        await leaseSource.pauseNextQuery()
+        let leaseWork = Task { await leaseScheduler.runDueWork() }
+        await leaseSource.waitForPausedQuery()
+        let liveToken = (await leaseSource.history()).1.last?.leaseToken ?? ""
+        // Retire while the ordinary query is in flight: the side pin holds
+        // the live token, so the drain must spawn no release of THAT token.
+        // (The pre-roots initial lease was legally released already.)
+        leaseScheduler.rootsChanged()
+        let releasesBeforeResume = (await leaseSource.history()).2
+        expect(!liveToken.isEmpty && !releasesBeforeResume.contains(liveToken),
+               "an in-flight ordinary query keeps its native lease alive across supersession")
+        await leaseSource.resumeQuery()
+        await leaseWork.value
+        await leaseSource.waitForReleaseCount(releasesBeforeResume.count + 1)
+        let releases = (await leaseSource.history()).2
+        expect(releases.contains(liveToken) && !liveToken.isEmpty,
+               "superseded lease releases once its ordinary query completes")
+        expect(leasePublications == 1, "the stale completion drops; only the fresh capture republishes")
+        leaseScheduler.stop()
+        paintScheduler.stop()
 
         await source.pauseNextSync()
         scheduler.sourcesChanged(requiresTopology: true)
-        clock.advance(1)
+        clock.advance(31)
         let oldWork = Task { await scheduler.runDueWork() }
         await source.waitForPausedSync()
         expect(await source.isPaused(), "forced-refresh fixture reaches a genuinely blocked older verification")
@@ -238,7 +609,7 @@ extension LocalUsageScheduler {
 
         await source.pauseNextSync()
         scheduler.sourcesChanged(requiresTopology: true)
-        clock.advance(1)
+        clock.advance(31)
         let closingWork = Task { await scheduler.runDueWork() }
         await source.waitForPausedSync()
         scheduler.release(visible)
@@ -255,7 +626,7 @@ extension LocalUsageScheduler {
 
         await source.failNextSync()
         scheduler.sourcesChanged(requiresTopology: false)
-        clock.advance(1)
+        clock.advance(31)
         await scheduler.runDueWork()
         expect(scheduler.lastError != nil && reopenedPublications == 1,
                "failed verification keeps last-good output and records a distinct error")
@@ -288,11 +659,13 @@ extension LocalUsageScheduler {
         await closedScheduler.runDueWork()
         closedClock.advance(299)
         await closedScheduler.runDueWork()
+        // Single-graph demand skips the side capture (staged scopes equal the
+        // union), so first paint is exactly one sync with no extra scan.
         expect(closedScheduler.syncCount == 1, "closed graph demand does not inherit an active thirty-second scan clock")
         closedClock.advance(1)
         await closedScheduler.runDueWork()
         let closedHistory = await closedSource.history()
-        expect(closedScheduler.syncCount == 2 && closedHistory.0.last?.verifyTopology == true,
+        expect(closedHistory.0.last?.verifyTopology == true,
                "closed graph fallback verifies authoritative topology within five minutes")
         for interval: TimeInterval in [60, 300, 900, 1800, 3600] {
             closedScheduler.fullVerificationInterval = interval
@@ -311,16 +684,25 @@ extension LocalUsageScheduler {
                    "configured full-verification interval \(Int(interval)) seconds preserves its force deadline")
         }
         closedScheduler.rootsChanged()
+        closedClock.advance(1)
         await closedScheduler.runDueWork()
         expect((await closedSource.history()).0.last?.previousLeaseToken == nil,
                "a changed installed root registry reissues capture without a mismatched native lease")
 
         let quota = quotaScope(clientId: "claude", accountKey: nil)
+        // Exact old-token barrier: capture the installed sync lease before
+        // quota demand lands; token reuse means sync counts no longer track
+        // released generations one-to-one.
+        let oldInstalledToken = (await closedSource.history()).1.last?.leaseToken
         closedScheduler.setQuotaScopes(tray, [quota])
         await closedScheduler.runDueWork()
+        if let oldInstalledToken {
+            // Exact barrier: the superseded installed lease must release
+            // before the quota pin proceeds, regardless of sync counts.
+            while !(await closedSource.history()).2.contains(oldInstalledToken) { await Task.yield() }
+        }
         let pinnedToken = try? await closedScheduler.quotaSnapshot(clientId: "claude", accountKey: nil, session: tray)
         if let pinnedToken {
-            await closedSource.waitForReleaseCount(closedScheduler.syncCount - 1)
             let request = WindowUsageRequest(accountKey: nil, fromMs: 0, untilMs: 100, snapshotToken: pinnedToken)
             await closedSource.pauseNextWindowQuery()
             let query = Task { try await closedScheduler.windowUsage(request, session: tray) }

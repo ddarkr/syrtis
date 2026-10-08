@@ -1583,7 +1583,7 @@ fn write_creds_atomic(path: &Path, creds: &Value) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = tokscale_core::fs_atomic::replace_file(&tmp, path) {
+    if let Err(error) = syrtis_core::fs_atomic::replace_file(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }

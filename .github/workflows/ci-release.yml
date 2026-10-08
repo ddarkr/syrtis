@@ -25,14 +25,15 @@ jobs:
     # Same image as ci.yml's build job; see the comment there for why xcode-27.
     runs-on: xcode-27
     steps:
-      # No step after checkout needs the token: the submodule is fetched by
-      # checkout itself and SwiftPM clones Sparkle anonymously.
+      # No step after checkout needs the token: there are no submodules left
+      # (the engine is owned source) and SwiftPM clones Sparkle anonymously.
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.1"
 
       # Restores the dependency cache ci.yml's build job keeps (the same
       # shared-key) but never writes it: that job is the one writer, and two

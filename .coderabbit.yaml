@@ -51,12 +51,13 @@ reviews:
         UI lifecycle: a change here needs evidence that closing the popover or
         settings window stops polling and background rendering.
 
-    - path: "vendor/**"
+    - path: "crates/syrtis_core/**"
       instructions: |
-        Shared-engine boundary (AGENTS.md invariants). Shared Rust changes land
-        in tokscale-core with their ledger update; this repository advances only
-        a reviewed gitlink. App-owned FFI, the C ABI, Swift and build wiring stay
-        here. Flag a patch that edits vendored engine source in place.
+        Owned-engine boundary (AGENTS.md invariants). The engine is same-repo
+        source, not a pinned submodule: engine and FFI changes land together
+        with their ledger update. App-owned FFI, the C ABI, Swift and build
+        wiring stay in their crates. Flag a change that forks a second copy
+        of engine logic outside crates/syrtis_core.
 
     - path: "docs/**/*.md"
       instructions: |

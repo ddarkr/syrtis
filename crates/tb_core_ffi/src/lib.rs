@@ -1,4 +1,4 @@
-//! C-ABI bridge over tokscale-core for the Swift app.
+//! C-ABI bridge over syrtis-core for the Swift app.
 //!
 //! Contract: every entry point returns a heap-allocated, NUL-terminated JSON
 //! string; the caller must release it with `tb_free`. Entry points are
@@ -26,6 +26,8 @@ mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
+#[cfg(test)]
+mod durable_usage_tests;
 mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
@@ -104,8 +106,8 @@ impl LocalSourceContext {
         &self,
         year: Option<String>,
         clients: Option<Vec<String>>,
-    ) -> tokscale_core::ReportOptions {
-        tokscale_core::ReportOptions {
+    ) -> syrtis_core::ReportOptions {
+        syrtis_core::ReportOptions {
             home_dir: self
                 .home_dir
                 .as_ref()
@@ -113,7 +115,7 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 extra_scan_paths: extra_scan_paths::snapshot(),
                 ..Default::default()
             },
@@ -125,8 +127,8 @@ impl LocalSourceContext {
         &self,
         year: Option<String>,
         clients: Option<Vec<String>>,
-    ) -> tokscale_core::LocalParseOptions {
-        tokscale_core::LocalParseOptions {
+    ) -> syrtis_core::LocalParseOptions {
+        syrtis_core::LocalParseOptions {
             home_dir: self
                 .home_dir
                 .as_ref()
@@ -134,7 +136,7 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 extra_scan_paths: extra_scan_paths::snapshot(),
                 ..Default::default()
             },
@@ -270,7 +272,7 @@ fn serialize_agent_usage_payload(
     })
 }
 
-/// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
+/// Cap rayon's global thread pool to 2 workers. syrtis-core uses rayon for
 /// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
 /// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
 /// each idle worker busy-waits before parking, and every 10s poll wakes the
@@ -714,7 +716,7 @@ fn graph_cached_in_lane(
     };
     let context = LocalSourceContext::current();
     let fresh =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
+        syrtis_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
@@ -739,7 +741,7 @@ fn graph_compute(year: &str) -> Result<EncodedLocalPayload, String> {
     // both paths so the probe and report scan observe identical source roots.
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
-    let token = tokscale_core::local_source_change_token(&context.parse_options(None, None))?;
+    let token = syrtis_core::local_source_change_token(&context.parse_options(None, None))?;
     #[cfg(test)]
     tests::GRAPH_COMPUTES.fetch_add(1, Ordering::SeqCst);
     let data = encode_local_payload(&usage_graph::run(&context, year)?)?;
@@ -1001,14 +1003,14 @@ fn tail_tick_if_stale() {
 }
 
 /// Smoke probe: parse all local clients and report the message count.
-/// Proves the staticlib links and tokscale-core can read this machine.
+/// Proves the staticlib links and syrtis-core can read this machine.
 /// (Legacy Phase 0 shape: `{"ok":true,"messages":N}`, no `data` wrapper.)
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
         let _local = local_usage_guard();
         let context = LocalSourceContext::current();
-        let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
+        let json = match syrtis_core::parse_local_clients(context.parse_options(None, None)) {
             Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
             Err(e) => serde_json::json!({"ok": false, "err": e}).to_string(),
         };
@@ -1184,7 +1186,7 @@ pub extern "C" fn tb_quota_provider_ids() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn tb_client_ids() -> *mut c_char {
     guarded("tb_client_ids", || {
-        let ids: Vec<&str> = tokscale_core::ClientId::ALL
+        let ids: Vec<&str> = syrtis_core::ClientId::ALL
             .iter()
             .map(|client| client.as_str())
             .collect();
@@ -1250,7 +1252,6 @@ pub unsafe extern "C" fn tb_quota_curve(
 
 /// Replace the process-wide extra-scan-paths registry (see the
 /// `extra_scan_paths` module doc). `json` is an object of
-/// `{"<public-client-id>": ["<absolute-dir-path>", ...]}`, e.g.
 /// `{"claude":["/Users/x/.claude-work/projects","/Users/x/.claude-work/transcripts"]}`.
 /// Full-replace: passing `{}` (or every client's list empty) clears the
 /// registry. Every subsequent report/parse call picks up the new roots
@@ -1262,7 +1263,8 @@ pub unsafe extern "C" fn tb_quota_curve(
 /// next scan, with no need to call this setter again. A path is only ever
 /// left out of the registry (`rejected`) when its client id is not one this
 /// consumer wires extra-root support for. Malformed JSON returns
-/// `{"ok":false,...}` and leaves the registry untouched.
+/// `{"ok":false,...}` and leaves the registry untouched. Reapplying the
+/// identical registry is a no-op: caches and leases are left alone.
 ///
 /// # Safety
 /// `json` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -1284,6 +1286,7 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 /// right now says nothing about which account its credential belongs to.
 /// Replacing this registry also invalidates local usage caches: it changes the
 /// account exclusions used by window scans independently of extra scan roots.
+/// Reapplying the identical list is a no-op: caches and leases are left alone.
 ///
 /// This is NOT `tb_set_extra_scan_paths`. That one takes the expanded
 /// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides what the
@@ -1506,10 +1509,17 @@ unsafe fn set_claude_config_dirs_from_c(json: *const c_char) -> Result<serde_jso
     let raw = unsafe { CStr::from_ptr(json) }
         .to_str()
         .map_err(|_| "Claude config dirs payload is not valid UTF-8".to_string())?;
-    let result = claude_config_dirs::set_from_json(raw)?;
-    // Account exclusions affect window scans even before the independently
-    // installed extra-root registry catches up.
-    invalidate_scan_caches();
+    // The `changed` comparison runs under the registry write lock, so two
+    // concurrent setters serialize and the second sees the first's result.
+    // Invalidation runs after that lock is released: cache/lease locks never
+    // nest inside the registry lock, so no lock-order inversion with a
+    // publisher holding a cache lock while reading the registry.
+    let (result, changed) = claude_config_dirs::set_from_json(raw)?;
+    if changed {
+        // Account exclusions affect window scans even before the independently
+        // installed extra-root registry catches up.
+        invalidate_scan_caches();
+    }
     Ok(result)
 }
 
@@ -1522,13 +1532,15 @@ unsafe fn set_extra_scan_paths_from_c(json: *const c_char) -> Result<serde_json:
     let raw = unsafe { CStr::from_ptr(json) }
         .to_str()
         .map_err(|_| "extra scan paths payload is not valid UTF-8".to_string())?;
-    let result = extra_scan_paths::set_from_json(raw)?;
-    invalidate_scan_caches();
+    let (result, changed) = extra_scan_paths::set_from_json(raw)?;
+    if changed {
+        invalidate_scan_caches();
+    }
     Ok(result)
 }
 
 /// Drop everything that could answer a scan question from before the root set
-/// changed. Called only after a successful registry replace.
+/// changed. Called only after an effective registry replace.
 ///
 /// The setter's contract is that the next report picks up the new roots, and
 /// three caches sit in front of that. `graph_cached` returns any entry younger
@@ -1538,11 +1550,10 @@ unsafe fn set_extra_scan_paths_from_c(json: *const c_char) -> Result<serde_json:
 /// just-added one. `tail_tick_if_stale` holds its event window for
 /// `TAIL_TICK_SECS` the same way. Both self-heal once their timer expires,
 /// because a changed root set changes the source token; clearing here is what
-/// makes "immediately" true rather than "within half a minute".
-///
-/// Clearing unconditionally is deliberate: the setter runs at launch (empty
-/// cache, no-op) and on Settings edits (rare). Comparing old and new registries
-/// to skip a no-op replace would cost more than the recompute it saves.
+/// makes "immediately" true rather than "within half a minute". A reapplied
+/// identical registry skips this entirely: the caller's `changed` check runs
+/// under the registry write lock, so no new effective roots can slip in
+/// between the comparison and the bump below.
 ///
 /// Clearing alone would still lose to a scan already running: it snapshots its
 /// roots at the top and publishes after, so its old-root result would land
@@ -1647,6 +1658,8 @@ mod tests {
     ///
     /// Moves the generation with both real `extern "C"` setters rather than
     /// bumping the counter directly, so omitting either invalidation fails.
+    /// A reapplied identical registry must NOT move it: the second half of
+    /// each setter's coverage pins the generation still after a no-op.
     #[test]
     fn a_scan_that_started_before_a_root_change_does_not_publish_its_result() {
         let _g = extra_scan_paths::TEST_LOCK
@@ -1655,6 +1668,8 @@ mod tests {
         let _accounts = claude_config_dirs::TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        extra_scan_paths::reset_for_test();
+        claude_config_dirs::reset_for_test();
 
         // What an in-flight scan captured before the user touched Settings.
         let generation_at_scan_start = ROOT_GENERATION.load(Ordering::SeqCst);
@@ -1664,10 +1679,18 @@ mod tests {
             encode_local_payload(&serde_json::json!({"from": "old roots"})).unwrap(),
         );
 
-        let payload = CString::new("{}").expect("payload has no interior NUL");
+        // An effective replace through the real entry point: a fresh root the
+        // registry did not hold, so the generation must move. `"{}"` would be
+        // a no-op against the reset registry and must not move it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let payload =
+            CString::new(serde_json::json!({"claude": [root.display().to_string()]}).to_string())
+                .expect("payload has no interior NUL");
         let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
-        assert!(!raw.is_null(), "setter returned NULL");
-        unsafe { tb_free(raw) };
+        let reply = unsafe { take(raw) };
+        assert!(reply.contains("\"ok\":true"), "setter failed: {reply}");
 
         assert!(
             !publish_graph("2026", generation_at_scan_start, stale),
@@ -1724,7 +1747,7 @@ mod tests {
         let reply = unsafe { take(raw) };
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["ok"], true);
-        assert_eq!(claude_config_dirs::snapshot(), vec![account_dir]);
+        assert_eq!(claude_config_dirs::snapshot(), vec![account_dir.clone()]);
         let previous_graph: serde_json::Value =
             serde_json::from_str(&unsafe { take(graph_pointer) }).unwrap();
         assert_eq!(
@@ -1732,7 +1755,55 @@ mod tests {
             serde_json::json!({"ok": true, "data": {"from": "new roots"}}),
             "the caller's pointer survives a registry clear of its encoded cache"
         );
+
+        // Identical reapply through the same entry point: still queryable,
+        // generation untouched, caches left alone.
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                "2026".to_string(),
+                (
+                    Instant::now(),
+                    5678,
+                    encode_local_payload(&serde_json::json!({"from": "new roots"})).unwrap(),
+                ),
+            );
+        lock_tick().last = Some(Instant::now());
+        let generation = ROOT_GENERATION.load(Ordering::SeqCst);
+        let raw = unsafe { tb_set_claude_config_dirs(payload.as_ptr()) };
+        let reply = unsafe { take(raw) };
+        assert!(reply.contains("\"ok\":true"), "setter failed: {reply}");
+        assert_eq!(
+            ROOT_GENERATION.load(Ordering::SeqCst),
+            generation,
+            "reapplying the identical config dirs moved the publication barrier"
+        );
+        assert!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("2026"),
+            "a no-op reapply cleared a cache that was still current"
+        );
+        assert!(
+            lock_tick().last.is_some(),
+            "a no-op reapply unstamped the live tail"
+        );
+
+        // Malformed input fails closed: registry and generation untouched.
+        let bad = CString::new("{not json").expect("payload has no interior NUL");
+        let raw = unsafe { tb_set_claude_config_dirs(bad.as_ptr()) };
+        let reply = unsafe { take(raw) };
+        assert!(
+            reply.contains("\"ok\":false"),
+            "bad input accepted: {reply}"
+        );
+        assert_eq!(claude_config_dirs::snapshot(), vec![account_dir]);
+        assert_eq!(ROOT_GENERATION.load(Ordering::SeqCst), generation);
+
         claude_config_dirs::reset_for_test();
+        extra_scan_paths::reset_for_test();
 
         // Leave no state behind for the other tests sharing these statics.
         GRAPH_CACHE
@@ -1755,6 +1826,7 @@ mod tests {
         let _g = extra_scan_paths::TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        extra_scan_paths::reset_for_test();
 
         GRAPH_CACHE
             .lock()
@@ -1769,15 +1841,22 @@ mod tests {
             );
         lock_tick().last = Some(Instant::now());
 
-        let payload = CString::new("{}").expect("payload has no interior NUL");
+        // An effective replace: a fresh root the registry did not hold.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let generation = ROOT_GENERATION.load(Ordering::SeqCst);
+        let payload =
+            CString::new(serde_json::json!({"claude": [root.display().to_string()]}).to_string())
+                .expect("payload has no interior NUL");
         let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
         assert!(!raw.is_null(), "setter returned NULL");
-        let reply = unsafe { CStr::from_ptr(raw) }
-            .to_str()
-            .expect("reply is UTF-8")
-            .to_string();
-        unsafe { tb_free(raw) };
+        let reply = unsafe { take(raw) };
         assert!(reply.contains("\"ok\":true"), "setter failed: {reply}");
+        assert!(
+            ROOT_GENERATION.load(Ordering::SeqCst) > generation,
+            "an effective registry replace left the publication barrier still"
+        );
 
         assert!(
             GRAPH_CACHE
@@ -1790,6 +1869,61 @@ mod tests {
             lock_tick().last.is_none(),
             "live tail is still stamped fresh, so the next tick would skip the reparse"
         );
+
+        // Identical reapply: entry re-seeded, generation and caches untouched.
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                "2026".to_string(),
+                (
+                    Instant::now(),
+                    5678,
+                    encode_local_payload(&serde_json::json!({"from": "new roots"})).unwrap(),
+                ),
+            );
+        lock_tick().last = Some(Instant::now());
+        let generation = ROOT_GENERATION.load(Ordering::SeqCst);
+        let raw = unsafe { tb_set_extra_scan_paths(payload.as_ptr()) };
+        let reply = unsafe { take(raw) };
+        assert!(reply.contains("\"ok\":true"), "setter failed: {reply}");
+        assert_eq!(
+            ROOT_GENERATION.load(Ordering::SeqCst),
+            generation,
+            "reapplying the identical scan roots moved the publication barrier"
+        );
+        assert!(
+            GRAPH_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("2026"),
+            "a no-op reapply cleared a cache that was still current"
+        );
+        assert!(
+            lock_tick().last.is_some(),
+            "a no-op reapply unstamped the live tail"
+        );
+
+        // Invalid input fails closed: registry and generation untouched.
+        let bad = CString::new("{not json").expect("payload has no interior NUL");
+        let raw = unsafe { tb_set_extra_scan_paths(bad.as_ptr()) };
+        let reply = unsafe { take(raw) };
+        assert!(
+            reply.contains("\"ok\":false"),
+            "bad input accepted: {reply}"
+        );
+        assert_eq!(ROOT_GENERATION.load(Ordering::SeqCst), generation);
+        assert_eq!(
+            extra_scan_paths::snapshot().get("claude"),
+            Some(&vec![root.clone()])
+        );
+
+        extra_scan_paths::reset_for_test();
+        GRAPH_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        lock_tick().last = None;
     }
 
     #[test]
@@ -3061,7 +3195,16 @@ mod tests {
                 graph_abi_value(false)
             });
             aged.recv_timeout(Duration::from_secs(5)).unwrap();
-            let roots = CString::new("{}").unwrap();
+            // An effective registry replace: a fresh root the empty registry
+            // does not hold. `"{}"` would be a no-op now and must not move the
+            // barrier, so it cannot drive this transition anymore.
+            let new_root_dir = tempfile::tempdir().unwrap();
+            let new_root = new_root_dir.path().join("projects");
+            std::fs::create_dir_all(&new_root).unwrap();
+            let roots = CString::new(
+                serde_json::json!({"claude": [new_root.display().to_string()]}).to_string(),
+            )
+            .unwrap();
             let reply: serde_json::Value =
                 serde_json::from_str(&unsafe { take(tb_set_extra_scan_paths(roots.as_ptr())) })
                     .unwrap();

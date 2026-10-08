@@ -3,54 +3,33 @@ status: active
 id: vendor-readme
 kind: reference
 scope: repository
-read_when: advancing or auditing the vendor/tokscale-core consumer pin
+read_when: tracing the former shared-engine dependency or current engine ownership
 last_verified: 2026-10-08
-sources: [".gitmodules", "vendor/tokscale-core", "docs/knowledge/vendor-tokscale.md"]
+sources: ["Cargo.toml", "crates/syrtis_core/Cargo.toml", "docs/knowledge/vendor-tokscale.md"]
 ---
 
-# Shared Rust core pin
+# Former shared Rust core
 
-TokenBar consumes a pinned shared engine as a Git submodule. This branch uses
-a reviewed local fork; the existing configured remote is unchanged.
-Consumer integration rules are documented in
-[`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md).
+Syrtis owns its Rust engine as ordinary source in
+[`crates/syrtis_core`](../crates/syrtis_core). The package is `syrtis-core`;
+parsing, source synchronization, persistent usage, pricing, and aggregation are
+changed and verified with the app in this repository. Builds do not fetch or
+publish a separate engine repository and do not need recursive submodule setup.
 
-| Field | Value |
-|---|---|
-| Path | `vendor/tokscale-core` |
-| Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `3c9c31314e137b22c9bfca932abb9c7e0c9ee155` |
-| Upstream and local-patch ledger | Pinned [`UPSTREAM.md`](tokscale-core/UPSTREAM.md) |
+The imported implementation derives from
+[tokscale](https://github.com/junhoyeo/tokscale) and the former
+[tokscale-core fork](https://github.com/Nanako0129/tokscale-core). Its MIT
+[license](../crates/syrtis_core/LICENSE), attribution, and inherited
+[upstream ledger](../crates/syrtis_core/UPSTREAM.md) remain with the source.
+The ledger is historical provenance, not an integration or release gate.
 
-## Ownership
+The last local dependency checkpoint was
+`890a306e908ab1e61bcd006285782768a8087593`; it is not a current consumer pin.
+The source cutover also preserves local implementation changes made after that
+checkpoint. Current ownership and data-retention rules live in
+[`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md) and
+[`architecture.md`](../docs/knowledge/architecture.md).
 
-The shared repository owns parsers, scanning, cache behavior, pricing, and
-aggregation. TokenBar owns the gitlink, root `Cargo.lock`,
-`crates/tb_core_ffi`, `Sources/CTB/include/ctb.h`, Swift code, and application
-build wiring.
-
-Do not edit shared Rust source inside the TokenBar submodule. Land and verify
-engine changes in `tokscale-core`, then advance this pin to the reviewed engine
-commit and run the TokenBar consumer gates.
-
-## Checkout
-
-This local fork commit has not been published to the configured remote.
-The current checkout has its objects; a fresh recursive clone cannot fetch
-this pin until the fork is published and its remote is configured. No push,
-PR, remote change, release, or Windows runtime verification is implied.
-
-Clone recursively:
-
-```bash
-git clone --recurse-submodules https://github.com/Nanako0129/TokenBar.git
-```
-
-For an existing checkout:
-
-```bash
-git submodule update --init --recursive
-```
-
-The submodule must be clean and its checked-out `HEAD` must equal the gitlink
-before building or releasing.
+Windows owns its own engine and app integration. This cutover does not update
+or verify the Windows runtime. Commit, push, integration, and release still
+require explicit authorization.

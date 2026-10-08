@@ -1,4 +1,4 @@
-//! Per-hour usage breakdown for the popover, backed by tokscale-core's
+//! Per-hour usage breakdown for the popover, backed by syrtis-core's
 //! `get_hourly_report`. Mirrors tokscale's TUI "Hourly" view: one entry per
 //! "YYYY-MM-DD HH:00" slot with the token breakdown, message/turn counts, and
 //! cost. The frontend folds these slots into a 24-hour-of-day distribution.
@@ -51,17 +51,17 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_hourly_report(options))?;
+    let report = runtime.block_on(syrtis_core::get_hourly_report(options))?;
 
     let data = map_report(report);
     crate::encode_local_payload(&data)
 }
 pub(crate) fn run_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
-    options: tokscale_core::ReportOptions,
-    pricing: Option<&tokscale_core::pricing::PricingService>,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
+    options: syrtis_core::ReportOptions,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> Result<crate::EncodedLocalPayload, String> {
-    let report = tokscale_core::get_hourly_report_from_snapshot(snapshot, options, pricing)?;
+    let report = syrtis_core::get_hourly_report_from_snapshot(snapshot, options, pricing)?;
     crate::encode_local_payload(&map_report(report))
 }
 
@@ -77,7 +77,7 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn map_report(report: tokscale_core::HourlyReport) -> HourlyReportData {
+fn map_report(report: syrtis_core::HourlyReport) -> HourlyReportData {
     HourlyReportData {
         entries: report
             .entries
@@ -126,8 +126,8 @@ mod tests {
         cache_read: i64,
         cache_write: i64,
         reasoning: i64,
-    ) -> tokscale_core::HourlyUsage {
-        tokscale_core::HourlyUsage {
+    ) -> syrtis_core::HourlyUsage {
+        syrtis_core::HourlyUsage {
             hour: "2026-07-12 00:00".to_string(),
             clients: vec!["antigravity_cli".to_string()],
             models: vec!["gemini-3-pro".to_string()],
@@ -142,8 +142,8 @@ mod tests {
         }
     }
 
-    fn wrap(entries: Vec<tokscale_core::HourlyUsage>) -> tokscale_core::HourlyReport {
-        tokscale_core::HourlyReport {
+    fn wrap(entries: Vec<syrtis_core::HourlyUsage>) -> syrtis_core::HourlyReport {
+        syrtis_core::HourlyReport {
             entries,
             total_cost: 0.0,
             processing_time_ms: 0,

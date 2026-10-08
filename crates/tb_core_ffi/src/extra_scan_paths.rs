@@ -1,5 +1,5 @@
-//! Consumer-side wiring for tokscale-core's per-client `extra_scan_paths`
-//! mechanism (`vendor/tokscale-core/src/scanner.rs:60`). The mechanism itself
+//! Consumer-side wiring for syrtis-core's per-client `extra_scan_paths`
+//! mechanism (`crates/syrtis_core/src/scanner.rs:60`). The mechanism itself
 //! is fully implemented upstream — canonical dedup, home-escape warning, and
 //! merge into the scan queue all already exist; this module only holds the
 //! process-wide registry `tb_set_extra_scan_paths` writes into and that
@@ -30,7 +30,7 @@ pub(crate) fn snapshot() -> BTreeMap<String, Vec<PathBuf>> {
 
 /// Public client ids this consumer actually wires an extra-scan-path
 /// registry entry for. Upstream's `extra_scan_paths_for()`
-/// (`vendor/tokscale-core/src/scanner.rs:412`) silently drops unknown ids and
+/// (`crates/syrtis_core/src/scanner.rs:412`) silently drops unknown ids and
 /// `supports_extra_dir_scanning()` (`:743`) excludes a few known ones — but
 /// that upstream filtering happens deep inside the scan, long after this
 /// setter has already reported success. A client id that gets this far and
@@ -67,7 +67,7 @@ enum PathShape {
 /// an unmounted volume or a config dir Claude hasn't populated yet becomes
 /// valid on its own, and the next scan picks it up. A path that exists but is
 /// not a directory never becomes one, and retaining it is worse than useless —
-/// upstream's `scan_directory` (`vendor/tokscale-core/src/scanner.rs:278`)
+/// upstream's `scan_directory` (`crates/syrtis_core/src/scanner.rs:278`)
 /// only checks `exists()` before handing the root to `WalkDir`, which yields a
 /// regular file as its own entry. A `*.jsonl` file passed here would therefore
 /// be reported as merely `unreadable` while silently contributing its contents
@@ -109,7 +109,15 @@ fn classify(path: &std::path::Path) -> PathShape {
 /// own, upstream's scan already skips a root that is missing at scan time, and
 /// dropping it here would orphan the user's setting until an app restart —
 /// nothing re-registers an unchanged UserDefaults value.
-pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
+///
+/// Returns the reported payload and whether the effective registry changed.
+/// The comparison runs under the registry write lock: callers invalidate
+/// caches only when `changed` is true, after the lock is released, so a
+/// no-op reapply never disturbs live leases. Storage is canonical —
+/// per-client duplicates collapse, so `[X, X]` equals `[X]` — while
+/// `registeredCount` still counts every registrable occurrence and the
+/// `unreadable`/`rejected` notes are reported per occurrence.
+pub(crate) fn set_from_json(raw: &str) -> Result<(serde_json::Value, bool), String> {
     let input: BTreeMap<String, Vec<String>> =
         serde_json::from_str(raw).map_err(|e| format!("invalid extra scan paths JSON: {}", e))?;
 
@@ -132,7 +140,18 @@ pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
 
         let mut client_paths = Vec::new();
         for raw_path in paths {
-            let path = PathBuf::from(&raw_path);
+            // Trailing separators name the same directory: `/x/y/` vs `/x/y`
+            // must not count as a registry change (and upstream dedups the
+            // same root anyway). Reported notes keep the caller's spelling.
+            let stripped = raw_path.trim_end_matches('/');
+            let canonical = if stripped.is_empty() && raw_path.starts_with('/') {
+                "/".to_string()
+            } else if stripped.is_empty() {
+                raw_path.clone()
+            } else {
+                stripped.to_string()
+            };
+            let path = PathBuf::from(&canonical);
             match classify(&path) {
                 PathShape::Registrable(note) => {
                     if let Some(reason) = note {
@@ -142,7 +161,9 @@ pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
                             "reason": reason,
                         }));
                     }
-                    client_paths.push(path);
+                    if !client_paths.contains(&path) {
+                        client_paths.push(path);
+                    }
                     registered_count += 1;
                 }
                 PathShape::Unusable(reason) => rejected.push(serde_json::json!({
@@ -157,15 +178,22 @@ pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
         }
     }
 
-    *EXTRA_SCAN_PATHS
+    let mut guard = EXTRA_SCAN_PATHS
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = registered;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let changed = *guard != registered;
+    if changed {
+        *guard = registered;
+    }
 
-    Ok(serde_json::json!({
-        "registeredCount": registered_count,
-        "unreadable": unreadable,
-        "rejected": rejected,
-    }))
+    Ok((
+        serde_json::json!({
+            "registeredCount": registered_count,
+            "unreadable": unreadable,
+            "rejected": rejected,
+        }),
+        changed,
+    ))
 }
 
 /// Guards every test that touches `EXTRA_SCAN_PATHS` behind one process-wide
@@ -202,7 +230,7 @@ mod tests {
 
     fn total_claude_tokens(context: &LocalSourceContext) -> i64 {
         let options = context.parse_options(None, Some(vec!["claude".to_string()]));
-        let parsed = tokscale_core::parse_local_clients(options).unwrap();
+        let parsed = syrtis_core::parse_local_clients(options).unwrap();
         parsed
             .messages
             .iter()
@@ -223,7 +251,7 @@ mod tests {
     fn set_claude_roots_result(paths: &[&Path]) -> serde_json::Value {
         let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         let payload = serde_json::json!({ "claude": list }).to_string();
-        set_from_json(&payload).unwrap()
+        set_from_json(&payload).unwrap().0
     }
 
     // A1: two temp roots, id-disjoint content. Unset -> only primary. Set -> sum.
@@ -377,7 +405,7 @@ mod tests {
             ]
         })
         .to_string();
-        let result = set_from_json(&payload).unwrap();
+        let (result, _) = set_from_json(&payload).unwrap();
 
         assert_eq!(
             result["registeredCount"], 2,
@@ -504,7 +532,7 @@ mod tests {
     fn a4b_invalid_json_returns_error_result() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset();
-        let err = set_from_json("{not json").unwrap_err();
+        let err = set_from_json("{not json}").unwrap_err();
         assert!(err.contains("invalid extra scan paths JSON"), "got: {err}");
         reset();
     }
@@ -532,11 +560,11 @@ mod tests {
 
         let context = context_for(primary.path());
         let before_token =
-            tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
+            syrtis_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
 
         set_claude_roots(&[&extra_root]);
         let after_token =
-            tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
+            syrtis_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
 
         assert_ne!(
             before_token, after_token,
@@ -557,7 +585,7 @@ mod tests {
         let options = context.parse_options(None, None);
         assert_eq!(
             options.scanner_settings.extra_scan_paths,
-            tokscale_core::scanner::ScannerSettings::default().extra_scan_paths
+            syrtis_core::scanner::ScannerSettings::default().extra_scan_paths
         );
         assert!(options.scanner_settings.extra_scan_paths.is_empty());
     }
@@ -604,7 +632,7 @@ mod tests {
         // any client id not in SUPPORTED_CLIENTS exercises the same path.
         let payload =
             serde_json::json!({ "crush": [valid_root.display().to_string()] }).to_string();
-        let result = set_from_json(&payload).unwrap();
+        let (result, _) = set_from_json(&payload).unwrap();
 
         assert_eq!(
             result["registeredCount"], 0,
@@ -621,6 +649,42 @@ mod tests {
             snapshot().is_empty(),
             "the registry must not carry an entry for an unsupported client"
         );
+        reset();
+    }
+
+    #[test]
+    fn identical_reapply_reports_unchanged_and_duplicates_collapse() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        let extra = tempfile::tempdir().unwrap();
+        let root = extra.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let payload = serde_json::json!({ "claude": [root.display().to_string()] }).to_string();
+        let (_, first) = set_from_json(&payload).unwrap();
+        assert!(first);
+        let (_, changed) = set_from_json(&payload).unwrap();
+        assert!(!changed);
+        // A duplicate occurrence reports one more registration but stores once.
+        let duplicate = serde_json::json!({
+            "claude": [root.display().to_string(), root.display().to_string()]
+        })
+        .to_string();
+        let (dup_result, dup_changed) = set_from_json(&duplicate).unwrap();
+        assert_eq!(dup_result["registeredCount"], 2);
+        assert!(!dup_changed);
+        assert_eq!(snapshot().get("claude"), Some(&vec![root.clone()]));
+        // Trailing-separator spelling is the same effective directory.
+        let slashed = serde_json::json!({
+            "claude": [format!("{}/", root.display())]
+        })
+        .to_string();
+        let (_, slash_changed) = set_from_json(&slashed).unwrap();
+        assert!(!slash_changed);
+        assert_eq!(snapshot().get("claude"), Some(&vec![root]));
+        let (_, cleared) = set_from_json("{}").unwrap();
+        assert!(cleared);
+        let (_, recleared) = set_from_json("{}").unwrap();
+        assert!(!recleared);
         reset();
     }
 }

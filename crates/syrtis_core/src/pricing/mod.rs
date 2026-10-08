@@ -1,0 +1,1648 @@
+pub mod aliases;
+pub mod cache;
+pub mod custom;
+pub mod litellm;
+pub mod lookup;
+pub mod openrouter;
+
+use custom::CustomPricing;
+use lookup::{
+    compute_cost_and_coverage_for_lookup_result, CostEstimate, LookupResult, PricingLookup,
+};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
+use crate::TokenBreakdown;
+
+pub use litellm::ModelPricing;
+
+const REMOTE_PRICING_TTL_SECS: u64 = 3600;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemotePricingDiagnostic {
+    Missing,
+    Stale,
+    Corrupt,
+}
+
+/// Cache-only pricing data for a remote source fold.
+///
+/// The root is supplied by the caller and is read directly. No default path,
+/// environment variable, or network fetch participates in construction.
+#[derive(Clone)]
+pub struct RemotePricingSnapshot {
+    service: Option<Arc<PricingService>>,
+    digest: [u8; 32],
+    diagnostic: Option<RemotePricingDiagnostic>,
+}
+
+impl std::fmt::Debug for RemotePricingSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemotePricingSnapshot")
+            .field("has_service", &self.service.is_some())
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+impl RemotePricingSnapshot {
+    pub fn from_cache_root(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref();
+        let files = ["pricing-litellm.json", "pricing-openrouter.json"];
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(b"tokenbar-remote-pricing-v1");
+        if !root.is_absolute() {
+            for filename in files {
+                descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
+                descriptor.extend_from_slice(filename.as_bytes());
+                descriptor.extend_from_slice(&u64::MAX.to_be_bytes());
+            }
+            return Self {
+                service: None,
+                digest: Sha256::digest(descriptor).into(),
+                diagnostic: Some(RemotePricingDiagnostic::Missing),
+            };
+        }
+        let mut datasets = Vec::with_capacity(files.len());
+        let mut diagnostic = None;
+        for filename in files {
+            let bytes = fs::read(root.join(filename));
+            match &bytes {
+                Ok(bytes) => {
+                    descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
+                    descriptor.extend_from_slice(filename.as_bytes());
+                    descriptor.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                    descriptor.extend_from_slice(bytes);
+                }
+                Err(_) => {
+                    descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
+                    descriptor.extend_from_slice(filename.as_bytes());
+                    descriptor.extend_from_slice(&u64::MAX.to_be_bytes());
+                }
+            }
+            match bytes
+                .map_err(|_| DatasetError::Missing)
+                .and_then(|bytes| decode_fresh_dataset(&bytes))
+            {
+                Ok(data) => datasets.push(Some(data)),
+                Err(DatasetError::Missing) => {
+                    diagnostic.get_or_insert(RemotePricingDiagnostic::Missing);
+                    datasets.push(None);
+                }
+                Err(DatasetError::Stale) => {
+                    diagnostic.get_or_insert(RemotePricingDiagnostic::Stale);
+                    datasets.push(None);
+                }
+                Err(DatasetError::Corrupt) => {
+                    diagnostic.get_or_insert(RemotePricingDiagnostic::Corrupt);
+                    datasets.push(None);
+                }
+            }
+        }
+        let digest = Sha256::digest(descriptor).into();
+        let service = PricingService::from_cached_datasets_with_custom(
+            CustomPricing::default(),
+            datasets.remove(0),
+            datasets.remove(0),
+        )
+        .map(Arc::new);
+        Self {
+            service,
+            digest,
+            diagnostic,
+        }
+    }
+
+    pub fn content_digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn diagnostic(&self) -> Option<RemotePricingDiagnostic> {
+        self.diagnostic
+    }
+
+    pub(crate) fn service(&self) -> Option<&PricingService> {
+        self.service.as_deref()
+    }
+}
+
+#[derive(Debug)]
+enum DatasetError {
+    Missing,
+    Stale,
+    Corrupt,
+}
+
+fn decode_fresh_dataset(bytes: &[u8]) -> Result<HashMap<String, ModelPricing>, DatasetError> {
+    #[derive(Deserialize)]
+    struct Envelope<T> {
+        timestamp: u64,
+        data: T,
+    }
+    let envelope: Envelope<HashMap<String, ModelPricing>> =
+        serde_json::from_slice(bytes).map_err(|_| DatasetError::Corrupt)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| DatasetError::Corrupt)?
+        .as_secs();
+    if envelope.timestamp > now {
+        return Err(DatasetError::Corrupt);
+    }
+    if now.saturating_sub(envelope.timestamp) > REMOTE_PRICING_TTL_SECS {
+        return Err(DatasetError::Stale);
+    }
+    Ok(envelope.data)
+}
+
+/// In-memory pricing snapshot plus the instant it was fetched, so the process
+/// -wide service can be refreshed on a TTL instead of being frozen for the
+/// whole process lifetime (the old `OnceCell` behaviour).
+struct CachedService {
+    service: Arc<PricingService>,
+    fetched_at: Instant,
+}
+
+static PRICING_SERVICE: RwLock<Option<CachedService>> = RwLock::const_new(None);
+
+/// How long an in-memory pricing snapshot is reused before a refresh is
+/// attempted. Aligned with the on-disk LiteLLM cache TTL (1h, see
+/// `cache::CACHE_TTL_SECS`) so a refresh past this point re-reads the file
+/// cache cheaply and only hits the network when that, too, has gone stale.
+const IN_MEMORY_TTL: Duration = Duration::from_secs(3600);
+
+/// Unix-seconds time the LiteLLM pricing dataset was last fetched from upstream
+/// (the on-disk cache write time), or `None` when no cache exists yet. Drives
+/// the "prices updated …" hint in the UI.
+pub fn pricing_cached_at() -> Option<u64> {
+    litellm::cached_at()
+}
+
+// @keep: documents non-obvious filtering behavior — without this, the next person
+// will wonder why github_copilot entries disappear from the pricing data.
+/// Provider prefixes in LiteLLM data that use subscription-based pricing ($0.00)
+/// and should be excluded from pay-per-token cost estimation.
+const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
+
+pub struct PricingService {
+    custom: CustomPricing,
+    lookup: PricingLookup,
+    retained_base_bytes: usize,
+}
+
+// Conservative retained-allocation accounting, not allocator/RSS telemetry.
+// Hash tables include spare buckets/control bytes; heap allocations include
+// fixed bookkeeping headroom. Saturation fails cache admission closed.
+fn allocation_bytes(capacity: usize, element_bytes: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.saturating_mul(element_bytes).saturating_add(64)
+    }
+}
+
+fn map_allocation_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    allocation_bytes(
+        map.capacity().saturating_mul(2),
+        std::mem::size_of::<(K, V)>().saturating_add(1),
+    )
+}
+
+fn pricing_map_bytes(map: &HashMap<String, ModelPricing>) -> usize {
+    map.keys().fold(map_allocation_bytes(map), |bytes, key| {
+        bytes.saturating_add(allocation_bytes(key.capacity(), 1))
+    })
+}
+
+impl PricingService {
+    pub fn new(
+        litellm_data: HashMap<String, ModelPricing>,
+        openrouter_data: HashMap<String, ModelPricing>,
+    ) -> Self {
+        Self::new_with_custom(CustomPricing::default(), litellm_data, openrouter_data)
+    }
+
+    pub fn new_with_custom(
+        custom: CustomPricing,
+        litellm_data: HashMap<String, ModelPricing>,
+        openrouter_data: HashMap<String, ModelPricing>,
+    ) -> Self {
+        Self {
+            retained_base_bytes: std::mem::size_of::<Self>()
+                .saturating_add(custom.retained_bytes()),
+            custom,
+            lookup: PricingLookup::new_with_sakana(
+                litellm_data,
+                openrouter_data,
+                Self::build_cursor_overrides(),
+                Self::build_sakana_overrides(),
+            ),
+        }
+    }
+
+    /// Conservative bytes retained by this service, including lookup cache
+    /// growth. Shared Arc owners must charge one service instance only once.
+    /// Immutable catalog accounting is computed at construction; reads do not
+    /// traverse the catalog or allocate.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_base_bytes
+            .saturating_add(self.lookup.retained_bytes())
+    }
+
+    // @keep: the retain logic is non-trivial (lowercase + prefix match); this doc
+    // explains *why* these entries are dropped, not just *what* the code does.
+    /// Filter out LiteLLM entries from subscription-based providers (e.g. github_copilot/)
+    /// whose $0.00 pricing is meaningless for per-token cost estimation.
+    fn filter_litellm_data(
+        mut data: HashMap<String, ModelPricing>,
+    ) -> HashMap<String, ModelPricing> {
+        data.retain(|key, _| {
+            let lower = key.to_lowercase();
+            !EXCLUDED_LITELLM_PREFIXES
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+        });
+        data
+    }
+
+    // @keep: Cursor-sourced pricing for models not yet in LiteLLM/OpenRouter.
+    // Checked after exact/prefix matches but before fuzzy matching in PricingLookup,
+    // so real upstream entries (including provider-prefixed like openai/gpt-5.3-codex)
+    // always win. Source citations are required for audit trail.
+    fn build_cursor_overrides() -> HashMap<String, ModelPricing> {
+        // @keep: the difference between `None` and `Some(0.0)` here is load-bearing.
+        // The 5th field is cache CREATION. `None` means "rate unknown", and the
+        // cache-write bucket then reports Unknown coverage. `Some(0.0)` means
+        // "documented free". `compute_cost` already reads an absent rate as
+        // 0.0, so the two produce an identical cost; only the coverage verdict
+        // differs. Set it ONLY where Cursor documents cache creation as free —
+        // guessing a rate would invent spend.
+        /// `(model id, input, output, cache read, cache creation)`, per token.
+        type CursorRateRow = (&'static str, f64, f64, Option<f64>, Option<f64>);
+
+        let entries: &[CursorRateRow] = &[
+            // GPT-5.3 family: $1.75/$14.00 per 1M tokens, $0.175 cache read
+            // Source: Cursor docs (cursor.com/en-US/docs/models), llm-stats.com
+            ("gpt-5.3", 0.00000175, 0.000014, Some(1.75e-7), None),
+            ("gpt-5.3-codex", 0.00000175, 0.000014, Some(1.75e-7), None),
+            (
+                "gpt-5.3-codex-spark",
+                0.00000175,
+                0.000014,
+                Some(1.75e-7),
+                None,
+            ),
+            // Composer 1: $1.25/$10.00 per 1M tokens, $0.125 cache read
+            // Source: Cursor docs (cursor.com/docs/models#model-pricing)
+            ("composer 1", 0.00000125, 0.00001, Some(1.25e-7), None),
+            ("composer-1", 0.00000125, 0.00001, Some(1.25e-7), None),
+            // Composer 1.5: $3.50/$17.50 per 1M tokens, $0.35 cache read
+            // Source: Cursor docs (cursor.com/docs/models#model-pricing), issue #276
+            ("composer 1.5", 0.0000035, 0.0000175, Some(3.5e-7), None),
+            ("composer-1.5", 0.0000035, 0.0000175, Some(3.5e-7), None),
+            // Composer 2: $0.50/$2.50 per 1M input/output, $0.20/M cache read; cache creation free
+            // Composer 2 Fast: $1.50/$7.50 per 1M, $0.35/M cache read; cache creation free
+            // Source: Cursor docs (cursor.com/docs/models#model-pricing)
+            ("composer 2", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer-2", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer 2 fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
+            ("composer-2-fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
+            // Composer 2: $0.50/$2.50 per 1M input/output, $0.20/M cache read; cache creation free
+            // Composer 2 Fast: $1.50/$7.50 per 1M, $0.35/M cache read; cache creation free
+            // Source: Cursor docs (cursor.com/docs/models#model-pricing)
+            ("composer-2.5", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer-2.5-fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
+        ];
+
+        let mut overrides = HashMap::with_capacity(entries.len());
+        for (model_id, input, output, cache_read, cache_creation) in entries {
+            overrides.insert(
+                model_id.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(*input),
+                    output_cost_per_token: Some(*output),
+                    cache_read_input_token_cost: *cache_read,
+                    cache_creation_input_token_cost: *cache_creation,
+                    ..Default::default()
+                },
+            );
+        }
+        // Grok 4.6: $2.00/$6.00 per 1M input/output, $0.50/M cache read;
+        // >200K-context tier $4.00/$12.00 per 1M, $1.00/M cache read
+        // Source: Cursor model docs (cursor.com/docs/models#model-pricing);
+        // rates mirror models.dev xai/grok-4.6 including the >200K context tier
+        overrides.insert(
+            "grok-4.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(6e-6),
+                cache_read_input_token_cost: Some(5e-7),
+                input_cost_per_token_above_200k_tokens: Some(4e-6),
+                output_cost_per_token_above_200k_tokens: Some(12e-6),
+                cache_read_input_token_cost_above_200k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        overrides
+    }
+
+    // Sakana's Fugu Ultra is not present in the upstream catalogs. Bare `fugu`
+    // remains intentionally unpriced because its router rate depends on the
+    // underlying model selected for each request.
+    fn build_sakana_overrides() -> HashMap<String, ModelPricing> {
+        let mut overrides = HashMap::with_capacity(1);
+        overrides.insert(
+            "fugu-ultra".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(3e-5),
+                cache_read_input_token_cost: Some(5e-7),
+                cache_creation_input_token_cost: None,
+                input_cost_per_token_above_272k_tokens: Some(1e-5),
+                output_cost_per_token_above_272k_tokens: Some(4.5e-5),
+                cache_read_input_token_cost_above_272k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        overrides
+    }
+
+    async fn fetch_inner() -> Result<Self, String> {
+        let (litellm_result, openrouter_data) =
+            tokio::join!(litellm::fetch(), openrouter::fetch_all_mapped());
+
+        let litellm_data = litellm_result.map_err(|e| e.to_string())?;
+        let litellm_data = Self::filter_litellm_data(litellm_data);
+
+        Ok(Self::new_with_custom(
+            CustomPricing::load_from_default_path(),
+            litellm_data,
+            openrouter_data,
+        ))
+    }
+
+    fn from_cached_datasets(
+        litellm_data: Option<HashMap<String, ModelPricing>>,
+        openrouter_data: Option<HashMap<String, ModelPricing>>,
+    ) -> Option<Self> {
+        Self::from_cached_datasets_with_custom(
+            CustomPricing::load_from_default_path(),
+            litellm_data,
+            openrouter_data,
+        )
+    }
+
+    fn from_cached_datasets_with_custom(
+        custom: CustomPricing,
+        litellm_data: Option<HashMap<String, ModelPricing>>,
+        openrouter_data: Option<HashMap<String, ModelPricing>>,
+    ) -> Option<Self> {
+        if litellm_data.is_none() && openrouter_data.is_none() {
+            return None;
+        }
+
+        Some(Self::new_with_custom(
+            custom,
+            Self::filter_litellm_data(litellm_data.unwrap_or_default()),
+            openrouter_data.unwrap_or_default(),
+        ))
+    }
+
+    pub fn load_cached_any_age() -> Option<Self> {
+        Self::from_cached_datasets(
+            litellm::load_cached_any_age(),
+            openrouter::load_cached_any_age(),
+        )
+    }
+
+    /// Read the pinned context's cached catalog without an HTTP/TTL refresh.
+    /// Source verification and pricing freshness are independent operations.
+    pub fn load_cached_for_local_source(
+        context: &crate::ResolvedLocalSourceContext,
+    ) -> Option<Self> {
+        Self::load_cached_any_age_from_config_dir(context.pricing_config_dir())
+    }
+
+    pub(crate) fn load_cached_any_age_from_config_dir(config_dir: &Path) -> Option<Self> {
+        let cache_dir = config_dir.join("cache");
+        Self::from_cached_datasets_with_custom(
+            CustomPricing::load_from_path(&config_dir.join("custom-pricing.json")),
+            litellm::load_cached_any_age_from_dir(&cache_dir),
+            openrouter::load_cached_any_age_from_dir(&cache_dir),
+        )
+    }
+
+    pub async fn get_or_init() -> Result<Arc<PricingService>, String> {
+        // Fast path: a fresh in-memory snapshot serves without taking the write
+        // lock, so the common case (called on every refresh tick) is cheap.
+        {
+            let guard = PRICING_SERVICE.read().await;
+            if let Some(cached) = guard.as_ref() {
+                if cached.fetched_at.elapsed() < IN_MEMORY_TTL {
+                    return Ok(Arc::clone(&cached.service));
+                }
+            }
+        }
+
+        // Slow path: snapshot is missing or past its TTL — refetch under the
+        // write lock, re-checking in case another task refreshed it first.
+        let mut guard = PRICING_SERVICE.write().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.fetched_at.elapsed() < IN_MEMORY_TTL {
+                return Ok(Arc::clone(&cached.service));
+            }
+        }
+
+        match Self::fetch_inner().await {
+            Ok(service) => {
+                let service = Arc::new(service);
+                *guard = Some(CachedService {
+                    service: Arc::clone(&service),
+                    fetched_at: Instant::now(),
+                });
+                Ok(service)
+            }
+            // Refresh failed (e.g. offline). Keep serving the last good snapshot
+            // — a stale price beats none — and only surface the error when the
+            // cell was never warmed.
+            Err(err) => match guard.as_ref() {
+                Some(cached) => Ok(Arc::clone(&cached.service)),
+                None => Err(err),
+            },
+        }
+    }
+
+    pub fn lookup_with_source(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+    ) -> Option<LookupResult> {
+        self.lookup_with_source_and_provider(model_id, force_source, None)
+    }
+
+    pub fn lookup_with_source_and_provider(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let force_custom = force_source.is_some_and(|source| source.eq_ignore_ascii_case("custom"));
+
+        if force_custom {
+            // `PricingLookup` has no custom dataset of its own. Keep forced
+            // custom lookups fail-closed, while still allowing the same full-id
+            // and terminal custom seam used by automatic lookup.
+            if self.custom.is_empty() {
+                return None;
+            }
+            return self
+                .lookup
+                .lookup_with_source_and_provider_and_terminal_custom(
+                    model_id,
+                    Some("custom"),
+                    provider_id,
+                    |candidate| self.lookup_custom(candidate),
+                );
+        }
+
+        if force_source.is_none() && !self.custom.is_empty() {
+            return self
+                .lookup
+                .lookup_with_source_and_provider_and_terminal_custom(
+                    model_id,
+                    None,
+                    provider_id,
+                    |candidate| self.lookup_custom(candidate),
+                );
+        }
+
+        // With no custom data, keep the normal cached PricingLookup path. For
+        // forced upstream sources, never allow a custom callback to participate.
+        self.lookup
+            .lookup_with_source_and_provider(model_id, force_source, provider_id)
+    }
+
+    pub fn calculate_cost(
+        &self,
+        model_id: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> f64 {
+        let usage = TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            cache_write_1h: 0,
+        };
+        self.calculate_cost_with_provider(model_id, None, &usage)
+    }
+
+    pub(crate) fn estimate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<CostEstimate> {
+        if self.custom.is_empty() {
+            return self
+                .lookup
+                .estimate_cost_with_provider(model_id, provider_id, usage);
+        }
+
+        let result = self.lookup_with_source_and_provider(model_id, None, provider_id)?;
+        Some(compute_cost_and_coverage_for_lookup_result(&result, usage))
+    }
+
+    pub fn calculate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> f64 {
+        self.estimate_cost_with_provider(model_id, provider_id, usage)
+            .map_or(0.0, |estimate| estimate.cost)
+    }
+
+    fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
+        self.custom
+            .lookup_exact_with_key(model_id)
+            .map(|result| LookupResult {
+                pricing: result.pricing.clone(),
+                source: "Custom".into(),
+                matched_key: result.matched_key.to_string(),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        }
+    }
+
+    fn custom_service(
+        custom: HashMap<String, ModelPricing>,
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+    ) -> PricingService {
+        PricingService::new_with_custom(CustomPricing::from_models(custom), litellm, openrouter)
+    }
+
+    /// Composer 2's cache creation is documented free, but it was encoded as
+    /// `None` ("rate unknown"), so a request with cache-write tokens reported
+    /// Partial coverage. The cost is unchanged either way — `compute_cost`
+    /// reads an absent rate as 0.0 — so this is purely the coverage verdict.
+    #[test]
+    fn cursor_documented_free_cache_creation_covers_cache_write_usage() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000,
+            output: 500,
+            cache_read: 200,
+            cache_write: 300,
+            ..Default::default()
+        };
+
+        let composer2 = service
+            .estimate_cost_with_provider("composer-2", None, &usage)
+            .expect("composer-2 prices from the Cursor table");
+        assert_eq!(composer2.coverage, lookup::EstimateCoverage::Complete);
+        let expected = 1_000.0 * 5e-7 + 500.0 * 2.5e-6 + 200.0 * 2e-7;
+        assert!((composer2.cost - expected).abs() < 1e-12);
+
+        // Undocumented stays unknown: Composer 1.5 has no published rate.
+        let composer15 = service
+            .estimate_cost_with_provider("composer-1.5", None, &usage)
+            .expect("composer-1.5 prices from the Cursor table");
+        assert_eq!(composer15.coverage, lookup::EstimateCoverage::Partial);
+    }
+
+    #[test]
+    fn test_filter_excludes_github_copilot() {
+        let mut data = HashMap::new();
+        data.insert(
+            "github_copilot/gpt-5.3-codex".into(),
+            ModelPricing::default(),
+        );
+        data.insert("github_copilot/gpt-4o".into(), ModelPricing::default());
+        data.insert(
+            "gpt-5.2".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000175),
+                ..Default::default()
+            },
+        );
+        data.insert("openai/gpt-5.2".into(), ModelPricing::default());
+
+        let filtered = PricingService::filter_litellm_data(data);
+        assert!(!filtered.contains_key("github_copilot/gpt-5.3-codex"));
+        assert!(!filtered.contains_key("github_copilot/gpt-4o"));
+        assert!(filtered.contains_key("gpt-5.2"));
+        assert!(filtered.contains_key("openai/gpt-5.2"));
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_when_not_in_upstream() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("gpt-5.3-codex", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00000175));
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000014));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(1.75e-7));
+    }
+
+    #[test]
+    fn test_cursor_yields_to_litellm_exact() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.3-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.002),
+                output_cost_per_token: Some(0.016),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let result = service.lookup_with_source("gpt-5.3-codex", None).unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.002));
+    }
+
+    #[test]
+    fn test_cursor_yields_to_openrouter_prefix() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-5.3-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.003),
+                output_cost_per_token: Some(0.012),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(HashMap::new(), openrouter);
+        let result = service.lookup_with_source("gpt-5.3-codex", None).unwrap();
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.003));
+    }
+
+    #[test]
+    fn test_cursor_skipped_when_force_source_set() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        assert!(service
+            .lookup_with_source("gpt-5.3-codex", Some("litellm"))
+            .is_none());
+        assert!(service
+            .lookup_with_source("gpt-5.3-codex", Some("openrouter"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_cursor_matches_after_version_normalization() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("gpt-5-3-codex", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "gpt-5.3-codex");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00000175));
+    }
+
+    #[test]
+    fn test_cursor_matches_provider_prefixed_input() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("openai/gpt-5.3-codex", None)
+            .unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn test_cursor_provider_prefix_yields_to_upstream() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-5.3-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.003),
+                output_cost_per_token: Some(0.012),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(HashMap::new(), openrouter);
+        let result = service
+            .lookup_with_source("openai/gpt-5.3-codex", None)
+            .unwrap();
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.003));
+    }
+
+    #[test]
+    fn test_cursor_matches_via_suffix_stripping() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("gpt-5.3-codex-high", None)
+            .unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("gpt-5.3-codex", 1_000_000, 100_000, 0, 0, 0);
+        let expected = 1_000_000.0 * 0.00000175 + 100_000.0 * 0.000014;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_1() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("Composer 1", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer 1");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00000125));
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.00001));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(1.25e-7));
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_1() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("Composer 1", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 0.00000125 + 100_000.0 * 0.00001 + 50_000.0 * 1.25e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_hyphenated_composer_1() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("composer-1", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-1");
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_1_5() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("Composer 1.5", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer 1.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.0000035));
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.0000175));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(3.5e-7));
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_1_5() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("Composer 1.5", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 0.0000035 + 100_000.0 * 0.0000175 + 50_000.0 * 3.5e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_hyphenated_composer_1_5() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("composer-1.5", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-1.5");
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("composer-2", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-2");
+        assert_eq!(result.pricing.input_cost_per_token, Some(5e-7));
+        assert_eq!(result.pricing.output_cost_per_token, Some(2.5e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(2e-7));
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost; only Some(0.0) reports the
+        // cache-write bucket as covered.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2_spaced() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("Composer 2", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer 2");
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2_fast() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("composer-2-fast", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-2-fast");
+        assert_eq!(result.pricing.input_cost_per_token, Some(1.5e-6));
+        assert_eq!(result.pricing.output_cost_per_token, Some(7.5e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(3.5e-7));
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost; only Some(0.0) reports the
+        // cache-write bucket as covered.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2_fast_spaced() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("Composer 2 Fast", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer 2 fast");
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_2() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("composer-2", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 5e-7 + 100_000.0 * 2.5e-6 + 50_000.0 * 2e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_composer_2_cache_write_free() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let with_write = service.calculate_cost("composer-2", 0, 0, 0, 500_000, 0);
+        let without_write = service.calculate_cost("composer-2", 0, 0, 0, 0, 0);
+        assert!((with_write - without_write).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_2_fast() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("composer-2-fast", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 1.5e-6 + 100_000.0 * 7.5e-6 + 50_000.0 * 3.5e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_composer_2_fast_cache_write_free() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let with_write = service.calculate_cost("composer-2-fast", 0, 0, 0, 500_000, 0);
+        let without_write = service.calculate_cost("composer-2-fast", 0, 0, 0, 0, 0);
+        assert!(
+            (with_write - without_write).abs() < 1e-10,
+            "Cache creation should be free for Composer 2 Fast"
+        );
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2_5() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("composer-2.5", None).unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-2.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(5e-7));
+        assert_eq!(result.pricing.output_cost_per_token, Some(2.5e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(2e-7));
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost; only Some(0.0) reports the
+        // cache-write bucket as covered.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
+    }
+
+    #[test]
+    fn test_cursor_returns_pricing_for_composer_2_5_fast() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("composer-2.5-fast", None)
+            .unwrap();
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "composer-2.5-fast");
+        assert_eq!(result.pricing.input_cost_per_token, Some(1.5e-6));
+        assert_eq!(result.pricing.output_cost_per_token, Some(7.5e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(3.5e-7));
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost; only Some(0.0) reports the
+        // cache-write bucket as covered.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_2_5() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("composer-2.5", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 5e-7 + 100_000.0 * 2.5e-6 + 50_000.0 * 2e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_composer_2_5_cache_write_free() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let with_write = service.calculate_cost("composer-2.5", 0, 0, 0, 500_000, 0);
+        let without_write = service.calculate_cost("composer-2.5", 0, 0, 0, 0, 0);
+        assert!((with_write - without_write).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_for_composer_2_5_fast() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cost = service.calculate_cost("composer-2.5-fast", 1_000_000, 100_000, 50_000, 0, 0);
+        let expected = 1_000_000.0 * 1.5e-6 + 100_000.0 * 7.5e-6 + 50_000.0 * 3.5e-7;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cursor_calculate_cost_composer_2_5_fast_cache_write_free() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let with_write = service.calculate_cost("composer-2.5-fast", 0, 0, 0, 500_000, 0);
+        let without_write = service.calculate_cost("composer-2.5-fast", 0, 0, 0, 0, 0);
+        assert!(
+            (with_write - without_write).abs() < 1e-10,
+            "Cache creation should be free for Composer 2.5 Fast"
+        );
+    }
+
+    #[test]
+    fn test_cursor_composer_lookup_case_insensitive() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        let lower = service.lookup_with_source("composer 1", None);
+        let upper = service.lookup_with_source("COMPOSER 1", None);
+        let mixed = service.lookup_with_source("Composer 1", None);
+
+        assert!(lower.is_some(), "lowercase should resolve");
+        assert!(upper.is_some(), "UPPERCASE should resolve");
+        assert!(mixed.is_some(), "Mixed Case should resolve");
+
+        assert_eq!(
+            lower.unwrap().pricing.input_cost_per_token,
+            upper.unwrap().pricing.input_cost_per_token
+        );
+    }
+
+    #[test]
+    fn test_from_cached_datasets_returns_none_when_both_sources_missing() {
+        assert!(PricingService::from_cached_datasets(None, None).is_none());
+    }
+
+    #[test]
+    fn test_from_cached_datasets_filters_subscription_only_litellm_entries() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "github_copilot/gpt-5.3-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "gpt-5.2".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000175),
+                ..Default::default()
+            },
+        );
+
+        let service = PricingService::from_cached_datasets(Some(litellm), None).unwrap();
+
+        assert!(service
+            .lookup_with_source("github_copilot/gpt-5.3-codex", Some("litellm"))
+            .is_none());
+        assert!(service
+            .lookup_with_source("gpt-5.2", Some("litellm"))
+            .is_some());
+    }
+
+    #[test]
+    fn remote_snapshot_filters_subscription_rows_before_fallback_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "github_copilot/gpt-5.3-codex".to_owned(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "gpt-5.3-codex".to_owned(),
+            model_pricing(0.00000175, 0.000014),
+        );
+
+        for (name, data) in [
+            ("pricing-litellm.json", litellm),
+            ("pricing-openrouter.json", openrouter),
+        ] {
+            let envelope = serde_json::json!({ "timestamp": now, "data": data });
+            std::fs::write(
+                root.path().join(name),
+                serde_json::to_vec(&envelope).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let snapshot = RemotePricingSnapshot::from_cache_root(root.path());
+        let service = snapshot
+            .service()
+            .expect("fresh cache should build a service");
+        let result = service
+            .lookup_with_source_and_provider("github_copilot/gpt-5.3-codex", None, None)
+            .expect("the filtered subscription row should fall back to OpenRouter");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00000175));
+        assert!(service
+            .lookup_with_source("github_copilot/gpt-5.3-codex", Some("litellm"))
+            .is_none());
+    }
+
+    #[test]
+    fn custom_override_wins_over_litellm() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-4o".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-4o".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service.lookup_with_source("gpt-4o", None).unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(result.matched_key, "gpt-4o");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_override_wins_over_openrouter() {
+        let mut custom = HashMap::new();
+        custom.insert("grok-code".into(), model_pricing(0.000002, 0.000008));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("x-ai/grok-code".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, HashMap::new(), openrouter);
+        let result = service.lookup_with_source("grok-code", None).unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(result.matched_key, "grok-code");
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000008));
+    }
+
+    #[test]
+    fn custom_override_wins_over_built_in_terminal_for_routed_id() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-5.5".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.5".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service.lookup_with_source("cx/gpt-5.5", None).unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(result.matched_key, "gpt-5.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_terminal_raw_alias_key_matches_direct_and_forced_custom() {
+        let mut custom = HashMap::new();
+        custom.insert("k2p6".into(), model_pricing(0.000002, 0.000008));
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+
+        for force_source in [None, Some("custom")] {
+            let result = service.lookup_with_source("cx/k2p6", force_source).unwrap();
+            assert_eq!(result.source, "Custom");
+            assert_eq!(result.matched_key, "k2p6");
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+        }
+    }
+
+    #[test]
+    fn custom_terminal_canonical_alias_key_matches_direct_and_forced_custom() {
+        let mut custom = HashMap::new();
+        custom.insert("kimi-k2.6".into(), model_pricing(0.000003, 0.000012));
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+
+        for force_source in [None, Some("custom")] {
+            let result = service.lookup_with_source("cx/k2p6", force_source).unwrap();
+            assert_eq!(result.source, "Custom");
+            assert_eq!(result.matched_key, "kimi-k2.6");
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.000003));
+        }
+    }
+
+    #[test]
+    fn custom_exact_parenthesized_key_wins_before_tier_stripping() {
+        let mut custom = HashMap::new();
+        custom.insert("cx/gpt-5.5(high)".into(), model_pricing(0.000002, 0.000008));
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+
+        for force_source in [None, Some("custom")] {
+            let result = service
+                .lookup_with_source("CX/GPT-5.5(HIGH)", force_source)
+                .unwrap();
+            assert_eq!(result.source, "Custom");
+            assert_eq!(result.matched_key, "cx/gpt-5.5(high)");
+        }
+    }
+
+    #[test]
+    fn custom_exact_invalid_parenthesized_key_wins_but_missing_key_fails_closed() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "cx/not-a-real-model(invalid)".into(),
+            model_pricing(0.000002, 0.000008),
+        );
+        let mut litellm = HashMap::new();
+        litellm.insert("not-a-real-model".into(), model_pricing(0.00001, 0.00003));
+        let service = custom_service(custom, litellm.clone(), HashMap::new());
+
+        for force_source in [None, Some("custom")] {
+            let result = service
+                .lookup_with_source("cx/not-a-real-model(invalid)", force_source)
+                .unwrap();
+            assert_eq!(result.source, "Custom");
+            assert_eq!(result.matched_key, "cx/not-a-real-model(invalid)");
+        }
+
+        let without_exact = custom_service(HashMap::new(), litellm, HashMap::new());
+        for force_source in [None, Some("custom")] {
+            assert!(without_exact
+                .lookup_with_source("cx/not-a-real-model(invalid)", force_source)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn forced_upstream_sources_do_not_use_raw_custom_parenthesized_keys() {
+        let mut custom = HashMap::new();
+        custom.insert("cx/gpt-5.5(high)".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.5".into(), model_pricing(0.00001, 0.00003));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("gpt-5.5".into(), model_pricing(0.000003, 0.000012));
+        let service = custom_service(custom, litellm, openrouter);
+
+        let litellm_result = service
+            .lookup_with_source("cx/gpt-5.5(high)", Some("litellm"))
+            .unwrap();
+        assert_eq!(litellm_result.source, "LiteLLM");
+        assert_eq!(litellm_result.matched_key, "gpt-5.5");
+
+        let openrouter_result = service
+            .lookup_with_source("cx/gpt-5.5(high)", Some("openrouter"))
+            .unwrap();
+        assert_eq!(openrouter_result.source, "OpenRouter");
+        assert_eq!(openrouter_result.matched_key, "gpt-5.5");
+    }
+
+    #[test]
+    fn custom_terminal_override_does_not_steal_full_id_exact() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-5.5".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("cx/gpt-5.5".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service.lookup_with_source("cx/gpt-5.5", None).unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "cx/gpt-5.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00001));
+    }
+
+    #[test]
+    fn custom_terminal_override_does_not_steal_full_path_suffix_exact() {
+        let mut custom = HashMap::new();
+        custom.insert("grok-code-fast-1".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "azure_ai/grok-code-fast-1".into(),
+            model_pricing(0.00001, 0.00003),
+        );
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service
+            .lookup_with_source("azure_ai/grok-code-fast-1-high", None)
+            .unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "azure_ai/grok-code-fast-1");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.00001));
+    }
+
+    #[test]
+    fn custom_terminal_override_respects_forced_sources() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-5.5".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.5".into(), model_pricing(0.00001, 0.00003));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("gpt-5.5".into(), model_pricing(0.000003, 0.000012));
+
+        let service = custom_service(custom, litellm, openrouter);
+
+        let litellm_result = service
+            .lookup_with_source("cx/gpt-5.5", Some("litellm"))
+            .unwrap();
+        assert_eq!(litellm_result.source, "LiteLLM");
+        assert_eq!(litellm_result.pricing.input_cost_per_token, Some(0.00001));
+
+        let openrouter_result = service
+            .lookup_with_source("cx/gpt-5.5", Some("openrouter"))
+            .unwrap();
+        assert_eq!(openrouter_result.source, "OpenRouter");
+        assert_eq!(
+            openrouter_result.pricing.input_cost_per_token,
+            Some(0.000003)
+        );
+
+        let custom_result = service
+            .lookup_with_source("cx/gpt-5.5", Some("custom"))
+            .unwrap();
+        assert_eq!(custom_result.source, "Custom");
+        assert_eq!(custom_result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_terminal_override_does_not_bypass_provider_scoped_fail_closed() {
+        let mut terminal_custom = HashMap::new();
+        terminal_custom.insert("deepseek-v4-pro".into(), model_pricing(0.000002, 0.000008));
+        let service = custom_service(terminal_custom, HashMap::new(), HashMap::new());
+
+        for scope in ["models", "routers"] {
+            assert!(service
+                .lookup_with_source(&format!("accounts/fireworks/{scope}/deepseek-v4-pro"), None,)
+                .is_none());
+        }
+
+        let full_key = "accounts/fireworks/models/deepseek-v4-pro";
+        let mut exact_custom = HashMap::new();
+        exact_custom.insert(full_key.into(), model_pricing(0.000003, 0.000012));
+        let exact_service = custom_service(exact_custom, HashMap::new(), HashMap::new());
+        let result = exact_service.lookup_with_source(full_key, None).unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(result.matched_key, full_key);
+    }
+
+    #[test]
+    fn custom_terminal_override_unknown_stays_none() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-5.5".into(), model_pricing(0.000002, 0.000008));
+
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+        assert!(service
+            .lookup_with_source("cx/not-a-real-model-high", None)
+            .is_none());
+    }
+
+    #[test]
+    fn custom_override_respects_force_source() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-4o".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-4o".into(), model_pricing(0.00001, 0.00003));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-4o".into(), model_pricing(0.000003, 0.000012));
+
+        let service = custom_service(custom, litellm, openrouter);
+
+        let litellm_result = service
+            .lookup_with_source("gpt-4o", Some("LiteLLM"))
+            .unwrap();
+        assert_eq!(litellm_result.source, "LiteLLM");
+        assert_eq!(litellm_result.pricing.input_cost_per_token, Some(0.00001));
+
+        let openrouter_result = service
+            .lookup_with_source("gpt-4o", Some("OpenRouter"))
+            .unwrap();
+        assert_eq!(openrouter_result.source, "OpenRouter");
+        assert_eq!(
+            openrouter_result.pricing.input_cost_per_token,
+            Some(0.000003)
+        );
+
+        let custom_result = service
+            .lookup_with_source("gpt-4o", Some("Custom"))
+            .unwrap();
+        assert_eq!(custom_result.source, "Custom");
+        assert_eq!(custom_result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_force_source_does_not_fall_through_on_miss() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-4o".into(), model_pricing(0.0000025, 0.00001));
+
+        let service = custom_service(HashMap::new(), litellm, HashMap::new());
+
+        assert!(service
+            .lookup_with_source("gpt-4o", Some("custom"))
+            .is_none());
+    }
+
+    #[test]
+    fn custom_override_raw_match_wins() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "accounts/fireworks/routers/kimi-k2p6-turbo".into(),
+            model_pricing(0.000002, 0.000008),
+        );
+        let mut litellm = HashMap::new();
+        litellm.insert("kimi-k2.6".into(), model_pricing(0.00000095, 0.000004));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service
+            .lookup_with_source("accounts/fireworks/routers/kimi-k2p6-turbo", None)
+            .unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(
+            result.matched_key,
+            "accounts/fireworks/routers/kimi-k2p6-turbo"
+        );
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_override_non_scoped_terminal_match_wins() {
+        let mut custom = HashMap::new();
+        custom.insert("kimi-k2p6".into(), model_pricing(0.00000095, 0.000004));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-4-turbo".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let result = service
+            .lookup_with_source("hf:moonshotai/kimi-k2p6", None)
+            .unwrap();
+
+        assert_eq!(result.source, "Custom");
+        assert_eq!(result.matched_key, "kimi-k2p6");
+        assert_eq!(result.pricing.output_cost_per_token, Some(0.000004));
+    }
+
+    #[test]
+    fn custom_override_raw_beats_normalized() {
+        let mut custom = HashMap::new();
+        custom.insert("kimi-k2p6-turbo".into(), model_pricing(0.000001, 0.000004));
+        custom.insert(
+            "accounts/fireworks/models/kimi-k2p6-turbo".into(),
+            model_pricing(0.000002, 0.000008),
+        );
+
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("accounts/fireworks/models/kimi-k2p6-turbo", None)
+            .unwrap();
+
+        assert_eq!(
+            result.matched_key,
+            "accounts/fireworks/models/kimi-k2p6-turbo"
+        );
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn custom_override_skips_fuzzy_chain() {
+        let mut custom = HashMap::new();
+        custom.insert("kimi-k2p6-turbo".into(), model_pricing(0.000002, 0.000008));
+
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+
+        assert!(service
+            .lookup_with_source("my-kimi-k2p6-turbo", None)
+            .is_none());
+    }
+
+    #[test]
+    fn no_custom_falls_through_to_litellm() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-4o".into(), model_pricing(0.0000025, 0.00001));
+
+        let service = custom_service(HashMap::new(), litellm, HashMap::new());
+        let result = service.lookup_with_source("gpt-4o", None).unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.0000025));
+    }
+
+    #[test]
+    fn custom_calculate_cost_uses_override() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "accounts/fireworks/routers/kimi-k2p6-turbo".into(),
+            model_pricing(0.000002, 0.000008),
+        );
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "accounts/fireworks/routers/kimi-k2p6-turbo".into(),
+            model_pricing(0.00001, 0.00003),
+        );
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let cost = service.calculate_cost(
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+            1_000_000,
+            100_000,
+            0,
+            0,
+            0,
+        );
+
+        let expected = 1_000_000.0 * 0.000002 + 100_000.0 * 0.000008;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn custom_calculate_cost_uses_terminal_override() {
+        let mut custom = HashMap::new();
+        custom.insert("gpt-5.5".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.5".into(), model_pricing(0.00001, 0.00003));
+
+        let service = custom_service(custom, litellm, HashMap::new());
+        let cost = service.calculate_cost("cx/gpt-5.5", 1_000_000, 100_000, 0, 0, 0);
+
+        let expected = 1_000_000.0 * 0.000002 + 100_000.0 * 0.000008;
+        assert!((cost - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_sakana_returns_pricing_for_fugu_ultra() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source("fugu-ultra", None).unwrap();
+        assert_eq!(result.source, "Sakana");
+        assert_eq!(result.matched_key, "fugu-ultra");
+        assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+        assert_eq!(result.pricing.output_cost_per_token, Some(3e-5));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(5e-7));
+        assert_eq!(
+            result.pricing.input_cost_per_token_above_272k_tokens,
+            Some(1e-5)
+        );
+        assert_eq!(
+            result.pricing.output_cost_per_token_above_272k_tokens,
+            Some(4.5e-5)
+        );
+        assert_eq!(
+            result.pricing.cache_read_input_token_cost_above_272k_tokens,
+            Some(1e-6)
+        );
+    }
+
+    #[test]
+    fn test_sakana_bare_fugu_is_unpriced() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        assert!(service.lookup_with_source("fugu", None).is_none());
+    }
+
+    #[test]
+    fn test_sakana_yields_to_litellm_exact() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fugu-ultra".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+
+        let service = PricingService::new(litellm, HashMap::new());
+        let result = service.lookup_with_source("fugu-ultra", None).unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.001));
+    }
+
+    #[test]
+    fn test_sakana_override_requires_sakana_provider_identity() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        for (model_id, provider_id) in [
+            ("fugu-ultra", "openrouter"),
+            ("openrouter/fugu-ultra", "openrouter"),
+            ("openrouter/fugu-ultra", "sakana"),
+            ("sakana/fugu-ultra", "openrouter"),
+            ("fugu-ultra", "sakana/openrouter"),
+            ("fugu-ultra", "openrouter/sakana"),
+            ("fugu-ultra", "unknown"),
+            ("fugu-ultra", "unknown/sakana"),
+            ("fugu-ultra", "sakana/unknown"),
+            ("fugu-ultra", "sakana/"),
+            ("fugu-ultra", "/sakana"),
+            ("fugu-ultra", "sakana//sakana"),
+            ("fugu-ultra", "sakana.openrouter"),
+            ("fugu-ultra", ""),
+            ("fugu-ultra", "   "),
+        ] {
+            assert!(
+                service
+                    .lookup_with_source_and_provider(model_id, None, Some(provider_id))
+                    .is_none(),
+                "non-Sakana identity resolved: model={model_id} provider={provider_id}"
+            );
+        }
+
+        assert!(service
+            .lookup_with_source_and_provider("sakana/openrouter/fugu-ultra", None, None)
+            .is_none());
+
+        let result = service
+            .lookup_with_source_and_provider("sakana/fugu-ultra", None, Some("sakana"))
+            .unwrap();
+        assert_eq!(result.source, "Sakana");
+        assert_eq!(result.matched_key, "fugu-ultra");
+
+        let repeated = service
+            .lookup_with_source_and_provider(
+                "sakana/sakana/fugu-ultra",
+                None,
+                Some("sakana/sakana"),
+            )
+            .unwrap();
+        assert_eq!(repeated.source, "Sakana");
+        assert_eq!(repeated.matched_key, "fugu-ultra");
+
+        let usage = TokenBreakdown {
+            input: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            service.calculate_cost_with_provider("fugu-ultra", None, &usage),
+            5e-6
+        );
+        assert_eq!(
+            service.calculate_cost_with_provider("fugu-ultra", Some("unknown"), &usage),
+            0.0
+        );
+        assert_eq!(
+            service.calculate_cost_with_provider("fugu-ultra", None, &usage),
+            5e-6
+        );
+    }
+
+    #[test]
+    fn test_sakana_fugu_ultra_request_tier_and_alias() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let regular = service.calculate_cost("fugu-ultra", 272_000, 3, 0, 0, 4);
+        let regular_expected = 272_000.0 * 5e-6 + 7.0 * 3e-5;
+        assert!((regular - regular_expected).abs() < 1e-12);
+
+        let long = service.calculate_cost("fugu-ultra-20260615", 271_999, 3, 2, 0, 4);
+        let long_expected = 271_999.0 * 1e-5 + 7.0 * 4.5e-5 + 2.0 * 1e-6;
+        assert!((long - long_expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sakana_cache_write_does_not_select_long_context() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let without_cache_write = service.calculate_cost("fugu-ultra", 271_999, 10, 0, 0, 0);
+        let with_cache_write = service.calculate_cost("fugu-ultra", 271_999, 10, 0, 10_000, 0);
+        assert!((with_cache_write - without_cache_write).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sakana_cold_and_warm_costs_are_deterministic() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let cold = service.calculate_cost("fugu-ultra", 270_540, 630, 7_936, 0, 0);
+        let warm = service.calculate_cost("fugu-ultra", 270_540, 630, 7_936, 0, 0);
+        assert_eq!(cold.to_bits(), warm.to_bits());
+    }
+
+    #[test]
+    fn test_verified_litellm_long_context_survives_custom_pipeline() {
+        let mut custom = HashMap::new();
+        custom.insert("unrelated-model".into(), model_pricing(0.000002, 0.000008));
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                input_cost_per_token_above_272k_tokens: Some(1e-5),
+                output_cost_per_token: Some(3e-5),
+                output_cost_per_token_above_272k_tokens: Some(4.5e-5),
+                cache_read_input_token_cost: Some(5e-7),
+                cache_read_input_token_cost_above_272k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let service = custom_service(custom, litellm, HashMap::new());
+        let cost = service.calculate_cost("gpt-5.5", 271_999, 3, 2, 0, 4);
+        let expected = 271_999.0 * 1e-5 + 7.0 * 4.5e-5 + 2.0 * 1e-6;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+}

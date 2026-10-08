@@ -1,0 +1,6408 @@
+//! Parallel file scanner for session directories
+//!
+//! Uses walkdir with rayon for parallel directory traversal.
+
+use rayon::prelude::*;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+use crate::clients::{ClientId, PathRoot};
+use crate::sessions::{normalize_workspace_key, workspace_label_from_key};
+use crate::{ResolvedLocalSourceContext, SourceContextUnavailable};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+type DiscoveryFailure = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+thread_local! {
+    static DISCOVERY_FAILURE: std::cell::RefCell<Option<DiscoveryFailure>> = const { std::cell::RefCell::new(None) };
+    static WATCH_DISCOVERY: std::cell::RefCell<Option<WatchDiscovery>> = const { std::cell::RefCell::new(None) };
+}
+
+struct DiscoveryGuard(Option<DiscoveryFailure>);
+impl DiscoveryGuard {
+    fn enter(failure: Option<DiscoveryFailure>) -> Self {
+        Self(DISCOVERY_FAILURE.with(|slot| slot.replace(failure)))
+    }
+}
+impl Drop for DiscoveryGuard {
+    fn drop(&mut self) {
+        DISCOVERY_FAILURE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+fn record_discovery_failure(error: impl std::fmt::Display) {
+    DISCOVERY_FAILURE.with(|slot| {
+        if let Some(failure) = slot.borrow().as_ref() {
+            let mut first = failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if first.is_none() {
+                *first = Some(format!("source discovery incomplete: {error}"));
+            }
+        }
+    });
+}
+
+fn discovery_io<T>(result: std::io::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            record_discovery_failure(error);
+            None
+        }
+    }
+}
+
+/// Captured by the same task assembly that produces the actual scan. Directory
+/// roots include absent roots; topology files are verified without rediscovery.
+#[derive(Default)]
+pub(crate) struct WatchDiscovery {
+    pub roots: BTreeMap<PathBuf, bool>,
+    pub topology_files: HashSet<PathBuf>,
+}
+
+fn record_watch_root(path: &Path, directory: bool) {
+    WATCH_DISCOVERY.with(|slot| {
+        if let Some(capture) = slot.borrow_mut().as_mut() {
+            capture
+                .roots
+                .entry(path.to_path_buf())
+                .and_modify(|kind| *kind |= directory)
+                .or_insert(directory);
+        }
+    });
+}
+
+fn discovery_read_dir(path: impl AsRef<Path>) -> Option<std::fs::ReadDir> {
+    let path = path.as_ref();
+    record_watch_root(path, true);
+    discovery_io(std::fs::read_dir(path))
+}
+
+fn discovery_read_topology(path: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
+    record_watch_root(path, false);
+    WATCH_DISCOVERY.with(|slot| {
+        if let Some(capture) = slot.borrow_mut().as_mut() {
+            capture.topology_files.insert(path.to_path_buf());
+        }
+    });
+    discovery_io(std::fs::read_to_string(path))
+}
+
+pub(crate) fn scan_with_watch_discovery(
+    context: &ResolvedLocalSourceContext,
+    clients: &[String],
+) -> Result<(ScanResult, WatchDiscovery), String> {
+    struct Restore(Option<WatchDiscovery>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCH_DISCOVERY.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let restore =
+        Restore(WATCH_DISCOVERY.with(|slot| slot.replace(Some(WatchDiscovery::default()))));
+    let scan = scan_all_clients_with_source_context(context, clients)
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = &scan.discovery_error {
+        return Err(error.clone());
+    }
+    let capture = WATCH_DISCOVERY
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default();
+    drop(restore);
+    Ok((scan, capture))
+}
+
+fn checked_exists(path: &Path) -> bool {
+    record_watch_root(path, false);
+    discovery_io(std::fs::metadata(path)).is_some()
+}
+fn checked_file(path: &Path) -> bool {
+    let metadata = discovery_io(std::fs::metadata(path));
+    // A rejected file candidate can be a directory, not a file dependency.
+    record_watch_root(path, metadata.as_ref().is_some_and(|value| value.is_dir()));
+    metadata.is_some_and(|value| value.is_file())
+}
+fn checked_directory(path: &Path) -> bool {
+    record_watch_root(path, true);
+    discovery_io(std::fs::metadata(path)).is_some_and(|metadata| metadata.is_dir())
+}
+
+fn checked_mirror_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(entries) = discovery_read_dir(home.join(".cc-mirror")) {
+        for entry in entries {
+            let Some(entry) = discovery_io(entry) else {
+                continue;
+            };
+            let variant = entry.path().join("variant.json");
+            let Some(contents) = discovery_read_topology(&variant) else {
+                continue;
+            };
+            let metadata = match serde_json::from_str::<crate::cc_mirror::VariantFile>(&contents) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    record_discovery_failure(error);
+                    continue;
+                }
+            };
+            if let Some(config) =
+                crate::cc_mirror::config_dir_from_variant_metadata(&variant, home, &metadata)
+            {
+                let projects = config.join("projects");
+                if checked_directory(&projects) || !checked_exists(&projects) {
+                    roots.push(projects);
+                }
+            }
+        }
+    }
+    roots.sort_unstable();
+    roots
+}
+
+fn track_discovery<T>(scan: impl FnOnce() -> T) -> (T, Option<String>) {
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let guard = DiscoveryGuard::enter(Some(failure.clone()));
+    let result = scan();
+    drop(guard);
+    let error = failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    (result, error)
+}
+
+/// Source-affecting environment variables read directly by scanner resolvers
+/// rather than through a client's `PathRoot` definition.
+pub(crate) const DIRECT_SOURCE_ENV_KEYS: &[&str] = &[
+    "TOKSCALE_HEADLESS_DIR",
+    "COPILOT_OTEL_FILE_EXPORTER_PATH",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "KIMI_CODE_HOME",
+    "TOKSCALE_EXTRA_DIRS",
+    "GOOSE_PATH_ROOT",
+];
+
+/// Emit a one-time `tracing::warn!` if `path` does not start with the scan's
+/// supplied home directory. The scan is NOT blocked — this is a heads-up only.
+fn warn_if_escapes_home(home: &Path, client_id: ClientId, path: &Path) {
+    if !path.starts_with(home) {
+        tracing::warn!(
+            client = client_id.as_str(),
+            path = %path.display(),
+            home = %home.display(),
+            "extra scan path is outside $HOME — verify this is intentional"
+        );
+    }
+}
+
+/// User-controlled scanner settings loaded from a config file.
+///
+/// This is the persistent, declarative counterpart to environment variables
+/// like `TOKSCALE_EXTRA_DIRS` — it lives on the `scanner` key inside
+/// `~/.config/tokscale/settings.json` and is threaded down into
+/// [`scan_all_clients_with_scanner_settings`].
+///
+/// `#[serde(default)]` at both the struct and field level guarantees that
+/// older settings.json files (which have no `scanner` key at all, or an
+/// empty `{}`) deserialize cleanly without errors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScannerSettings {
+    /// Absolute paths to additional OpenCode SQLite databases to scan.
+    ///
+    /// Use this when the opencode binary was launched with `OPENCODE_DB`
+    /// pointing at a location outside the default `~/.local/share/opencode`
+    /// data directory, so tokscale's auto-discovery can't find it.
+    ///
+    /// Paths are merged into the auto-discovered
+    /// [`ScanResult::opencode_dbs`] list; duplicates (by canonical path)
+    /// are removed and non-existent entries are silently skipped so stale
+    /// config does not break the scan. WAL/SHM sidecar files are rejected
+    /// with the same [`is_opencode_db_filename`] check used for
+    /// auto-discovery.
+    #[serde(default)]
+    pub opencode_db_paths: Vec<PathBuf>,
+    /// Additional per-client scan roots loaded from settings.json.
+    ///
+    /// Keys use public client ids like `codex`, `gemini`, and `openclaw`
+    /// so the JSON stays stable and human-editable.
+    #[serde(default)]
+    pub extra_scan_paths: BTreeMap<String, Vec<PathBuf>>,
+    /// Per-client scan roots to drop, matched as path prefixes after every
+    /// other root has been discovered.
+    ///
+    /// Exists because a root reaches the scan by several independent routes —
+    /// the client's declared path, this settings file's `extra_scan_paths`,
+    /// the built-in extras, a `.cc-mirror` variant naming an absolute config
+    /// directory, a cowork session tree — and a caller that owns only one of
+    /// those registries cannot keep a directory out of the scan by editing it.
+    /// A prefix here removes the directory whichever route found it, on the
+    /// context-free scan and on a captured source context alike.
+    ///
+    /// Keys use the same public client ids as [`Self::extra_scan_paths`].
+    #[serde(default)]
+    pub excluded_scan_paths: BTreeMap<String, Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrushDbSource {
+    pub db_path: PathBuf,
+    pub workspace_key: Option<String>,
+    pub workspace_label: Option<String>,
+}
+
+/// Result of scanning all session directories
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScanResult {
+    /// A permission, traversal, or registry-read failure makes absence unsafe.
+    pub discovery_error: Option<String>,
+    pub files: [Vec<PathBuf>; ClientId::COUNT],
+    /// All OpenCode SQLite databases discovered under the data dir.
+    ///
+    /// Includes the default `opencode.db` (used by `latest`/`beta` channels
+    /// and anyone with `OPENCODE_DISABLE_CHANNEL_DB=1`) as well as any
+    /// channel-suffixed variants such as `opencode-stable.db`,
+    /// `opencode-nightly.db`, etc. See upstream logic in opencode's
+    /// `packages/opencode/src/storage/db.ts` (`getChannelPath`).
+    pub opencode_dbs: Vec<PathBuf>,
+    pub copilot_desktop_db: Option<PathBuf>,
+    pub synthetic_db: Option<PathBuf>,
+    pub kilo_db: Option<PathBuf>,
+    pub hermes_db: Option<PathBuf>,
+    pub goose_db: Option<PathBuf>,
+    pub zed_db: Option<PathBuf>,
+    pub kiro_db: Option<PathBuf>,
+    /// ZCode v2 CLI usage database at `~/.zcode/cli/db/db.sqlite`.
+    pub zcode_db: Option<PathBuf>,
+    pub crush_dbs: Vec<CrushDbSource>,
+    /// Path to the OpenCode legacy JSON directory (for migration cache stat checks)
+    pub opencode_json_dir: Option<PathBuf>,
+    /// Admitted scan-task roots from this scan's own assembly, after exclusions.
+    /// Only populated by the source-context scan; legacy wrappers leave it empty.
+    pub(crate) durable_roots: Vec<(ClientId, PathBuf)>,
+    /// Exact native DB file candidates captured independent of file existence.
+    pub(crate) durable_db_candidates: Vec<(ClientId, PathBuf)>,
+    /// Octofriend SQLite candidate for the `synthetic` namespace, when enabled.
+    pub(crate) durable_synthetic_db: Option<PathBuf>,
+    /// OpenCode channel-DB directory (`<xdg-data>/opencode`), when enabled.
+    pub(crate) durable_opencode_data_dir: Option<PathBuf>,
+    /// Configured OpenCode DB paths with valid channel filenames, kept even when
+    /// the file is gone (the live merge drops missing files).
+    pub(crate) durable_opencode_extra: Vec<PathBuf>,
+    /// Grok `logs/unified.jsonl` candidates derived from this scan's roots.
+    pub(crate) durable_grok_unified: Vec<PathBuf>,
+    /// Hermes home roots backing the `<home>/state.db` pattern.
+    pub(crate) durable_hermes_homes: Vec<PathBuf>,
+    /// `~/.cc-mirror` base: default-layout mirror roots live under it.
+    pub(crate) durable_mirror_base: Option<PathBuf>,
+    /// Cowork `local-agent-mode-sessions` base for Claude archived facts.
+    pub(crate) durable_cowork_base: Option<PathBuf>,
+    /// Caller exclusions, cloned so admission denies them on every lane.
+    pub(crate) durable_excluded: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl Default for ScanResult {
+    fn default() -> Self {
+        Self {
+            files: std::array::from_fn(|_| Vec::new()),
+            discovery_error: None,
+            opencode_dbs: Vec::new(),
+            copilot_desktop_db: None,
+            synthetic_db: None,
+            kilo_db: None,
+            hermes_db: None,
+            goose_db: None,
+            zed_db: None,
+            kiro_db: None,
+            zcode_db: None,
+            crush_dbs: Vec::new(),
+            opencode_json_dir: None,
+            durable_roots: Vec::new(),
+            durable_db_candidates: Vec::new(),
+            durable_synthetic_db: None,
+            durable_opencode_data_dir: None,
+            durable_opencode_extra: Vec::new(),
+            durable_grok_unified: Vec::new(),
+            durable_hermes_homes: Vec::new(),
+            durable_mirror_base: None,
+            durable_cowork_base: None,
+            durable_excluded: BTreeMap::new(),
+        }
+    }
+}
+
+impl ScanResult {
+    pub fn get(&self, client: ClientId) -> &Vec<PathBuf> {
+        &self.files[client as usize]
+    }
+
+    pub fn get_mut(&mut self, client: ClientId) -> &mut Vec<PathBuf> {
+        &mut self.files[client as usize]
+    }
+
+    /// Get total number of files found
+    pub fn total_files(&self) -> usize {
+        self.files.iter().map(|v| v.len()).sum()
+    }
+
+    /// Get all files as a single vector
+    pub fn all_files(&self) -> Vec<(ClientId, PathBuf)> {
+        let mut result = Vec::with_capacity(self.total_files());
+
+        for client in ClientId::iter() {
+            for path in self.get(client) {
+                result.push((client, path.clone()));
+            }
+        }
+
+        result
+    }
+
+    /// Return every Hermes SQLite database that should be parsed.
+    ///
+    /// Hermes has a default `state.db` path plus profile databases discovered
+    /// automatically or through `scanner.extraScanPaths.hermes`. The generic
+    /// `files` bucket carries the profile DBs, so this helper gives callers a
+    /// single deduped view without changing older `hermes_db` consumers that
+    /// only expect the default path.
+    pub fn hermes_db_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        let mut push = |path: &Path| {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if seen.insert(key) {
+                paths.push(path.to_path_buf());
+            }
+        };
+
+        if let Some(path) = &self.hermes_db {
+            push(path);
+        }
+
+        for path in self.get(ClientId::Hermes) {
+            push(path);
+        }
+
+        paths
+    }
+
+    /// Return every Zed threads SQLite database that should be parsed.
+    pub fn zed_db_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        let mut push = |path: &Path| {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if seen.insert(key) {
+                paths.push(path.to_path_buf());
+            }
+        };
+
+        if let Some(path) = &self.zed_db {
+            push(path);
+        }
+
+        for path in self.get(ClientId::Zed) {
+            push(path);
+        }
+        paths
+    }
+
+    /// Whether a stored `(namespace, path)` was an admissible origin in this
+    /// captured scan. Covers this scan's post-exclusion task roots plus the
+    /// native DB candidate assembly (independent of file existence), the
+    /// synthetic Octofriend candidate, validly-named configured OpenCode DBs,
+    /// per-home `<home>/state.db` Hermes defaults, Grok unified candidates,
+    /// and the default-layout `~/.cc-mirror` + Cowork Claude bases.
+    /// Dynamic Crush registry paths come from the live registry read, so a
+    /// registry that itself vanished is NOT admitted here: QueryArchive's
+    /// same-context persisted-origins fallback owns that case.
+    pub fn admits_durable_source(&self, namespace: &str, path: &Path) -> bool {
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+        if let Some(prefixes) = self.durable_excluded.get(namespace) {
+            let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            for prefix in prefixes {
+                if prefix.as_os_str().is_empty() {
+                    continue;
+                }
+                let prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.clone());
+                if resolved.starts_with(&prefix) {
+                    return false;
+                }
+            }
+        }
+        let Some(client) = ClientId::from_str(namespace) else {
+            if namespace != "synthetic" {
+                return false;
+            }
+            return self
+                .durable_synthetic_db
+                .as_ref()
+                .is_some_and(|candidate| path == candidate);
+        };
+        if self
+            .durable_roots
+            .iter()
+            .any(|(id, root)| *id == client && path.starts_with(root))
+        {
+            return true;
+        }
+        if self
+            .durable_grok_unified
+            .iter()
+            .any(|candidate| path == candidate)
+            && client == ClientId::Grok
+        {
+            return true;
+        }
+        if self
+            .durable_db_candidates
+            .iter()
+            .any(|(id, candidate)| *id == client && path == candidate)
+        {
+            return true;
+        }
+        if client == ClientId::OpenCode {
+            if self
+                .durable_opencode_extra
+                .iter()
+                .any(|candidate| path == candidate)
+            {
+                return true;
+            }
+            if let Some(dir) = self.durable_opencode_data_dir.as_ref() {
+                if path.starts_with(dir)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_opencode_db_filename)
+                {
+                    return true;
+                }
+            }
+        }
+        if client == ClientId::Hermes
+            && self.durable_hermes_homes.iter().any(|home| {
+                path == home.join("state.db")
+                    || path.starts_with(home.join("profiles")) && path.ends_with("state.db")
+            })
+        {
+            return true;
+        }
+        if client == ClientId::Claude {
+            if self
+                .durable_mirror_base
+                .as_ref()
+                .is_some_and(|base| path.starts_with(base))
+            {
+                return true;
+            }
+            if self
+                .durable_cowork_base
+                .as_ref()
+                .is_some_and(|base| path.starts_with(base))
+            {
+                return true;
+            }
+        }
+        if client == ClientId::Crush {
+            return self.crush_dbs.iter().any(|db| db.db_path == *path);
+        }
+        false
+    }
+}
+
+pub fn headless_roots_with_env_strategy(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    if use_env_roots {
+        if let Ok(path) = std::env::var("TOKSCALE_HEADLESS_DIR") {
+            return vec![PathBuf::from(path)];
+        }
+    }
+
+    let mut roots = Vec::new();
+    roots.push(PathBuf::from(format!(
+        "{}/.config/tokscale/headless",
+        home_dir
+    )));
+
+    let mac_root = PathBuf::from(format!(
+        "{}/Library/Application Support/tokscale/headless",
+        home_dir
+    ));
+    roots.push(mac_root);
+
+    roots
+}
+
+pub fn headless_roots(home_dir: &str) -> Vec<PathBuf> {
+    headless_roots_with_env_strategy(home_dir, true)
+}
+
+pub fn copilot_exporter_path_with_env_strategy(use_env_roots: bool) -> Option<PathBuf> {
+    if !use_env_roots {
+        return None;
+    }
+
+    let path = std::env::var("COPILOT_OTEL_FILE_EXPORTER_PATH").ok()?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(PathBuf::from(trimmed))
+}
+
+pub fn copilot_exporter_path() -> Option<PathBuf> {
+    copilot_exporter_path_with_env_strategy(true)
+}
+
+// Kiro keeps legacy snapshots at `<workspace>/*.chat`, execution records at
+// `<workspace>/<store>/*`, and workspace-session JSON at
+// `workspace-sessions/<workspace>/*.json`. Do not recurse into mirrored project
+// trees or treat root-level JSON/extensionless files as usage sources.
+fn is_kiro_globalstorage_artifact(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect();
+
+    match components.as_slice() {
+        [workspace, file] if workspace != "workspace-sessions" => file.ends_with(".chat"),
+        [bucket, _, file] if bucket == "workspace-sessions" => file.ends_with(".json"),
+        [workspace, _, file] if workspace != "workspace-sessions" => {
+            file.ends_with(".json") || Path::new(file.as_ref()).extension().is_none()
+        }
+        _ => false,
+    }
+}
+
+// Kiro structured sessions have one exact topology below the sessions root:
+// `<workspace>/sess_<uuid>/session.json`. Reject deeper mirrored trees so an
+// unrelated nested `sess_*` directory cannot become an automatic source.
+fn is_kiro_ide_session_artifact(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect();
+
+    matches!(
+        components.as_slice(),
+        [_, session, file] if session.starts_with("sess_") && file == "session.json"
+    )
+}
+
+/// Whether an OpenClaw transcript name is a compaction checkpoint snapshot.
+///
+/// OpenClaw writes these as `<session>.checkpoint.<uuid>.jsonl`; its archive
+/// cleanup can then append a reset/deleted suffix and optionally compress the
+/// result. Keep the UUID checks aligned with OpenClaw's classifier so ordinary
+/// sessions that merely contain `checkpoint` in their names remain visible.
+fn is_openclaw_compaction_checkpoint(file_name: &str) -> bool {
+    fn is_uuid(value: &str) -> bool {
+        if value.len() != 36 {
+            return false;
+        }
+
+        value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => matches!(byte, b'1'..=b'5'),
+            19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_hexdigit(),
+        })
+    }
+
+    let normalized = file_name.strip_suffix(".zst").unwrap_or(file_name);
+    let stem = normalized.strip_suffix(".jsonl").or_else(|| {
+        [".jsonl.deleted.", ".jsonl.reset."]
+            .into_iter()
+            .filter_map(|marker| normalized.rfind(marker))
+            .max()
+            .map(|index| &normalized[..index])
+    });
+    let Some(stem) = stem else {
+        return false;
+    };
+
+    let lowercase = stem.to_ascii_lowercase();
+    let Some((session_id, checkpoint_id)) = lowercase.rsplit_once(".checkpoint.") else {
+        return false;
+    };
+    !session_id.is_empty() && is_uuid(checkpoint_id)
+}
+
+/// Most workers a scan runs, however many cores the machine has (upstream
+/// #1153). Directory walks block on the filesystem rather than the CPU, so
+/// past a handful the extra workers park and contend instead of finding files.
+const SCAN_WORKER_CEILING: usize = 4;
+
+/// Walk every scan task in parallel on a pool capped at `SCAN_WORKER_CEILING`.
+/// A pool that fails to build falls back to the global pool: correct, just
+/// without the cap.
+fn run_scan_tasks<P: Send>(
+    tasks: Vec<(ClientId, P, &str)>,
+    root: impl Fn(&P) -> &Path + Sync,
+) -> Vec<(ClientId, Vec<PathBuf>)> {
+    let failure = DISCOVERY_FAILURE.with(|slot| slot.borrow().clone());
+    let scan = |tasks: Vec<(ClientId, P, &str)>| -> Vec<(ClientId, Vec<PathBuf>)> {
+        tasks
+            .into_par_iter()
+            .map(|(client_id, path, pattern)| {
+                let _guard = DiscoveryGuard::enter(failure.clone());
+                (client_id, scan_directory_path(root(&path), pattern))
+            })
+            .collect()
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("tokscale-scan-{i}"))
+        .build()
+    {
+        Ok(pool) => pool.install(|| scan(tasks)),
+        Err(_) => scan(tasks),
+    }
+}
+
+/// Scan a single directory for session files
+pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
+    scan_directory_path(Path::new(root), pattern)
+}
+
+fn scan_directory_path(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
+    if !checked_exists(root_path) {
+        return Vec::new();
+    }
+
+    // Sequential on purpose (upstream #1164): every caller already runs this
+    // inside a parallel map over scan tasks (`run_scan_tasks`). A nested
+    // `par_bridge` serialises `WalkDir::next()` under its own mutex and can
+    // convoy-stall on large trees; upstream measured the sequential walk
+    // faster (~130 ms vs ~250 ms on 31.5k files). Upstream's maintainer notes
+    // it is a stall, not a deadlock, and does not explain the #1153 hang.
+    let mut paths: Vec<PathBuf> = WalkDir::new(root_path)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                record_discovery_failure(error);
+                None
+            }
+        })
+        .filter(|e| {
+            let path = e.path();
+            // WalkDir already knows the entry type from the directory read, so
+            // trust it for the common regular-file case and avoid a redundant
+            // stat() per file. Symlinks still follow metadata to preserve the
+            // existing file-symlink behavior.
+            let file_type = e.file_type();
+            let is_file = file_type.is_file() || (file_type.is_symlink() && checked_file(path));
+            if !is_file {
+                return false;
+            }
+
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            let is_in_archive_dir = path.components().any(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("archive")
+            });
+
+            match pattern {
+                "*.json" => file_name.ends_with(".json"),
+                "*.json|*.jsonl" => file_name.ends_with(".json") || file_name.ends_with(".jsonl"),
+                "*.jsonl" => file_name.ends_with(".jsonl"),
+                // OpenClaw: also match archived transcripts
+                // (<uuid>.jsonl.deleted.<ts>, <uuid>.jsonl.reset.<ts>) and
+                // zstd archives (<uuid>.jsonl.zst, upstream #1285). Compaction
+                // checkpoint snapshots are OpenClaw's own bookkeeping, not
+                // usage, and are excluded first so an archived checkpoint
+                // cannot slip in as a copy (upstream #1293).
+                "*.jsonl*" => {
+                    !is_openclaw_compaction_checkpoint(file_name)
+                        && (file_name.ends_with(".jsonl")
+                            || file_name.ends_with(".jsonl.zst")
+                            || file_name.contains(".jsonl.deleted.")
+                            || file_name.contains(".jsonl.reset."))
+                }
+                "*.csv" => file_name.ends_with(".csv"),
+                "usage*.csv" => {
+                    if is_in_archive_dir {
+                        return false;
+                    }
+
+                    if file_name == "usage.csv" {
+                        return true;
+                    }
+
+                    // Accept only per-account files: usage.<account>.csv
+                    if !file_name.starts_with("usage.") || !file_name.ends_with(".csv") {
+                        return false;
+                    }
+
+                    // Exclude legacy backups like usage.backup-<ts>.csv
+                    if file_name.starts_with("usage.backup") {
+                        return false;
+                    }
+
+                    true
+                }
+                // Cursor cache: JSON is the current format, CSV is legacy. Both
+                // are matched so a cache written before the JSON switch still
+                // parses; sibling de-duplication (JSON wins) happens after the
+                // scan so a co-existing CSV never double-counts (upstream #1247).
+                "usage*.json|usage*.csv" => {
+                    if is_in_archive_dir {
+                        return false;
+                    }
+
+                    if !file_name.starts_with("usage.")
+                        || !(file_name.ends_with(".json") || file_name.ends_with(".csv"))
+                    {
+                        return false;
+                    }
+
+                    // Excludes backups like usage.backup-<ts>.csv; non-usage
+                    // files such as usage.last-sync-attempt fail the suffix test.
+                    !file_name.starts_with("usage.backup")
+                }
+                "session-*.json" => {
+                    file_name.starts_with("session-") && file_name.ends_with(".json")
+                }
+                // jcode session snapshots; the `.journal.jsonl` sidecar ends in
+                // `.jsonl` so it is correctly excluded (read as a sibling, not
+                // scanned).
+                "session_*.json" => {
+                    file_name.starts_with("session_") && file_name.ends_with(".json")
+                }
+                "T-*.json" => file_name.starts_with("T-") && file_name.ends_with(".json"),
+                "*.settings.json" => file_name.ends_with(".settings.json"),
+                "kiro-globalstorage" => is_kiro_globalstorage_artifact(root_path, path),
+                "kiro-ide-session" => is_kiro_ide_session_artifact(root_path, path),
+                "sessions.json" => file_name == "sessions.json",
+                "wire.jsonl" => file_name == "wire.jsonl",
+                // Muse Code: one `session.jsonl` per session directory at any
+                // depth under `muse/sessions/`, including `subagent/<uuid>/`.
+                "session.jsonl" => file_name == "session.jsonl",
+                "events.jsonl" => file_name == "events.jsonl",
+                // Grok Build ACP session updates and unified inference log.
+                "updates.jsonl" => file_name == "updates.jsonl",
+                "unified.jsonl" => file_name == "unified.jsonl",
+                "ui_messages.json" => file_name == "ui_messages.json",
+                "session-usage.json" => file_name == "session-usage.json",
+                "chat-messages.json" => file_name == "chat-messages.json",
+                "state.db" => file_name == "state.db",
+                "threads.db" => file_name == "threads.db",
+                // Antigravity CLI conversation databases. `ends_with(".db")`
+                // naturally rejects the `.db-wal`/`.db-shm`/`.db-journal`
+                // sidecars SQLite writes alongside the main file.
+                "*.db" => file_name.ends_with(".db"),
+                _ => false,
+            }
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    // Sort for deterministic ordering. sort_unstable() is sufficient (no stability
+    // requirement for PathBuf) and avoids allocation. Note: ordering is byte-lexical,
+    // not case-normalized (known Windows/macOS caveat for mixed-case paths).
+    paths.sort_unstable();
+    paths
+}
+
+/// Parse a `TOKSCALE_EXTRA_DIRS`-formatted string into (ClientId, path) pairs.
+///
+/// Format: comma-separated `client:path` pairs.
+/// Example: `"claude:/path/to/mac/sessions,openclaw:/other/path"`
+///
+/// Only returns entries whose client is present in `enabled`.
+/// This is a pure function — the caller is responsible for reading the
+/// environment variable and passing its value here.
+pub fn parse_extra_dirs(value: &str, enabled: &HashSet<ClientId>) -> Vec<(ClientId, String)> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            let (client_str, path) = entry.split_once(':')?;
+            let client_id = ClientId::from_str(client_str.trim())?;
+            if !enabled.contains(&client_id) || !supports_extra_dir_scanning(client_id) {
+                return None;
+            }
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some((client_id, path))
+        })
+        .collect()
+}
+
+pub fn extra_scan_paths_for(
+    settings: &ScannerSettings,
+    enabled: &HashSet<ClientId>,
+) -> Vec<(ClientId, PathBuf)> {
+    settings
+        .extra_scan_paths
+        .iter()
+        .filter_map(|(client_str, paths)| {
+            let client_id = ClientId::from_str(client_str)?;
+            if !enabled.contains(&client_id) || !supports_extra_dir_scanning(client_id) {
+                return None;
+            }
+            Some(
+                paths
+                    .iter()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .cloned()
+                    .map(move |path| (client_id, path)),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+pub fn built_in_extra_scan_paths_for(
+    home_dir: &str,
+    enabled: &HashSet<ClientId>,
+) -> Vec<(ClientId, PathBuf)> {
+    let mut paths = Vec::new();
+
+    if enabled.contains(&ClientId::Claude) {
+        paths.push((
+            ClientId::Claude,
+            PathBuf::from(format!("{}/.claude/transcripts", home_dir)),
+        ));
+        paths.extend(
+            checked_mirror_roots(Path::new(home_dir))
+                .into_iter()
+                .map(|path| (ClientId::Claude, path)),
+        );
+        paths.extend(
+            discover_cowork_project_roots(Path::new(home_dir))
+                .into_iter()
+                .map(|path| (ClientId::Claude, path)),
+        );
+    }
+
+    paths
+}
+
+/// Discover Hermes profile databases under a resolved Hermes home directory.
+///
+/// Hermes stores the default profile at `<hermes-home>/state.db` and named
+/// profiles at `<hermes-home>/profiles/<profile>/state.db`.
+///
+/// Data-isolation rule: sibling and default profiles are discovered only when
+/// scanning from the root Hermes home. When `HERMES_HOME` resolves to a named
+/// profile such as `<root>/profiles/coder`, the user has scoped discovery to
+/// that profile, so the primary `state.db` is handled separately and this
+/// helper must not climb to sibling or default profiles.
+///
+/// `read_dir` keeps discovery intentionally shallow: only immediate children
+/// of the root home's `profiles/` directory are considered.
+pub(crate) fn discover_hermes_profile_state_dbs(hermes_home: &Path) -> Vec<PathBuf> {
+    let is_profile_scoped = |path: &Path| {
+        path.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "profiles")
+    };
+    if is_profile_scoped(hermes_home)
+        || std::fs::canonicalize(hermes_home).is_ok_and(|path| is_profile_scoped(&path))
+    {
+        return Vec::new();
+    }
+
+    let mut dbs: Vec<PathBuf> = discovery_read_dir(hermes_home.join("profiles"))
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(discovery_io))
+        .filter_map(|entry| {
+            let state_db = entry.path().join("state.db");
+            checked_file(&state_db).then_some(state_db)
+        })
+        .collect();
+    dbs.sort_unstable();
+    dbs.dedup();
+    dbs
+}
+
+/// Candidate Hermes homes for the default database and named profiles.
+///
+/// An explicit `HERMES_HOME` is authoritative, including when it scopes the
+/// scan to one profile. Otherwise Windows also uses `%LOCALAPPDATA%/hermes`;
+/// the supplied-home fallback is always included so isolated scans can resolve
+/// the equivalent `AppData/Local/hermes` layout without process environment.
+fn hermes_home_candidates(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut homes = vec![PathBuf::from(
+        ClientId::Hermes
+            .data()
+            .root
+            .resolve_with_env_strategy(home_dir, use_env_roots),
+    )];
+
+    let hermes_home_set = use_env_roots
+        && std::env::var("HERMES_HOME")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !hermes_home_set {
+        if cfg!(target_os = "windows") && use_env_roots {
+            if let Some(local_app_data) =
+                std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+            {
+                homes.push(PathBuf::from(local_app_data).join("hermes"));
+            }
+        }
+        homes.push(PathBuf::from(home_dir).join("AppData/Local/hermes"));
+    }
+
+    homes
+}
+
+/// Claude desktop "Cowork" (local-agent-mode) writes standard Claude Code
+/// transcripts under a fresh per-session directory:
+///
+/// ```text
+/// ~/Library/Application Support/Claude/local-agent-mode-sessions/
+///   <workspace>/<sub>/local_<uuid>/.claude/projects/<encoded>/*.jsonl
+///   <workspace>/<sub>/local_<uuid>/audit.jsonl   # event log — NOT scanned
+/// ```
+///
+/// Each session gets its own `local_<uuid>/.claude/projects`, so a single
+/// static path can't cover future sessions — we recurse to discover every
+/// `.claude/projects` root under the sessions tree. We deliberately return the
+/// `projects` directories (not the sessions root) so the sibling `audit.jsonl`
+/// is never picked up: it mirrors the same assistant `usage` records and would
+/// double-count every Cowork message. macOS-only in practice; on other
+/// platforms the root simply doesn't exist and an empty vec is returned.
+fn discover_cowork_project_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let root = home_dir
+        .join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("local-agent-mode-sessions");
+    if !checked_directory(&root) {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    let mut it = WalkDir::new(&root).into_iter();
+    while let Some(entry) = it.next() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_discovery_failure(error);
+                continue;
+            }
+        };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let is_projects = entry.file_name().to_str() == Some("projects")
+            && entry
+                .path()
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some(".claude");
+        if is_projects {
+            roots.push(entry.path().to_path_buf());
+            // The transcript subtree is scanned later via this root; no need to
+            // descend into it during discovery.
+            it.skip_current_dir();
+        }
+    }
+    roots.sort_unstable();
+    roots
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CrushProjectList {
+    #[serde(default)]
+    projects: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrushProject {
+    path: String,
+    data_dir: String,
+}
+
+/// Discover every OpenCode SQLite database under the opencode data dir.
+///
+/// Matches:
+/// - `opencode.db` (default, used by `latest`/`beta` channels or when
+///   `OPENCODE_DISABLE_CHANNEL_DB=1` is set)
+/// - `opencode-<channel>.db` where `<channel>` is the sanitized channel name
+///   opencode bakes into the build (e.g. `stable`, `nightly`). Upstream
+///   sanitizes channels with `/[^a-zA-Z0-9._-]/g -> "-"`, so the suffix we
+///   accept here mirrors that character class exactly.
+///
+/// Ignores WAL/SHM sidecar files (`opencode.db-wal`, `opencode.db-shm`, etc.)
+/// and anything that does not end in `.db`.
+///
+/// Returns a sorted, deterministic list for stable downstream behavior.
+pub(crate) fn discover_opencode_dbs(data_dir: &Path) -> Vec<PathBuf> {
+    let Some(entries) = discovery_read_dir(data_dir) else {
+        return Vec::new();
+    };
+
+    let mut dbs: Vec<PathBuf> = entries
+        .filter_map(discovery_io)
+        .filter_map(|entry| {
+            let file_type = discovery_io(entry.file_type())?;
+            if !file_type.is_file() {
+                // Could be a symlink — accept it if it resolves to a file.
+                if !checked_file(&entry.path()) {
+                    return None;
+                }
+            }
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !is_opencode_db_filename(name) {
+                return None;
+            }
+            Some(path)
+        })
+        .collect();
+
+    dbs.sort_unstable();
+    dbs
+}
+
+/// Returns true if `name` matches the opencode db naming rule:
+/// `opencode.db` or `opencode-<channel>.db` with `<channel>` drawn from the
+/// same `[a-zA-Z0-9._-]` character class that opencode's `getChannelPath`
+/// normalizes to. Sidecar files (`.db-wal`, `.db-shm`, `.db-journal`) are
+/// rejected because they do not end in `.db`.
+fn is_opencode_db_filename(name: &str) -> bool {
+    // Strip the trailing `.db` — reject anything else so WAL/SHM sidecars
+    // (e.g. `opencode.db-wal`) are ignored.
+    let stem = match name.strip_suffix(".db") {
+        Some(stem) => stem,
+        None => return false,
+    };
+    if stem == "opencode" {
+        return true;
+    }
+    let channel = match stem.strip_prefix("opencode-") {
+        Some(channel) => channel,
+        None => return false,
+    };
+    if channel.is_empty() {
+        return false;
+    }
+    channel
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn crush_db_path(data_dir: &Path) -> Option<PathBuf> {
+    let candidate = data_dir.join("crush.db");
+    checked_file(&candidate).then_some(candidate)
+}
+
+fn resolve_crush_data_dir(project: &CrushProject, relative_base: Option<&Path>) -> PathBuf {
+    let data_dir = PathBuf::from(&project.data_dir);
+    if data_dir.is_absolute() {
+        data_dir
+    } else {
+        relative_base
+            .map_or_else(
+                || PathBuf::from(&project.path),
+                |base| base.join(&project.path),
+            )
+            .join(data_dir)
+    }
+}
+
+fn scan_crush_registry(registry_path: &Path, relative_base: Option<&Path>) -> Vec<CrushDbSource> {
+    let Some(registry) = discovery_read_topology(registry_path) else {
+        return Vec::new();
+    };
+
+    let list: CrushProjectList = match serde_json::from_str(&registry) {
+        Ok(list) => list,
+        Err(error) => {
+            record_discovery_failure(error);
+            return Vec::new();
+        }
+    };
+
+    list.projects
+        .into_iter()
+        .filter_map(
+            |project| match serde_json::from_value::<CrushProject>(project) {
+                Ok(project) => Some(project),
+                Err(error) => {
+                    record_discovery_failure(error);
+                    None
+                }
+            },
+        )
+        .filter_map(|project| {
+            let db_path = crush_db_path(&resolve_crush_data_dir(&project, relative_base))?;
+            let workspace_key = normalize_workspace_key(&project.path);
+            let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+            Some(CrushDbSource {
+                db_path,
+                workspace_key,
+                workspace_label,
+            })
+        })
+        .collect()
+}
+
+fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource> {
+    let registry_path = PathBuf::from(
+        ClientId::Crush
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots),
+    );
+    let mut dbs = scan_crush_registry(&registry_path, None);
+    dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
+    dbs.dedup_by(|a, b| a.db_path == b.db_path);
+    dbs
+}
+
+/// Kimi Work (Kimi Desktop's embedded daimon runtime) keeps Kimi Code
+/// `wire.jsonl` sessions under the desktop app-data tree (upstream #1170).
+const KIMI_WORK_SUFFIX: &str = "kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions";
+
+/// Join a `/`-separated relative path one component at a time, so the result
+/// uses native separators on every platform.
+fn join_segments(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .fold(root.to_path_buf(), |path, segment| path.join(segment))
+}
+
+/// Kimi Desktop's optional relocated Work share directory, read from
+/// `<app-data>/kimi-desktop/daimon-storage.json`'s `shareDir`.
+fn kimi_work_share_dir_root(app_data: &Path) -> Option<PathBuf> {
+    let content =
+        discovery_read_topology(app_data.join("kimi-desktop").join("daimon-storage.json"))?;
+    let config: Value = match serde_json::from_str(&content) {
+        Ok(config) => config,
+        Err(error) => {
+            record_discovery_failure(error);
+            return None;
+        }
+    };
+    let share_dir = config.get("shareDir")?.as_str()?;
+    if share_dir.trim().is_empty() {
+        return None;
+    }
+    Some(join_segments(
+        Path::new(share_dir),
+        "daimon/runtime/kimi-code/home/sessions",
+    ))
+}
+
+/// Candidate Kimi Work session roots. There is no Work build for Linux. macOS
+/// uses the home's app-data root. Windows always includes the home-relative
+/// root, plus — when environment roots are enabled and `app_data` is given —
+/// the relocated `shareDir` if one is configured, else `<app_data>`'s root.
+fn kimi_work_roots(home_dir: &Path, app_data: Option<&Path>) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return vec![join_segments(
+            &home_dir.join("Library").join("Application Support"),
+            KIMI_WORK_SUFFIX,
+        )];
+    }
+    if cfg!(target_os = "windows") {
+        let mut roots = vec![join_segments(
+            &home_dir.join("AppData").join("Roaming"),
+            KIMI_WORK_SUFFIX,
+        )];
+        if let Some(app_data) = app_data {
+            roots.push(
+                kimi_work_share_dir_root(app_data)
+                    .unwrap_or_else(|| join_segments(app_data, KIMI_WORK_SUFFIX)),
+            );
+        }
+        return roots;
+    }
+    Vec::new()
+}
+
+fn cline_additional_vscode_task_roots(home_dir: &Path, app_data: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![home_dir
+        .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks")];
+    if let Some(app_data) = app_data {
+        roots.push(app_data.join("Code/User/globalStorage/saoudrizwan.claude-dev/tasks"));
+    }
+
+    roots.push(
+        PathBuf::from(home_dir)
+            .join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+    );
+    roots.push(
+        PathBuf::from(home_dir)
+            .join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+    );
+
+    roots
+}
+
+fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
+    // Kilo CLI currently loads a single SQLite DB via `scan_result.kilo_db`
+    // Roo/KiloCode require local + remote and server task roots, and Crush
+    // discovers SQLite DBs via the project registry rather than scanned file
+    // paths. Hermes/Zed profile databases are named consistently enough for
+    // `scan_directory` to find them from user-provided roots.
+    !matches!(
+        client_id,
+        ClientId::Kilo | ClientId::Crush | ClientId::Goose | ClientId::Zcode
+    )
+}
+
+fn push_grok_unified_log_candidates(candidates: &mut Vec<PathBuf>, scan_root: &Path) {
+    candidates.push(scan_root.join("logs/unified.jsonl"));
+    if scan_root.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+        if let Some(grok_home) = scan_root.parent() {
+            candidates.push(grok_home.join("logs/unified.jsonl"));
+        }
+    }
+}
+
+fn grok_unified_log_path_from_updates(updates_path: &Path) -> Option<PathBuf> {
+    updates_path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("sessions"))
+        .and_then(Path::parent)
+        .map(|grok_home| grok_home.join("logs/unified.jsonl"))
+}
+
+/// Drop every scan task at or under a caller-excluded prefix for its client.
+///
+/// Applied to the assembled task list rather than inside
+/// [`push_unique_scan_task_with_pattern`], because that is the only place every
+/// discovery route has finished contributing: the declared root, the settings
+/// file's extra paths, the built-in extras, the `.cc-mirror` variants and the
+/// cowork trees all push through the helper at different points, and a guard
+/// placed at any one of them would let the others past.
+///
+/// Both sides are canonicalized, for the same reason the helper canonicalizes
+/// its dedup key at the call below: a symlinked directory would otherwise walk
+/// straight past a string comparison.
+///
+/// Both scan paths call it: the context-free one on its `String` tasks and
+/// the source-context one on its `PathBuf` tasks, each just before
+/// `run_scan_tasks`.
+fn retain_unexcluded_scan_tasks<P: AsRef<Path>>(
+    tasks: &mut Vec<(ClientId, P, &'static str)>,
+    scanner_settings: &ScannerSettings,
+) {
+    if scanner_settings.excluded_scan_paths.is_empty() {
+        return;
+    }
+    let excluded: Vec<(ClientId, PathBuf)> = scanner_settings
+        .excluded_scan_paths
+        .iter()
+        .filter_map(|(client_str, paths)| ClientId::from_str(client_str).map(|id| (id, paths)))
+        .flat_map(|(client_id, paths)| {
+            paths
+                .iter()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(move |path| {
+                    (
+                        client_id,
+                        std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                    )
+                })
+        })
+        .collect();
+    if excluded.is_empty() {
+        return;
+    }
+    tasks.retain(|(client_id, path, _)| {
+        let path = path.as_ref();
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let admitted = !excluded
+            .iter()
+            .any(|(excluded_id, prefix)| excluded_id == client_id && resolved.starts_with(prefix));
+        if !admitted {
+            WATCH_DISCOVERY.with(|slot| {
+                if let Some(capture) = slot.borrow_mut().as_mut() {
+                    capture.roots.remove(path);
+                }
+            });
+        }
+        admitted
+    });
+}
+
+fn push_unique_scan_task(
+    tasks: &mut Vec<(ClientId, String, &'static str)>,
+    seen: &mut HashSet<(ClientId, PathBuf)>,
+    client_id: ClientId,
+    raw_path: impl Into<PathBuf>,
+) {
+    push_unique_scan_task_with_pattern(tasks, seen, client_id, raw_path, client_id.data().pattern);
+}
+
+fn push_unique_scan_task_with_pattern(
+    tasks: &mut Vec<(ClientId, String, &'static str)>,
+    seen: &mut HashSet<(ClientId, PathBuf)>,
+    client_id: ClientId,
+    raw_path: impl Into<PathBuf>,
+    pattern: &'static str,
+) {
+    let raw_path = raw_path.into();
+    if raw_path.as_os_str().is_empty() {
+        return;
+    }
+
+    let key = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| raw_path.clone());
+    if seen.insert((client_id, key)) {
+        tasks.push((client_id, raw_path.to_string_lossy().to_string(), pattern));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kiro_global_storage_roots(home_dir: &str) -> [PathBuf; 2] {
+    [
+        PathBuf::from(format!(
+            "{}/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent",
+            home_dir
+        )),
+        PathBuf::from(format!(
+            "{}/Library/Application Support/kiro/User/globalStorage/kiro.kiroagent",
+            home_dir
+        )),
+    ]
+}
+
+/// Merge user-configured OpenCode db paths from [`ScannerSettings`] into the
+/// auto-discovered list, in-place.
+///
+/// Rules:
+/// - Non-existent paths are silently skipped so stale config never aborts a
+///   scan (the config outlives any single opencode install).
+/// - WAL/SHM/journal sidecars are rejected via [`is_opencode_db_filename`].
+/// - Duplicates are removed by canonicalized path comparison, so a user who
+///   explicitly lists an auto-discovered db in their config does not cause
+///   it to be parsed twice.
+///
+/// Kept as a separate helper so the unit tests can exercise the merge
+/// semantics without spinning up a full `scan_all_clients` run.
+pub(crate) fn merge_user_opencode_db_paths(discovered: &mut Vec<PathBuf>, extra_paths: &[PathBuf]) {
+    if extra_paths.is_empty() {
+        return;
+    }
+
+    // Build a canonical-path set of what we already have so we can dedup
+    // against auto-discovered entries. Fall back to the raw path if
+    // canonicalize fails (e.g. on a filesystem that doesn't support it),
+    // which preserves the pre-canonicalization behavior without silently
+    // dropping entries.
+    let mut seen: HashSet<PathBuf> = discovered
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    for raw in extra_paths {
+        if !checked_file(raw) {
+            // Stale config or wrong path — silently skip.
+            continue;
+        }
+        let Some(name) = raw.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_opencode_db_filename(name) {
+            // Reject sidecars (`.db-wal`, `.db-shm`) and anything that does
+            // not match the upstream channel-db naming rule.
+            continue;
+        }
+        let canonical = std::fs::canonicalize(raw).unwrap_or_else(|_| raw.clone());
+        if seen.insert(canonical) {
+            discovered.push(raw.clone());
+        }
+    }
+}
+
+/// Scan all session client directories in parallel, with user-controlled
+/// [`ScannerSettings`] merged in.
+///
+/// This is the preferred entry point when you have loaded persistent
+/// settings (e.g. from `~/.config/tokscale/settings.json`). Thin wrappers
+/// [`scan_all_clients_with_env_strategy`] and [`scan_all_clients`] call
+/// into this with `ScannerSettings::default()` for callers that don't care
+/// about the persistent config.
+pub fn scan_all_clients_with_scanner_settings(
+    home_dir: &str,
+    clients: &[String],
+    use_env_roots: bool,
+    scanner_settings: &ScannerSettings,
+) -> ScanResult {
+    let (mut scan, error) = track_discovery(|| {
+        scan_all_clients_with_env_strategy_inner(home_dir, clients, use_env_roots, scanner_settings)
+    });
+    scan.discovery_error = error;
+    scan
+}
+
+pub fn scan_all_clients_with_source_context(
+    context: &ResolvedLocalSourceContext,
+    clients: &[String],
+) -> Result<ScanResult, SourceContextUnavailable> {
+    let (scan, error) = track_discovery(|| scan_all_clients_resolved_inner(context, clients));
+    scan.map(|mut scan| {
+        scan.discovery_error = error;
+        scan
+    })
+}
+
+pub fn headless_roots_with_source_context(
+    context: &ResolvedLocalSourceContext,
+) -> Result<Vec<PathBuf>, SourceContextUnavailable> {
+    let roots =
+        if context.use_env_roots() && context.source_env_is_explicit("TOKSCALE_HEADLESS_DIR") {
+            vec![context
+                .source_env_path("TOKSCALE_HEADLESS_DIR")
+                .ok_or(SourceContextUnavailable)?
+                .to_path_buf()]
+        } else {
+            default_headless_roots(context.home_dir())
+        };
+    Ok(roots)
+}
+
+fn default_headless_roots(home_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        home_dir.join(".config/tokscale/headless"),
+        home_dir.join("Library/Application Support/tokscale/headless"),
+    ]
+}
+
+/// Scan all session client directories in parallel
+pub fn scan_all_clients_with_env_strategy(
+    home_dir: &str,
+    clients: &[String],
+    use_env_roots: bool,
+) -> ScanResult {
+    scan_all_clients_with_scanner_settings(
+        home_dir,
+        clients,
+        use_env_roots,
+        &ScannerSettings::default(),
+    )
+}
+
+fn scan_all_clients_resolved_inner(
+    context: &ResolvedLocalSourceContext,
+    clients: &[String],
+) -> Result<ScanResult, SourceContextUnavailable> {
+    let mut result = ScanResult::default();
+    let home_dir = context.home_dir();
+    let use_env_roots = context.use_env_roots();
+    let scanner_settings = context.scanner_settings();
+
+    let include_all = clients.is_empty();
+    let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
+    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
+        ClientId::iter().collect()
+    } else {
+        clients
+            .iter()
+            .filter_map(|s| ClientId::from_str(s))
+            .collect()
+    };
+    let headless_roots = headless_roots_with_source_context(context)?;
+    let mut tasks: Vec<(ClientId, PathBuf, &'static str)> = Vec::new();
+    let xdg_data = context.resolve_client_root(PathRoot::XdgData)?;
+    result.durable_excluded = scanner_settings.excluded_scan_paths.clone();
+    if enabled.contains(&ClientId::Claude) {
+        result.durable_mirror_base = Some(home_dir.join(".cc-mirror"));
+        result.durable_cowork_base = Some(
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("local-agent-mode-sessions"),
+        );
+    }
+    let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
+
+    // Every glob scan root funnels through here, so one check covers them all
+    // — including roots that come from file *contents*, such as a cc-mirror
+    // variant's `configDir`, which no caller ever gets to approve.
+    let mut push = |client_id: ClientId, path: PathBuf, pattern: &'static str| {
+        if path.as_os_str().is_empty() || !context.admits_scan_root(&path) {
+            return;
+        }
+        if seen_scan_roots.insert((client_id, path.clone())) {
+            tasks.push((client_id, path, pattern));
+        }
+    };
+
+    for client_id in ClientId::ALL
+        .iter()
+        .filter(|client| enabled.contains(*client))
+    {
+        if matches!(
+            client_id,
+            ClientId::OpenCode
+                | ClientId::Codex
+                | ClientId::OpenClaw
+                | ClientId::RooCode
+                | ClientId::KiloCode
+                | ClientId::Cline
+                | ClientId::Kilo
+                | ClientId::Hermes
+                | ClientId::Goose
+                | ClientId::Zed
+                | ClientId::Zcode
+                | ClientId::Crush
+                | ClientId::Codebuff
+        ) {
+            continue;
+        }
+        push(
+            *client_id,
+            context.resolve_client_path(*client_id)?,
+            client_id.data().pattern,
+        );
+    }
+
+    if enabled.contains(&ClientId::Kimi) {
+        let home = if use_env_roots {
+            context
+                .source_env_path("KIMI_CODE_HOME")
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home_dir.join(".kimi-code"))
+        } else {
+            home_dir.join(".kimi-code")
+        };
+        push(
+            ClientId::Kimi,
+            home.join("sessions"),
+            ClientId::Kimi.data().pattern,
+        );
+        let app_data = if cfg!(target_os = "windows") && use_env_roots {
+            context.source_env_path("APPDATA")
+        } else {
+            None
+        };
+        for root in kimi_work_roots(home_dir, app_data) {
+            push(ClientId::Kimi, root, ClientId::Kimi.data().pattern);
+        }
+    }
+
+    let mut grok_unified_paths = Vec::new();
+    if enabled.contains(&ClientId::Grok) {
+        push_grok_unified_log_candidates(
+            &mut grok_unified_paths,
+            &context.resolve_client_path(ClientId::Grok)?,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if enabled.contains(&ClientId::Kiro) {
+        for root in [
+            home_dir.join("Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent"),
+            home_dir.join("Library/Application Support/kiro/User/globalStorage/kiro.kiroagent"),
+        ] {
+            push(ClientId::Kiro, root, "kiro-globalstorage");
+        }
+    }
+    if enabled.contains(&ClientId::Kiro) {
+        push(
+            ClientId::Kiro,
+            home_dir.join(".kiro/sessions"),
+            "kiro-ide-session",
+        );
+    }
+
+    for (client_id, path) in extra_scan_paths_for(scanner_settings, &enabled) {
+        if client_id == ClientId::Grok {
+            push_grok_unified_log_candidates(&mut grok_unified_paths, &path);
+        }
+        push(client_id, path, client_id.data().pattern);
+    }
+
+    if enabled.contains(&ClientId::Claude) {
+        push(
+            ClientId::Claude,
+            home_dir.join(".claude/transcripts"),
+            ClientId::Claude.data().pattern,
+        );
+        for path in checked_mirror_roots(home_dir) {
+            push(ClientId::Claude, path, ClientId::Claude.data().pattern);
+        }
+        for path in discover_cowork_project_roots(home_dir) {
+            push(ClientId::Claude, path, ClientId::Claude.data().pattern);
+        }
+    }
+
+    if use_env_roots {
+        for (client_id, path) in context.extra_scan_paths() {
+            if enabled.contains(client_id) {
+                if *client_id == ClientId::Grok {
+                    push_grok_unified_log_candidates(&mut grok_unified_paths, path);
+                }
+                push(*client_id, path.clone(), client_id.data().pattern);
+            }
+        }
+    }
+
+    if enabled.contains(&ClientId::OpenCode) {
+        let data_dir = xdg_data.join("opencode");
+        result.durable_opencode_data_dir = Some(data_dir.clone());
+        result.opencode_dbs = discover_opencode_dbs(&data_dir);
+        result.durable_opencode_extra = scanner_settings
+            .opencode_db_paths
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_opencode_db_filename)
+            })
+            .cloned()
+            .collect();
+        merge_user_opencode_db_paths(
+            &mut result.opencode_dbs,
+            &scanner_settings.opencode_db_paths,
+        );
+        result.opencode_dbs.sort_unstable();
+        result.opencode_dbs.dedup();
+        let path = context.resolve_client_path(ClientId::OpenCode)?;
+        result.opencode_json_dir = Some(path.clone());
+        push(ClientId::OpenCode, path, ClientId::OpenCode.data().pattern);
+    }
+
+    if enabled.contains(&ClientId::Codex) {
+        let codex_home = context.resolve_client_root(ClientId::Codex.data().root)?;
+        push(
+            ClientId::Codex,
+            codex_home.join("sessions"),
+            ClientId::Codex.data().pattern,
+        );
+        push(
+            ClientId::Codex,
+            context.codex_archive_root().to_path_buf(),
+            ClientId::Codex.data().pattern,
+        );
+        for root in &headless_roots {
+            push(
+                ClientId::Codex,
+                root.join("codex"),
+                ClientId::Codex.data().pattern,
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::OpenClaw) {
+        for path in [
+            context.resolve_client_path(ClientId::OpenClaw)?,
+            home_dir.join(".clawdbot/agents"),
+            home_dir.join(".moltbot/agents"),
+            home_dir.join(".moldbot/agents"),
+        ] {
+            push(ClientId::OpenClaw, path, ClientId::OpenClaw.data().pattern);
+        }
+    }
+    for (client, extension) in [
+        (ClientId::RooCode, "rooveterinaryinc.roo-cline"),
+        (ClientId::KiloCode, "kilocode.kilo-code"),
+        (ClientId::Cline, "saoudrizwan.claude-dev"),
+    ] {
+        if !enabled.contains(&client) {
+            continue;
+        }
+        push(
+            client,
+            context.resolve_client_path(client)?,
+            client.data().pattern,
+        );
+        push(
+            client,
+            home_dir
+                .join(".vscode-server/data/User/globalStorage")
+                .join(extension)
+                .join("tasks"),
+            client.data().pattern,
+        );
+        if client == ClientId::Cline {
+            let app_data = if cfg!(target_os = "windows") && use_env_roots {
+                context.source_env_path("APPDATA")
+            } else {
+                None
+            };
+            for root in cline_additional_vscode_task_roots(home_dir, app_data) {
+                push(client, root, client.data().pattern);
+            }
+        }
+    }
+    if include_synthetic {
+        let candidate = xdg_data.join("octofriend/sqlite.db");
+        result.durable_synthetic_db = Some(candidate.clone());
+        record_watch_root(&candidate, false);
+        if checked_exists(&candidate) {
+            result.synthetic_db = Some(candidate);
+        }
+    }
+    if enabled.contains(&ClientId::Hermes) {
+        let hermes_root = context.resolve_client_root(ClientId::Hermes.data().root)?;
+        let hermes_is_set = use_env_roots && context.source_env_is_explicit("HERMES_HOME");
+        let mut homes = vec![hermes_root];
+        if !hermes_is_set {
+            if cfg!(target_os = "windows") && use_env_roots {
+                if let Some(local) = context.source_env_path("LOCALAPPDATA") {
+                    homes.push(local.join("hermes"));
+                }
+            }
+            homes.push(home_dir.join("AppData/Local/hermes"));
+        }
+        result.durable_hermes_homes = homes.clone();
+        let mut extra_dbs = Vec::new();
+        for hermes_home in homes {
+            let default_db = hermes_home.join("state.db");
+            if checked_file(&default_db) {
+                if result.hermes_db.is_none() {
+                    result.hermes_db = Some(default_db);
+                } else if result.hermes_db.as_ref() != Some(&default_db) {
+                    extra_dbs.push(default_db);
+                }
+            }
+            extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
+        }
+        extra_dbs.sort_unstable();
+        extra_dbs.dedup();
+        result.get_mut(ClientId::Hermes).extend(extra_dbs);
+    }
+
+    if enabled.contains(&ClientId::Goose) {
+        let mut candidates = Vec::new();
+        if use_env_roots && context.source_env_is_explicit("GOOSE_PATH_ROOT") {
+            if let Some(root) = context.source_env_path("GOOSE_PATH_ROOT") {
+                candidates.push(root.join("data/sessions/sessions.db"));
+            }
+        }
+        candidates.extend([
+            context.resolve_client_path(ClientId::Goose)?,
+            home_dir.join("Library/Application Support/goose/sessions/sessions.db"),
+            home_dir.join("Library/Application Support/Block/goose/sessions/sessions.db"),
+            home_dir.join(".local/share/Block/goose/sessions/sessions.db"),
+        ]);
+        for path in &candidates {
+            record_watch_root(path, false);
+            result
+                .durable_db_candidates
+                .push((ClientId::Goose, path.clone()));
+        }
+        result.goose_db = candidates.into_iter().find(|path| checked_file(path));
+    }
+    if enabled.contains(&ClientId::Kilo) {
+        let path = context.resolve_client_path(ClientId::Kilo)?;
+        result
+            .durable_db_candidates
+            .push((ClientId::Kilo, path.clone()));
+        record_watch_root(&path, false);
+        if checked_exists(&path) {
+            result.kilo_db = Some(path);
+        }
+    }
+    if enabled.contains(&ClientId::Zed) {
+        let mut candidates = vec![context.resolve_client_path(ClientId::Zed)?];
+        #[cfg(target_os = "macos")]
+        candidates.push(home_dir.join("Library/Application Support/Zed/threads/threads.db"));
+        if !use_env_roots {
+            candidates.push(home_dir.join("AppData/Local/Zed/threads/threads.db"));
+        }
+        #[cfg(target_os = "windows")]
+        if use_env_roots {
+            if let Some(root) = context.data_local_dir() {
+                candidates.push(root.join("Zed/threads/threads.db"));
+            }
+        }
+        for path in &candidates {
+            record_watch_root(path, false);
+            result
+                .durable_db_candidates
+                .push((ClientId::Zed, path.clone()));
+        }
+        result.zed_db = candidates.into_iter().find(|path| checked_file(path));
+    }
+
+    if enabled.contains(&ClientId::Crush) {
+        let path = context.resolve_client_path(ClientId::Crush)?;
+        let mut dbs = scan_crush_registry(&path, Some(context.capture_cwd()));
+        // Crush databases bypass `push`, and a registry entry's `data_dir` is
+        // file content that may be absolute, so it needs the same check.
+        dbs.retain(|db| context.admits_scan_root(&db.db_path));
+        dbs.sort_by(|a, b| a.db_path.cmp(&b.db_path));
+        dbs.dedup_by(|a, b| a.db_path == b.db_path);
+        result.crush_dbs = dbs;
+    }
+    if enabled.contains(&ClientId::Kiro) {
+        let candidates = [
+            home_dir.join(".local/share/kiro-cli/data.sqlite3"),
+            home_dir.join("Library/Application Support/kiro-cli/data.sqlite3"),
+        ];
+        for path in &candidates {
+            record_watch_root(path, false);
+            result
+                .durable_db_candidates
+                .push((ClientId::Kiro, path.clone()));
+        }
+        result.kiro_db = candidates.into_iter().find(|path| checked_file(path));
+    }
+    if enabled.contains(&ClientId::Zcode) {
+        let path = context.resolve_client_path(ClientId::Zcode)?;
+        result
+            .durable_db_candidates
+            .push((ClientId::Zcode, path.clone()));
+        result.zcode_db = checked_file(&path).then_some(path);
+    }
+    if enabled.contains(&ClientId::Codebuff) {
+        if use_env_roots {
+            if context.source_env_is_explicit("CODEBUFF_DATA_DIR") {
+                let root = context
+                    .source_env_path("CODEBUFF_DATA_DIR")
+                    .ok_or(SourceContextUnavailable)?;
+                push(
+                    ClientId::Codebuff,
+                    root.join("projects"),
+                    ClientId::Codebuff.data().pattern,
+                );
+            } else {
+                for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                    push(
+                        ClientId::Codebuff,
+                        home_dir.join(".config").join(channel).join("projects"),
+                        ClientId::Codebuff.data().pattern,
+                    );
+                }
+            }
+        } else {
+            for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                push(
+                    ClientId::Codebuff,
+                    home_dir.join(".config").join(channel).join("projects"),
+                    ClientId::Codebuff.data().pattern,
+                );
+            }
+        }
+    }
+
+    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
+    for (_, path, _) in &tasks {
+        record_watch_root(path, true);
+    }
+    result.durable_roots = tasks
+        .iter()
+        .map(|(client, path, _)| (*client, path.clone()))
+        .collect();
+    let scan_results = run_scan_tasks(tasks, |path| path.as_path());
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for (client_id, files) in scan_results {
+        for file in files {
+            let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if seen.insert(key) {
+                result.get_mut(client_id).push(file);
+            }
+        }
+    }
+    grok_unified_paths.extend(
+        result
+            .get(ClientId::Grok)
+            .iter()
+            .filter_map(|path| grok_unified_log_path_from_updates(path)),
+    );
+    result.durable_grok_unified = grok_unified_paths.clone();
+    for path in grok_unified_paths {
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if checked_file(&path) && seen.insert(key) {
+            result.get_mut(ClientId::Grok).push(path);
+        }
+    }
+    result.get_mut(ClientId::Grok).sort_unstable();
+
+    if enabled.contains(&ClientId::Copilot) {
+        let desktop_db = home_dir.join(".copilot/data.db");
+        result
+            .durable_db_candidates
+            .push((ClientId::Copilot, desktop_db.clone()));
+        record_watch_root(&desktop_db, false);
+        if checked_file(&desktop_db) {
+            result.copilot_desktop_db = Some(desktop_db);
+        }
+        if use_env_roots && context.source_env_is_explicit("COPILOT_OTEL_FILE_EXPORTER_PATH") {
+            if let Some(path) = context.source_env_path("COPILOT_OTEL_FILE_EXPORTER_PATH") {
+                let path = path.to_path_buf();
+                result
+                    .durable_db_candidates
+                    .push((ClientId::Copilot, path.clone()));
+                record_watch_root(&path, false);
+                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if checked_file(&path) && seen.insert(key) {
+                    result.get_mut(ClientId::Copilot).push(path);
+                    result.get_mut(ClientId::Copilot).sort_unstable();
+                }
+            }
+        }
+    }
+
+    prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+
+    Ok(result)
+}
+
+fn scan_all_clients_with_env_strategy_inner(
+    home_dir: &str,
+    clients: &[String],
+    use_env_roots: bool,
+    scanner_settings: &ScannerSettings,
+) -> ScanResult {
+    let mut result = ScanResult::default();
+
+    let include_all = clients.is_empty();
+    let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
+
+    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
+        ClientId::iter().collect()
+    } else {
+        clients
+            .iter()
+            .filter_map(|s| ClientId::from_str(s))
+            .collect()
+    };
+
+    let headless_roots = headless_roots_with_env_strategy(home_dir, use_env_roots);
+
+    // Define scan tasks
+    let mut tasks: Vec<(ClientId, String, &str)> = Vec::new();
+    let mut seen_scan_roots: HashSet<(ClientId, PathBuf)> = HashSet::new();
+
+    for client_id in ClientId::ALL
+        .iter()
+        .filter(|client| enabled.contains(*client))
+    {
+        if matches!(
+            client_id,
+            ClientId::OpenCode
+                | ClientId::Codex
+                | ClientId::OpenClaw
+                | ClientId::RooCode
+                | ClientId::KiloCode
+                | ClientId::Cline
+                | ClientId::Kilo
+                | ClientId::Hermes
+                | ClientId::Goose
+                | ClientId::Zed
+                | ClientId::Zcode
+                | ClientId::Crush
+                | ClientId::Codebuff
+        ) {
+            continue;
+        }
+
+        let def = client_id.data();
+        let path = def.resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, *client_id, path);
+    }
+
+    if enabled.contains(&ClientId::Kimi) {
+        let kimi_code_home = if use_env_roots {
+            std::env::var("KIMI_CODE_HOME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("{}/.kimi-code", home_dir))
+        } else {
+            format!("{}/.kimi-code", home_dir)
+        };
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Kimi,
+            format!("{}/sessions", kimi_code_home),
+        );
+        let app_data = if cfg!(target_os = "windows") && use_env_roots {
+            std::env::var_os("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+        for root in kimi_work_roots(Path::new(home_dir), app_data.as_deref()) {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Kimi, root);
+        }
+    }
+
+    let mut grok_unified_paths = Vec::new();
+    if enabled.contains(&ClientId::Grok) {
+        let grok_sessions = PathBuf::from(
+            ClientId::Grok
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
+        push_grok_unified_log_candidates(&mut grok_unified_paths, &grok_sessions);
+    }
+
+    // Register built-in Kiro IDE roots before user-configured or environment
+    // extras. Otherwise a default `*.json` task for an overlapping root can
+    // reserve it first and silently miss `.chat` and extensionless records.
+    #[cfg(target_os = "macos")]
+    if enabled.contains(&ClientId::Kiro) {
+        for root in kiro_global_storage_roots(home_dir) {
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Kiro,
+                root,
+                "kiro-globalstorage",
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::Kiro) {
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Kiro,
+            PathBuf::from(format!("{}/.kiro/sessions", home_dir)),
+            "kiro-ide-session",
+        );
+    }
+
+    for (client_id, path) in extra_scan_paths_for(scanner_settings, &enabled) {
+        warn_if_escapes_home(Path::new(home_dir), client_id, &path);
+        if client_id == ClientId::Grok {
+            push_grok_unified_log_candidates(&mut grok_unified_paths, &path);
+        }
+        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
+    }
+
+    for (client_id, path) in built_in_extra_scan_paths_for(home_dir, &enabled) {
+        if client_id == ClientId::Grok {
+            push_grok_unified_log_candidates(&mut grok_unified_paths, &path);
+        }
+        push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
+    }
+
+    // Extra scan directories are part of the caller's environment, so they are
+    // intentionally ignored when an explicit --home override disables env roots.
+    if use_env_roots {
+        let extra_dirs_val = std::env::var("TOKSCALE_EXTRA_DIRS").unwrap_or_default();
+        for (client_id, path) in parse_extra_dirs(&extra_dirs_val, &enabled) {
+            let path = PathBuf::from(path);
+            warn_if_escapes_home(Path::new(home_dir), client_id, &path);
+            if client_id == ClientId::Grok {
+                push_grok_unified_log_candidates(&mut grok_unified_paths, &path);
+            }
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
+        }
+    }
+
+    if enabled.contains(&ClientId::OpenCode) {
+        let xdg_data = PathRoot::XdgData.resolve_with_env_strategy(home_dir, use_env_roots);
+
+        // OpenCode 1.2+: SQLite database(s) at ~/.local/share/opencode/opencode*.db
+        //
+        // opencode picks its db filename at build time based on the release
+        // channel: `latest`/`beta` use `opencode.db`, other channels use
+        // `opencode-<channel>.db` (e.g. `opencode-stable.db`). A single user
+        // can run multiple channels side by side, so we pick up every match
+        // under the data dir. See `getChannelPath` in
+        // opencode/packages/opencode/src/storage/db.ts for the source of
+        // the naming rule.
+        let opencode_data_dir = PathBuf::from(format!("{}/opencode", xdg_data));
+        result.opencode_dbs = discover_opencode_dbs(&opencode_data_dir);
+
+        // Merge user-configured `scanner.opencodeDbPaths` here, INSIDE the
+        // `enabled.contains(&ClientId::OpenCode)` guard, so a request like
+        // `tokscale --claude` does not pull in OpenCode dbs the user pinned
+        // for unrelated reasons. Inflated OpenCode `counts` and wasted
+        // SQLite parsing work otherwise sneak past the message-level
+        // client filter that runs much later in the pipeline.
+        merge_user_opencode_db_paths(
+            &mut result.opencode_dbs,
+            &scanner_settings.opencode_db_paths,
+        );
+        result.opencode_dbs.sort_unstable();
+        result.opencode_dbs.dedup();
+
+        // OpenCode legacy: JSON files at ~/.local/share/opencode/storage/message/*/*.json
+        let opencode_path = ClientId::OpenCode
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        result.opencode_json_dir = Some(PathBuf::from(&opencode_path));
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::OpenCode,
+            opencode_path,
+        );
+    }
+
+    if enabled.contains(&ClientId::Codex) {
+        // Codex: ~/.codex/sessions/**/*.jsonl
+        let codex_home = if use_env_roots {
+            std::env::var("CODEX_HOME").unwrap_or_else(|_| format!("{}/.codex", home_dir))
+        } else {
+            format!("{}/.codex", home_dir)
+        };
+        let codex_path = ClientId::Codex
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Codex,
+            codex_path,
+        );
+
+        // Codex archived sessions: ~/.codex/archived_sessions/**/*.jsonl
+        let codex_archived_path = format!("{}/archived_sessions", codex_home);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Codex,
+            codex_archived_path,
+        );
+
+        // Codex headless: <headless_root>/codex/*.jsonl
+        for root in &headless_roots {
+            push_unique_scan_task(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Codex,
+                root.join("codex"),
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::OpenClaw) {
+        // OpenClaw transcripts: ~/.openclaw/agents/**/*.jsonl
+        let openclaw_path = ClientId::OpenClaw
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::OpenClaw,
+            openclaw_path,
+        );
+
+        // Legacy paths (Clawd -> Moltbot -> OpenClaw rebrand history)
+        let clawdbot_path = format!("{}/.clawdbot/agents", home_dir);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::OpenClaw,
+            clawdbot_path,
+        );
+
+        let moltbot_path = format!("{}/.moltbot/agents", home_dir);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::OpenClaw,
+            moltbot_path,
+        );
+
+        let moldbot_path = format!("{}/.moldbot/agents", home_dir);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::OpenClaw,
+            moldbot_path,
+        );
+    }
+
+    if include_synthetic {
+        let xdg_data = PathRoot::XdgData.resolve_with_env_strategy(home_dir, use_env_roots);
+        let octofriend_db_path = PathBuf::from(format!("{}/octofriend/sqlite.db", xdg_data));
+        if checked_exists(&octofriend_db_path) {
+            result.synthetic_db = Some(octofriend_db_path);
+        }
+    }
+
+    if enabled.contains(&ClientId::RooCode) {
+        let local_path = ClientId::RooCode
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::RooCode,
+            local_path,
+        );
+
+        let server_path = format!(
+            "{}/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
+            home_dir
+        );
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::RooCode,
+            server_path,
+        );
+    }
+
+    if enabled.contains(&ClientId::KiloCode) {
+        let local_path = ClientId::KiloCode
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::KiloCode,
+            local_path,
+        );
+
+        let server_path = format!(
+            "{}/.vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks",
+            home_dir
+        );
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::KiloCode,
+            server_path,
+        );
+    }
+
+    if enabled.contains(&ClientId::Cline) {
+        let local_path = ClientId::Cline
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::Cline,
+            local_path,
+        );
+
+        let app_data = if cfg!(target_os = "windows") && use_env_roots {
+            std::env::var_os("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+        for root in cline_additional_vscode_task_roots(Path::new(home_dir), app_data.as_deref()) {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
+        }
+    }
+
+    if enabled.contains(&ClientId::Kilo) {
+        let kilo_db_path = ClientId::Kilo
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        if checked_exists(std::path::Path::new(&kilo_db_path)) {
+            result.kilo_db = Some(PathBuf::from(kilo_db_path));
+        }
+    }
+
+    if enabled.contains(&ClientId::Hermes) {
+        let mut extra_dbs = Vec::new();
+        for hermes_home in hermes_home_candidates(home_dir, use_env_roots) {
+            let default_db = hermes_home.join("state.db");
+            if checked_file(&default_db) {
+                if result.hermes_db.is_none() {
+                    result.hermes_db = Some(default_db);
+                } else if result.hermes_db.as_ref() != Some(&default_db) {
+                    extra_dbs.push(default_db);
+                }
+            }
+            extra_dbs.extend(discover_hermes_profile_state_dbs(&hermes_home));
+        }
+        extra_dbs.sort_unstable();
+        extra_dbs.dedup();
+        result.get_mut(ClientId::Hermes).extend(extra_dbs);
+    }
+
+    if enabled.contains(&ClientId::Goose) {
+        if use_env_roots {
+            if let Ok(custom_root) = std::env::var("GOOSE_PATH_ROOT") {
+                let trimmed = custom_root.trim();
+                if !trimmed.is_empty() {
+                    let custom_path = PathBuf::from(trimmed).join("data/sessions/sessions.db");
+                    if checked_file(&custom_path) {
+                        result.goose_db = Some(custom_path);
+                    }
+                }
+            }
+        }
+        if result.goose_db.is_none() {
+            let xdg_path = ClientId::Goose
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots);
+            let xdg = PathBuf::from(xdg_path);
+            if checked_file(&xdg) {
+                result.goose_db = Some(xdg);
+            }
+        }
+        if result.goose_db.is_none() {
+            let macos_path = PathBuf::from(format!(
+                "{}/Library/Application Support/goose/sessions/sessions.db",
+                home_dir
+            ));
+            if checked_file(&macos_path) {
+                result.goose_db = Some(macos_path);
+            }
+        }
+        if result.goose_db.is_none() {
+            let legacy_macos_path = PathBuf::from(format!(
+                "{}/Library/Application Support/Block/goose/sessions/sessions.db",
+                home_dir
+            ));
+            if checked_file(&legacy_macos_path) {
+                result.goose_db = Some(legacy_macos_path);
+            }
+        }
+        if result.goose_db.is_none() {
+            let legacy_xdg_path = PathBuf::from(format!(
+                "{}/.local/share/Block/goose/sessions/sessions.db",
+                home_dir
+            ));
+            if checked_file(&legacy_xdg_path) {
+                result.goose_db = Some(legacy_xdg_path);
+            }
+        }
+    }
+
+    if enabled.contains(&ClientId::Zed) {
+        let zed_db_path = ClientId::Zed
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        let xdg = PathBuf::from(zed_db_path);
+        if checked_file(&xdg) {
+            result.zed_db = Some(xdg);
+        }
+        #[cfg(target_os = "macos")]
+        if result.zed_db.is_none() {
+            let macos_path = PathBuf::from(format!(
+                "{}/Library/Application Support/Zed/threads/threads.db",
+                home_dir
+            ));
+            if checked_file(&macos_path) {
+                result.zed_db = Some(macos_path);
+            }
+        }
+        if !use_env_roots && result.zed_db.is_none() {
+            let windows_path = PathBuf::from(home_dir).join("AppData/Local/Zed/threads/threads.db");
+            if checked_file(&windows_path) {
+                result.zed_db = Some(windows_path);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if use_env_roots && result.zed_db.is_none() {
+            if let Some(local_app_data) = dirs::data_local_dir() {
+                let windows_path = local_app_data.join("Zed/threads/threads.db");
+                if checked_file(&windows_path) {
+                    result.zed_db = Some(windows_path);
+                }
+            }
+        }
+    }
+
+    if enabled.contains(&ClientId::Crush) {
+        result.crush_dbs = discover_crush_dbs(home_dir, use_env_roots);
+    }
+
+    if enabled.contains(&ClientId::Kiro) {
+        let xdg_path = PathBuf::from(format!("{}/.local/share/kiro-cli/data.sqlite3", home_dir));
+        if checked_file(&xdg_path) {
+            result.kiro_db = Some(xdg_path);
+        }
+        if result.kiro_db.is_none() {
+            let macos_path = PathBuf::from(format!(
+                "{}/Library/Application Support/kiro-cli/data.sqlite3",
+                home_dir
+            ));
+            if checked_file(&macos_path) {
+                result.kiro_db = Some(macos_path);
+            }
+        }
+    }
+
+    if enabled.contains(&ClientId::Zcode) {
+        let path = PathBuf::from(
+            ClientId::Zcode
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
+        result.zcode_db = checked_file(&path).then_some(path);
+    }
+
+    if enabled.contains(&ClientId::Codebuff) {
+        // Codebuff persists per-channel chat history under
+        // ~/.config/<channel>/projects/<project>/chats/<chatId>/chat-messages.json.
+        // When CODEBUFF_DATA_DIR is set to a non-empty value (via
+        // PathRoot::EnvVar), scan only that root; otherwise — including when
+        // the env var is unset *or* set to an empty/whitespace string — walk
+        // the three known channel roots:
+        //   - ~/.config/manicode (primary / legacy name — Codebuff was "Manicode")
+        //   - ~/.config/manicode-dev
+        //   - ~/.config/manicode-staging
+        let trimmed_override = if use_env_roots {
+            std::env::var("CODEBUFF_DATA_DIR")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        } else {
+            None
+        };
+
+        let mut codebuff_roots: Vec<String> = Vec::new();
+        if let Some(root) = trimmed_override {
+            codebuff_roots.push(format!("{}/projects", root.trim_end_matches('/')));
+        } else {
+            let config_dir = format!("{}/.config", home_dir);
+            for channel in ["manicode", "manicode-dev", "manicode-staging"] {
+                codebuff_roots.push(format!("{}/{}/projects", config_dir, channel));
+            }
+        }
+
+        for root in codebuff_roots {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Codebuff, root);
+        }
+    }
+
+    retain_unexcluded_scan_tasks(&mut tasks, scanner_settings);
+
+    let scan_results = run_scan_tasks(tasks, |path| Path::new(path.as_str()));
+
+    // Aggregate results, deduplicating physical files across overlapping roots.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for (client_id, files) in scan_results {
+        for file in files {
+            let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if seen.insert(key) {
+                result.get_mut(client_id).push(file);
+            }
+        }
+    }
+
+    grok_unified_paths.extend(
+        result
+            .get(ClientId::Grok)
+            .iter()
+            .filter_map(|path| grok_unified_log_path_from_updates(path)),
+    );
+
+    for path in grok_unified_paths {
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if checked_file(&path) && seen.insert(key) {
+            result.get_mut(ClientId::Grok).push(path);
+        }
+    }
+    result.get_mut(ClientId::Grok).sort_unstable();
+
+    if enabled.contains(&ClientId::Copilot) {
+        let desktop_db = PathBuf::from(home_dir).join(".copilot/data.db");
+        if checked_file(&desktop_db) {
+            result.copilot_desktop_db = Some(desktop_db);
+        }
+
+        if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if checked_file(&path) && seen.insert(key) {
+                let copilot_files = result.get_mut(ClientId::Copilot);
+                copilot_files.push(path);
+                copilot_files.sort_unstable();
+            }
+        }
+    }
+
+    prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+
+    result
+}
+
+/// Drop each Cursor `usage[.account].csv` whose `usage[.account].json` sibling
+/// (same directory) is also present, so an account is parsed from exactly one
+/// file. Mirrors upstream #1247.
+fn prefer_cursor_json_over_csv(files: &mut Vec<PathBuf>) {
+    let is_ext = |path: &Path, want: &str| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+    };
+    let json_stems: HashSet<PathBuf> = files
+        .iter()
+        .filter(|path| is_ext(path, "json"))
+        .map(|path| path.with_extension(""))
+        .collect();
+    files.retain(|path| !(is_ext(path, "csv") && json_stems.contains(&path.with_extension(""))));
+}
+
+pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
+    scan_all_clients_with_env_strategy(home_dir, clients, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove(&mut self, key: &'static str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan_without_extra_dirs(home_dir: &str, clients: &[String]) -> ScanResult {
+        let mut extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        extra.remove("TOKSCALE_EXTRA_DIRS");
+        scan_all_clients(home_dir, clients)
+    }
+
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn change(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(previous)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_guard_restores_after_unwind() {
+        const KEY: &str = "TOKSCALE_SCANNER_ENV_GUARD_SELF_CHECK";
+        let mut outer = EnvGuard::capture(&[KEY]);
+        outer.set(KEY, "before");
+        let result = std::panic::catch_unwind(|| {
+            let mut inner = EnvGuard::capture(&[KEY]);
+            inner.set(KEY, "during");
+            panic!("exercise EnvGuard unwinding");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os(KEY), Some("before".into()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cwd_guard_restores_after_unwind() {
+        let original = std::env::current_dir().unwrap();
+        let target = TempDir::new().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = CwdGuard::change(target.path());
+            panic!("exercise CwdGuard unwinding");
+        });
+        assert!(result.is_err());
+        assert_eq!(std::env::current_dir().unwrap(), original);
+    }
+
+    fn setup_mock_copilot_dir(home: &Path) {
+        let sessions_dir = home.join(".copilot/otel");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let file_path = sessions_dir.join("copilot.jsonl");
+        let mut file = File::create(file_path).unwrap();
+        writeln!(file, "{{\"type\":\"span\",\"name\":\"chat gpt-5.4-mini\"}}").unwrap();
+    }
+
+    #[test]
+    fn test_scan_result_total_files() {
+        let mut result = ScanResult::default();
+        result
+            .get_mut(ClientId::OpenCode)
+            .push(PathBuf::from("a.json"));
+        result
+            .get_mut(ClientId::OpenCode)
+            .push(PathBuf::from("b.json"));
+        result
+            .get_mut(ClientId::Claude)
+            .push(PathBuf::from("c.jsonl"));
+        result
+            .get_mut(ClientId::Gemini)
+            .push(PathBuf::from("d.json"));
+        result.get_mut(ClientId::Pi).push(PathBuf::from("e.jsonl"));
+        assert_eq!(result.total_files(), 5);
+    }
+
+    #[test]
+    fn test_scan_result_all_files() {
+        let mut result = ScanResult::default();
+        result
+            .get_mut(ClientId::OpenCode)
+            .push(PathBuf::from("a.json"));
+        result
+            .get_mut(ClientId::Claude)
+            .push(PathBuf::from("b.jsonl"));
+        result
+            .get_mut(ClientId::Codex)
+            .push(PathBuf::from("c.jsonl"));
+        result
+            .get_mut(ClientId::Gemini)
+            .push(PathBuf::from("d.json"));
+        result
+            .get_mut(ClientId::Cursor)
+            .push(PathBuf::from("e.csv"));
+        result.get_mut(ClientId::Pi).push(PathBuf::from("f.jsonl"));
+
+        let all = result.all_files();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0], (ClientId::OpenCode, PathBuf::from("a.json")));
+        assert_eq!(all[1], (ClientId::Claude, PathBuf::from("b.jsonl")));
+        assert_eq!(all[2], (ClientId::Codex, PathBuf::from("c.jsonl")));
+        assert_eq!(all[3], (ClientId::Cursor, PathBuf::from("e.csv")));
+        assert_eq!(all[4], (ClientId::Gemini, PathBuf::from("d.json")));
+        assert_eq!(all[5], (ClientId::Pi, PathBuf::from("f.jsonl")));
+    }
+
+    #[test]
+    fn test_scan_result_empty() {
+        let result = ScanResult::default();
+        assert_eq!(result.total_files(), 0);
+        assert!(result.all_files().is_empty());
+    }
+
+    #[test]
+    fn test_client_id_equality() {
+        assert_eq!(ClientId::OpenCode, ClientId::OpenCode);
+        assert_ne!(ClientId::OpenCode, ClientId::Claude);
+    }
+
+    #[test]
+    fn test_scan_directory_json_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        // Create test files
+        File::create(path.join("test1.json")).unwrap();
+        File::create(path.join("test2.json")).unwrap();
+        File::create(path.join("data.txt")).unwrap();
+        File::create(path.join("other.jsonl")).unwrap();
+
+        let json_files = scan_directory(path.to_str().unwrap(), "*.json");
+        assert_eq!(json_files.len(), 2);
+        assert!(json_files.iter().all(|p| p.extension().unwrap() == "json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_directory_keeps_file_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.json");
+        let alias = dir.path().join("alias.json");
+        File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let files = scan_directory(dir.path().to_str().unwrap(), "*.json");
+        assert_eq!(files, vec![alias, target]);
+    }
+
+    #[test]
+    fn test_scan_directory_json_or_jsonl_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("session.json")).unwrap();
+        File::create(path.join("session.jsonl")).unwrap();
+        File::create(path.join("session.txt")).unwrap();
+
+        let session_files = scan_directory(path.to_str().unwrap(), "*.json|*.jsonl");
+        assert_eq!(session_files.len(), 2);
+        assert_eq!(
+            session_files
+                .iter()
+                .map(|path| path.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["session.json", "session.jsonl"]
+        );
+    }
+
+    #[test]
+    fn test_scan_directory_jsonl_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("session.jsonl")).unwrap();
+        File::create(path.join("log.jsonl")).unwrap();
+        File::create(path.join("data.json")).unwrap();
+
+        let jsonl_files = scan_directory(path.to_str().unwrap(), "*.jsonl");
+        assert_eq!(jsonl_files.len(), 2);
+        assert!(jsonl_files
+            .iter()
+            .all(|p| p.extension().unwrap() == "jsonl"));
+    }
+
+    #[test]
+    fn test_scan_directory_session_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("session-001.json")).unwrap();
+        File::create(path.join("session-abc.json")).unwrap();
+        File::create(path.join("other.json")).unwrap();
+        File::create(path.join("session.json")).unwrap(); // Shouldn't match
+
+        let session_files = scan_directory(path.to_str().unwrap(), "session-*.json");
+        assert_eq!(session_files.len(), 2);
+        assert!(session_files.iter().all(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            name.starts_with("session-") && name.ends_with(".json")
+        }));
+    }
+
+    #[test]
+    fn test_scan_directory_ui_messages_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        let tasks = path.join("tasks");
+        fs::create_dir_all(tasks.join("task-a")).unwrap();
+        fs::create_dir_all(tasks.join("task-b")).unwrap();
+        fs::create_dir_all(tasks.join("task-c")).unwrap();
+
+        File::create(tasks.join("task-a").join("ui_messages.json")).unwrap();
+        File::create(tasks.join("task-b").join("ui_messages.json")).unwrap();
+        File::create(tasks.join("task-c").join("api_conversation_history.json")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "ui_messages.json");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|p| {
+            p.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                == "ui_messages.json"
+        }));
+    }
+
+    fn names_of(files: &[PathBuf]) -> Vec<String> {
+        let mut names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_scan_directory_cursor_pattern_matches_usage_json_and_csv_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        for name in [
+            "usage.json",
+            "usage.csv",
+            "usage.work.json",
+            "usage.work.csv",
+            "usage.last-sync-attempt",
+            "usage.backup-1.json",
+            "usage.backup-1.csv",
+            "usage-notes.json",
+            "other.json",
+        ] {
+            File::create(path.join(name)).unwrap();
+        }
+        let archive = path.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        File::create(archive.join("usage.json")).unwrap();
+        File::create(archive.join("usage.csv")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "usage*.json|usage*.csv");
+        assert_eq!(
+            names_of(&files),
+            vec![
+                "usage.csv",
+                "usage.json",
+                "usage.work.csv",
+                "usage.work.json"
+            ]
+        );
+    }
+
+    fn cursor_cache(home: &Path) -> PathBuf {
+        let dir = home.join(".config/tokscale/cursor-cache");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cursor_scan(home: &Path, settings: &ScannerSettings) -> Vec<PathBuf> {
+        scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["cursor".to_string()],
+            false,
+            settings,
+        )
+        .get(ClientId::Cursor)
+        .to_vec()
+    }
+
+    #[test]
+    fn test_cursor_scan_json_only_and_json_wins_over_csv_per_account() {
+        let dir = TempDir::new().unwrap();
+        let cache = cursor_cache(dir.path());
+        // active: json + csv -> json. team-a: json only. team-b: csv only.
+        for name in [
+            "usage.json",
+            "usage.csv",
+            "usage.team-a.json",
+            "usage.team-b.csv",
+            "usage.last-sync-attempt",
+        ] {
+            File::create(cache.join(name)).unwrap();
+        }
+        let files = cursor_scan(dir.path(), &ScannerSettings::default());
+        assert_eq!(
+            names_of(&files),
+            vec!["usage.json", "usage.team-a.json", "usage.team-b.csv"]
+        );
+
+        let csv_only = TempDir::new().unwrap();
+        File::create(cursor_cache(csv_only.path()).join("usage.csv")).unwrap();
+        assert_eq!(
+            names_of(&cursor_scan(csv_only.path(), &ScannerSettings::default())),
+            vec!["usage.csv"]
+        );
+    }
+
+    #[test]
+    fn test_prefer_cursor_json_over_csv_is_per_directory() {
+        let a = PathBuf::from("/a");
+        let b = PathBuf::from("/b");
+        let mut files = vec![
+            a.join("usage.json"),
+            a.join("usage.csv"),
+            b.join("usage.csv"),
+        ];
+        prefer_cursor_json_over_csv(&mut files);
+        assert_eq!(files, vec![a.join("usage.json"), b.join("usage.csv")]);
+    }
+
+    /// The takeover seam (Syrtis cursor sync): excluding the default cache root
+    /// and adding another directory leaves only the other directory's file.
+    #[test]
+    #[serial]
+    fn test_cursor_takeover_excluded_default_root_plus_extra_dir() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let cli_cache = cursor_cache(home);
+        File::create(cli_cache.join("usage.csv")).unwrap();
+        File::create(cli_cache.join("usage.json")).unwrap();
+        let sync_dir = home.join("sync");
+        fs::create_dir_all(&sync_dir).unwrap();
+        File::create(sync_dir.join("usage.synced.json")).unwrap();
+
+        let extra = BTreeMap::from([("cursor".to_string(), vec![sync_dir.clone()])]);
+        let both = cursor_scan(
+            home,
+            &ScannerSettings {
+                extra_scan_paths: extra.clone(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            both.iter().any(|p| p.starts_with(&cli_cache))
+                && both.iter().any(|p| p.starts_with(&sync_dir)),
+            "fixture is inert: {both:?}"
+        );
+
+        let settings = ScannerSettings {
+            extra_scan_paths: extra,
+            excluded_scan_paths: BTreeMap::from([("cursor".to_string(), vec![cli_cache.clone()])]),
+            ..Default::default()
+        };
+        let taken = cursor_scan(home, &settings);
+        assert_eq!(taken, vec![sync_dir.join("usage.synced.json")]);
+
+        // Same seam through a captured source context.
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home.to_path_buf()), false, settings).unwrap();
+        let via_context = scan_all_clients_with_source_context(&context, &["cursor".to_string()])
+            .unwrap()
+            .get(ClientId::Cursor)
+            .to_vec();
+        assert_eq!(via_context, vec![sync_dir.join("usage.synced.json")]);
+    }
+
+    #[test]
+    fn test_scan_directory_nested() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        // Create nested structure
+        let sub1 = path.join("project1");
+        let sub2 = path.join("project2");
+        fs::create_dir_all(&sub1).unwrap();
+        fs::create_dir_all(&sub2).unwrap();
+
+        File::create(sub1.join("session.json")).unwrap();
+        File::create(sub2.join("session.json")).unwrap();
+        File::create(path.join("root.json")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "*.json");
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn test_scan_directory_csv_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("usage.csv")).unwrap();
+        File::create(path.join("data.csv")).unwrap();
+        File::create(path.join("other.json")).unwrap();
+
+        let csv_files = scan_directory(path.to_str().unwrap(), "*.csv");
+        assert_eq!(csv_files.len(), 2);
+        assert!(csv_files.iter().all(|p| p.extension().unwrap() == "csv"));
+    }
+
+    #[test]
+    fn test_scan_directory_nonexistent() {
+        let files = scan_directory("/nonexistent/path/that/does/not/exist", "*.json");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_empty() {
+        let dir = TempDir::new().unwrap();
+        let files = scan_directory(dir.path().to_str().unwrap(), "*.json");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_deterministic_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        for name in ["zebra.jsonl", "alpha.jsonl", "middle.jsonl", "beta.jsonl"] {
+            File::create(path.join(name)).unwrap();
+        }
+
+        let first = scan_directory(path.to_str().unwrap(), "*.jsonl");
+        let second = scan_directory(path.to_str().unwrap(), "*.jsonl");
+        let third = scan_directory(path.to_str().unwrap(), "*.jsonl");
+
+        assert_eq!(first, second, "Repeated scans must return identical order");
+        assert_eq!(second, third, "Repeated scans must return identical order");
+
+        let names: Vec<_> = first
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha.jsonl", "beta.jsonl", "middle.jsonl", "zebra.jsonl"],
+            "Results must be lexically sorted"
+        );
+    }
+
+    fn setup_mock_opencode_dir(base: &std::path::Path) {
+        let opencode_path = base.join(".local/share/opencode/storage/message/proj1");
+        fs::create_dir_all(&opencode_path).unwrap();
+        let mut file = File::create(opencode_path.join("msg_001.json")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_claude_dir(base: &std::path::Path) {
+        let claude_path = base.join(".claude/projects/myproject");
+        fs::create_dir_all(&claude_path).unwrap();
+        let mut file = File::create(claude_path.join("conversation.jsonl")).unwrap();
+        file.write_all(b"").unwrap();
+    }
+
+    fn setup_mock_claude_transcripts_dir(base: &std::path::Path) -> PathBuf {
+        let transcript_path = base.join(".claude/transcripts");
+        fs::create_dir_all(&transcript_path).unwrap();
+        let file_path = transcript_path.join("ses_123456789012345678901234567.jsonl");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"").unwrap();
+        file_path
+    }
+
+    fn setup_mock_codex_dir(base: &std::path::Path) {
+        let codex_path = base.join(".codex/sessions");
+        fs::create_dir_all(&codex_path).unwrap();
+        let mut file = File::create(codex_path.join("session.jsonl")).unwrap();
+        file.write_all(b"").unwrap();
+    }
+
+    fn setup_mock_codex_archived_dir(base: &std::path::Path) {
+        let archived_path = base.join(".codex/archived_sessions");
+        fs::create_dir_all(&archived_path).unwrap();
+        let mut file = File::create(archived_path.join("archived.jsonl")).unwrap();
+        file.write_all(b"").unwrap();
+    }
+
+    fn setup_mock_gemini_dir(base: &std::path::Path) {
+        let gemini_path = base.join(".gemini/tmp/123/chats");
+        fs::create_dir_all(&gemini_path).unwrap();
+        let mut file = File::create(gemini_path.join("session-abc.json")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_pi_dir(base: &std::path::Path) {
+        let pi_path = base.join(".pi/agent/sessions/--test--");
+        fs::create_dir_all(&pi_path).unwrap();
+        let mut file = File::create(pi_path.join("1733011200000_pi_ses_001.jsonl")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_omp_dir(base: &std::path::Path) {
+        let omp_path = base.join(".omp/agent/sessions/--omp-test--");
+        fs::create_dir_all(&omp_path).unwrap();
+        let mut file =
+            File::create(omp_path.join("2026-04-06T03-04-28Z_omp_ses_001.jsonl")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_zed_xdg_db(base: &std::path::Path) -> PathBuf {
+        let zed_db = base.join(".local/share/zed/threads/threads.db");
+        fs::create_dir_all(zed_db.parent().unwrap()).unwrap();
+        File::create(&zed_db).unwrap();
+        zed_db
+    }
+
+    #[cfg(target_os = "macos")]
+    fn setup_mock_zed_macos_db(base: &std::path::Path) -> PathBuf {
+        let zed_db = base.join("Library/Application Support/Zed/threads/threads.db");
+        fs::create_dir_all(zed_db.parent().unwrap()).unwrap();
+        File::create(&zed_db).unwrap();
+        zed_db
+    }
+
+    fn setup_mock_kimi_dir(base: &std::path::Path) {
+        let kimi_session = base.join(".kimi/sessions/group1/session-uuid-1");
+        fs::create_dir_all(&kimi_session).unwrap();
+        let mut file = File::create(kimi_session.join("wire.jsonl")).unwrap();
+        file.write_all(b"{\"type\": \"metadata\", \"protocol_version\": \"1.3\"}\n")
+            .unwrap();
+    }
+
+    fn setup_mock_muse_dir(base: &std::path::Path) {
+        // Mirror the real layout: ~/.local/share/muse/sessions/YYYY/MM/DD/<uuid>/
+        // with a subagent transcript nested beside the parent session.
+        let session_dir = base.join(".local/share/muse/sessions/2026/09/18/session-fixture");
+        fs::create_dir_all(&session_dir).unwrap();
+        File::create(session_dir.join("session.jsonl")).unwrap();
+        let subagent_dir = session_dir.join("subagent/child-fixture");
+        fs::create_dir_all(&subagent_dir).unwrap();
+        File::create(subagent_dir.join("session.jsonl")).unwrap();
+        File::create(session_dir.join("cli-fixture.log")).unwrap();
+        File::create(session_dir.join("events.jsonl")).unwrap();
+    }
+
+    fn setup_mock_kimi_code_dir(base: &std::path::Path) -> PathBuf {
+        let wire = base.join(".kimi-code/sessions/workspace/session-code/agents/main/wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        File::create(&wire).unwrap();
+        wire
+    }
+
+    fn setup_mock_junie_dir(base: &std::path::Path) -> PathBuf {
+        let events = base.join(".junie/sessions/session-1/events.jsonl");
+        fs::create_dir_all(events.parent().unwrap()).unwrap();
+        File::create(&events).unwrap();
+        events
+    }
+
+    fn setup_mock_opencodereview_dir(base: &std::path::Path) -> PathBuf {
+        let session = base.join(".opencodereview/sessions/repo/session-1.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        File::create(&session).unwrap();
+        session
+    }
+
+    fn setup_mock_grok_home(grok_home: &std::path::Path) {
+        let grok_session = grok_home.join("sessions/%2Ftmp%2Fproject/session-uuid-1");
+        fs::create_dir_all(&grok_session).unwrap();
+        let mut file = File::create(grok_session.join("updates.jsonl")).unwrap();
+        file.write_all(b"{\"method\":\"session/update\"}\n")
+            .unwrap();
+
+        let grok_logs = grok_home.join("logs");
+        fs::create_dir_all(grok_logs.join("archive")).unwrap();
+        File::create(grok_logs.join("unified.jsonl")).unwrap();
+        File::create(grok_logs.join("archive/unified.jsonl")).unwrap();
+    }
+
+    fn setup_mock_grok_dir(base: &std::path::Path) {
+        setup_mock_grok_home(&base.join(".grok"));
+    }
+
+    fn setup_mock_openclaw_dir(base: &std::path::Path) {
+        // Mirror real OpenClaw layout: ~/.openclaw/agents/<agentId>/sessions/*.jsonl
+        let openclaw_sessions = base.join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&openclaw_sessions).unwrap();
+
+        let mut transcript = File::create(openclaw_sessions.join("session-abc.jsonl")).unwrap();
+        transcript.write_all(b"{}").unwrap();
+
+        let mut archived_deleted =
+            File::create(openclaw_sessions.join("session-deleted.jsonl.deleted.123")).unwrap();
+        archived_deleted.write_all(b"{}").unwrap();
+
+        let mut archived_reset =
+            File::create(openclaw_sessions.join("session-reset.jsonl.reset.456")).unwrap();
+        archived_reset.write_all(b"{}").unwrap();
+
+        // Even if an index exists, we should count JSONL transcripts (not sessions.json only)
+        let mut index = File::create(openclaw_sessions.join("sessions.json")).unwrap();
+        index.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_roocode_dir(base: &std::path::Path) {
+        let local = base
+            .join(".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-local");
+        let server = base.join(
+            ".vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-server",
+        );
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&server).unwrap();
+        File::create(local.join("ui_messages.json")).unwrap();
+        File::create(server.join("ui_messages.json")).unwrap();
+    }
+
+    fn setup_mock_kilocode_dir(base: &std::path::Path) {
+        let local =
+            base.join(".config/Code/User/globalStorage/kilocode.kilo-code/tasks/task-local");
+        let server = base
+            .join(".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks/task-server");
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&server).unwrap();
+        File::create(local.join("ui_messages.json")).unwrap();
+        File::create(server.join("ui_messages.json")).unwrap();
+    }
+
+    fn setup_mock_cline_dir(base: &std::path::Path) {
+        let local =
+            base.join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/task-local");
+        let macos = base.join(
+            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/task-macos",
+        );
+        let windows = base.join(
+            "AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks/task-windows",
+        );
+        let server = base.join(
+            ".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks/task-server",
+        );
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&macos).unwrap();
+        fs::create_dir_all(&windows).unwrap();
+        fs::create_dir_all(&server).unwrap();
+        File::create(local.join("ui_messages.json")).unwrap();
+        File::create(macos.join("ui_messages.json")).unwrap();
+        File::create(windows.join("ui_messages.json")).unwrap();
+        File::create(server.join("ui_messages.json")).unwrap();
+    }
+
+    fn setup_mock_crush_registry(registry_path: &Path, projects_json: &str) {
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        fs::write(registry_path, projects_json).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_headless_roots_default() {
+        let mut _env = EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR"]);
+        _env.remove("TOKSCALE_HEADLESS_DIR");
+
+        let home = "/tmp/tokscale-test-home";
+        let roots = headless_roots(home);
+        let config_root = PathBuf::from(format!("{}/.config/tokscale/headless", home));
+        let mac_root = PathBuf::from(format!(
+            "{}/Library/Application Support/tokscale/headless",
+            home
+        ));
+
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&config_root));
+        assert!(roots.contains(&mac_root));
+    }
+
+    #[test]
+    #[serial]
+    fn test_headless_roots_override() {
+        let mut _env = EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR"]);
+        _env.set("TOKSCALE_HEADLESS_DIR", "/custom/headless");
+
+        let roots = headless_roots("/tmp/home");
+        assert_eq!(roots, vec![PathBuf::from("/custom/headless")]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_headless_roots_ignore_env_override_when_disabled() {
+        let mut _env = EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR"]);
+        _env.set("TOKSCALE_HEADLESS_DIR", "/custom/headless");
+
+        let roots = headless_roots_with_env_strategy("/tmp/home", false);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/tmp/home/.config/tokscale/headless"),
+                PathBuf::from("/tmp/home/Library/Application Support/tokscale/headless")
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn source_context_codex_archives_match_legacy_capture_time_scan() {
+        let dir = TempDir::new().unwrap();
+        let capture_cwd = dir.path().join("capture-cwd");
+        let later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&capture_cwd).unwrap();
+        fs::create_dir_all(&later_cwd).unwrap();
+        let capture_cwd = fs::canonicalize(capture_cwd).unwrap();
+        let later_cwd = fs::canonicalize(later_cwd).unwrap();
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let mut env = EnvGuard::capture(&["CODEX_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.set("CODEX_HOME", "\u{00a0}");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let write_session = |path: &Path| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"{}\n").unwrap();
+            fs::canonicalize(path).unwrap()
+        };
+        let main = write_session(&home.join(".codex/sessions/main.jsonl"));
+        let archive = write_session(&capture_cwd.join("\u{00a0}/archived_sessions/archive.jsonl"));
+        let fallback_archive = write_session(&home.join(".codex/archived_sessions/fallback.jsonl"));
+        let later_archive =
+            write_session(&later_cwd.join("\u{00a0}/archived_sessions/later.jsonl"));
+
+        let legacy = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            true,
+        );
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home), true, ScannerSettings::default())
+                .unwrap();
+        std::env::set_current_dir(&later_cwd).unwrap();
+        let resolved =
+            scan_all_clients_with_source_context(&context, &["codex".to_string()]).unwrap();
+        let canonical = |scan: &ScanResult| {
+            let mut files = scan
+                .get(ClientId::Codex)
+                .iter()
+                .map(|path| {
+                    fs::canonicalize(if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        capture_cwd.join(path)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            files.sort_unstable();
+            files
+        };
+        let mut expected = vec![main, archive];
+        expected.sort_unstable();
+        let legacy = canonical(&legacy);
+        let resolved = canonical(&resolved);
+
+        assert_eq!(legacy, expected);
+        assert_eq!(resolved, expected);
+        assert!(!resolved.contains(&fallback_archive));
+        assert!(!resolved.contains(&later_archive));
+    }
+
+    #[test]
+    #[serial]
+    fn source_context_headless_overrides_match_legacy_capture_time_scan() {
+        let dir = TempDir::new().unwrap();
+        let requested_capture_cwd = dir.path().join("capture-cwd");
+        let requested_later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&requested_capture_cwd).unwrap();
+        fs::create_dir_all(&requested_later_cwd).unwrap();
+        let capture_cwd = fs::canonicalize(requested_capture_cwd).unwrap();
+        let later_cwd = fs::canonicalize(requested_later_cwd).unwrap();
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let mut env =
+            EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR", "TOKSCALE_EXTRA_DIRS", "CODEX_HOME"]);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("CODEX_HOME");
+
+        let create_session = |root: &Path, name: &str| {
+            let path = root.join("codex").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"{}\n").unwrap();
+            path
+        };
+        let canonical_files = |files: &[PathBuf]| {
+            let mut files = files
+                .iter()
+                .map(fs::canonicalize)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            files.sort_unstable();
+            files
+        };
+
+        let default_config_root = home.join(".config/tokscale/headless");
+        let default_macos_root = home.join("Library/Application Support/tokscale/headless");
+        let whitespace_root = capture_cwd.join("\u{00a0}");
+        let custom_root = capture_cwd.join("custom-headless");
+        let default_config_file = create_session(&default_config_root, "config.jsonl");
+        let default_macos_file = create_session(&default_macos_root, "macos.jsonl");
+        let empty_file = create_session(&capture_cwd, "capture-cwd.jsonl");
+        let later_empty_file = create_session(&later_cwd, "later-cwd.jsonl");
+        let whitespace_file = create_session(&whitespace_root, "whitespace.jsonl");
+        let custom_file = create_session(&custom_root, "custom.jsonl");
+
+        let cases = vec![
+            (
+                "unset",
+                None,
+                vec![default_config_root.clone(), default_macos_root.clone()],
+                vec![default_config_root, default_macos_root],
+                vec![default_config_file, default_macos_file],
+            ),
+            (
+                "empty",
+                Some(""),
+                vec![PathBuf::new()],
+                vec![capture_cwd.clone()],
+                vec![empty_file],
+            ),
+            (
+                "whitespace",
+                Some("\u{00a0}"),
+                vec![PathBuf::from("\u{00a0}")],
+                vec![whitespace_root],
+                vec![whitespace_file],
+            ),
+            (
+                "nonempty",
+                Some("custom-headless"),
+                vec![PathBuf::from("custom-headless")],
+                vec![custom_root],
+                vec![custom_file],
+            ),
+        ];
+        let mut identities = BTreeMap::new();
+        let later_empty_file = fs::canonicalize(later_empty_file).unwrap();
+
+        for (name, override_value, legacy_roots, context_roots, expected_files) in cases {
+            std::env::set_current_dir(&capture_cwd).unwrap();
+            match override_value {
+                Some(value) => env.set("TOKSCALE_HEADLESS_DIR", value),
+                None => env.remove("TOKSCALE_HEADLESS_DIR"),
+            }
+
+            assert_eq!(
+                headless_roots_with_env_strategy(home.to_str().unwrap(), true),
+                legacy_roots,
+                "{name}"
+            );
+            let legacy_scan = scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["codex".to_string()],
+                true,
+            );
+            let legacy_files = canonical_files(legacy_scan.get(ClientId::Codex));
+            let context = ResolvedLocalSourceContext::capture(
+                Some(home.clone()),
+                true,
+                ScannerSettings::default(),
+            )
+            .unwrap();
+            identities.insert(name, context.identity_bytes());
+
+            std::env::set_current_dir(&later_cwd).unwrap();
+            assert_eq!(
+                headless_roots_with_source_context(&context).unwrap(),
+                context_roots,
+                "{name}"
+            );
+            let context_scan =
+                scan_all_clients_with_source_context(&context, &["codex".to_string()]).unwrap();
+            let context_files = canonical_files(context_scan.get(ClientId::Codex));
+            let expected_files = canonical_files(&expected_files);
+            assert_eq!(legacy_files, expected_files, "legacy {name}");
+            assert_eq!(context_files, expected_files, "context {name}");
+            assert!(!context_files.contains(&later_empty_file), "{name}");
+        }
+
+        assert_ne!(identities["unset"], identities["empty"]);
+        assert_ne!(identities["unset"], identities["whitespace"]);
+        assert_ne!(identities["empty"], identities["whitespace"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_opencode() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_opencode_dir(home);
+
+        // Set XDG_DATA_HOME for the test
+        _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["opencode".to_string()]);
+        assert_eq!(result.get(ClientId::OpenCode).len(), 1);
+        assert!(result.get(ClientId::Claude).is_empty());
+        assert!(result.get(ClientId::Codex).is_empty());
+        assert!(result.get(ClientId::Gemini).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_opencode_empty_xdg_uses_home_fallback() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+        _xdg.set("XDG_DATA_HOME", "");
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_opencode_dir(home);
+        let data_dir = home.join(".local/share/opencode");
+        let db = data_dir.join("opencode.db");
+        File::create(&db).unwrap();
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["opencode".to_string()]);
+        let json_dir = home.join(".local/share/opencode/storage/message");
+        assert_eq!(result.opencode_json_dir, Some(json_dir.clone()));
+        assert_eq!(
+            result.get(ClientId::OpenCode),
+            &[json_dir.join("proj1/msg_001.json")]
+        );
+        assert_eq!(result.opencode_dbs, vec![db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_opencode_home_override_ignores_xdg_env() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("target-home");
+        let conflicting_xdg = dir.path().join("conflicting-xdg");
+        setup_mock_opencode_dir(&home);
+        fs::create_dir_all(&conflicting_xdg).unwrap();
+
+        _xdg.set("XDG_DATA_HOME", &conflicting_xdg);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["opencode".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::OpenCode).len(), 1);
+        assert_eq!(
+            result.opencode_json_dir,
+            Some(home.join(".local/share/opencode/storage/message"))
+        );
+    }
+
+    #[test]
+    fn test_is_opencode_db_filename_accepts_default_and_channel_variants() {
+        // Default channel (`latest`/`beta`) and explicit-disable use this name.
+        assert!(is_opencode_db_filename("opencode.db"));
+        // Channel-suffixed dbs, drawn from opencode's `[a-zA-Z0-9._-]`
+        // character class in getChannelPath.
+        assert!(is_opencode_db_filename("opencode-stable.db"));
+        assert!(is_opencode_db_filename("opencode-nightly.db"));
+        assert!(is_opencode_db_filename("opencode-canary.db"));
+        assert!(is_opencode_db_filename("opencode-local.db"));
+        assert!(is_opencode_db_filename("opencode-1.2.3.db"));
+        assert!(is_opencode_db_filename("opencode-pr_42.db"));
+    }
+
+    #[test]
+    fn test_is_opencode_db_filename_rejects_sidecars_and_unrelated_files() {
+        // WAL/SHM/journal sidecar files share the prefix — must be ignored
+        // so we don't try to "parse" them.
+        assert!(!is_opencode_db_filename("opencode.db-wal"));
+        assert!(!is_opencode_db_filename("opencode.db-shm"));
+        assert!(!is_opencode_db_filename("opencode.db-journal"));
+        assert!(!is_opencode_db_filename("opencode-stable.db-wal"));
+        // Unrelated / malformed names.
+        assert!(!is_opencode_db_filename("opencode"));
+        assert!(!is_opencode_db_filename("opencode-.db"));
+        assert!(!is_opencode_db_filename("opencode_stable.db"));
+        assert!(!is_opencode_db_filename("opencode-stable/beta.db"));
+        assert!(!is_opencode_db_filename("auth.json"));
+        assert!(!is_opencode_db_filename("other.db"));
+    }
+
+    #[test]
+    fn test_discover_opencode_dbs_finds_multiple_channels_and_skips_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // Real dbs for two channels running side by side — the case from
+        // junhoyeo/tokscale#387.
+        File::create(data_dir.join("opencode.db")).unwrap();
+        File::create(data_dir.join("opencode-stable.db")).unwrap();
+        // SQLite WAL/SHM sidecars that must not be treated as dbs.
+        File::create(data_dir.join("opencode.db-wal")).unwrap();
+        File::create(data_dir.join("opencode.db-shm")).unwrap();
+        File::create(data_dir.join("opencode-stable.db-wal")).unwrap();
+        // Unrelated files that live in the same dir.
+        File::create(data_dir.join("auth.json")).unwrap();
+
+        let found = discover_opencode_dbs(&data_dir);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["opencode-stable.db", "opencode.db"]);
+    }
+
+    #[test]
+    fn test_discover_opencode_dbs_returns_empty_for_missing_dir() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(discover_opencode_dbs(&missing).is_empty());
+    }
+
+    #[test]
+    fn test_merge_user_opencode_db_paths_picks_up_path_outside_xdg() {
+        // Simulate `OPENCODE_DB=/arbitrary/abs/path/custom.db` upstream:
+        // the file is a real opencode db but lives outside
+        // `~/.local/share/opencode`, so auto-discovery never sees it.
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("somewhere-else");
+        fs::create_dir_all(&outside).unwrap();
+        let user_db = outside.join("opencode.db");
+        File::create(&user_db).unwrap();
+
+        let mut discovered: Vec<PathBuf> = Vec::new();
+        merge_user_opencode_db_paths(&mut discovered, std::slice::from_ref(&user_db));
+
+        assert_eq!(discovered, vec![user_db]);
+    }
+
+    #[test]
+    fn test_merge_user_opencode_db_paths_skips_nonexistent_and_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("opencode-stable.db");
+        File::create(&real).unwrap();
+        let wal = dir.path().join("opencode-stable.db-wal");
+        File::create(&wal).unwrap();
+        let missing = dir.path().join("opencode-missing.db"); // never created
+
+        let mut discovered: Vec<PathBuf> = Vec::new();
+        merge_user_opencode_db_paths(
+            &mut discovered,
+            &[real.clone(), wal.clone(), missing.clone()],
+        );
+
+        // Nonexistent path: silently skipped so stale config can't break a scan.
+        // Sidecar path: rejected by is_opencode_db_filename.
+        assert_eq!(discovered, vec![real]);
+    }
+
+    #[test]
+    fn test_merge_user_opencode_db_paths_dedups_against_auto_discovered() {
+        let dir = TempDir::new().unwrap();
+        let shared = dir.path().join("opencode.db");
+        File::create(&shared).unwrap();
+
+        // User explicitly lists a path that auto-discovery also found —
+        // must not double-parse the same sqlite file.
+        let mut discovered: Vec<PathBuf> = vec![shared.clone()];
+        merge_user_opencode_db_paths(&mut discovered, std::slice::from_ref(&shared));
+
+        assert_eq!(discovered, vec![shared]);
+    }
+
+    #[test]
+    fn test_scanner_settings_deserialize_from_json_camel_case() {
+        // This is the contract the CLI's settings.json relies on: the
+        // field is `opencodeDbPaths`, and an empty object or missing key
+        // must round-trip to Default without erroring.
+        let json = r#"{
+            "opencodeDbPaths": ["/one/opencode.db", "/two/opencode-stable.db"]
+        }"#;
+        let parsed: ScannerSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.opencode_db_paths.len(), 2);
+        assert_eq!(
+            parsed.opencode_db_paths[0],
+            PathBuf::from("/one/opencode.db")
+        );
+        assert_eq!(
+            parsed.opencode_db_paths[1],
+            PathBuf::from("/two/opencode-stable.db")
+        );
+
+        let empty: ScannerSettings = serde_json::from_str("{}").unwrap();
+        assert!(empty.opencode_db_paths.is_empty());
+    }
+
+    #[test]
+    fn test_scanner_settings_deserialize_extra_scan_paths_camel_case() {
+        let json = r#"{
+            "extraScanPaths": {
+                "codex": [
+                    "/tmp/project-a/.codex/sessions",
+                    "/tmp/project-b/.codex/archived_sessions"
+                ],
+                "gemini": ["/tmp/imports/gemini/tmp"]
+            }
+        }"#;
+
+        let parsed: ScannerSettings = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&parsed).unwrap();
+
+        assert_eq!(
+            serialized["extraScanPaths"]["codex"][0],
+            serde_json::json!("/tmp/project-a/.codex/sessions")
+        );
+        assert_eq!(
+            serialized["extraScanPaths"]["codex"][1],
+            serde_json::json!("/tmp/project-b/.codex/archived_sessions")
+        );
+        assert_eq!(
+            serialized["extraScanPaths"]["gemini"][0],
+            serde_json::json!("/tmp/imports/gemini/tmp")
+        );
+    }
+
+    /// Build a Claude fixture whose transcripts arrive by the three routes an
+    /// excluded directory can be reached through, and return the home plus the
+    /// two configured directories.
+    ///
+    /// - `work-d` is in `extra_scan_paths` *and* named by a `.cc-mirror` variant
+    /// - `work-e` is in `extra_scan_paths` only
+    /// - `work-d/sub` is named by its own variant, so it sits under `work-d`
+    ///   but below no registry entry
+    fn claude_exclusion_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let dir_d = home.join("work-d");
+        let dir_e = home.join("work-e");
+        let dir_sub = dir_d.join("sub");
+        for root in [&home.join(".claude"), &dir_d, &dir_e, &dir_sub] {
+            let projects = root.join("projects").join("proj");
+            fs::create_dir_all(&projects).unwrap();
+            File::create(projects.join("session.jsonl")).unwrap();
+        }
+        for (name, config_dir) in [("v1", &dir_d), ("v2", &dir_sub)] {
+            let variant = home.join(".cc-mirror").join(name);
+            fs::create_dir_all(&variant).unwrap();
+            // Build the JSON rather than formatting it, matching every other
+            // variant fixture in this crate. A Windows `configDir` is full of
+            // backslashes and each one introduces a JSON escape: written into
+            // a string literal by hand, `C:\Users\...` parses as the invalid
+            // escapes `\U`, `\A`, ... the variant is skipped, and the fixture
+            // goes inert on Windows while staying green everywhere else.
+            fs::write(
+                variant.join("variant.json"),
+                serde_json::json!({ "configDir": config_dir }).to_string(),
+            )
+            .unwrap();
+        }
+        (dir_d, dir_e, dir_sub)
+    }
+
+    fn claude_scan_roots(home: &Path, settings: &ScannerSettings) -> Vec<PathBuf> {
+        scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+            settings,
+        )
+        .get(ClientId::Claude)
+        .to_vec()
+    }
+
+    fn registry_for(dirs: [&Path; 2]) -> BTreeMap<String, Vec<PathBuf>> {
+        BTreeMap::from([(
+            "claude".to_string(),
+            dirs.iter()
+                .flat_map(|dir| [dir.join("projects"), dir.join("transcripts")])
+                .collect(),
+        )])
+    }
+
+    /// The exclusion has to drop a directory whichever route found it: through
+    /// `extra_scan_paths`, through a `.cc-mirror` variant naming it, and
+    /// through a variant naming a directory *below* it.
+    ///
+    /// Three routes and two directories rather than one of each, because a
+    /// directory reachable two ways dedups into a single task at
+    /// `push_unique_scan_task_with_pattern` and cannot tell the routes apart —
+    /// `work-e` is registry-only, so a leak through the registry is visible on
+    /// its own.
+    #[test]
+    #[serial]
+    fn test_excluded_scan_paths_drop_every_route_to_a_claude_directory() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let without = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                extra_scan_paths: extra_scan_paths.clone(),
+                ..Default::default()
+            },
+        );
+        for expected in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                without.iter().any(|path| path.starts_with(expected)),
+                "fixture is inert: nothing scanned under {expected:?}, got {without:?}"
+            );
+        }
+
+        let with = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                extra_scan_paths,
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    vec![dir_d.clone(), dir_e.clone()],
+                )]),
+                ..Default::default()
+            },
+        );
+        for excluded in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                !with.iter().any(|path| path.starts_with(excluded)),
+                "excluded directory still scanned: {excluded:?} in {with:?}"
+            );
+        }
+        assert!(
+            with.iter()
+                .any(|path| path.starts_with(home.join(".claude"))),
+            "the exclusion removed the primary root too: {with:?}"
+        );
+    }
+
+    /// An exclusion naming only the registered roots misses a `.cc-mirror`
+    /// variant that resolves below a configured directory but below no registry
+    /// entry — which is why the caller excludes config directories and
+    /// registered roots both, rather than picking one registry to trust.
+    #[test]
+    #[serial]
+    fn test_excluding_registered_roots_alone_misses_a_nested_mirror_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let roots = claude_scan_roots(
+            home,
+            &ScannerSettings {
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    extra_scan_paths["claude"].clone(),
+                )]),
+                extra_scan_paths,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            roots.iter().any(|path| path.starts_with(&dir_sub)),
+            "expected the nested mirror root to survive a registry-only exclusion, got {roots:?}"
+        );
+        assert!(
+            !roots.iter().any(|path| path.starts_with(&dir_e)),
+            "the registered root should still have been excluded: {roots:?}"
+        );
+    }
+
+    fn claude_context_roots(
+        home: &Path,
+        use_env_roots: bool,
+        settings: ScannerSettings,
+    ) -> Vec<PathBuf> {
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home.to_path_buf()), use_env_roots, settings)
+                .unwrap();
+        scan_all_clients_with_source_context(&context, &["claude".to_string()])
+            .unwrap()
+            .get(ClientId::Claude)
+            .to_vec()
+    }
+
+    /// The same three routes as the context-free test above, through the
+    /// source-context entry every production report scans with. That path
+    /// used to ignore `excluded_scan_paths` entirely.
+    #[test]
+    #[serial]
+    fn test_source_context_excluded_scan_paths_drop_every_route_to_a_claude_directory() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, dir_sub) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+
+        let without = claude_context_roots(
+            home,
+            false,
+            ScannerSettings {
+                extra_scan_paths: extra_scan_paths.clone(),
+                ..Default::default()
+            },
+        );
+        for expected in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                without.iter().any(|path| path.starts_with(expected)),
+                "fixture is inert: nothing scanned under {expected:?}, got {without:?}"
+            );
+        }
+
+        let with = claude_context_roots(
+            home,
+            false,
+            ScannerSettings {
+                extra_scan_paths,
+                excluded_scan_paths: BTreeMap::from([(
+                    "claude".to_string(),
+                    vec![dir_d.clone(), dir_e.clone()],
+                )]),
+                ..Default::default()
+            },
+        );
+        for excluded in [&dir_d, &dir_e, &dir_sub] {
+            assert!(
+                !with.iter().any(|path| path.starts_with(excluded)),
+                "excluded directory still scanned: {excluded:?} in {with:?}"
+            );
+        }
+        assert!(
+            with.iter()
+                .any(|path| path.starts_with(home.join(".claude"))),
+            "the exclusion removed the primary root too: {with:?}"
+        );
+    }
+
+    /// `TOKSCALE_EXTRA_DIRS` reaches a captured context by its own route
+    /// (`context.extra_scan_paths()`), not through `ScannerSettings`.
+    #[test]
+    #[serial]
+    fn test_source_context_excluded_scan_paths_drop_an_env_extra_dir() {
+        let mut env = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (_, dir_e, _) = claude_exclusion_fixture(home);
+        env.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", dir_e.join("projects").display()),
+        );
+
+        let without = claude_context_roots(home, true, ScannerSettings::default());
+        assert!(
+            without.iter().any(|path| path.starts_with(&dir_e)),
+            "fixture is inert: the env extra dir was not scanned, got {without:?}"
+        );
+
+        let with = claude_context_roots(
+            home,
+            true,
+            ScannerSettings {
+                excluded_scan_paths: BTreeMap::from([("claude".to_string(), vec![dir_e.clone()])]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !with.iter().any(|path| path.starts_with(&dir_e)),
+            "env extra dir still scanned: {with:?}"
+        );
+    }
+
+    /// No exclusion, an empty map and an empty list for the client all scan
+    /// exactly what the default capture scans.
+    #[test]
+    #[serial]
+    fn test_source_context_empty_exclusions_scan_what_the_default_scans() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let (dir_d, dir_e, _) = claude_exclusion_fixture(home);
+        let extra_scan_paths = registry_for([&dir_d, &dir_e]);
+        let scan = |excluded_scan_paths| {
+            claude_context_roots(
+                home,
+                false,
+                ScannerSettings {
+                    extra_scan_paths: extra_scan_paths.clone(),
+                    excluded_scan_paths,
+                    ..Default::default()
+                },
+            )
+        };
+
+        let default = scan(BTreeMap::new());
+        assert!(default.len() >= 4, "fixture is inert: {default:?}");
+        assert_eq!(
+            scan(BTreeMap::from([("claude".to_string(), Vec::new())])),
+            default
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_merges_user_path() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        // Auto-discoverable channel db inside XDG data dir.
+        let data_dir = home.join(".local/share/opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+        File::create(data_dir.join("opencode-stable.db")).unwrap();
+
+        // User-configured db living outside XDG_DATA_HOME, the way an
+        // `OPENCODE_DB=/abs/path/opencode.db` user would have it.
+        let outside_dir = home.join("elsewhere");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_db = outside_dir.join("opencode.db");
+        File::create(&outside_db).unwrap();
+
+        let settings = ScannerSettings {
+            opencode_db_paths: vec![outside_db.clone()],
+            ..Default::default()
+        };
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["opencode".to_string()],
+            false,
+            &settings,
+        );
+
+        // Both paths must appear — the auto-discovered stable db and the
+        // user-configured outside-XDG db.
+        let names: Vec<String> = result
+            .opencode_dbs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "opencode-stable.db"),
+            "expected auto-discovered opencode-stable.db, got {names:?}"
+        );
+        assert!(
+            result.opencode_dbs.iter().any(|p| p == &outside_db),
+            "expected user-configured {} in {:?}",
+            outside_db.display(),
+            result.opencode_dbs
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_merges_settings_extra_paths() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let default_root = home.join(".codex/sessions");
+        fs::create_dir_all(&default_root).unwrap();
+        File::create(default_root.join("default.jsonl")).unwrap();
+
+        let extra_root = home.join("workspace/project-a/.codex/sessions");
+        fs::create_dir_all(&extra_root).unwrap();
+        File::create(extra_root.join("extra.jsonl")).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "codex": [extra_root]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            false,
+            &settings,
+        );
+
+        assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_merges_hermes_extra_profile_db() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let default_dir = home.join(".hermes");
+        fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = home.join("external-hermes/director_planning");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "hermes": [
+                    profile_dir,
+                    profile_db
+                ]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &settings,
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    fn test_scan_all_clients_auto_discovers_hermes_profile_dbs() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_a_dir = hermes_home.join("profiles/director_planning");
+        fs::create_dir_all(&profile_a_dir).unwrap();
+        let profile_a_db = profile_a_dir.join("state.db");
+        File::create(&profile_a_db).unwrap();
+
+        let profile_b_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&profile_b_dir).unwrap();
+        let profile_b_db = profile_b_dir.join("state.db");
+        File::create(&profile_b_db).unwrap();
+
+        let nested_dir = profile_b_dir.join("archive");
+        fs::create_dir_all(&nested_dir).unwrap();
+        File::create(nested_dir.join("state.db")).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(
+            result.hermes_db_paths(),
+            vec![default_db, profile_a_db, profile_b_db]
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_auto_discovers_hermes_profiles_without_default_db() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let profile_dir = home.join(".hermes/profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db, None);
+        assert_eq!(result.hermes_db_paths(), vec![profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_auto_discovers_profiles_under_hermes_home() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let hermes_home = home.join("custom-hermes-home");
+
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        _hermes.set("HERMES_HOME", &hermes_home);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_profile_scoped_hermes_home_isolates_to_own_profile() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        let default_db = hermes_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let coder_dir = hermes_home.join("profiles/coder");
+        fs::create_dir_all(&coder_dir).unwrap();
+        let coder_db = coder_dir.join("state.db");
+        File::create(&coder_db).unwrap();
+
+        let research_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&research_dir).unwrap();
+        let research_db = research_dir.join("state.db");
+        File::create(&research_db).unwrap();
+
+        let nested_dir = coder_dir.join("profiles/archived");
+        fs::create_dir_all(&nested_dir).unwrap();
+        File::create(nested_dir.join("state.db")).unwrap();
+
+        _hermes.set("HERMES_HOME", &coder_dir);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&coder_db));
+        assert_eq!(result.hermes_db_paths(), vec![coder_db]);
+        assert!(!result.hermes_db_paths().contains(&research_db));
+        assert!(!result.hermes_db_paths().contains(&default_db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_symlinked_profile_scoped_hermes_home_preserves_isolation() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let hermes_home = home.join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        File::create(hermes_home.join("state.db")).unwrap();
+
+        let coder_dir = hermes_home.join("profiles/coder");
+        fs::create_dir_all(&coder_dir).unwrap();
+        File::create(coder_dir.join("state.db")).unwrap();
+
+        let research_dir = hermes_home.join("profiles/research");
+        fs::create_dir_all(&research_dir).unwrap();
+        File::create(research_dir.join("state.db")).unwrap();
+
+        let nested_dir = coder_dir.join("profiles/archived");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_db = nested_dir.join("state.db");
+        File::create(&nested_db).unwrap();
+
+        let profile_alias = home.join("coder-profile");
+        std::os::unix::fs::symlink(&coder_dir, &profile_alias).unwrap();
+        let aliased_db = profile_alias.join("state.db");
+
+        _hermes.set("HERMES_HOME", &profile_alias);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&aliased_db));
+        assert_eq!(result.hermes_db_paths(), vec![aliased_db]);
+        assert!(!result.hermes_db_paths().contains(&nested_db));
+    }
+
+    #[test]
+    fn test_scan_discovers_hermes_windows_local_appdata_home() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        let default_db = windows_home.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = windows_home.join("profiles/research");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_explicit_hermes_home_does_not_widen_to_windows_fallback() {
+        let mut _hermes = EnvGuard::capture(&["HERMES_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        _hermes.remove("TOKSCALE_EXTRA_DIRS");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let explicit_home = home.join("custom-hermes-home");
+        fs::create_dir_all(&explicit_home).unwrap();
+        let explicit_db = explicit_home.join("state.db");
+        File::create(&explicit_db).unwrap();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(&windows_home).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+
+        _hermes.set("HERMES_HOME", &explicit_home);
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&explicit_db));
+        assert_eq!(result.hermes_db_paths(), vec![explicit_db]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hermes_windows_fallback_dedups_physical_database_overlaps() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_home = home.join("AppData/Local/hermes");
+        fs::create_dir_all(windows_home.join("profiles/research")).unwrap();
+        File::create(windows_home.join("state.db")).unwrap();
+        File::create(windows_home.join("profiles/research/state.db")).unwrap();
+        std::os::unix::fs::symlink(&windows_home, home.join(".hermes")).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        let paths = result.hermes_db_paths();
+        assert_eq!(paths.len(), 2, "physical dbs must be parsed exactly once");
+        let canonical: HashSet<PathBuf> = paths
+            .iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect();
+        assert_eq!(canonical.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_all_clients_with_scanner_settings_discovers_zed_windows_local_appdata_home() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_threads_dir = home.join("AppData/Local/Zed/threads");
+        fs::create_dir_all(&windows_threads_dir).unwrap();
+        let threads_db = windows_threads_dir.join("threads.db");
+        File::create(&threads_db).unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["zed".to_string()],
+            false,
+            &ScannerSettings::default(),
+        );
+
+        assert_eq!(result.zed_db.as_ref(), Some(&threads_db));
+    }
+
+    #[test]
+    fn test_scan_all_clients_with_scanner_settings_merges_zed_extra_threads_db() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let windows_threads_dir = home.join("custom-zed/threads");
+        fs::create_dir_all(&windows_threads_dir).unwrap();
+        let threads_db = windows_threads_dir.join("threads.db");
+        File::create(&threads_db).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "zed": [windows_threads_dir]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["zed".to_string()],
+            false,
+            &settings,
+        );
+
+        assert_eq!(result.zed_db_paths(), vec![threads_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_respects_hermes_client_filter() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let profile_dir = home.join("external-hermes/director_planning");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "hermes": [profile_dir]
+            }
+        }))
+        .unwrap();
+
+        let claude_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+            &settings,
+        );
+        assert!(claude_only.hermes_db_paths().is_empty());
+
+        let hermes_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &settings,
+        );
+        assert_eq!(hermes_only.hermes_db_paths(), vec![profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_dedups_settings_and_env_extra_paths() {
+        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS", "CODEX_HOME"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        _extra.set("CODEX_HOME", home.join(".codex"));
+
+        let default_root = home.join(".codex/sessions");
+        fs::create_dir_all(&default_root).unwrap();
+        File::create(default_root.join("default.jsonl")).unwrap();
+
+        let extra_root = home.join("workspace/project-a/.codex/sessions");
+        fs::create_dir_all(&extra_root).unwrap();
+        File::create(extra_root.join("extra.jsonl")).unwrap();
+
+        _extra.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("codex:{}", extra_root.join("..").join("sessions").display()),
+        );
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "codex": [extra_root]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            true,
+            &settings,
+        );
+
+        assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_respects_opencode_client_filter() {
+        // Regression guard: previously the scanner unconditionally
+        // merged `scanner.opencodeDbPaths` after the inner scan, which
+        // bypassed the existing `enabled.contains(&ClientId::OpenCode)`
+        // guard. A request like `tokscale --claude` would still pull in
+        // user-pinned OpenCode dbs and inflate `parse_local_clients`
+        // counts plus waste SQLite parsing work.
+        //
+        // The fix moves the merge inside the OpenCode-enabled block, so
+        // this test exercises the four canonical filter shapes:
+        //   1. ["claude"]    → opencode_dbs must be empty
+        //   2. ["opencode"]  → both auto + user-configured dbs present
+        //   3. ["synthetic"] → both present (synthetic enables all)
+        //   4. []            → both present (empty filter = all clients)
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        // Auto-discoverable channel db inside XDG data dir.
+        let data_dir = home.join(".local/share/opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+        let auto_db = data_dir.join("opencode.db");
+        File::create(&auto_db).unwrap();
+
+        // User-configured db living outside XDG_DATA_HOME (mirrors the
+        // `OPENCODE_DB=/abs/path/opencode.db` use case).
+        let outside_dir = home.join("elsewhere");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_db = outside_dir.join("opencode.db");
+        File::create(&outside_db).unwrap();
+
+        let settings = ScannerSettings {
+            opencode_db_paths: vec![outside_db.clone()],
+            ..Default::default()
+        };
+
+        let scan = |clients: &[&str]| {
+            let owned: Vec<String> = clients.iter().map(|s| s.to_string()).collect();
+            scan_all_clients_with_scanner_settings(home.to_str().unwrap(), &owned, false, &settings)
+        };
+
+        // 1. clients=["claude"] — OpenCode disabled, dbs must stay empty.
+        let claude_only = scan(&["claude"]);
+        assert!(
+            claude_only.opencode_dbs.is_empty(),
+            "scanner.opencodeDbPaths must NOT leak into a Claude-only scan, \
+             got {:?}",
+            claude_only.opencode_dbs
+        );
+
+        // 2. clients=["opencode"] — both auto-discovered + user-configured.
+        let opencode_only = scan(&["opencode"]);
+        assert!(
+            opencode_only.opencode_dbs.iter().any(|p| p == &auto_db),
+            "expected auto-discovered {} in {:?}",
+            auto_db.display(),
+            opencode_only.opencode_dbs
+        );
+        assert!(
+            opencode_only.opencode_dbs.iter().any(|p| p == &outside_db),
+            "expected user-configured {} in {:?}",
+            outside_db.display(),
+            opencode_only.opencode_dbs
+        );
+
+        // 3. clients=["synthetic"] — synthetic enables all clients, so
+        //    both dbs must be present.
+        let synthetic_only = scan(&["synthetic"]);
+        assert!(
+            synthetic_only.opencode_dbs.iter().any(|p| p == &auto_db),
+            "synthetic-only filter must enable OpenCode auto-discovery, got {:?}",
+            synthetic_only.opencode_dbs
+        );
+        assert!(
+            synthetic_only.opencode_dbs.iter().any(|p| p == &outside_db),
+            "synthetic-only filter must merge user-configured paths, got {:?}",
+            synthetic_only.opencode_dbs
+        );
+
+        // 4. clients=[] — empty filter = all clients = both dbs present.
+        let all_clients = scan(&[]);
+        assert!(
+            all_clients.opencode_dbs.iter().any(|p| p == &auto_db),
+            "empty client filter must enable OpenCode auto-discovery, got {:?}",
+            all_clients.opencode_dbs
+        );
+        assert!(
+            all_clients.opencode_dbs.iter().any(|p| p == &outside_db),
+            "empty client filter must merge user-configured paths, got {:?}",
+            all_clients.opencode_dbs
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_opencode_picks_up_channel_suffixed_dbs() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let data_dir = home.join(".local/share/opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        File::create(data_dir.join("opencode.db")).unwrap();
+        File::create(data_dir.join("opencode-stable.db")).unwrap();
+        File::create(data_dir.join("opencode-nightly.db")).unwrap();
+        // Sidecars that must be ignored.
+        File::create(data_dir.join("opencode.db-wal")).unwrap();
+        File::create(data_dir.join("opencode-stable.db-shm")).unwrap();
+
+        _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["opencode".to_string()]);
+
+        let names: Vec<String> = result
+            .opencode_dbs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "opencode-nightly.db".to_string(),
+                "opencode-stable.db".to_string(),
+                "opencode.db".to_string(),
+            ],
+            "expected all channel dbs, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_pi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_pi_dir(home);
+
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
+        assert_eq!(result.get(ClientId::Pi).len(), 1);
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_omp_scanned_as_omp() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_omp_dir(home);
+
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["omp".to_string()], false);
+        assert_eq!(result.get(ClientId::Omp).len(), 1);
+        assert!(result.get(ClientId::Omp)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
+        assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_omp_not_scanned_as_pi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_pi_dir(home);
+        setup_mock_omp_dir(home);
+
+        // Pi alone: no `omp` lane is enabled to claim the root first, so
+        // this is where a stray Pi scan of the OMP root would show.
+        let clients = ["pi".to_string()];
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            false,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        for result in [legacy, resolved] {
+            assert_eq!(result.get(ClientId::Pi).len(), 1);
+            assert!(result.get(ClientId::Pi)[0].ends_with("1733011200000_pi_ses_001.jsonl"));
+            assert!(result.get(ClientId::Omp).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_scan_all_clients_pi_and_omp_each_scan_only_their_own_root() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_pi_dir(home);
+        setup_mock_omp_dir(home);
+        let clients = ["pi".to_string(), "omp".to_string()];
+
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            false,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        for result in [legacy, resolved] {
+            assert_eq!(result.get(ClientId::Pi).len(), 1);
+            assert!(result.get(ClientId::Pi)[0].ends_with("1733011200000_pi_ses_001.jsonl"));
+            assert_eq!(result.get(ClientId::Omp).len(), 1);
+            assert!(
+                result.get(ClientId::Omp)[0].ends_with("2026-04-06T03-04-28Z_omp_ses_001.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_zed_xdg_db() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let zed_db = setup_mock_zed_xdg_db(home);
+        _xdg.set("XDG_DATA_HOME", home.join(".local/share"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["zed".to_string()]);
+
+        assert_eq!(result.zed_db.as_ref(), Some(&zed_db));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_zed_macos_fallback() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let zed_db = setup_mock_zed_macos_db(home);
+        _xdg.remove("XDG_DATA_HOME");
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["zed".to_string()]);
+
+        assert_eq!(result.zed_db.as_ref(), Some(&zed_db));
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Claude).len(), 1);
+        assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    /// Regression for #815: nested-layout subagent/workflow transcripts
+    /// (`<session>/subagents/workflows/<wf>/agent-*.jsonl`) must be discovered by
+    /// the recursive project-dir walk, so their usage is counted. The sibling
+    /// `journal.jsonl` orchestration metadata is discovered too, but the parser
+    /// drops it (covered in the claudecode parser tests).
+    #[test]
+    fn test_scan_all_clients_claude_nested_workflow_agents() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let wf = home.join(".claude/projects/myproject/sess-uuid/subagents/workflows/wf_abc");
+        fs::create_dir_all(&wf).unwrap();
+        let agent = wf.join("agent-a123.jsonl");
+        File::create(&agent).unwrap().write_all(b"{}\n").unwrap();
+        File::create(wf.join("journal.jsonl"))
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+        assert!(
+            result.get(ClientId::Claude).iter().any(|p| p == &agent),
+            "nested workflow agent transcript must be discovered, got {:?}",
+            result.get(ClientId::Claude)
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_transcripts() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+        let transcript = setup_mock_claude_transcripts_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::Claude).len(), 2);
+        assert!(
+            result
+                .get(ClientId::Claude)
+                .iter()
+                .any(|path| path == &transcript),
+            "expected Claude transcript {} in {:?}",
+            transcript.display(),
+            result.get(ClientId::Claude)
+        );
+        assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_transcripts_without_projects_dir() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let transcript = setup_mock_claude_transcripts_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::Claude), &vec![transcript]);
+        assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_discovers_cc_mirror_variant_projects() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let variant_dir = home.join(".cc-mirror/kimi-code");
+        let config_dir = variant_dir.join("config");
+        let project_dir = config_dir.join("projects/project-one");
+        fs::create_dir_all(&project_dir).unwrap();
+        let variant_file = variant_dir.join("variant.json");
+        fs::write(
+            &variant_file,
+            serde_json::json!({
+                "name": "kimi-code",
+                "provider": "kimi",
+                "configDir": config_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let variant_session = project_dir.join("variant-session.jsonl");
+        File::create(&variant_session).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::Claude).len(), 2);
+        assert!(
+            result
+                .get(ClientId::Claude)
+                .iter()
+                .any(|path| path == &variant_session),
+            "expected cc-mirror session {} in {:?}",
+            variant_session.display(),
+            result.get(ClientId::Claude)
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_dedups_cc_mirror_config_dir_pointing_at_normal_claude() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let normal_claude_dir = home.join(".claude");
+        let variant_dir = home.join(".cc-mirror/plain-mirror");
+        fs::create_dir_all(&variant_dir).unwrap();
+        fs::write(
+            variant_dir.join("variant.json"),
+            serde_json::json!({
+                "name": "plain-mirror",
+                "provider": "mirror",
+                "configDir": normal_claude_dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Claude).len(),
+            1,
+            "cc-mirror variants pointing at ~/.claude must not duplicate normal Claude files"
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_gemini() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_gemini_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["gemini".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Gemini).len(), 1);
+        assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_gemini_jsonl_session() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let gemini_path = home.join(".gemini/tmp/123/chats");
+        fs::create_dir_all(&gemini_path).unwrap();
+        File::create(gemini_path.join("session-abc.jsonl")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["gemini".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Gemini).len(), 1);
+        assert!(result.get(ClientId::Gemini)[0].ends_with("session-abc.jsonl"));
+    }
+
+    #[test]
+    fn test_scan_all_clients_copilot() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_copilot_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["copilot".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::Copilot).len(), 1);
+        assert!(result.get(ClientId::Copilot)[0].ends_with("copilot.jsonl"));
+    }
+
+    #[test]
+    fn test_scan_all_clients_copilot_discovers_desktop_database() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".copilot")).unwrap();
+        let desktop_db = home.join(".copilot/data.db");
+        File::create(&desktop_db).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["copilot".to_string()],
+            false,
+        );
+
+        assert_eq!(result.copilot_desktop_db.as_ref(), Some(&desktop_db));
+        assert!(result.get(ClientId::Copilot).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_copilot_includes_explicit_exporter_file() {
+        let mut _exporter = EnvGuard::capture(&["COPILOT_OTEL_FILE_EXPORTER_PATH"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let explicit_dir = home.join("otel-export");
+        fs::create_dir_all(&explicit_dir).unwrap();
+        let explicit_file = explicit_dir.join("copilot-explicit.jsonl");
+        File::create(&explicit_file).unwrap();
+
+        _exporter.set("COPILOT_OTEL_FILE_EXPORTER_PATH", &explicit_file);
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["copilot".to_string()]);
+
+        assert_eq!(result.get(ClientId::Copilot), &vec![explicit_file]);
+    }
+
+    #[test]
+    fn test_scan_all_clients_openclaw_jsonl_only() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_openclaw_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::OpenClaw).len(), 3);
+        assert!(result
+            .get(ClientId::OpenClaw)
+            .iter()
+            .any(|path| path.ends_with("session-abc.jsonl")));
+        assert!(result
+            .get(ClientId::OpenClaw)
+            .iter()
+            .any(|path| path.ends_with("session-deleted.jsonl.deleted.123")));
+        assert!(result
+            .get(ClientId::OpenClaw)
+            .iter()
+            .any(|path| path.ends_with("session-reset.jsonl.reset.456")));
+    }
+
+    #[test]
+    fn test_scan_all_clients_openclaw_deleted_transcript() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let openclaw_sessions = home.join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&openclaw_sessions).unwrap();
+        File::create(openclaw_sessions.join("session-archived.jsonl.deleted.1700000000000"))
+            .unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::OpenClaw).len(), 1);
+        assert!(result.get(ClientId::OpenClaw)[0]
+            .ends_with("session-archived.jsonl.deleted.1700000000000"));
+    }
+
+    // Ported from upstream #1293.
+    #[test]
+    fn scan_openclaw_excludes_only_canonical_compaction_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let checkpoint = "11111111-1111-4111-8111-111111111111";
+
+        let kept = [
+            "primary.jsonl",
+            "primary.checkpoint.not-a-uuid.jsonl",
+            "primary.checkpoint.11111111-1111-0111-8111-111111111111.jsonl",
+            "named-checkpoint-session.jsonl.deleted.legacy-timestamp",
+            "primary.checkpoint.not-a-uuid.jsonl.reset.legacy-timestamp.zst",
+        ];
+        for name in kept {
+            fs::write(sessions.join(name), b"{}").unwrap();
+        }
+        for name in [
+            format!("primary.checkpoint.{checkpoint}.jsonl"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.zst"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.deleted.legacy-timestamp"),
+            format!("primary.checkpoint.{checkpoint}.jsonl.reset.legacy-timestamp.zst"),
+        ] {
+            fs::write(sessions.join(name), b"{}").unwrap();
+        }
+
+        let scan = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        let names: HashSet<_> = scan
+            .get(ClientId::OpenClaw)
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert_eq!(names, kept.into_iter().collect());
+    }
+
+    // Ported from upstream #1285.
+    #[test]
+    fn scan_openclaw_compressed_transcripts_reaches_the_parser() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".openclaw/agents/main/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = br#"{"type":"message","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","usage":{"input":100,"output":50},"timestamp":1788566869012}}"#;
+        for name in [
+            "plain-archive.jsonl.zst",
+            "deleted.jsonl.deleted.timestamp.nonce.zst",
+            "reset.jsonl.reset.timestamp.nonce.zst",
+        ] {
+            fs::write(
+                sessions.join(name),
+                zstd::encode_all(&content[..], 0).unwrap(),
+            )
+            .unwrap();
+        }
+        fs::write(sessions.join("unrelated.zst"), b"not a session").unwrap();
+
+        let scan = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["openclaw".to_string()],
+            false,
+        );
+        assert_eq!(scan.get(ClientId::OpenClaw).len(), 3);
+        for path in scan.get(ClientId::OpenClaw) {
+            let messages = crate::sessions::openclaw::parse_openclaw_transcript(path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.total(), 150);
+        }
+    }
+
+    #[test]
+    fn test_scan_all_clients_multiple() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        setup_mock_claude_dir(home);
+        setup_mock_gemini_dir(home);
+
+        // use_env_roots=false to avoid interference from TOKSCALE_EXTRA_DIRS
+        // set by parallel tests
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string(), "gemini".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::Claude).len(), 1);
+        assert_eq!(result.get(ClientId::Gemini).len(), 1);
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Codex).is_empty());
+    }
+
+    #[test]
+    fn test_scan_crush_registry_resolves_relative_and_absolute_data_dirs() {
+        let dir = TempDir::new().unwrap();
+        let project_a = dir.path().join("project-a");
+        let project_b_data = dir.path().join("project-b-data");
+        fs::create_dir_all(project_a.join(".crush")).unwrap();
+        fs::create_dir_all(&project_b_data).unwrap();
+        File::create(project_a.join(".crush").join("crush.db")).unwrap();
+        File::create(project_b_data.join("crush.db")).unwrap();
+
+        let registry_path = dir.path().join("projects.json");
+        let projects_json = serde_json::json!({
+        "projects": [
+                      { "path": project_a, "data_dir": ".crush" },
+                      {
+                          "path": dir.path().join("project-b"),
+                          "data_dir": project_b_data,
+                      },
+                      {
+                          "path": dir.path().join("missing-project"),
+                          "data_dir": ".crush",
+                      },
+                  ],
+              })
+        .to_string();
+        setup_mock_crush_registry(&registry_path, &projects_json);
+
+        let result = scan_crush_registry(&registry_path, None);
+        assert_eq!(
+            result,
+            vec![
+                CrushDbSource {
+                    db_path: project_a.join(".crush").join("crush.db"),
+                    workspace_key: normalize_workspace_key(&project_a.display().to_string()),
+                    workspace_label: Some("project-a".to_string()),
+                },
+                CrushDbSource {
+                    db_path: project_b_data.join("crush.db"),
+                    workspace_key: normalize_workspace_key(
+                        &dir.path().join("project-b").display().to_string()
+                    ),
+                    workspace_label: Some("project-b".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scan_crush_registry_skips_malformed_project_entries() {
+        let dir = TempDir::new().unwrap();
+        let valid_project = dir.path().join("valid-project");
+        fs::create_dir_all(valid_project.join(".crush")).unwrap();
+        File::create(valid_project.join(".crush").join("crush.db")).unwrap();
+
+        let registry_path = dir.path().join("projects.json");
+        let projects_json = serde_json::json!({
+        "projects": [
+                      { "path": valid_project, "data_dir": ".crush" },
+                      { "path": 123, "data_dir": ".crush" },
+                      { "data_dir": ".crush" },
+                      "not-an-object",
+                  ],
+              })
+        .to_string();
+        setup_mock_crush_registry(&registry_path, &projects_json);
+
+        let result = scan_crush_registry(&registry_path, None);
+        assert_eq!(
+            result,
+            vec![CrushDbSource {
+                db_path: valid_project.join(".crush").join("crush.db"),
+                workspace_key: normalize_workspace_key(&valid_project.display().to_string()),
+                workspace_label: Some("valid-project".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_discover_crush_dbs_ignores_cwd_without_override() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("workspace");
+        let nested = project.join("src/subdir");
+        let xdg = dir.path().join("xdg");
+
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(xdg.join("crush")).unwrap();
+        fs::create_dir_all(project.join(".crush")).unwrap();
+        File::create(project.join(".crush").join("crush.db")).unwrap();
+        fs::write(
+            xdg.join("crush").join("projects.json"),
+            r#"{"projects":[]}"#,
+        )
+        .unwrap();
+
+        _xdg.set("XDG_DATA_HOME", &xdg);
+        let _cwd = CwdGuard::change(&nested);
+
+        let result = discover_crush_dbs(home.to_str().unwrap(), false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_crush_populates_crush_db_paths() {
+        let mut _xdg = EnvGuard::capture(&["XDG_DATA_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let project = dir.path().join("project");
+        let data_dir = project.join(".crush");
+
+        fs::create_dir_all(xdg.join("crush")).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        File::create(data_dir.join("crush.db")).unwrap();
+
+        let registry_path = xdg.join("crush").join("projects.json");
+        let projects_json = serde_json::json!({
+            "projects": [{ "path": project, "data_dir": ".crush" }],
+        })
+        .to_string();
+        setup_mock_crush_registry(&registry_path, &projects_json);
+
+        _xdg.set("XDG_DATA_HOME", &xdg);
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["crush".to_string()]);
+        assert_eq!(
+            result.crush_dbs,
+            vec![CrushDbSource {
+                db_path: data_dir.join("crush.db"),
+                workspace_key: normalize_workspace_key(&project.display().to_string()),
+                workspace_label: Some("project".to_string()),
+            }]
+        );
+        assert!(result.get(ClientId::Crush).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn source_context_crush_relative_projects_use_capture_cwd() {
+        let mut env = EnvGuard::capture(&["XDG_DATA_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        let dir = TempDir::new().unwrap();
+        let capture_cwd = dir.path().join("capture-cwd");
+        let later_cwd = dir.path().join("later-cwd");
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let relative_db = Path::new("project/.crush/crush.db");
+        fs::create_dir_all(capture_cwd.join(relative_db).parent().unwrap()).unwrap();
+        fs::create_dir_all(later_cwd.join(relative_db).parent().unwrap()).unwrap();
+        fs::write(capture_cwd.join(relative_db), b"capture").unwrap();
+        fs::write(later_cwd.join(relative_db), b"later").unwrap();
+        setup_mock_crush_registry(
+            &xdg.join("crush/projects.json"),
+            r#"{"projects":[{"path":"project","data_dir":".crush"}]}"#,
+        );
+        env.set("XDG_DATA_HOME", &xdg);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let _cwd = CwdGuard::change(&capture_cwd);
+        let clients = ["crush".to_string()];
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, true);
+        assert_eq!(fs::read(&legacy.crush_dbs[0].db_path).unwrap(), b"capture");
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.clone()),
+            true,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+
+        std::env::set_current_dir(&later_cwd).unwrap();
+        let later_context =
+            ResolvedLocalSourceContext::capture(Some(home), true, ScannerSettings::default())
+                .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+
+        assert_eq!(
+            fs::read(&resolved.crush_dbs[0].db_path).unwrap(),
+            b"capture"
+        );
+        assert_eq!(
+            resolved.crush_dbs[0].workspace_key,
+            legacy.crush_dbs[0].workspace_key
+        );
+        assert_ne!(context.identity_bytes(), later_context.identity_bytes());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_headless_paths() {
+        let mut _headless =
+            EnvGuard::capture(&["TOKSCALE_HEADLESS_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"]);
+        _headless.remove("TOKSCALE_HEADLESS_DIR");
+        _headless.remove("CODEX_HOME");
+        _headless.remove("GEMINI_CLI_HOME");
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let mac_root = home
+            .join("Library")
+            .join("Application Support")
+            .join("tokscale")
+            .join("headless");
+
+        fs::create_dir_all(mac_root.join("codex")).unwrap();
+        File::create(mac_root.join("codex").join("codex.jsonl")).unwrap();
+
+        let result = scan_without_extra_dirs(
+            home.to_str().unwrap(),
+            &[
+                "claude".to_string(),
+                "codex".to_string(),
+                "gemini".to_string(),
+            ],
+        );
+
+        assert!(result.get(ClientId::Claude).is_empty());
+        assert_eq!(result.get(ClientId::Codex).len(), 1);
+        assert!(result.get(ClientId::Gemini).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codex_with_env() {
+        let mut _codex = EnvGuard::capture(&["CODEX_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_codex_dir(home);
+
+        // Set CODEX_HOME environment variable
+        _codex.set("CODEX_HOME", home.join(".codex"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
+        assert_eq!(result.get(ClientId::Codex).len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codex_home_override_ignores_codex_home_env() {
+        let mut _codex = EnvGuard::capture(&["CODEX_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("target-home");
+        let conflicting = dir.path().join("conflicting-codex-home");
+        setup_mock_codex_dir(&home);
+        fs::create_dir_all(&conflicting).unwrap();
+
+        _codex.set("CODEX_HOME", &conflicting);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["codex".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Codex).len(), 1);
+        assert!(result.get(ClientId::Codex)[0].ends_with("session.jsonl"));
+        assert!(result.get(ClientId::Codex)[0].starts_with(home.join(".codex")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codex_archived_sessions() {
+        let mut _codex = EnvGuard::capture(&["CODEX_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_codex_archived_dir(home);
+
+        _codex.set("CODEX_HOME", home.join(".codex"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
+        assert_eq!(result.get(ClientId::Codex).len(), 1);
+        assert!(result.get(ClientId::Codex)[0].ends_with("archived.jsonl"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codex_sessions_and_archived() {
+        let mut _codex = EnvGuard::capture(&["CODEX_HOME"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_codex_dir(home);
+        setup_mock_codex_archived_dir(home);
+
+        _codex.set("CODEX_HOME", home.join(".codex"));
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codex".to_string()]);
+        assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    /// Ported from upstream `d409ee07`: nested subagent transcripts are found,
+    /// and only files named exactly `session.jsonl` count (a sibling `.log`
+    /// and another `.jsonl` do not).
+    #[test]
+    fn test_scan_all_clients_muse() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_muse_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["muse".to_string()],
+            false,
+        );
+        let files = result.get(ClientId::Muse);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| path.ends_with("session.jsonl")));
+        assert!(files.iter().any(|path| path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("session-fixture")));
+        assert!(files.iter().any(|path| path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("child-fixture")));
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_kimi_and_kimi_code() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_kimi_dir(home);
+        let kimi_code = setup_mock_kimi_code_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Kimi).len(), 2);
+        assert!(result
+            .get(ClientId::Kimi)
+            .iter()
+            .any(|path| path == &kimi_code));
+        assert!(result
+            .get(ClientId::Kimi)
+            .iter()
+            .all(|path| path.ends_with("wire.jsonl")));
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    /// Kimi Work lays sessions out under the desktop app-data root exactly like
+    /// Kimi Code: `<work-root>/wd_<workspace>_<hash>/<conv-*|ctitle-*>/agents/main/wire.jsonl`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_test_wire(home: &std::path::Path, session_id: &str) -> PathBuf {
+        let app_data = if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else {
+            home.join("AppData").join("Roaming")
+        };
+        kimi_work_wire_from_root(&app_data, session_id)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn kimi_work_wire_from_root(app_data: &std::path::Path, session_id: &str) -> PathBuf {
+        super::join_segments(
+            app_data,
+            &format!(
+                "{KIMI_WORK_SUFFIX}/wd_workspace_c107cac82a87/{session_id}/agents/main/wire.jsonl"
+            ),
+        )
+    }
+
+    /// Ported from upstream #1170: conversation and title-generation sessions
+    /// under the Work root are both discovered as Kimi.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn test_scan_all_clients_kimi_work_discovers_conv_and_ctitle_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let conv = kimi_work_test_wire(home, "conv-4e171339d10b9954d0fc24da");
+        let ctitle = kimi_work_test_wire(home, "ctitle-01a01fe5-e170-765c-a1b3-c4daad0cda13");
+        for path in [&conv, &ctitle] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(path).unwrap();
+        }
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        let kimi_files = result.get(ClientId::Kimi);
+        assert_eq!(kimi_files.len(), 2);
+        assert!(kimi_files.contains(&conv));
+        assert!(kimi_files.contains(&ctitle));
+    }
+
+    /// Ported from upstream #1170: the home-relative Work root is always
+    /// scanned; the `%APPDATA%` root (or its relocated `shareDir`) only when
+    /// environment roots are enabled.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "windows")]
+    fn test_scan_all_clients_kimi_work_respects_env_roots() {
+        let mut env = EnvGuard::capture(&[
+            "APPDATA",
+            "KIMI_CODE_HOME",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_HEADLESS_DIR",
+        ]);
+        env.remove("KIMI_CODE_HOME");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("TOKSCALE_HEADLESS_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let work_literal = kimi_work_test_wire(&home, "conv-session-work-1");
+        fs::create_dir_all(work_literal.parent().unwrap()).unwrap();
+        File::create(&work_literal).unwrap();
+
+        let app_data = dir.path().join("conflicting-appdata");
+        let app_data_wire = kimi_work_wire_from_root(&app_data, "ctitle-session-work-2");
+        fs::create_dir_all(app_data_wire.parent().unwrap()).unwrap();
+        File::create(&app_data_wire).unwrap();
+        env.set("APPDATA", &app_data);
+
+        let scan = |use_env_roots| {
+            scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["kimi".to_string()],
+                use_env_roots,
+            )
+            .get(ClientId::Kimi)
+            .to_vec()
+        };
+        assert_eq!(scan(false), vec![work_literal.clone()]);
+        let with_env = scan(true);
+        assert_eq!(with_env.len(), 2);
+        assert!(with_env.contains(&work_literal));
+        assert!(with_env.contains(&app_data_wire));
+
+        let share_dir = dir.path().join("custom-share");
+        let config_path = app_data.join("kimi-desktop").join("daimon-storage.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({"shareDir": share_dir.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        let configured_wire = super::join_segments(
+            &share_dir,
+            "daimon/runtime/kimi-code/home/sessions/wd_workspace_c107cac82a87/conv-configured-share/agents/main/wire.jsonl",
+        );
+        fs::create_dir_all(configured_wire.parent().unwrap()).unwrap();
+        File::create(&configured_wire).unwrap();
+
+        let relocated = scan(true);
+        assert_eq!(relocated.len(), 2);
+        assert!(relocated.contains(&work_literal));
+        assert!(relocated.contains(&configured_wire));
+        assert!(!relocated.contains(&app_data_wire));
+    }
+
+    /// Ported from upstream #1170: there is no Work build for Linux, so a
+    /// similarly named tree under a Linux home is not scanned.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_all_clients_kimi_work_is_not_discovered_on_linux() {
+        let dir = TempDir::new().unwrap();
+        let wire = super::join_segments(
+            &dir.path().join("Library/Application Support"),
+            &format!("{KIMI_WORK_SUFFIX}/wd_workspace_c107cac82a87/conv-linux-session/agents/main/wire.jsonl"),
+        );
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        File::create(&wire).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        assert!(result.get(ClientId::Kimi).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_kimi_code_home_obeys_env_strategy() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let override_home = dir.path().join("override");
+        fs::create_dir_all(&home).unwrap();
+        let default_wire = setup_mock_kimi_code_dir(&home);
+        let override_wire =
+            override_home.join("sessions/workspace/session-code/agents/main/wire.jsonl");
+        fs::create_dir_all(override_wire.parent().unwrap()).unwrap();
+        File::create(&override_wire).unwrap();
+
+        let mut env = EnvGuard::capture(&["KIMI_CODE_HOME", "APPDATA"]);
+        env.remove("APPDATA");
+        env.set("KIMI_CODE_HOME", &override_home);
+        let with_env =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["kimi".to_string()], true);
+        assert_eq!(
+            with_env.get(ClientId::Kimi),
+            std::slice::from_ref(&override_wire)
+        );
+
+        for empty_override in ["", "   "] {
+            env.set("KIMI_CODE_HOME", empty_override);
+            let fallback = scan_all_clients_with_env_strategy(
+                home.to_str().unwrap(),
+                &["kimi".to_string()],
+                true,
+            );
+            assert_eq!(
+                fallback.get(ClientId::Kimi),
+                std::slice::from_ref(&default_wire)
+            );
+        }
+
+        let without_env = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimi".to_string()],
+            false,
+        );
+        assert_eq!(
+            without_env.get(ClientId::Kimi),
+            std::slice::from_ref(&default_wire)
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_junie_and_opencodereview() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let junie = setup_mock_junie_dir(home);
+        let review = setup_mock_opencodereview_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["junie".to_string(), "opencodereview".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Junie), std::slice::from_ref(&junie));
+        assert_eq!(
+            result.get(ClientId::OpenCodeReview),
+            std::slice::from_ref(&review)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_hindsight_usage_files() {
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.remove("HINDSIGHT_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let usage_root = home.join(".hindsight/usage");
+        fs::create_dir_all(&usage_root).unwrap();
+        let expected = usage_root.join("2026-09.jsonl");
+        File::create(&expected).unwrap();
+        File::create(usage_root.join("ignore.txt")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["hindsight".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Hindsight).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_honors_hindsight_home() {
+        let dir = TempDir::new().unwrap();
+        let custom_root = dir.path().join("custom-hindsight");
+        let usage_root = custom_root.join("usage");
+        fs::create_dir_all(&usage_root).unwrap();
+        let expected = usage_root.join("2026-09.jsonl");
+        File::create(&expected).unwrap();
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.set("HINDSIGHT_HOME", custom_root.to_str().unwrap());
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["hindsight".to_string()],
+            true,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Hindsight).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_zcode_v2_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().to_path_buf();
+        let db_dir = home.join(".zcode/cli/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("db.sqlite");
+        File::create(&db_path).unwrap();
+        // The JSONL root upstream also scans is not ported: nothing there may
+        // reach any lane.
+        let legacy_dir = home.join(".zcode/projects/demo");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        File::create(legacy_dir.join("session.jsonl")).unwrap();
+        let clients = ["zcode".to_string()];
+
+        let legacy = scan_all_clients_with_env_strategy(home.to_str().unwrap(), &clients, false);
+        assert_eq!(legacy.zcode_db.as_deref(), Some(db_path.as_path()));
+        assert!(legacy.get(ClientId::Zcode).is_empty());
+
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home), false, ScannerSettings::default())
+                .unwrap();
+        let resolved = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        assert_eq!(resolved.zcode_db.as_deref(), Some(db_path.as_path()));
+        assert!(resolved.get(ClientId::Zcode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_directory_updates_jsonl_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        let session_dir = path.join("%2Ftmp%2Fproject").join("session-uuid-1");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        File::create(session_dir.join("updates.jsonl")).unwrap();
+        File::create(session_dir.join("events.jsonl")).unwrap();
+        File::create(session_dir.join("updates.json")).unwrap();
+
+        let updates_files = scan_directory(path.to_str().unwrap(), "updates.jsonl");
+        assert_eq!(updates_files.len(), 1);
+        assert!(updates_files[0].ends_with("updates.jsonl"));
+    }
+
+    #[test]
+    fn test_scan_all_clients_grok() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_grok_dir(home);
+
+        // use_env_roots=false so a real GROK_HOME cannot steal the scan root.
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["grok".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Grok).len(), 2);
+        assert!(result
+            .get(ClientId::Grok)
+            .iter()
+            .any(|path| path.ends_with("updates.jsonl")));
+        assert!(result
+            .get(ClientId::Grok)
+            .iter()
+            .any(|path| path == &home.join(".grok/logs/unified.jsonl")));
+        assert!(!result
+            .get(ClientId::Grok)
+            .iter()
+            .any(|path| path == &home.join(".grok/logs/archive/unified.jsonl")));
+        assert!(result.get(ClientId::OpenCode).is_empty());
+        assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_grok_discovers_configured_unified_logs_once() {
+        let mut env = EnvGuard::capture(&["GROK_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.remove("GROK_HOME");
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let primary_home = home.join(".grok");
+        let settings_home = home.join("settings-grok");
+        let env_root = home.join("env-root");
+        let env_home = env_root.join("nested/.grok");
+        setup_mock_grok_home(&primary_home);
+        setup_mock_grok_home(&settings_home);
+        setup_mock_grok_home(&env_home);
+
+        let primary_sessions = primary_home.join("sessions");
+        let settings_sessions = settings_home.join("sessions");
+        let settings = ScannerSettings {
+            extra_scan_paths: BTreeMap::from([(
+                "grok".to_string(),
+                vec![primary_sessions.clone(), settings_home.clone()],
+            )]),
+            ..Default::default()
+        };
+        env.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!(
+                "grok:{},grok:{}",
+                settings_sessions.display(),
+                env_root.display()
+            ),
+        );
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["grok".to_string()],
+            true,
+            &settings,
+        );
+        let files = result.get(ClientId::Grok);
+        assert_eq!(files.len(), 6);
+
+        for grok_home in [&primary_home, &settings_home, &env_home] {
+            for expected in [
+                grok_home.join("sessions/%2Ftmp%2Fproject/session-uuid-1/updates.jsonl"),
+                grok_home.join("logs/unified.jsonl"),
+            ] {
+                assert_eq!(
+                    files.iter().filter(|path| *path == &expected).count(),
+                    1,
+                    "expected {} exactly once in {files:?}",
+                    expected.display()
+                );
+            }
+            assert!(!files
+                .iter()
+                .any(|path| path == &grok_home.join("logs/archive/unified.jsonl")));
+        }
+    }
+
+    #[test]
+    fn test_scan_all_clients_roocode() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_roocode_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["roocode".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::RooCode).len(), 2);
+        assert!(result
+            .get(ClientId::RooCode)
+            .iter()
+            .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    #[test]
+    fn test_scan_all_clients_kilocode() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_kilocode_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kilocode".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::KiloCode).len(), 2);
+        assert!(result
+            .get(ClientId::KiloCode)
+            .iter()
+            .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    #[test]
+    fn test_scan_all_clients_cline() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_cline_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Cline).len(), 4);
+        assert!(result
+            .get(ClientId::Cline)
+            .iter()
+            .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    #[test]
+    fn test_parse_extra_dirs_basic() {
+        let enabled: HashSet<ClientId> = [ClientId::Claude, ClientId::OpenClaw]
+            .iter()
+            .copied()
+            .collect();
+        let dirs = parse_extra_dirs("claude:/tmp/mac-sessions,openclaw:/tmp/oc-extra", &enabled);
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].0, ClientId::Claude);
+        assert_eq!(dirs[0].1, "/tmp/mac-sessions");
+        assert_eq!(dirs[1].0, ClientId::OpenClaw);
+        assert_eq!(dirs[1].1, "/tmp/oc-extra");
+    }
+
+    #[test]
+    fn test_parse_extra_dirs_filters_disabled_clients() {
+        let enabled: HashSet<ClientId> = [ClientId::Claude].iter().copied().collect();
+        let dirs = parse_extra_dirs(
+            "claude:/tmp/mac-sessions,gemini:/tmp/gemini-extra",
+            &enabled,
+        );
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].0, ClientId::Claude);
+    }
+
+    #[test]
+    fn test_parse_extra_dirs_skips_unsupported_clients() {
+        let enabled: HashSet<ClientId> =
+            [ClientId::Claude, ClientId::Kilo].iter().copied().collect();
+        let dirs = parse_extra_dirs("claude:/tmp/mac-sessions,kilo:/tmp/kilo", &enabled);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].0, ClientId::Claude);
+        assert_eq!(dirs[0].1, "/tmp/mac-sessions");
+    }
+
+    #[test]
+    fn test_parse_extra_dirs_empty_string() {
+        let enabled: HashSet<ClientId> = ClientId::iter().collect();
+        let dirs = parse_extra_dirs("", &enabled);
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extra_dirs_invalid_client() {
+        let enabled: HashSet<ClientId> = ClientId::iter().collect();
+        let dirs = parse_extra_dirs("nonexistent:/tmp/foo", &enabled);
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_extra_dirs() {
+        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        // Setup default Claude dir
+        setup_mock_claude_dir(home);
+
+        // Setup extra dir with additional session files
+        let extra_dir = TempDir::new().unwrap();
+        let extra_project = extra_dir.path().join("mac-project");
+        fs::create_dir_all(&extra_project).unwrap();
+        File::create(extra_project.join("extra-session.jsonl")).unwrap();
+
+        _extra.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", extra_dir.path().to_string_lossy()),
+        );
+
+        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+        // 1 from default path + 1 from extra dir
+        assert_eq!(result.get(ClientId::Claude).len(), 2);
+    }
+
+    fn setup_mock_codebuff_chat(base: &Path, channel: &str, chat_id: &str) -> PathBuf {
+        let chat_dir = base
+            .join(".config")
+            .join(channel)
+            .join("projects")
+            .join("sandbox")
+            .join("chats")
+            .join(chat_id);
+        fs::create_dir_all(&chat_dir).unwrap();
+        let file_path = chat_dir.join("chat-messages.json");
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, "[]").unwrap();
+        file_path
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codebuff_walks_all_three_channels_by_default() {
+        let mut _codebuff = EnvGuard::capture(&["CODEBUFF_DATA_DIR"]);
+        _codebuff.remove("CODEBUFF_DATA_DIR");
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_codebuff_chat(home, "manicode", "2025-12-14T10-00-00.000Z");
+        setup_mock_codebuff_chat(home, "manicode-dev", "2025-12-14T11-00-00.000Z");
+        setup_mock_codebuff_chat(home, "manicode-staging", "2025-12-14T12-00-00.000Z");
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
+        assert_eq!(result.get(ClientId::Codebuff).len(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codebuff_empty_env_var_falls_back_to_default_channels() {
+        let mut _codebuff = EnvGuard::capture(&["CODEBUFF_DATA_DIR"]);
+        // Regression: a whitespace-only override used to produce zero scan
+        // roots because the `Some(_)` branch was taken and then skipped.
+        _codebuff.set("CODEBUFF_DATA_DIR", "   ");
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_codebuff_chat(home, "manicode", "2025-12-14T10-00-00.000Z");
+        setup_mock_codebuff_chat(home, "manicode-dev", "2025-12-14T11-00-00.000Z");
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
+        assert_eq!(result.get(ClientId::Codebuff).len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_codebuff_honours_explicit_env_override() {
+        let mut _codebuff = EnvGuard::capture(&["CODEBUFF_DATA_DIR"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        // Default-channel data that should NOT be picked up when the env is set.
+        setup_mock_codebuff_chat(home, "manicode", "2025-12-14T10-00-00.000Z");
+        // Override target (lives OUTSIDE ~/.config to prove the override wins).
+        let override_root = dir.path().join("custom-codebuff");
+        let override_chat_dir = override_root
+            .join("projects")
+            .join("sandbox")
+            .join("chats")
+            .join("2025-12-14T11-00-00.000Z");
+        fs::create_dir_all(&override_chat_dir).unwrap();
+        File::create(override_chat_dir.join("chat-messages.json")).unwrap();
+
+        _codebuff.set("CODEBUFF_DATA_DIR", &override_root);
+
+        let result = scan_without_extra_dirs(home.to_str().unwrap(), &["codebuff".to_string()]);
+        assert_eq!(result.get(ClientId::Codebuff).len(), 1);
+        assert!(result.get(ClientId::Codebuff)[0]
+            .to_string_lossy()
+            .contains("custom-codebuff"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_ignores_extra_dirs_when_env_roots_disabled() {
+        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let extra_dir = TempDir::new().unwrap();
+        let extra_project = extra_dir.path().join("mac-project");
+        fs::create_dir_all(&extra_project).unwrap();
+        File::create(extra_project.join("extra-session.jsonl")).unwrap();
+
+        _extra.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", extra_dir.path().to_string_lossy()),
+        );
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Claude).len(), 1);
+    }
+
+    /// Verify that an extra scan path outside $HOME does not abort the scan.
+    /// `warn_if_escapes_home` must only warn, never block.
+    #[test]
+    #[serial]
+    fn test_extra_scan_path_outside_home_does_not_block_scan() {
+        let fake_home = TempDir::new().unwrap();
+        let outside_home = TempDir::new().unwrap();
+        let outside_path = outside_home.path();
+        assert!(!outside_path.starts_with(fake_home.path()));
+
+        // Populate with a valid session file so the scanner has something to find.
+        let session_dir = outside_path.join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        File::create(session_dir.join("session-abc123.json")).unwrap();
+
+        // Set TOKSCALE_EXTRA_DIRS to point claude at the outside path.
+        let mut _extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        _extra.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("claude:{}", outside_path.to_string_lossy()),
+        );
+
+        // The scan must complete without panicking.
+        let _result = scan_all_clients_with_env_strategy(
+            fake_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            true, // use_env_roots = true so TOKSCALE_EXTRA_DIRS is picked up
+        );
+
+        // No assertion on result.get(ClientId::Claude) — the outside dir might
+        // not match the expected file patterns. The test goal is only liveness:
+        // the scan must not panic when an extra path escapes $HOME.
+    }
+
+    /// Build a Claude "Cowork" (local-agent-mode) session tree under `home`
+    /// and return the per-session `.claude/projects` root. Each session also
+    /// gets an `audit.jsonl` sibling, which mirrors the same assistant `usage`
+    /// records and must never be scanned (it would double-count).
+    fn setup_mock_cowork_session(home: &Path, session_uuid: &str) -> PathBuf {
+        let session = home
+            .join("Library/Application Support/Claude/local-agent-mode-sessions")
+            .join("workspace-1")
+            .join("sub-1")
+            .join(format!("local_{session_uuid}"));
+        let projects = session.join(".claude/projects");
+        let encoded = projects.join("-Users-someone-outputs");
+        fs::create_dir_all(&encoded).unwrap();
+        File::create(encoded.join(format!("{session_uuid}.jsonl"))).unwrap();
+
+        // Sub-agent transcript nested under the same projects root.
+        let subagents = encoded.join("00000000-0000-0000-0000-000000000000/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        File::create(subagents.join("agent-1.jsonl")).unwrap();
+
+        // Event/audit log — sibling of `.claude`, NOT under `projects`.
+        File::create(session.join("audit.jsonl")).unwrap();
+
+        projects
+    }
+
+    #[test]
+    fn test_discover_cowork_project_roots_excludes_audit_log() {
+        let home = TempDir::new().unwrap();
+        let projects_a = setup_mock_cowork_session(home.path(), "aaaa");
+        let projects_b = setup_mock_cowork_session(home.path(), "bbbb");
+
+        let roots = discover_cowork_project_roots(home.path());
+
+        // Exactly the two per-session `.claude/projects` roots, nothing else —
+        // crucially not the sessions root (which would sweep in audit.jsonl).
+        assert_eq!(roots, vec![projects_a, projects_b]);
+        assert!(
+            roots.iter().all(|root| root.ends_with(".claude/projects")),
+            "discovery must return projects roots, not the sessions tree: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_cowork_project_roots_absent_when_no_sessions() {
+        let home = TempDir::new().unwrap();
+        assert!(discover_cowork_project_roots(home.path()).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_counts_cowork_transcripts_not_audit_log() {
+        let home = TempDir::new().unwrap();
+        setup_mock_cowork_session(home.path(), "aaaa"); // transcript + subagent + audit
+        setup_mock_cowork_session(home.path(), "bbbb"); // transcript + subagent + audit
+
+        // use_env_roots = false keeps the scan hermetic (no $HOME / env dirs);
+        // built-in extra Claude roots (incl. Cowork) are still discovered.
+        let result = scan_all_clients_with_env_strategy(
+            home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+        );
+
+        let claude_files = result.get(ClientId::Claude);
+        // 2 transcripts + 2 sub-agent transcripts = 4; the 2 audit.jsonl files
+        // must be excluded or every Cowork message would be counted twice.
+        assert_eq!(
+            claude_files.len(),
+            4,
+            "expected 4 Cowork transcripts, got: {claude_files:?}"
+        );
+        assert!(
+            claude_files
+                .iter()
+                .all(|path| path.file_name().and_then(|n| n.to_str()) != Some("audit.jsonl")),
+            "audit.jsonl must never be scanned: {claude_files:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn m15a_globalstorage_scanner_discovers_file() {
+        let home = TempDir::new().unwrap();
+        let root = home
+            .path()
+            .join("Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent");
+        let file = root.join("workspace-a/conversation.chat");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        File::create(&file).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            false,
+        );
+
+        assert!(
+            result.get(ClientId::Kiro).contains(&file),
+            "globalStorage fixture must be discovered; old scanner returned no file"
+        );
+    }
+
+    #[test]
+    fn test_scan_directory_kiro_globalstorage_pattern_filters_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("kiro.kiroagent");
+        let workspace = root.join("workspace-a");
+        let execution_store = workspace.join("execution-store");
+        let workspace_session = root.join("workspace-sessions/workspace-a");
+        fs::create_dir_all(&execution_store).unwrap();
+        fs::create_dir_all(&workspace_session).unwrap();
+        File::create(workspace.join("snapshot.chat")).unwrap();
+        File::create(workspace.join("project.json")).unwrap();
+        File::create(workspace.join("notes")).unwrap();
+        File::create(execution_store.join("execution.json")).unwrap();
+        File::create(execution_store.join("execution-record")).unwrap();
+        fs::create_dir_all(execution_store.join("project")).unwrap();
+        File::create(execution_store.join("project/mirror.json")).unwrap();
+        File::create(workspace_session.join("session.json")).unwrap();
+        fs::create_dir_all(workspace_session.join("project")).unwrap();
+        File::create(workspace_session.join("project/mirror.json")).unwrap();
+        File::create(workspace.join("index.sqlite")).unwrap();
+        File::create(workspace.join("notes.txt")).unwrap();
+
+        let files = scan_directory(root.to_str().unwrap(), "kiro-globalstorage");
+        let relative: Vec<_> = files
+            .iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            relative,
+            vec![
+                PathBuf::from("workspace-a")
+                    .join("execution-store")
+                    .join("execution-record"),
+                PathBuf::from("workspace-a")
+                    .join("execution-store")
+                    .join("execution.json"),
+                PathBuf::from("workspace-a").join("snapshot.chat"),
+                PathBuf::from("workspace-sessions")
+                    .join("workspace-a")
+                    .join("session.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn m15b_kiro_ide_scanner_discovers_only_session_anchors() {
+        let home = TempDir::new().unwrap();
+        let sessions_root = home.path().join(".kiro/sessions");
+        let sess_dir = sessions_root.join("workspace-a/sess_02f1c107");
+        fs::create_dir_all(&sess_dir).unwrap();
+        let session = sess_dir.join("session.json");
+        let messages = sess_dir.join("messages.jsonl");
+        File::create(&session).unwrap();
+        File::create(&messages).unwrap();
+
+        let cli_dir = sessions_root.join("cli");
+        fs::create_dir_all(&cli_dir).unwrap();
+        File::create(cli_dir.join("session.json")).unwrap();
+        File::create(sessions_root.join("workspace-a/session.json")).unwrap();
+        let nested_mirror = sessions_root.join("workspace-a/mirror/sess_nested");
+        fs::create_dir_all(&nested_mirror).unwrap();
+        File::create(nested_mirror.join("session.json")).unwrap();
+
+        assert_eq!(
+            scan_directory(sessions_root.to_str().unwrap(), "kiro-ide-session"),
+            vec![session.clone()]
+        );
+
+        let result = scan_all_clients_with_env_strategy(
+            home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            false,
+        );
+        assert!(result.get(ClientId::Kiro).contains(&session));
+        assert!(!result.get(ClientId::Kiro).contains(&messages));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn test_kiro_globalstorage_roots_precede_extra_paths_and_dedup_canonical_files() {
+        let mut extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS"]);
+        let home = TempDir::new().unwrap();
+        let uppercase_root = home
+            .path()
+            .join("Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent");
+        let lowercase_root = home
+            .path()
+            .join("Library/Application Support/kiro/User/globalStorage/kiro.kiroagent");
+        let file = uppercase_root.join("workspace-a/transcript.chat");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        File::create(&file).unwrap();
+        let execution = uppercase_root.join("workspace-a/execution-store/execution");
+        fs::create_dir_all(execution.parent().unwrap()).unwrap();
+        File::create(&execution).unwrap();
+
+        // The two casing roots resolve to the same physical root. The scanner
+        // must register the first root once and not duplicate its files.
+        if !lowercase_root.exists() {
+            fs::create_dir_all(lowercase_root.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&uppercase_root, &lowercase_root).unwrap();
+        }
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {"kiro": [lowercase_root]}
+        }))
+        .unwrap();
+        extra.set(
+            "TOKSCALE_EXTRA_DIRS",
+            format!("kiro:{}", uppercase_root.display()),
+        );
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.path().to_str().unwrap(),
+            &["kiro".to_string()],
+            true,
+            &settings,
+        );
+        assert_eq!(result.get(ClientId::Kiro), &vec![execution, file.clone()]);
+
+        let disabled = scan_all_clients_with_scanner_settings(
+            home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            true,
+            &settings,
+        );
+        assert!(disabled.get(ClientId::Kiro).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_scans_preserve_exclusions_and_primary_overlap_order() {
+        let root = TempDir::new().unwrap();
+        let home = root.path();
+        let (excluded, other, _) = claude_exclusion_fixture(home);
+        let settings = ScannerSettings {
+            extra_scan_paths: registry_for([&excluded, &other]),
+            excluded_scan_paths: BTreeMap::from([(
+                "claude".to_string(),
+                vec![excluded.clone(), other.clone()],
+            )]),
+            ..Default::default()
+        };
+        let context =
+            ResolvedLocalSourceContext::capture(Some(home.to_path_buf()), false, settings).unwrap();
+        let scan = scan_all_clients_with_source_context(&context, &["claude".to_string()]).unwrap();
+        assert!(scan.discovery_error.is_none());
+        assert!(!scan
+            .get(ClientId::Claude)
+            .iter()
+            .any(|path| path.starts_with(&excluded) || path.starts_with(&other)));
+        let sessions = home.join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        File::create(sessions.join("one.jsonl")).unwrap();
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.set("SENPI_CODING_AGENT_DIR", home.join(".pi/agent"));
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.to_path_buf()),
+            true,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        let clients = ["pi".to_string(), "senpi".to_string()];
+        let first = scan_all_clients_with_source_context(&context, &clients).unwrap();
+        let declared = ClientId::ALL
+            .iter()
+            .find(|client| **client == ClientId::Pi || **client == ClientId::Senpi)
+            .unwrap();
+        assert_eq!(first.get(*declared).len(), 1);
+        for _ in 0..8 {
+            assert_eq!(
+                scan_all_clients_with_source_context(&context, &clients).unwrap(),
+                first
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirror_redirect_to_non_directory_fails_complete_discovery() {
+        let root = TempDir::new().unwrap();
+        let variant = root.path().join(".cc-mirror/one");
+        fs::create_dir_all(&variant).unwrap();
+        let target = root.path().join("not-directory");
+        fs::write(&target, b"not a directory").unwrap();
+        fs::write(
+            variant.join("variant.json"),
+            serde_json::json!({"configDir":target}).to_string(),
+        )
+        .unwrap();
+        let (_, error) = track_discovery(|| checked_mirror_roots(root.path()));
+        assert!(
+            error.is_some(),
+            "invalid derived directory must not publish successful absence"
+        );
+    }
+}

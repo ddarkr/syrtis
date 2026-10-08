@@ -69,7 +69,12 @@ fn normalize(raw: &str) -> Result<String, String> {
 /// now says nothing about which account its Keychain item belongs to, and the
 /// answer would go stale the moment a volume mounts. It also keeps this setter
 /// off the `stat` path that made `extra_scan_paths` block its caller.
-pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
+///
+/// Returns the reported payload and whether the effective registry changed.
+/// The comparison runs under the registry write lock: callers invalidate
+/// caches only when `changed` is true, after the lock is released, so a
+/// no-op reapply never disturbs live leases.
+pub(crate) fn set_from_json(raw: &str) -> Result<(serde_json::Value, bool), String> {
     let input: Vec<String> =
         serde_json::from_str(raw).map_err(|e| format!("invalid Claude config dirs JSON: {}", e))?;
 
@@ -93,14 +98,21 @@ pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
     }
 
     let registered_count = registered.len();
-    *CLAUDE_CONFIG_DIRS
+    let mut guard = CLAUDE_CONFIG_DIRS
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = registered;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let changed = *guard != registered;
+    if changed {
+        *guard = registered;
+    }
 
-    Ok(serde_json::json!({
-        "registeredCount": registered_count,
-        "rejected": rejected,
-    }))
+    Ok((
+        serde_json::json!({
+            "registeredCount": registered_count,
+            "rejected": rejected,
+        }),
+        changed,
+    ))
 }
 
 /// One process-wide mutex for every test that reads or writes the static, so
@@ -125,11 +137,11 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_for_test();
 
-        let result = set_from_json(
+        let (result, changed) = set_from_json(
             r#"["/Users/x/.claude-work/", "/Users/x/claude dir ", "relative/dir", "", "/Users/x/.claude-work"]"#,
         )
         .unwrap();
-
+        assert!(changed);
         assert_eq!(result["registeredCount"], 2);
         assert_eq!(
             snapshot(),
@@ -154,11 +166,36 @@ mod tests {
         );
         // And a path that is nothing but whitespace is still refused, by the
         // absolute-path rule rather than by trimming it into emptiness.
-        assert!(set_from_json(r#"["   "]"#).unwrap()["registeredCount"] == 0);
+        let (whitespace, whitespace_changed) = set_from_json(r#"["   "]"#).unwrap();
+        assert_eq!(whitespace["registeredCount"], 0);
+        assert!(whitespace_changed);
 
-        // Full-replace, including back to nothing.
-        set_from_json("[]").unwrap();
+        // Full-replace, including back to nothing. The whitespace-only input
+        // above already replaced the registry with empty, so `[]` is a no-op.
+        let (_, cleared_changed) = set_from_json("[]").unwrap();
+        assert!(!cleared_changed);
         assert!(snapshot().is_empty());
+        reset_for_test();
+    }
+
+    #[test]
+    fn identical_reapply_reports_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_for_test();
+        let payload = r#"["/Users/x/.claude-work"]"#;
+        let (_, first) = set_from_json(payload).unwrap();
+        assert!(first);
+        let (result, changed) = set_from_json(payload).unwrap();
+        assert!(!changed);
+        assert_eq!(result["registeredCount"], 1);
+        // Trailing-separator spelling is the same effective directory.
+        let (_, normalized) = set_from_json(r#"["/Users/x/.claude-work/"]"#).unwrap();
+        assert!(!normalized);
+        assert_eq!(snapshot(), vec!["/Users/x/.claude-work".to_string()]);
+        let (_, cleared) = set_from_json("[]").unwrap();
+        assert!(cleared);
+        let (_, recleared) = set_from_json("[]").unwrap();
+        assert!(!recleared);
         reset_for_test();
     }
 

@@ -3,18 +3,18 @@ status: historical
 id: kb-plan-shared-rust-engine-extraction
 kind: plan
 scope: cross-project
-read_when: reviewing the completed shared-engine extraction, advancing a consumer pin, or rehearsing rollback
-last_verified: 2026-07-29
-sources: ["public tokscale-core PR #1", "public TokenBar PR #114", "public TokenBar-Windows PR #12", ".gitmodules", "vendor/README.md", "docs/knowledge/vendor-tokscale.md"]
+read_when: reviewing the completed shared-engine extraction or its historical rollback evidence
+last_verified: 2026-10-08
+sources: ["public tokscale-core PR #1", "public TokenBar PR #114", "public TokenBar-Windows PR #12", "vendor/README.md", "docs/knowledge/vendor-tokscale.md"]
 ---
 
 # Shared Rust engine extraction plan
 
 > **Historical completion record：** CORE-R0 through CORE-X1D completed on
-> 2026-07-29. Current shared-engine work follows
-> [`vendor-tokscale.md`](../vendor-tokscale.md); this plan preserves the
-> extraction decisions, gates, and rollback evidence rather than authorizing a
-> new migration.
+> 2026-07-29. Current engine work follows
+> [`vendor-tokscale.md`](../vendor-tokscale.md) and belongs to `crates/syrtis_core`.
+> This plan preserves the former extraction decisions, gates, and rollback
+> evidence; it does not require a current submodule or separate engine release.
 
 ## 目錄
 

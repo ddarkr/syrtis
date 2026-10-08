@@ -300,7 +300,7 @@ enum DiscordPresence {
     /// The gate is the point. A graph client id can be `cc-mirror/<name>` where
     /// `<name>` comes straight out of a user's local config file and is only
     /// character-filtered, never semantically constrained
-    /// (vendor/tokscale-core/src/sessions/claudecode.rs:60-62). Falling through
+    /// (crates/syrtis_core/src/sessions/claudecode.rs:60-62). Falling through
     /// to `ClientRegistry.style(id)` would title-case that string and publish an
     /// employer or internal-tool name on a public Discord profile. Gating first
     /// means `style()`'s title-case fallback branch is unreachable from here.

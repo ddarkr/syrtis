@@ -33,7 +33,7 @@ public extension ModelReportEntry {
     /// `nil` otherwise.
     ///
     /// A client that reports its own per-message cost (OpenCode, MiMo Code)
-    /// has that figure taken verbatim by tokscale-core — it never meets a
+    /// has that figure taken verbatim by syrtis-core — it never meets a
     /// pricing table — so a unit error upstream reaches the row unchallenged.
     /// This is the only thing standing between that and the number on screen.
     ///

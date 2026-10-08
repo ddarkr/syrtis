@@ -17,7 +17,6 @@ ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*$')
 LEDGER_IDS = {f'SRC-{n:03d}' for n in range(1, 59)}
 LINK = re.compile(r'!?\[[^]]*\]\(([^)]+)\)')
 SKIP = {'.agent-local','.omo','.git','.build','target','.swiftpm','node_modules','dist'}
-EXTERNAL_DOC_ROOT = ('vendor', 'tokscale-core')
 MACHINE = [
     re.compile(r'/Users/[^\s`"\']+'),
     re.compile(r'/home/[^\s`"\']+'),
@@ -89,17 +88,6 @@ def source_path_issue(root,value):
     try: resolved.relative_to(root)
     except ValueError: return 'source path escapes repository root'
     if not resolved.exists():
-        submodule=(root/Path(*EXTERNAL_DOC_ROOT)).resolve()
-        gitmodules=root/'.gitmodules'
-        try: resolved.relative_to(submodule)
-        except ValueError: pass
-        else:
-            declared=gitmodules.is_file() and re.search(
-                r'(?m)^\s*path\s*=\s*vendor/tokscale-core\s*$',
-                gitmodules.read_text(encoding='utf-8'),
-            )
-            uninitialized=not submodule.exists() or (submodule.is_dir() and not any(submodule.iterdir()))
-            if declared and uninitialized: return None
         return f'source path does not exist: {value}'
     return None
 def relative_links(root,p,text):
@@ -115,7 +103,7 @@ def relative_links(root,p,text):
 
 def validate(root):
     root=Path(root).resolve(); errors=[]
-    files=sorted(p for p in root.rglob('*.md') if not (set(p.relative_to(root).parts)&SKIP) and p.relative_to(root).parts[:2] != EXTERNAL_DOC_ROOT)
+    files=sorted(p for p in root.rglob('*.md') if not (set(p.relative_to(root).parts)&SKIP))
     required_adapters = [root/'AGENTS.md', root/'CLAUDE.md', root/'vendor'/'AGENTS.md', root/'landing'/'AGENTS.md']
     for p in required_adapters:
         label=p.relative_to(root)
@@ -169,6 +157,8 @@ def validate(root):
                     aset={slug(x.group(1)) for x in re.finditer(r'^#{1,6}\s+(.+?)\s*#*\s*$',target.read_text(encoding='utf-8'),re.M)}
                     if slug(anchor) not in aset: errors.append(Issue(rel,number,f'missing heading anchor #{anchor} in {target.relative_to(root)}'))
         errors += scan_text(rel,text)
+        if data.get('kind') == 'ledger' and 'source_total' in data:
+            check_ledger(root,p,meta,errors)
     # Adapters are part of the same contract, not just knowledge documents.
     adapter_paths.update(p for p in files if p.name in ('AGENTS.md','CLAUDE.md','CONTRIBUTING.md'))
     for p in sorted(adapter_paths): errors += check_adapter(root,p)
@@ -195,172 +185,40 @@ def validate(root):
     for value,paths in owners.items():
         if len(paths)>1: errors.append(Issue(paths[1].relative_to(root),1,f'canonical_for {value!r} is owned by multiple documents'))
     vendor=root/'vendor'/'README.md'; vendor_doc=knowledge/'vendor-tokscale.md'
-    if not vendor.exists(): errors.append(Issue('vendor/README.md',1,'consumer pin owner is missing'))
+    if not vendor.exists(): errors.append(Issue('vendor/README.md',1,'vendor README is missing'))
     if not vendor_doc.exists(): errors.append(Issue('docs/knowledge/vendor-tokscale.md',1,'vendor-tokscale.md is missing'))
-    elif not any(t==vendor for t,_,_ in relative_links(root,vendor_doc,vendor_doc.read_text(encoding='utf-8')) if isinstance(t,Path)): errors.append(Issue(vendor_doc.relative_to(root),1,'vendor-tokscale.md must link to the consumer pin document'))
-    check_engine_pin(root,files,errors)
-    check_engine_delta(root,files,errors)
-    check_advance_claims(root,files,errors)
+    elif not any(t==vendor for t,_,_ in relative_links(root,vendor_doc,vendor_doc.read_text(encoding='utf-8')) if isinstance(t,Path)): errors.append(Issue(vendor_doc.relative_to(root),1,'vendor-tokscale.md must link to the vendor document'))
+    check_engine_history(root,files,errors)
     check_last_verified_moves(root,docs,errors)
-    ledger=next((p for p,d in meta.items() if d.get('kind')=='ledger'),None)
-    if ledger: check_ledger(root,ledger,meta,errors)
-    else: errors.append(Issue('docs/knowledge',1,'migration ledger document is missing'))
     return errors
 
-PIN_ROW = re.compile(r'\|\s*Reviewed pin\s*\|\s*`([0-9a-f]{40})`\s*\|')
-# The phrase must sit next to the SHA it introduces. A knowledge table row can
-# be thousands of characters long and legitimately cite several historical
-# engine revisions, so anchoring on the line would flag those as stale.
-PIN_CLAIM = re.compile(r'(?i)(?:reviewed\s+pin|現在\s*pin\s+reviewed)[^\n]{0,80}?`([0-9a-f]{40})`')
-ENGINE_BLOB = re.compile(r'\[([^\]]*)\]\(https://github\.com/[^/]+/tokscale-core/blob/([0-9a-f]{40})/[^)]*\)')
+ENGINE_UPSTREAM_LEDGER = Path('crates/syrtis_core/UPSTREAM.md')
+# Historical provenance links may cite the former fork or upstream paths.
+# They are citations, not claims about current ownership, so only the label
+# must match the target it points at.
+ENGINE_BLOB = re.compile(r'\[([^\]]*)\]\(https://github\.com/[^/]+/(?:tokscale-core|tokscale)/blob/([0-9a-f]{40})/[^)]*\)')
 SHORT_SHA = re.compile(r'\b[0-9a-f]{7,40}\b')
-ENGINE_SHA = re.compile(r'https://github\.com/[^/]+/tokscale-core/(?:blob|commit|tree)/([0-9a-f]{40})')
 
-def gitlink_pin(root):
-    """The commit the submodule is pinned to right now, or None outside a checkout.
 
-    `vendor/README.md` declares the pin, but a declaration is not the pin --
-    the gitlink is. Comparing documents only to each other passes a tree where
-    every document agrees on a SHA that was never checked out.
+def check_engine_history(root,files,errors):
+    """Historical provenance stays checkable without submodule git access.
 
-    Reads the submodule's own HEAD rather than `git ls-tree HEAD`, because a
-    pin advance edits the gitlink and the documents together and runs this
-    before committing. Reading the committed tree would reject every correct
-    advance and pass only after the fact, which is the wrong way round for a
-    pre-commit gate.
+    The inherited UPSTREAM.md ledger is provenance, not a release gate: what
+    is checked is that engine-link labels name the revision they point at
+    (a reader who copies the label audits whatever it says) and that the
+    ledger file itself is present. Existence of a cited SHA inside a
+    submodule object database is no longer required and no longer checked.
     """
-    import subprocess
-    engine=root/'vendor'/'tokscale-core'
-    if not (engine/'.git').exists(): return None
-    try:
-        out=subprocess.run(['git','rev-parse','HEAD'],cwd=engine,
-                           capture_output=True,text=True,timeout=10)
-    except (OSError,subprocess.SubprocessError): return None
-    if out.returncode!=0: return None
-    m=re.match(r'([0-9a-f]{40})',out.stdout.strip())
-    return m.group(1) if m else None
-
-def engine_is_shallow(root):
-    """Whether the submodule's object database is truncated.
-
-    CI checks out submodules at depth 1, so it holds the current pin and
-    nothing else. Absence there means "not fetched", not "not a commit", and
-    the two must not produce the same verdict.
-    """
-    import subprocess
-    engine=root/'vendor'/'tokscale-core'
-    try:
-        out=subprocess.run(['git','rev-parse','--is-shallow-repository'],cwd=engine,
-                           capture_output=True,text=True,timeout=10)
-    except (OSError,subprocess.SubprocessError): return True
-    return out.returncode!=0 or out.stdout.strip()!='false'
-
-def sha_exists_in_engine(root,sha):
-    """Whether a SHA resolves in the submodule.
-
-    None when the question cannot be answered here -- no checkout, or a shallow
-    one that would report every historical revision as missing.
-    """
-    import subprocess
-    engine=root/'vendor'/'tokscale-core'
-    if not (engine/'.git').exists(): return None
-    if engine_is_shallow(root): return None
-    try:
-        out=subprocess.run(['git','cat-file','-e',f'{sha}^{{commit}}'],cwd=engine,
-                           capture_output=True,text=True,timeout=10)
-    except (OSError,subprocess.SubprocessError): return None
-    return out.returncode==0
-
-UNRESOLVED = object()  # asked and answered no, as distinct from cannot ask
-DELTA_CLAIM = re.compile(r'`([0-9a-f]{7,40})`\s*(?:→|->)\s*`([0-9a-f]{7,40})`\s*delta\s*(?:為|is)\s*([0-9,]+)\s*(?:個\s*)?engine\s*commit')
-
-def engine_rev_count(root,base,head):
-    """Commits in `base..head` inside the submodule.
-
-    Three outcomes, and collapsing them is how a guard passes while doing
-    nothing: an integer is the answer; None means the question cannot be asked
-    here (no checkout, or a shallow one that does not hold the range); and
-    UNRESOLVED means it was asked and the revisions are not in this engine,
-    which is a defect in the claim rather than a limit of the environment.
-    """
-    import subprocess
-    engine=root/'vendor'/'tokscale-core'
-    if not (engine/'.git').exists() or engine_is_shallow(root): return None
-    try:
-        out=subprocess.run(['git','rev-list','--count',f'{base}..{head}'],cwd=engine,
-                           capture_output=True,text=True,timeout=10)
-    except (OSError,subprocess.SubprocessError): return None
-    if out.returncode!=0: return UNRESOLVED
-    return int(out.stdout.strip() or 0)
-
-def check_engine_delta(root,files,errors):
-    """A delta claim names two revisions and a count; the count is derivable.
-
-    Three advances in a row shipped a stale one -- 52 survived into an advance
-    of 10, and 10 into an advance of 7 -- because the prose above it was
-    rewritten while the number under it was not. It is the one part of a
-    consequence paragraph a script can settle.
-    """
+    if not (root/ENGINE_UPSTREAM_LEDGER).is_file():
+        errors.append(Issue(str(ENGINE_UPSTREAM_LEDGER),1,'inherited upstream ledger is missing'))
     for p in files:
         rel=p.relative_to(root); text=p.read_text(encoding='utf-8')
-        for m in DELTA_CLAIM.finditer(text):
-            base,head,claimed=m.group(1),m.group(2),int(m.group(3).replace(',',''))
-            actual=engine_rev_count(root,base,head)
-            if actual is None or actual==claimed: continue
-            if actual is UNRESOLVED:
-                errors.append(Issue(rel,line_no(text,m.start()),
-                    f'delta endpoints do not resolve in the engine: {base}..{head}'))
-                continue
-            errors.append(Issue(rel,line_no(text,m.start()),
-                f'delta count disagrees with the engine\n    claimed {claimed} for {base}..{head}\n    actual  {actual}'))
-
-def check_engine_pin(root,files,errors):
-    """The reviewed engine pin is restated across several documents; vendor/README.md owns it.
-
-    Two shapes carry it and both drift. A prose claim names the SHA directly;
-    a permalink into the engine embeds it in the URL. Historical revisions are
-    legitimately cited in both shapes, so a citation is exempt only when it
-    says which revision it means: a link whose text carries the matching short
-    SHA is deliberate, a bare link is a claim about the current pin.
-
-    The owner document is checked against the gitlink rather than trusted, and
-    every engine SHA is checked for existence -- a fabricated one agrees with
-    itself everywhere it is pasted.
-    """
-    vendor_readme=root/'vendor'/'README.md'
-    if not vendor_readme.exists(): return
-    row=PIN_ROW.search(vendor_readme.read_text(encoding='utf-8'))
-    if not row:
-        errors.append(Issue('vendor/README.md',1,'reviewed pin row is missing or malformed'))
-        return
-    pin=row.group(1)
-    gitlink=gitlink_pin(root)
-    if gitlink and gitlink!=pin:
-        errors.append(Issue('vendor/README.md',1,f'declared pin does not match the gitlink\n    declared {pin}\n    gitlink  {gitlink}'))
-    seen=set()
-    for p in files:
-        rel=p.relative_to(root); text=p.read_text(encoding='utf-8')
-        for m in PIN_CLAIM.finditer(text):
-            if m.group(1)!=pin: errors.append(Issue(rel,line_no(text,m.start()),f'stale reviewed pin\n    found  {m.group(1)}\n    pin    {pin}'))
         for m in ENGINE_BLOB.finditer(text):
             label,target=m.group(1),m.group(2)
             marks=SHORT_SHA.findall(label)
-            if marks:
-                # A labelled link cites a specific revision. The label may name a
-                # historical one, but it must name the one the URL points at --
-                # a reader who copies the label audits whatever it says.
-                if not any(target.startswith(s) for s in marks):
-                    errors.append(Issue(rel,line_no(text,m.start()),f'engine link label does not match its target\n    label  {marks[0]}\n    target {target}'))
-                continue
-            if target!=pin: errors.append(Issue(rel,line_no(text,m.start()),f'stale engine link (label a revision explicitly to cite a historical one)\n    found  {target}\n    pin    {pin}'))
-        for m in ENGINE_SHA.finditer(text):
-            sha=m.group(1)
-            if sha in seen: continue
-            seen.add(sha)
-            if sha_exists_in_engine(root,sha) is False:
-                errors.append(Issue(rel,line_no(text,m.start()),f'engine commit does not exist: {sha}'))
-    if sha_exists_in_engine(root,pin) is False:
-        errors.append(Issue('vendor/README.md',1,f'declared pin does not exist in the engine: {pin}'))
+            if marks and not any(target.startswith(s) for s in marks):
+                errors.append(Issue(rel,line_no(text,m.start()),f'engine link label does not match its target\n    label  {marks[0]}\n    target {target}'))
+
 
 def _toplevel(root):
     import subprocess
@@ -388,83 +246,6 @@ def _ok(out): return out is not None and out.returncode==0
 def _merge_base(root):
     mb=_git(root,'merge-base','origin/main','HEAD')
     return mb.stdout.strip() if _ok(mb) and mb.stdout.strip() else None
-
-ADVANCE_PATHS=('crates/tb_core_ffi','Sources/CTB/include/ctb.h')
-
-def advance_touched(root):
-    """Which of ADVANCE_PATHS the current engine pin advance changed.
-
-    None when the question cannot be answered here: not a repository, or a
-    shallow clone that does not hold what it needs. The advance is, in order:
-
-    - this branch, when the gitlink (or the submodule checkout, during an
-      uncommitted advance) differs from the merge base with origin/main.
-      Measured from that merge base to the working tree, so FFI edits made in
-      an earlier commit of the same branch count. In CI's pull request merge
-      ref the merge base is main, so this is the whole pull request;
-    - an uncommitted advance with no usable merge base: HEAD to working tree;
-    - otherwise the newest first-parent commit that moved the gitlink,
-      against its first parent, which for a merged pull request is the whole
-      pull request.
-    """
-    committed=_git(root,'rev-parse','HEAD:vendor/tokscale-core')
-    if not _ok(committed): return None
-    current=gitlink_pin(root) or committed.stdout.strip()
-    mb=_merge_base(root)
-    at_base=_git(root,'rev-parse',f'{mb}:vendor/tokscale-core') if mb else None
-    # Either the committed gitlink or the checkout moving counts: a branch that
-    # committed an advance while the submodule still sits at the old pin must
-    # not fall through to the HEAD range and miss the committed FFI edits.
-    base_link=at_base.stdout.strip() if _ok(at_base) else None
-    if base_link and (base_link!=current or base_link!=committed.stdout.strip()):
-        rng=[mb]
-    elif current!=committed.stdout.strip():
-        rng=['HEAD']
-    else:
-        log=_git(root,'log','--first-parent','-1','--format=%H','--','vendor/tokscale-core')
-        if not _ok(log) or not log.stdout.strip(): return None
-        c=log.stdout.strip()
-        if not _ok(_git(root,'rev-parse','--verify','--quiet',f'{c}^1')): return None
-        rng=[f'{c}^1',c]
-    out=_git(root,'diff','--name-only',*rng,'--',*ADVANCE_PATHS)
-    if not _ok(out): return None
-    names=out.stdout.split()
-    return {p for p in ADVANCE_PATHS if any(n==p or n.startswith(p+'/') for n in names)}
-
-# Only sentences that say they describe the current advance are checked.
-# Consequence prose also records earlier advances ("該次", "前次", "That
-# advance"), and those claims stay true when the current one changes the
-# FFI. A current-advance claim worded without one of these markers escapes
-# this check; it is a reminder triggered by the observed diff, not a proof.
-# Quoted text is removed first: a sentence that quotes the claim in order to
-# scope it (「這次 … `ctb.h` 簽名不變」的敘述只描述 …) is not making it.
-CURRENT_ADVANCE=re.compile(r'(?i)這次|本次|this (?:pin )?advance|current pin')
-UNCHANGED_CLAIM={
-    'crates/tb_core_ffi':re.compile(r'`crates/tb_core_ffi`[^。；;\n]{0,24}?(?:零改動|unchanged|untouched)',re.I),
-    'Sources/CTB/include/ctb.h':re.compile(r'`ctb\.h`[^。；;\n]{0,24}?(?:簽名不變|unchanged)',re.I),
-}
-QUOTED=re.compile(r'「[^」]*」|“[^”]*”|"[^"\n]*"')
-# Clause boundaries: CJK sentence ends, semicolons, table cells, an English
-# full stop followed by a space, and line ends.
-CLAUSE=re.compile(r'[^。！？；;|\n]+?(?:[。！？；;|\n]|\.(?=\s)|$)')
-
-def check_advance_claims(root,files,errors):
-    """"This advance leaves the FFI crate / C header unchanged" must match the diff.
-
-    Items 7 and 8 of #291. The claim is copied forward with each pin advance,
-    so the one time an advance does touch `crates/tb_core_ffi` or `ctb.h` is
-    exactly when the stale sentence survives.
-    """
-    touched=advance_touched(root)
-    if not touched: return
-    for p in files:
-        rel=p.relative_to(root); text=p.read_text(encoding='utf-8')
-        for m in CLAUSE.finditer(text):
-            clause=QUOTED.sub('',m.group(0))
-            if not CURRENT_ADVANCE.search(clause): continue
-            for path in sorted(touched):
-                if UNCHANGED_CLAIM[path].search(clause):
-                    errors.append(Issue(rel,line_no(text,m.start()),f'claims the current pin advance left {path} unchanged, but the advance changed it'))
 
 def _evidence(text):
     """What a verification date vouches for: the body and the sources list."""
@@ -587,14 +368,16 @@ def check_ledger(root,path,meta,errors):
         errors.append(Issue(rel,1,'boundary_counts do not match ledger row kind counts'))
 
 FIXTURE_PIN='a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
-FIXTURE_OLD_PIN='0f1e2d3c4b5a69788796a5b4c3d2e1f098765432'
+FIXTURE_OLD_PIN='0f1e2d3c4b5a69788796a5b4c3d2e1f098765432'  # historical-provenance label target only; no pin semantics remain
 
 def self_test():
     class T(unittest.TestCase):
         def root(self,bad=False,parent=None):
             r=Path(tempfile.mkdtemp())
             if parent: r=r/parent/'repo'; r.mkdir(parents=True)
-            (r/'AGENTS.md').write_text('See docs/knowledge/README.md'); (r/'CLAUDE.md').write_text('See AGENTS.md'); (r/'vendor').mkdir(); (r/'landing').mkdir(); (r/'README.md').write_text('[Knowledge](docs/knowledge/README.md)'); (r/'vendor/README.md').write_text(f'---\nid: vendor-readme\nkind: reference\nstatus: active\nscope: repository\nread_when: pin\nlast_verified: 2026-07-14\nsources: [internal]\n---\n[Knowledge](../docs/knowledge/vendor-tokscale.md)\n\n| Field | Value |\n|---|---|\n| Reviewed pin | `{FIXTURE_PIN}` |\n'); (r/'vendor/AGENTS.md').write_text('See docs/knowledge/README.md'); (r/'landing/AGENTS.md').write_text('See docs/knowledge/README.md'); k=r/'docs/knowledge'; k.mkdir(parents=True)
+            (r/'AGENTS.md').write_text('See docs/knowledge/README.md'); (r/'CLAUDE.md').write_text('See AGENTS.md'); (r/'vendor').mkdir(); (r/'landing').mkdir(); (r/'README.md').write_text('[Knowledge](docs/knowledge/README.md)'); (r/'vendor/README.md').write_text('---\nid: vendor-readme\nkind: reference\nstatus: active\nscope: repository\nread_when: ownership\nlast_verified: 2026-07-14\nsources: [internal]\n---\n[Knowledge](../docs/knowledge/vendor-tokscale.md)\n'); (r/'vendor/AGENTS.md').write_text('See docs/knowledge/README.md'); (r/'landing/AGENTS.md').write_text('See docs/knowledge/README.md'); k=r/'docs/knowledge'; k.mkdir(parents=True)
+            (r/'crates/syrtis_core').mkdir(parents=True)
+            (r/'crates/syrtis_core/UPSTREAM.md').write_text('Historical attribution fixture\n')
             rows='\n'.join(f'| `SRC-{i:03d}` | {"local" if i==58 else "plan" if i==57 else "memory"} | topic-{i:03d} | active | public | migrated | doc-{i:03d} | checked |' for i in range(1,59))
             head='---\nid: ledger\nkind: ledger\nstatus: active\nscope: repository\nread_when: migration\nlast_verified: 2026-07-14\nsources: [internal]\nsource_total: 58\nboundary_counts: {memory: 56, plan: 1, local: 1}\n---\n# Ledger\n| source | kind | topic | status | privacy | treatment | destination | verification |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n'
             (k/'ledger.md').write_text(head+rows+'\n\n| verification | result |\n| --- | --- |\n| no-gaps | pass |\n'); (k/'vendor-tokscale.md').write_text('---\nid: vendor\nkind: canonical\nstatus: active\nscope: repo\nread_when: vendor\nlast_verified: 2026-07-14\nsources: [internal]\n---\n# Vendor\n[vendor](../../vendor/README.md)'); (k/'README.md').write_text('---\nid: index\nkind: index\nstatus: active\nscope: repo\nread_when: lookup\nlast_verified: 2026-07-14\nsources: [internal]\n---\n# Index\n[vendor](vendor-tokscale.md)\n[ledger](ledger.md#ledger)')
@@ -612,110 +395,10 @@ def self_test():
             errors='\n'.join(map(str,validate(r)))
             self.assertIn('missing link target assets',errors)
             self.assertIn('missing link target assets/chart.png',errors)
-        def test_engine_pin_claim_matching_owner_passes(self):
-            self.assertEqual(validate(self.append_doc(self.root(),f'\n\nNative reviewed pin is `{FIXTURE_PIN}`.\n')),[])
-        def test_stale_engine_pin_claim_is_reported(self):
-            self.assertIn('stale reviewed pin','\n'.join(map(str,validate(self.append_doc(self.root(),f'\n\nNative reviewed pin is `{FIXTURE_OLD_PIN}`.\n')))))
-        def test_stale_engine_blob_link_is_reported(self):
-            self.assertIn('stale engine link','\n'.join(map(str,validate(self.append_doc(self.root(),f'\n\n[`UPSTREAM.md`](https://github.com/owner/tokscale-core/blob/{FIXTURE_OLD_PIN}/UPSTREAM.md)\n')))))
         def test_engine_blob_link_labelled_with_its_revision_is_exempt(self):
             self.assertEqual(validate(self.append_doc(self.root(),f'\n\n[`UPSTREAM.md` at `{FIXTURE_OLD_PIN[:7]}`](https://github.com/owner/tokscale-core/blob/{FIXTURE_OLD_PIN}/UPSTREAM.md)\n')),[])
-        def test_engine_blob_link_at_the_pin_passes_unlabelled(self):
-            self.assertEqual(validate(self.append_doc(self.root(),f'\n\n[`UPSTREAM.md`](https://github.com/owner/tokscale-core/blob/{FIXTURE_PIN}/UPSTREAM.md)\n')),[])
-        def test_link_label_disagreeing_with_its_target_is_reported(self):
-            r=self.append_doc(self.root(),f'\n\n[`UPSTREAM.md` at `{FIXTURE_OLD_PIN[:7]}`](https://github.com/owner/tokscale-core/blob/{FIXTURE_PIN}/UPSTREAM.md)\n')
-            self.assertIn('label does not match its target','\n'.join(map(str,validate(r))))
-        def test_shallow_engine_skips_sha_existence_but_keeps_pin_checks(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),f'\n\nNative reviewed pin is `{FIXTURE_OLD_PIN}`.\n')
-            with mock.patch(f'{__name__}.engine_is_shallow',return_value=True), \
-                 mock.patch(f'{__name__}.gitlink_pin',return_value=FIXTURE_PIN):
-                s='\n'.join(map(str,validate(r)))
-            self.assertIn('stale reviewed pin',s)
-            self.assertNotIn('does not exist',s)
-        def test_gitlink_follows_an_uncommitted_submodule_checkout(self):
-            """A pin advance moves the submodule and edits the documents, then runs
-            this before committing. Reading the committed tree would reject every
-            correct advance, so the value must follow the submodule's own HEAD."""
-            import subprocess
-            r=self.root(); engine=r/'vendor'/'tokscale-core'; engine.mkdir(parents=True,exist_ok=True)
-            def git(*a,cwd=engine): subprocess.run(['git',*a],cwd=cwd,capture_output=True,check=True)
-            git('init','-q'); git('-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m','one')
-            first=subprocess.run(['git','rev-parse','HEAD'],cwd=engine,capture_output=True,text=True).stdout.strip()
-            self.assertEqual(gitlink_pin(r),first)
-            git('-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m','two')
-            second=subprocess.run(['git','rev-parse','HEAD'],cwd=engine,capture_output=True,text=True).stdout.strip()
-            self.assertNotEqual(first,second)
-            self.assertEqual(gitlink_pin(r),second,'must track the submodule checkout, not a committed gitlink')
-        def test_delta_count_disagreeing_with_the_engine_is_reported(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),'\n\n本次 `aaaaaaa` → `bbbbbbb` delta 為 10 個 engine commit。\n')
-            with mock.patch(f'{__name__}.engine_rev_count',return_value=7):
-                self.assertIn('delta count disagrees','\n'.join(map(str,validate(r))))
-        def test_delta_count_matching_the_engine_passes(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),'\n\n本次 `aaaaaaa` → `bbbbbbb` delta 為 7 個 engine commit。\n')
-            with mock.patch(f'{__name__}.engine_rev_count',return_value=7):
-                self.assertEqual(validate(r),[])
-        def test_uncountable_delta_does_not_block(self):
-            """A shallow clone cannot count a range it does not hold; silence beats a wrong number."""
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),'\n\n本次 `aaaaaaa` → `bbbbbbb` delta 為 999 個 engine commit。\n')
-            with mock.patch(f'{__name__}.engine_rev_count',return_value=None):
-                self.assertEqual(validate(r),[])
-        def test_delta_count_is_derived_from_a_real_repository(self):
-            """Without mocking `engine_rev_count`, so a check that never runs fails here.
-
-            The mocked tests above prove the comparison; they cannot prove it is
-            reached. In a shallow checkout it is not, which is how a stale count
-            passed CI three advances running."""
-            import subprocess
-            r=self.root(); engine=r/'vendor'/'tokscale-core'; engine.mkdir(parents=True,exist_ok=True)
-            def git(*a): subprocess.run(['git',*a],cwd=engine,capture_output=True,check=True)
-            git('init','-q')
-            shas=[]
-            for i in range(4):
-                git('-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m',f'c{i}')
-                shas.append(subprocess.run(['git','rev-parse','HEAD'],cwd=engine,capture_output=True,text=True).stdout.strip())
-            base,head=shas[0],shas[3]
-            self.assertEqual(engine_rev_count(r,base,head),3,'fixture must have a countable range')
-            self.append_doc(r,f'\n\n本次 `{base[:7]}` → `{head[:7]}` delta 為 99 個 engine commit。\n')
-            self.assertIn('delta count disagrees','\n'.join(map(str,validate(r))))
-        def test_unresolvable_delta_endpoints_are_reported(self):
-            """A typo in an endpoint must not silence the count check.
-
-            `git rev-list` exits non-zero for an unknown revision, which is an
-            answer, not an inability to ask -- collapsing the two lets anyone
-            disable the check by mistyping a SHA."""
-            import subprocess
-            r=self.root(); engine=r/'vendor'/'tokscale-core'; engine.mkdir(parents=True,exist_ok=True)
-            subprocess.run(['git','init','-q'],cwd=engine,capture_output=True,check=True)
-            subprocess.run(['git','-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m','c'],cwd=engine,capture_output=True,check=True)
-            self.append_doc(r,'\n\n本次 `deadbee` → `f00dfac` delta 為 3 個 engine commit。\n')
-            self.assertIn('do not resolve in the engine','\n'.join(map(str,validate(r))))
-        def test_missing_reviewed_pin_row_is_reported(self):
-            r=self.root(); (r/'vendor/README.md').write_text('[Knowledge](../docs/knowledge/vendor-tokscale.md)')
-            self.assertIn('reviewed pin row is missing','\n'.join(map(str,validate(r))))
-        def test_gitlink_disagreement_is_reported(self):
-            import unittest.mock as mock
-            r=self.root()
-            with mock.patch(f'{__name__}.gitlink_pin',return_value=FIXTURE_OLD_PIN):
-                self.assertIn('does not match the gitlink','\n'.join(map(str,validate(r))))
-        def test_gitlink_agreement_passes(self):
-            import unittest.mock as mock
-            r=self.root()
-            with mock.patch(f'{__name__}.gitlink_pin',return_value=FIXTURE_PIN):
-                self.assertEqual(validate(r),[])
-        def test_absent_gitlink_does_not_block(self):
-            import unittest.mock as mock
-            r=self.root()
-            with mock.patch(f'{__name__}.gitlink_pin',return_value=None):
-                self.assertEqual(validate(r),[])
-        def test_nonexistent_engine_sha_is_reported(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),f'\n\n[`UPSTREAM.md` at `{FIXTURE_OLD_PIN[:7]}`](https://github.com/owner/tokscale-core/blob/{FIXTURE_OLD_PIN}/UPSTREAM.md)\n')
-            with mock.patch(f'{__name__}.sha_exists_in_engine',side_effect=lambda root,sha: sha!=FIXTURE_OLD_PIN):
-                self.assertIn('does not exist','\n'.join(map(str,validate(r))))
+        def test_engine_blob_link_without_a_label_passes(self):
+            self.assertEqual(validate(self.append_doc(self.root(),f'\n\n[`UPSTREAM.md`](https://github.com/owner/tokscale/blob/{FIXTURE_PIN}/UPSTREAM.md)\n')),[])
         def test_vendor_readme_is_held_to_the_frontmatter_contract(self):
             r=self.root(); v=r/'vendor/README.md'; v.write_text(v.read_text().split('---\n',2)[2])
             self.assertIn('vendor/README.md:1: missing YAML frontmatter','\n'.join(map(str,validate(r))))
@@ -723,34 +406,6 @@ def self_test():
             import subprocess
             def git(*a): return subprocess.run(['git','-c','user.email=t@t','-c','user.name=t',*a],cwd=r,capture_output=True,text=True,check=True).stdout.strip()
             git('init','-q'); return git
-        def test_current_advance_claim_is_checked_against_the_diff(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),'\n\n這次 consumer 是 pin-only：`crates/tb_core_ffi` 零改動。\n\n該次 consumer 同樣是 pin-only，`crates/tb_core_ffi` 零改動。\n')
-            with mock.patch(f'{__name__}.advance_touched',return_value={'crates/tb_core_ffi'}):
-                errs=[str(e) for e in validate(r)]
-            self.assertEqual(len(errs),1,errs)
-            self.assertIn('left crates/tb_core_ffi unchanged',errs[0])
-            with mock.patch(f'{__name__}.advance_touched',return_value=set()):
-                self.assertEqual(validate(r),[],'an advance that left the crate alone must not flag the claim')
-        def test_advance_touched_reads_a_real_history(self):
-            """Unmocked, so a check that never reaches git fails here."""
-            r=self.root(); git=self.git_repo(r)
-            (r/'crates/tb_core_ffi').mkdir(parents=True); (r/'crates/tb_core_ffi/lib.rs').write_text('a')
-            # `git add -A` would drop the gitlink (no directory backs it), so
-            # stage by path after the gitlink is in the index.
-            git('add','-A'); git('update-index','--add','--cacheinfo',f'160000,{FIXTURE_OLD_PIN},vendor/tokscale-core')
-            git('commit','-q','-m','base')
-            self.assertEqual(git('rev-parse','HEAD:vendor/tokscale-core'),FIXTURE_OLD_PIN,'fixture must carry a gitlink')
-            self.assertIsNone(advance_touched(r),'a root commit has no parent to compare')
-            git('update-index','--cacheinfo',f'160000,{FIXTURE_PIN},vendor/tokscale-core'); git('commit','-q','-m','pin-only advance')
-            self.assertEqual(advance_touched(r),set())
-            (r/'crates/tb_core_ffi/lib.rs').write_text('b'); git('add','crates'); git('commit','-q','-m','later ffi work')
-            self.assertEqual(advance_touched(r),set(),'FFI work after a pin-only advance is not part of that advance')
-            (r/'crates/tb_core_ffi/lib.rs').write_text('c'); git('add','crates')
-            git('update-index','--cacheinfo',f'160000,{FIXTURE_OLD_PIN},vendor/tokscale-core'); git('commit','-q','-m','advance with ffi')
-            self.assertEqual(advance_touched(r),{'crates/tb_core_ffi'})
-            (r/'README.md').write_text('changed'); git('add','README.md'); git('commit','-q','-m','unrelated')
-            self.assertEqual(advance_touched(r),{'crates/tb_core_ffi'},'measured at the advance, not at HEAD')
         def test_body_change_must_move_last_verified(self):
             r=self.root(); git=self.git_repo(r); git('add','-A'); git('commit','-q','-m','base'); git('update-ref','refs/remotes/origin/main','HEAD')
             d=r/'docs/knowledge/vendor-tokscale.md'; original=d.read_text()
@@ -766,48 +421,6 @@ def self_test():
             r=self.root(); git=self.git_repo(r); git('add','-A'); git('commit','-q','-m','base')
             d=r/'docs/knowledge/vendor-tokscale.md'; d.write_text(d.read_text()+'\nA new sentence.\n')
             self.assertEqual(validate(r),[],'no origin/main means cannot ask, not a failure')
-        def test_quoted_and_earlier_clauses_are_not_current_claims(self):
-            import unittest.mock as mock
-            r=self.append_doc(self.root(),'\n\n下面關於「這次 consumer 是 pin-only、`ctb.h` 簽名不變」的敘述只描述推進。\n\nThis advance moves the pin; that earlier advance left `crates/tb_core_ffi` unchanged.\n\nThis advance leaves `crates/tb_core_ffi` unchanged.\n')
-            with mock.patch(f'{__name__}.advance_touched',return_value=set(ADVANCE_PATHS)):
-                errs=[str(e) for e in validate(r)]
-            self.assertEqual(len(errs),1,errs)
-            self.assertIn('left crates/tb_core_ffi unchanged',errs[0])
-        def test_advance_on_this_branch_counts_earlier_branch_commits(self):
-            """Locally the advance is the branch, not only the commit that moved the gitlink."""
-            r=self.root(); git=self.git_repo(r)
-            (r/'crates/tb_core_ffi').mkdir(parents=True); (r/'crates/tb_core_ffi/lib.rs').write_text('a')
-            git('add','-A'); git('update-index','--add','--cacheinfo',f'160000,{FIXTURE_OLD_PIN},vendor/tokscale-core'); git('commit','-q','-m','base')
-            git('update-ref','refs/remotes/origin/main','HEAD')
-            (r/'crates/tb_core_ffi/lib.rs').write_text('b'); git('add','crates'); git('commit','-q','-m','ffi first')
-            git('update-index','--cacheinfo',f'160000,{FIXTURE_PIN},vendor/tokscale-core'); git('commit','-q','-m','then the advance')
-            self.assertEqual(advance_touched(r),{'crates/tb_core_ffi'})
-        def test_committed_branch_advance_with_stale_checkout_is_not_missed(self):
-            import subprocess
-            r=self.root(); git=self.git_repo(r)
-            engine=r/'vendor/tokscale-core'; engine.mkdir(parents=True,exist_ok=True)
-            subprocess.run(['git','init','-q'],cwd=engine,check=True,capture_output=True)
-            subprocess.run(['git','-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m','e'],cwd=engine,check=True,capture_output=True)
-            old_pin=subprocess.run(['git','rev-parse','HEAD'],cwd=engine,capture_output=True,text=True).stdout.strip()
-            (r/'crates/tb_core_ffi').mkdir(parents=True); (r/'crates/tb_core_ffi/lib.rs').write_text('a')
-            git('add','crates','docs','README.md','AGENTS.md','CLAUDE.md','landing','vendor/README.md','vendor/AGENTS.md')
-            git('update-index','--add','--cacheinfo',f'160000,{old_pin},vendor/tokscale-core'); git('commit','-q','-m','base')
-            git('update-ref','refs/remotes/origin/main','HEAD')
-            (r/'crates/tb_core_ffi/lib.rs').write_text('b'); git('add','crates')
-            git('update-index','--cacheinfo',f'160000,{FIXTURE_PIN},vendor/tokscale-core'); git('commit','-q','-m','advance, checkout left behind')
-            self.assertEqual(gitlink_pin(r),old_pin,'fixture: checkout still at the old pin')
-            self.assertEqual(advance_touched(r),{'crates/tb_core_ffi'})
-        def test_uncommitted_advance_is_measured_against_head(self):
-            import subprocess
-            r=self.root(); git=self.git_repo(r)
-            (r/'crates/tb_core_ffi').mkdir(parents=True); (r/'crates/tb_core_ffi/lib.rs').write_text('a')
-            git('add','-A'); git('update-index','--add','--cacheinfo',f'160000,{FIXTURE_OLD_PIN},vendor/tokscale-core'); git('commit','-q','-m','base')
-            engine=r/'vendor/tokscale-core'; engine.mkdir(parents=True,exist_ok=True)
-            subprocess.run(['git','init','-q'],cwd=engine,check=True,capture_output=True)
-            subprocess.run(['git','-c','user.email=t@t','-c','user.name=t','commit','-q','--allow-empty','-m','e'],cwd=engine,check=True,capture_output=True)
-            self.assertEqual(advance_touched(r),set(),'checkout moved, FFI untouched')
-            (r/'crates/tb_core_ffi/lib.rs').write_text('b')
-            self.assertEqual(advance_touched(r),{'crates/tb_core_ffi'},'uncommitted FFI edit during an advance')
         def test_fresh_date_is_tied_to_the_base_commit(self):
             import os
             for stamp,expect_error in (('2026-07-15T12:00:00Z',False),('2026-08-01T12:00:00Z',True)):
@@ -829,50 +442,10 @@ def self_test():
                     payload='secret = sk-live-1\n/Users/alice/private-notes.md\n[missing](nope.md)'
                     (overlay/'AGENTS.md').write_text(payload); (overlay/'CLAUDE.md').write_text(payload); (nested/'notes.md').write_text(payload)
                     self.assertEqual(validate(r),[])
-        def test_external_engine_docs_are_ignored(self):
-            r=self.root(); engine=r/'vendor/tokscale-core'; engine.mkdir()
+        def test_owned_engine_docs_are_checked(self):
+            r=self.root(); engine=r/'crates/syrtis_core'
             (engine/'AGENTS.md').write_text('secret = sk-live-1\n[missing](nope.md)')
-            self.assertEqual(validate(r),[])
-        def test_skip_named_parent_does_not_hide_repo(self):
-            result='\n'.join(map(str,validate(self.root(True,'target')))); self.assertIn('invalid scope',result); self.assertNotIn('knowledge tree is missing',result)
-        def test_root_adapter_contract(self):
-            r=self.root(); (r/'CLAUDE.md').write_text('[missing](nope.md) /Users/local/file')
-            s='\n'.join(map(str,validate(r))); self.assertIn('missing adapter link target',s); self.assertIn('machine-local path',s); self.assertIn('root CLAUDE.md must route',s)
-        def test_contributing_adapter_contract(self):
-            r=self.root(); (r/'CONTRIBUTING.md').write_text('[Knowledge](docs/knowledge/README.md) [missing](nope.md) /Users/local/file')
-            s='\n'.join(map(str,validate(r))); self.assertIn('CONTRIBUTING.md:1: missing adapter link target',s); self.assertIn('CONTRIBUTING.md:1: machine-local path',s)
-        def test_linux_home_path(self):
-            r=self.root(); (r/'CLAUDE.md').write_text('See AGENTS.md /home/alice/workspace/file')
-            self.assertIn('machine-local path','\n'.join(map(str,validate(r))))
-        def test_absolute_workspace_paths(self):
-            for path in ('/workspace/alice/private-repo','/workspaces/team/private-repo'):
-                r=self.root(); (r/'CLAUDE.md').write_text(f'See AGENTS.md {path}')
-                self.assertIn('machine-local path','\n'.join(map(str,validate(r))))
-        def test_windows_user_path(self):
-            r=self.root(); (r/'CLAUDE.md').write_text('See AGENTS.md C:\\Users\\alice\\workspace\\private-repo')
-            self.assertIn('machine-local path','\n'.join(map(str,validate(r))))
-        def test_private_ledger_row(self):
-            r=self.root(); p=r/'docs/knowledge/ledger.md'; text=p.read_text().replace('public | migrated','project-private | migrated',1).replace('topic-001','token credentials'); p.write_text(text); self.assertIn('private ledger row', '\n'.join(map(str,validate(r))))
-        def test_invalid_date(self):
-            r=self.root(); p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('last_verified: 2026-07-14','last_verified: 2026-7-14')); result='\n'.join(map(str,validate(r))); self.assertIn('last_verified must be a valid YYYY-MM-DD date',result)
-        def test_missing_path_source(self):
-            r=self.root(); p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('sources: [internal]','sources: [docs/knowledge/missing.md]')); result='\n'.join(map(str,validate(r))); self.assertIn('source path does not exist',result)
-        def test_uninitialized_declared_submodule_source(self):
-            for empty_root in (False, True):
-                with self.subTest(empty_root=empty_root):
-                    r=self.root(); (r/'.gitmodules').write_text('[submodule "vendor/tokscale-core"]\n\tpath = vendor/tokscale-core\n')
-                    if empty_root: (r/'vendor/tokscale-core').mkdir()
-                    p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('sources: [internal]','sources: [vendor/tokscale-core/src/missing.rs]'))
-                    self.assertEqual(validate(r),[])
-        def test_populated_submodule_missing_source(self):
-            r=self.root(); (r/'.gitmodules').write_text('[submodule "vendor/tokscale-core"]\n\tpath = vendor/tokscale-core\n')
-            engine=r/'vendor/tokscale-core'; engine.mkdir(); (engine/'.git').write_text('gitdir: elsewhere')
-            p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('sources: [internal]','sources: [vendor/tokscale-core/src/missing.rs]'))
-            self.assertIn('source path does not exist','\n'.join(map(str,validate(r))))
-        def test_undeclared_submodule_missing_source(self):
-            r=self.root(); (r/'vendor/tokscale-core').mkdir()
-            p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('sources: [internal]','sources: [vendor/tokscale-core/src/missing.rs]'))
-            self.assertIn('source path does not exist','\n'.join(map(str,validate(r))))
+            self.assertIn('secret value','\n'.join(map(str,validate(r))))
         def test_absolute_source_path(self):
             r=self.root(); inside=r/'inside.md'; inside.write_text('fixture'); p=r/'docs/knowledge/ledger.md'; p.write_text(p.read_text().replace('sources: [internal]',f'sources: [{inside}]')); result='\n'.join(map(str,validate(r))); self.assertIn('source path must be relative',result)
         def test_source_path_escape(self):

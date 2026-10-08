@@ -99,7 +99,7 @@ enum Format {
         return compactTokens(tokens)
     }
 
-    /// Today's contribution-graph day key. tokscale-core buckets days in the
+    /// Today's contribution-graph day key. syrtis-core buckets days in the
     /// local timezone as `%Y-%m-%d`, so we must match that exactly.
     /// `timeZone` is injectable so a test can pin one. It defaults to
     /// `.current`, which is what every caller wants and what made the day-key

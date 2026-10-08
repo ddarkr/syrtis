@@ -314,14 +314,14 @@ extension UsagePayload {
     }
 
     /// The four tray-title figures with `hidden` client ids excluded. `today`
-    /// is the local-timezone `YYYY-MM-DD` day key (tokscale-core's bucketing).
+    /// is the local-timezone `YYYY-MM-DD` day key (syrtis-core's bucketing).
     ///
     /// An empty hidden set takes a fast path that reads `summary` and the
     /// today contribution totals directly, so the numbers are byte-identical
     /// to the pre-hide implementation (regression guard). With any client
     /// hidden, the figures are re-summed from the surviving per-client stripes.
     ///
-    /// Clamp-granularity caveat: vendor/tokscale-core's aggregator clamps a
+    /// Clamp-granularity caveat: crates/syrtis_core's aggregator clamps a
     /// day's `totals.tokens` with `.max(0)` at the aggregate level, while each
     /// per-client stripe lane clamps independently. With pathological negative
     /// token deltas the re-summed slow path can therefore differ slightly from

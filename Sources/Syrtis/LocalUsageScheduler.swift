@@ -63,7 +63,6 @@ final class LocalUsageScheduler {
     private var queryWorker: Task<Void, Never>?
     private var deadline: Task<Void, Never>?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
-    private var revision: UInt64 = 0
     private var rootEpoch: UInt64 = 0
     private var dirtySequence: UInt64 = 1
     private var checkedSequence: UInt64 = 0
@@ -86,6 +85,7 @@ final class LocalUsageScheduler {
     private var installedManifest: LocalSourceWatchManifest?
     private var lastHintInstall = -TimeInterval.infinity
     private var quotaPins: [String: Int] = [:]
+    private var leasePins: [String: Int] = [:]
     private var retiredSnapshots: [(token: String, quotas: [String])] = []
 
     func ignoreSnapshotOutput(in directory: URL) {
@@ -101,14 +101,28 @@ final class LocalUsageScheduler {
         drainRetiredSnapshots()
     }
 
+    private func pinLease(_ token: String) { leasePins[token, default: 0] += 1 }
+    private func unpinLease(_ token: String) {
+        let count = (leasePins[token] ?? 1) - 1
+        if count > 0 { leasePins[token] = count } else { leasePins[token] = nil }
+        drainRetiredSnapshots()
+    }
     private func retire(_ snapshot: LocalUsageSyncResult) {
+        // A snapshot identical to the live one is borrowed, not owned: the
+        // live lifecycle frees it, so only unpinned superseded generations
+        // enter the drain. Prevents double-release of a reused native token.
+        guard snapshot.leaseToken != sync?.leaseToken,
+              !retiredSnapshots.contains(where: { $0.token == snapshot.leaseToken }) else { return }
         retiredSnapshots.append((snapshot.leaseToken, snapshot.scopes.compactMap(\.quotaSnapshotToken)))
         drainRetiredSnapshots()
     }
-
     private func drainRetiredSnapshots() {
-        let ready = retiredSnapshots.filter { entry in !entry.quotas.contains { quotaPins[$0] != nil } }
-        retiredSnapshots.removeAll { entry in !entry.quotas.contains { quotaPins[$0] != nil } }
+        let ready = retiredSnapshots.filter { entry in
+            leasePins[entry.token] == nil && !entry.quotas.contains { quotaPins[$0] != nil }
+        }
+        retiredSnapshots.removeAll { entry in
+            leasePins[entry.token] == nil && !entry.quotas.contains { quotaPins[$0] != nil }
+        }
         for entry in ready { Task { [source] in await source.releaseLocalUsage(entry.token) } }
     }
     var fullVerificationInterval: TimeInterval = 1800 {
@@ -147,9 +161,10 @@ final class LocalUsageScheduler {
         let changed = owner.queries != queries || owner.active != active
         owner.queries = queries; owner.active = active; owner.callback = onValue
         owners[session] = owner
-        if changed { revision &+= 1; pruneResults() }
+        if changed { pruneResults() }
         for query in queries {
-            if !needsSync, let held = results[query], held.identity == identity(query) {
+            if !needsSync, let held = results[query], held.identity == identity(query),
+               syncedScopes.contains(query.scope) {
                 onValue(query, .success(held.value))
             }
         }
@@ -176,7 +191,6 @@ final class LocalUsageScheduler {
     func setQuotaScopes(_ session: Session, _ scopes: Set<LocalUsageScope>) {
         guard var owner = owners[session], owner.quotas != scopes else { return }
         owner.quotas = scopes; owners[session] = owner
-        revision &+= 1
         kick()
     }
 
@@ -190,17 +204,20 @@ final class LocalUsageScheduler {
 
     func release(_ session: Session) {
         guard owners.removeValue(forKey: session) != nil else { return }
-        revision &+= 1
         if owners.isEmpty {
             for (center, token) in observers { center.removeObserver(token) }
             observers.removeAll()
         }
+        // Late completions for this owner die here; a reopened session has a
+        // fresh identity and only receives work issued under it.
         for entry in waiting.values.filter({ $0.session == session }) {
             waiting.removeValue(forKey: entry.id)?.continuation.resume(throwing: CancellationError())
         }
         pruneResults()
         if scopes.isEmpty {
             hints.stop(); deadline?.cancel(); deadline = nil
+            // Only the empty-demand lane retires its snapshot; in-flight
+            // query pins keep their own leases alive through the drain.
             releaseSnapshot()
         }
         kick()
@@ -209,8 +226,10 @@ final class LocalUsageScheduler {
     func acquire(_ query: Query, session: Session, force: Bool = false) async throws -> LocalUsageValue {
         guard contains(session) else { throw CancellationError() }
         let barrier = requestForce(force)
+        // Exact held results stay usable while unrelated scopes keep global
+        // needsSync true; starvation by unrelated demand is a scheduler bug.
         if !force, let held = results[query], held.identity == identity(query),
-           syncedScopes.contains(query.scope), !needsSync {
+           syncedScopes.contains(query.scope) {
             return held.value
         }
         let id = UUID()
@@ -300,9 +319,14 @@ final class LocalUsageScheduler {
     }
 
     func rootsChanged() {
-        rootEpoch &+= 1; revision &+= 1
+        // Late in-flight outputs carry the old epoch and die on return. The
+        // replaced snapshot retires through the pin drain: ordinary query
+        // pins hold it alive, expired generations are never revived.
+        rootEpoch &+= 1
         previousLeaseUsable = false
-        results.removeAll(); syncedScopes.removeAll()
+        let replaced = sync
+        sync = nil; results.removeAll(); syncedScopes.removeAll()
+        if let replaced { retire(replaced) }
         topologyRequired = true; dirtySequence &+= 1; dirtyAt = nil
         kick()
     }
@@ -347,7 +371,6 @@ final class LocalUsageScheduler {
         }
         for query in demandedQueries { demandedScopes.insert(query.scope) }
     }
-    private var queries: Set<Query> { refreshDemand(); return demandedQueries }
     private var scopes: Set<LocalUsageScope> { refreshDemand(); return demandedScopes }
     private var active: Bool { refreshDemand(); return activeDemand }
     private var checkInterval: TimeInterval { active ? 30 : 300 }
@@ -372,8 +395,49 @@ final class LocalUsageScheduler {
         pruneResults(); kick()
     }
     private func pruneResults() {
-        let wanted = queries
-        results = results.filter { wanted.contains($0.key) }
+        refreshDemand()
+        results = results.filter { demandedQueries.contains($0.key) }
+    }
+    /// Owner IDs demanding one query. Captured before the await; late
+    /// completions intersect current IDs so a close plus reopen (fresh
+    /// identity) rejects old outputs while unrelated changes keep overlap.
+    private func demanders(of query: Query) -> Set<Session> {
+        var ids = Set<Session>()
+        for (session, owner) in owners where owner.queries.contains(query) { ids.insert(session) }
+        for entry in waiting.values where entry.query == query { ids.insert(entry.session) }
+        return ids
+    }
+    /// Owner IDs demanding at least one of these scopes, via queries or quota.
+    private func demanders(ofScopes scopes: Set<LocalUsageScope>) -> Set<Session> {
+        var ids = Set<Session>()
+        for (session, owner) in owners
+        where !owner.queries.filter({ scopes.contains($0.scope) }).isEmpty
+            || !owner.quotas.intersection(scopes).isEmpty { ids.insert(session) }
+        for entry in waiting.values where entry.query.map({ scopes.contains($0.scope) }) == true
+            || entry.quota.map({ scopes.contains($0) }) == true { ids.insert(entry.session) }
+        return ids
+    }
+    /// Ordinary waiters complete on their own exact result; unrelated scopes
+    /// keeping global needsSync true must not starve them. Forced barriers stay.
+    private func resumeReadyWaiters() {
+        for entry in Array(waiting.values) where contains(entry.session) && entry.force <= forceVerified {
+            if let query = entry.query, let value = results[query],
+               value.identity == identity(query), syncedScopes.contains(query.scope) {
+                waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: value.value)
+            } else if let quota = entry.quota, syncedScopes.contains(quota) {
+                waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: nil)
+            }
+        }
+    }
+    /// Ordinary (non-forced) waiters on one query resume after side staging.
+    private func resumeQueryWaiters(_ query: Query) {
+        for entry in Array(waiting.values) where entry.query == query
+            && contains(entry.session) && entry.force <= forceVerified {
+            if let value = results[query], value.identity == identity(query),
+               syncedScopes.contains(query.scope) {
+                waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: value.value)
+            }
+        }
     }
     private func releaseSnapshot() {
         guard let snapshot = sync else { return }
@@ -381,17 +445,22 @@ final class LocalUsageScheduler {
         retire(snapshot)
     }
     private func identity(_ query: Query) -> String {
-        guard let sync, let scope = sync.scopes.first(where: { $0.id == query.scope.id }) else { return "missing" }
+        guard let sync else { return "missing" }
+        return identity(query, in: sync)
+    }
+    private func identity(_ query: Query, in capture: LocalUsageSyncResult) -> String {
+        guard let scope = capture.scopes.first(where: { $0.id == query.scope.id }) else { return "missing" }
         let now = wallNow()
         let calendar = Calendar.current
         let day = calendar.startOfDay(for: now).timeIntervalSince1970
         let clock = query.isRecent ? Int64(now.timeIntervalSince1970 / 10) : Int64(day)
-        let price = query.isRecent ? "unpriced" : sync.priceGeneration
+        let price = query.isRecent ? "unpriced" : capture.priceGeneration
         let zone = query.isRecent ? "absolute" : TimeZone.current.identifier
-        return "\(rootEpoch)|\(sync.rootGeneration)|\(scope.sourceGeneration)|\(price)|\(zone)|\(clock)"
+        return "\(rootEpoch)|\(capture.rootGeneration)|\(scope.sourceGeneration)|\(price)|\(zone)|\(clock)"
     }
     private var nextClockDeadline: TimeInterval {
-        if queries.contains(where: \.isRecent) || owners.values.contains(where: { $0.clock != nil }) {
+        refreshDemand()
+        if demandedQueries.contains(where: \.isRecent) || owners.values.contains(where: { $0.clock != nil }) {
             return lastClock + 10
         }
         let now = wallNow()
@@ -402,10 +471,11 @@ final class LocalUsageScheduler {
     private func kick() {
         guard !stopped, automaticallySchedules else { return }
         deadline?.cancel(); deadline = nil
-        if scopes.isEmpty && !owners.values.contains(where: { $0.clock != nil }) { return }
+        refreshDemand()
+        if demandedScopes.isEmpty && !owners.values.contains(where: { $0.clock != nil }) { return }
         let now = monotonicNow()
         if worker == nil, now >= retryAt, needsSync { worker = Task { await self.runWorker() } }
-        let queryMissing = queries.contains {
+        let queryMissing = demandedQueries.contains {
             syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
         }
         if queryWorker == nil, now >= retryAt, queryMissing || now >= nextClockDeadline {
@@ -441,69 +511,189 @@ final class LocalUsageScheduler {
         let now = monotonicNow()
         if needsSync && now >= retryAt {
             publishStatus(true)
-            let requestedScopes = scopes
+            // First paint stages missing graphs before the slow union: one
+            // side capture over the missing graph scopes, then publish each,
+            // then the full union sync in the same turn. The side capture never
+            // replaces live snapshots, so quota/recent currency survives; the
+            // empty-sync lane promotes the union capture as its snapshot.
+            let reportStages = unpublishedGraphs()
             let epoch = rootEpoch
-            let issueRevision = revision
-            let sequence = dirtySequence
-            let forceBarrier = forceRequested
-            let full = forceVerified < forceBarrier || now - lastFull >= fullVerificationInterval
-            let topology = topologyRequired || full || now - lastTopology >= 300 || sync == nil
-            let pricing = needsPricing
-            do {
-                syncCount += 1
-                let captured = try await source.localUsageSync(LocalUsageSyncRequest(
-                    scopes: requestedScopes.sorted { $0.id < $1.id },
-                    previousLeaseToken: previousLeaseUsable ? sync?.leaseToken : nil,
-                    force: full, verifyTopology: topology, refreshPricing: pricing))
-                guard !stopped, epoch == rootEpoch, issueRevision == revision, requestedScopes == scopes else {
-                    if captured.leaseToken != sync?.leaseToken { await source.releaseLocalUsage(captured.leaseToken) }
-                    return
-                }
-                let previous = sync
-                sync = captured; syncedScopes = requestedScopes
-                previousLeaseUsable = true
-                lastCheck = monotonicNow(); checkedSequence = sequence
-                if full { lastFull = lastCheck }
-                if topology { lastTopology = lastCheck; topologyRequired = false }
-                if pricing { lastPricing = lastCheck }
-                forceVerified = forceBarrier
-                if checkedSequence == dirtySequence { dirtyAt = nil }
-                lastError = nil; retryAt = 0
-                if observesSources {
-                    let manifest = LocalSourceWatchManifest(
-                        roots: captured.watchManifest.roots,
-                        ignoredFileURLs: Array(Set(captured.watchManifest.ignoredFileURLs).union(ignoredOutputs)).sorted(),
-                        ignoredBasenameRules: Array(Set(captured.watchManifest.ignoredBasenameRules).union(ignoredWriteRules))
-                            .sorted { $0.parentURL + $0.pattern < $1.parentURL + $1.pattern })
-                    let differs = installedManifest.map {
-                        $0.roots != manifest.roots || $0.ignoredFileURLs != manifest.ignoredFileURLs
-                            || $0.ignoredBasenameRules != manifest.ignoredBasenameRules
-                    } ?? true
-                    if differs || (topology && hints.diagnostics.requiresVerificationFallback
-                                   && monotonicNow() - lastHintInstall >= 300) {
-                        installedManifest = manifest
-                        lastHintInstall = monotonicNow()
-                        hints.install(manifest) { [weak self] topology in
-                            self?.sourcesChanged(requiresTopology: topology)
-                        }
+            let stagedScopes = Set(reportStages.map { $0.query.scope })
+            if !reportStages.isEmpty, stagedScopes != scopes {
+                if let side = await sideCapture(stagedScopes) {
+                    for stage in reportStages {
+                        guard !stopped, epoch == rootEpoch else { break }
+                        await publishSideGraph(stage.query, from: side, epoch: epoch,
+                                               issueDemanderIDs: stage.owners)
                     }
+                    await releaseSideCapture(side)
                 }
-                if let previous, previous.leaseToken != captured.leaseToken { retire(previous) }
-            } catch {
-                guard epoch == rootEpoch, issueRevision == revision else { return }
-                lastError = String(describing: error)
-                previousLeaseUsable = false; syncedScopes.removeAll()
-                retryAt = forceRequested > forceBarrier ? 0 : monotonicNow() + min(10, checkInterval)
-                failWaiters(error, throughForce: forceBarrier)
-                for (session, owner) in owners where contains(session) {
-                    for query in owner.queries { owner.callback?(query, .failure(error)) }
-                }
-                return
+            }
+            if !stopped {
+                guard await syncScopes(scopes) else { return }
             }
         }
         await runClockWork()
     }
-
+    /// One native capture over exactly these scopes. Returns false when the
+    /// capture was dropped (owner close, root change, no demand overlap):
+    /// expired generations are never revived, stale outputs never admitted.
+    private func syncScopes(_ requested: Set<LocalUsageScope>) async -> Bool {
+        refreshDemand()
+        let epoch = rootEpoch
+        // Exact admission: only this capture's requested scopes and the owner
+        // IDs demanding them matter. Unrelated removals elsewhere must not
+        // discard a staged graph; a close plus reopen shares no identity.
+        let issueScopes = requested
+        let issueDemanderIDs = demanders(ofScopes: requested)
+        let sequence = dirtySequence
+        let forceBarrier = forceRequested
+        let now = monotonicNow()
+        let full = forceVerified < forceBarrier || now - lastFull >= fullVerificationInterval
+        let topology = topologyRequired || full || now - lastTopology >= 300 || sync == nil
+        let pricing = needsPricing
+        do {
+            syncCount += 1
+            let captured = try await source.localUsageSync(LocalUsageSyncRequest(
+                scopes: requested.sorted { $0.id < $1.id },
+                previousLeaseToken: previousLeaseUsable ? sync?.leaseToken : nil,
+                force: full, verifyTopology: topology, refreshPricing: pricing))
+            // A capture stays valid while any issuing demander still demands
+            // its exact scopes; unrelated removals elsewhere keep overlap.
+            refreshDemand()
+            let admitted = !stopped && epoch == rootEpoch
+                && issueScopes.isSubset(of: demandedScopes)
+                && !issueDemanderIDs.isDisjoint(with: demanders(ofScopes: issueScopes))
+            guard admitted else {
+                retire(captured)
+                return false
+            }
+            let previous = sync
+            sync = captured
+            syncedScopes = requested
+            previousLeaseUsable = true
+            lastCheck = monotonicNow(); checkedSequence = sequence
+            if full { lastFull = lastCheck }
+            if topology { lastTopology = lastCheck; topologyRequired = false }
+            if pricing { lastPricing = lastCheck }
+            forceVerified = max(forceVerified, forceBarrier)
+            if checkedSequence == dirtySequence { dirtyAt = nil }
+            lastError = nil; retryAt = 0
+            if observesSources {
+                let manifest = LocalSourceWatchManifest(
+                    roots: captured.watchManifest.roots,
+                    ignoredFileURLs: Array(Set(captured.watchManifest.ignoredFileURLs).union(ignoredOutputs)).sorted(),
+                    ignoredBasenameRules: Array(Set(captured.watchManifest.ignoredBasenameRules).union(ignoredWriteRules))
+                        .sorted { $0.parentURL + $0.pattern < $1.parentURL + $1.pattern })
+                let differs = installedManifest.map {
+                    $0.roots != manifest.roots || $0.ignoredFileURLs != manifest.ignoredFileURLs
+                        || $0.ignoredBasenameRules != manifest.ignoredBasenameRules
+                } ?? true
+                if differs || (topology && hints.diagnostics.requiresVerificationFallback
+                               && monotonicNow() - lastHintInstall >= 300) {
+                    installedManifest = manifest
+                    lastHintInstall = monotonicNow()
+                    hints.install(manifest) { [weak self] topology in
+                        self?.sourcesChanged(requiresTopology: topology)
+                    }
+                }
+            }
+            if let previous, previous.leaseToken != captured.leaseToken { retire(previous) }
+            return true
+        } catch {
+            // A failure only invalidates when the issuing demand still
+            // overlaps; unrelated drift leaves the captured graph alone.
+            refreshDemand()
+            guard epoch == rootEpoch, issueScopes.isSubset(of: demandedScopes),
+                  !issueDemanderIDs.isDisjoint(with: demanders(ofScopes: issueScopes)) else { return false }
+            lastError = String(describing: error)
+            previousLeaseUsable = false; syncedScopes.removeAll()
+            retryAt = forceRequested > forceBarrier ? 0 : monotonicNow() + min(10, checkInterval)
+            failWaiters(error, throughForce: forceBarrier)
+            for (session, owner) in owners where contains(session) {
+                for query in owner.queries { owner.callback?(query, .failure(error)) }
+            }
+            return false
+        }
+    }
+    private func unpublishedGraphs() -> [(query: Query, owners: Set<Session>)] {
+        refreshDemand()
+        var stages: [(query: Query, owners: Set<Session>)] = []
+        for query in demandedQueries where query.kind == "graph" && results[query]?.identity != identity(query) {
+            stages.append((query, demanders(of: query)))
+        }
+        stages.sort { $0.query.scope.id < $1.query.scope.id }
+        return stages
+    }
+    /// Capture without changing installed freshness or force barriers.
+    /// Pin through the entire batch; cleanup preserves a borrowed live token.
+    private func sideCapture(_ requested: Set<LocalUsageScope>) async -> LocalUsageSyncResult? {
+        refreshDemand()
+        let epoch = rootEpoch
+        let issueScopes = requested
+        let issueDemanderIDs = demanders(ofScopes: requested)
+        do {
+            syncCount += 1
+            let captured = try await source.localUsageSync(LocalUsageSyncRequest(
+                scopes: requested.sorted { $0.id < $1.id },
+                previousLeaseToken: previousLeaseUsable ? sync?.leaseToken : nil,
+                force: false, verifyTopology: false, refreshPricing: false))
+            refreshDemand()
+            guard !stopped, epoch == rootEpoch, issueScopes.isSubset(of: demandedScopes),
+                  !issueDemanderIDs.isDisjoint(with: demanders(ofScopes: issueScopes)) else {
+                retire(captured)
+                return nil
+            }
+            pinLease(captured.leaseToken)
+            return captured
+        } catch {
+            refreshDemand()
+            guard epoch == rootEpoch, issueScopes.isSubset(of: demandedScopes),
+                  !issueDemanderIDs.isDisjoint(with: demanders(ofScopes: issueScopes)) else { return nil }
+            lastError = String(describing: error)
+            return nil
+        }
+    }
+    private func releaseSideCapture(_ capture: LocalUsageSyncResult) async {
+        // Register retirement before unpinning so an already-retired borrowed
+        // token cannot drain and then be enqueued for release a second time.
+        // A borrowed live token stays alive (sync still references it, never
+        // retired while live); an owned new token frees when pins drain.
+        retire(capture)
+        unpinLease(capture.leaseToken)
+    }
+    /// Staged side publish: identity derives from the side capture, cached
+    /// only on exact match. Late outputs die; stale values never cached.
+    /// Ordinary (non-forced) waiters resume; forced waiters await the union.
+    private func publishSideGraph(_ query: Query, from side: LocalUsageSyncResult,
+                                  epoch: UInt64, issueDemanderIDs: Set<Session>) async {
+        refreshDemand()
+        guard !stopped, epoch == rootEpoch, demandedQueries.contains(query),
+              side.scopes.contains(where: { $0.id == query.scope.id }),
+              !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
+        let key = identity(query, in: side)
+        if results[query]?.identity == key { return }
+        queryCount += 1
+        do {
+            let value = try await source.localUsageQuery(LocalUsageQueryRequest(
+                leaseToken: side.leaseToken, scopeId: query.scope.id, kind: query.kind,
+                year: query.year, clients: query.clients, windowSecs: query.windowSecs,
+                nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
+            guard !stopped, epoch == rootEpoch, demandedQueries.contains(query),
+                  key == identity(query, in: side),
+                  !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
+            results[query] = Cached(value: value, identity: key)
+            for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
+                owner.callback?(query, .success(value))
+            }
+            resumeQueryWaiters(query)
+        } catch {
+            guard !stopped, epoch == rootEpoch, demandedQueries.contains(query),
+                  key == identity(query, in: side),
+                  !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
+            lastError = String(describing: error)
+        }
+    }
     /// Pure captured queries remain schedulable while mounted source I/O blocks.
     func runClockWork() async { await startQueryWorker().value }
 
@@ -519,31 +709,42 @@ final class LocalUsageScheduler {
 
     private func runQueries() async {
         guard !stopped, let snapshot = sync else { return }
-        let issueRevision = revision
+        refreshDemand()
         let epoch = rootEpoch
-        for query in queries.sorted(by: { $0.kind == "graph" && $1.kind != "graph" }) {
-            guard issueRevision == revision, epoch == rootEpoch, !stopped else { return }
-            guard syncedScopes.contains(query.scope) else { continue }
+        // Graph first paint already published above; remaining turns skip it.
+        for query in demandedQueries.sorted(by: { $0.kind == "graph" && $1.kind != "graph" }) {
+            guard epoch == rootEpoch, !stopped else { return }
+            guard demandedQueries.contains(query), syncedScopes.contains(query.scope) else { continue }
+            let issueDemanderIDs = demanders(of: query)
+            guard !issueDemanderIDs.isEmpty else { continue }
             let key = identity(query)
             if results[query]?.identity == key { continue }
+            let token = snapshot.leaseToken
+            pinLease(token)
             do {
+                defer { unpinLease(token) }
                 queryCount += 1
                 let value = try await source.localUsageQuery(LocalUsageQueryRequest(
-                    leaseToken: snapshot.leaseToken, scopeId: query.scope.id, kind: query.kind,
+                    leaseToken: token, scopeId: query.scope.id, kind: query.kind,
                     year: query.year, clients: query.clients, windowSecs: query.windowSecs,
                     nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
-                guard issueRevision == revision, epoch == rootEpoch, !stopped, queries.contains(query),
-                      syncedScopes.contains(query.scope), sync?.leaseToken == snapshot.leaseToken,
-                      key == identity(query) else { return }
+                guard epoch == rootEpoch, !stopped, demandedQueries.contains(query),
+                      syncedScopes.contains(query.scope), sync?.leaseToken == token,
+                      key == identity(query),
+                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
                 results[query] = Cached(value: value, identity: key)
-                for owner in owners.values where owner.queries.contains(query) {
+                for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
                     owner.callback?(query, .success(value))
                 }
+                resumeReadyWaiters()
             } catch {
-                guard issueRevision == revision, epoch == rootEpoch else { return }
+                guard epoch == rootEpoch, !stopped, demandedQueries.contains(query),
+                      syncedScopes.contains(query.scope), sync?.leaseToken == token,
+                      key == identity(query),
+                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
                 lastError = String(describing: error); retryAt = monotonicNow() + 10
                 previousLeaseUsable = false; syncedScopes.removeAll()
-                for owner in owners.values where owner.queries.contains(query) {
+                for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
                     owner.callback?(query, .failure(error))
                 }
                 for entry in waiting.values.filter({ $0.query == query }) {
@@ -551,13 +752,7 @@ final class LocalUsageScheduler {
                 }
             }
         }
-        for entry in Array(waiting.values) where !needsSync && contains(entry.session) && entry.force <= forceVerified {
-            if let query = entry.query, let value = results[query], value.identity == identity(query) {
-                waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: value.value)
-            } else if let quota = entry.quota, syncedScopes.contains(quota) {
-                waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: nil)
-            }
-        }
+        resumeReadyWaiters()
         pruneResults()
     }
     private func failWaiters(_ error: Error, throughForce: UInt64) {

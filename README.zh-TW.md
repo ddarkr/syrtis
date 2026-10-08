@@ -71,7 +71,7 @@ brew install --cask nanako0129/tap/syrtis
 
 ## 運作原理
 
-資料處理完全由 Rust 負責：以 Git submodule 形式引入的公開共享引擎 [tokscale-core](https://github.com/Nanako0129/tokscale-core) 負責解析工作階段、去重與計算價格；本專案所屬的 `crates/tb_core_ffi` 則負責額度擷取並公開 C ABI。其餘部分皆由 Swift 負責：包含 SwiftUI 介面、`NSStatusItem` 選單列外殼與 Sparkle 更新機制。
+資料處理完全由 Rust 負責：Syrtis 自有的 [`crates/syrtis_core`](crates/syrtis_core) 引擎負責解析工作階段、使用量儲存、去重與計算價格；`crates/tb_core_ffi` 則負責額度擷取並公開 C ABI。兩者都是本 repository 的一般原始碼，不需另外取得或發布引擎。其餘部分皆由 Swift 負責：包含 SwiftUI 介面、`NSStatusItem` 選單列外殼與 Sparkle 更新機制。
 
 ```sh
 make                        # cargo build --release, then swift build
@@ -98,7 +98,7 @@ Syrtis 堅持本機優先，無需註冊 Syrtis 帳號，但要讓計算結果�
 
 ## 致謝
 
-Syrtis 建立在 Junho Yeo 所開發的 **[tokscale](https://github.com/junhoyeo/tokscale)** 之上。Syrtis 的共享引擎 [`tokscale-core`](https://github.com/Nanako0129/tokscale-core) 源自該核心，負責超過 25 款 agent 的工作階段解析、去重與計價。tokscale 的互動式 TUI 亦是整個儀表板的架構藍本：總覽、模型、每月、每日、每小時、統計與 Agent 等視圖，以及 `In · Out · CR · CW` 欄位劃分，皆以此為雛形設計。
+Syrtis 建立在 Junho Yeo 所開發的 **[tokscale](https://github.com/junhoyeo/tokscale)** 之上。Syrtis 自有的 [`syrtis-core`](crates/syrtis_core) 引擎源自該核心及 [tokscale-core fork](https://github.com/Nanako0129/tokscale-core)，保留其 MIT 授權與作者署名，負責超過 25 款 agent 的工作階段解析、去重與計價。tokscale 的互動式 TUI 亦是整個儀表板的架構藍本：總覽、模型、每月、每日、每小時、統計與 Agent 等視圖，以及 `In · Out · CR · CW` 欄位劃分，皆以此為雛形設計。
 
 本產品線最初源自 handlecusion 開發的 [tokcat](https://github.com/handlecusion/tokcat) 的 fork——亦即最早以 tokscale 為基礎打造的 Tauri 選單列工具。當前的原生應用程式則是完全不包含 tokcat 程式碼的原生 Swift 重寫版，但選單列型態與招牌的旋轉貓咪皆源於該專案；貓咪的靈感則可追溯至 Takuto Nakamura 的 [RunCat](https://kyome.io/runcat/)。額度消耗速率卡片則參考了 Peter Steinberger 的 [CodexBar](https://github.com/steipete/CodexBar)。
 

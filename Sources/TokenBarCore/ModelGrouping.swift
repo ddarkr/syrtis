@@ -5,7 +5,7 @@
 /// raw `canonical_model_id`, so Swift surfaces that group graph rows by model
 /// have to apply the same fold themselves or they disagree with the Models
 /// view. This mirrors the engine's one built-in rule (`builtin_grouping` in
-/// `vendor/tokscale-core/src/model_alias.rs`): Grok Build keys turn usage by
+/// `crates/syrtis_core/src/model_alias.rs`): Grok Build keys turn usage by
 /// `grok-<version>-build` while the session names `grok-<version>` (#118).
 ///
 /// Presentation only. Anything that matches a model id — quota scopes and
