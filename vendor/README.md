@@ -19,7 +19,7 @@ Consumer integration rules are documented in
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `31c7e3c7162cf14c1ccf192a45d894f12d535e5c` |
+| Reviewed pin | `890a306e908ab1e61bcd006285782768a8087593` |
 | Upstream and local-patch ledger | Pinned [`UPSTREAM.md`](tokscale-core/UPSTREAM.md) |
 
 ## Ownership

@@ -39,11 +39,98 @@ struct Scope {
     account_key: Option<String>,
 }
 
+/// Exact engine producer identity: the resolved source context, the scan
+/// client list after engine default expansion, the pruning threshold, and
+/// the ingestion selection mode. Recent and primary quota scopes resolve to
+/// the same physical lane, so they share one snapshot+manifest; differing
+/// exclusions, accounts, or report roots stay isolated.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ProducerKey {
+    context: String,
+    clients: Vec<String>,
+    modified_after: Option<u64>,
+    report: bool,
+}
+
 impl Scope {
-    fn same_producer(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.clients == other.clients
-            && self.account_key == other.account_key
+    fn parse_options(
+        &self,
+        context: &crate::LocalSourceContext,
+    ) -> Result<tokscale_core::LocalParseOptions, String> {
+        match self.kind {
+            ScopeKind::Quota => {
+                crate::window_usage::account_parse_options(context, &self.account_key)
+            }
+            ScopeKind::Report => Ok(tokscale_core::local_report_scan_options(
+                &context.report_options(None, self.clients.clone()),
+            )),
+            ScopeKind::Recent => Ok(context.parse_options(None, self.clients.clone())),
+        }
+    }
+    fn producer_key(
+        &self,
+        context: &crate::LocalSourceContext,
+    ) -> Result<
+        (
+            ProducerKey,
+            tokscale_core::ResolvedLocalSourceContext,
+            tokscale_core::LocalParseOptions,
+            LocalUsageSelection,
+        ),
+        String,
+    > {
+        let options = self.parse_options(context)?;
+        let report = self.kind == ScopeKind::Report;
+        let selection = if report {
+            LocalUsageSelection::Report
+        } else {
+            LocalUsageSelection::LocalClients
+        };
+        // Quota extra accounts scan with their config dir as home; every other
+        // scope scans the real home. The capture below resolves the exact
+        // engine identity, including canonical clients and exclusions.
+        let scope_context = tokscale_core::ResolvedLocalSourceContext::capture(
+            self.account_key
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| context.home_dir.clone()),
+            options.use_env_roots,
+            options.scanner_settings.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut clients = options.clients.clone().unwrap_or_default();
+        if options.clients.is_none() {
+            clients = tokscale_core::ClientId::iter()
+                .filter(|client| selection == LocalUsageSelection::Report || client.parse_local())
+                .map(|client| client.as_str().to_string())
+                .collect();
+            clients.push("synthetic".to_string());
+        } else if report {
+            // Match `report_scan_clients`: cc-mirror variants scan the claude lane.
+            let mut lanes = Vec::new();
+            for id in &clients {
+                let lane = if id.starts_with("cc-mirror/") {
+                    "claude".to_string()
+                } else {
+                    id.clone()
+                };
+                if !lanes.contains(&lane) {
+                    lanes.push(lane);
+                }
+            }
+            clients = lanes;
+        }
+        Ok((
+            ProducerKey {
+                context: scope_context.identity_string(),
+                clients,
+                modified_after: options.modified_after,
+                report,
+            },
+            scope_context,
+            options,
+            selection,
+        ))
     }
     fn metadata_bytes(&self) -> usize {
         size_of::<Self>()
@@ -129,7 +216,7 @@ struct SyncResult<'a> {
 }
 
 struct SourceScope {
-    producer: Scope,
+    producer: ProducerKey,
     snapshot: LocalUsageSnapshot,
     manifest: Arc<tokscale_core::LocalSourceWatchManifest>,
     manifest_bytes: usize,
@@ -138,7 +225,15 @@ struct SourceScope {
 impl SourceScope {
     fn metadata_bytes(&self) -> usize {
         size_of::<Self>()
-            .saturating_add(self.producer.metadata_bytes())
+            .saturating_add(
+                self.producer.context.capacity()
+                    + self
+                        .producer
+                        .clients
+                        .iter()
+                        .map(|c| c.capacity())
+                        .sum::<usize>(),
+            )
             .saturating_add(self.snapshot.metadata_bytes())
             .saturating_add(self.manifest_bytes)
             .saturating_add(64)
@@ -163,20 +258,30 @@ struct Lease {
 }
 impl Lease {
     fn metadata_bytes(&self) -> usize {
-        self.scopes.iter().fold(
-            size_of::<Self>().saturating_add(self.scopes.capacity() * size_of::<ScopedLease>()),
-            |bytes, scope| {
-                bytes
-                    .saturating_add(scope.spec.metadata_bytes())
-                    .saturating_add(scope.source.metadata_bytes())
-                    .saturating_add(
-                        scope
-                            .quota_token
-                            .as_ref()
-                            .map_or(0, |token| size_of::<QuotaToken>() + token.0.capacity() + 64),
-                    )
-            },
-        )
+        let mut bytes =
+            size_of::<Self>().saturating_add(self.scopes.capacity() * size_of::<ScopedLease>());
+        for (index, scope) in self.scopes.iter().enumerate() {
+            // One retained capture serves every alias of its producer: count
+            // its snapshot+manifest once per distinct Arc, like the shared
+            // price catalog below. Per-scope spec/token metadata is still
+            // counted for every public ID, so the cap is a real upper bound
+            // that never inflates.
+            if !self.scopes[..index]
+                .iter()
+                .any(|prior| Arc::ptr_eq(&prior.source, &scope.source))
+            {
+                bytes = bytes.saturating_add(scope.source.metadata_bytes());
+            }
+            bytes = bytes
+                .saturating_add(scope.spec.metadata_bytes())
+                .saturating_add(
+                    scope
+                        .quota_token
+                        .as_ref()
+                        .map_or(0, |token| size_of::<QuotaToken>() + token.0.capacity() + 64),
+                );
+        }
+        bytes
     }
 }
 
@@ -230,12 +335,24 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
         normalized_clients(&mut scope.clients);
         match scope.kind {
             ScopeKind::Quota => {
-                if scope.clients.is_some() || scope.client_id.as_ref().is_none_or(String::is_empty)
-                {
+                if scope.clients.is_some() {
                     return Err("quota scope requires its client and account identity".into());
                 }
-                if scope.account_key.is_some() && scope.client_id.as_deref() != Some("claude") {
-                    return Err("this captured account has no local usage sources".into());
+                // Empty client ids carry no identity; treat them as omitted.
+                let client = scope.client_id.as_deref().filter(|id| !id.is_empty());
+                match (client, scope.account_key.as_ref()) {
+                    // The Swift primary quota scope omits both: it is the
+                    // cross-client attribution window, with or without a client tag.
+                    (None, None) | (Some(_), None) => {}
+                    // Extra accounts partition Claude sources by native registry
+                    // resolution, so only a Claude identity can name one.
+                    (Some("claude"), Some(_)) => {}
+                    (None, Some(_)) => {
+                        return Err("quota scope requires its client and account identity".into());
+                    }
+                    _ => {
+                        return Err("this captured account has no local usage sources".into());
+                    }
                 }
             }
             _ if scope.account_key.is_some() || scope.client_id.is_some() => {
@@ -275,16 +392,44 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
     } else {
         id()?
     };
-    let mut scopes: Vec<ScopedLease> = Vec::with_capacity(request.scopes.len());
-    for spec in request.scopes {
-        // A single synchronization visits each distinct producing scope once,
-        // including primary quota accounts which share the same physical lane.
-        let checked = scopes.iter().find(|scope| scope.spec.same_producer(&spec));
+    // Resolve every scope to its exact engine producer identity BEFORE any
+    // ingestion, so an oversized request fails cleanly without evicting
+    // earlier accepted state. Public scope IDs may share one producer; the
+    // engine's bounded 32-scope registry is the distinct-producer limit.
+    let mut planned: Vec<(
+        Scope,
+        ProducerKey,
+        tokscale_core::ResolvedLocalSourceContext,
+        tokscale_core::LocalParseOptions,
+        LocalUsageSelection,
+    )> = Vec::with_capacity(request.scopes.len());
+    {
+        let mut distinct: Vec<ProducerKey> = Vec::new();
+        for spec in request.scopes {
+            let (key, scope_context, options, selection) = spec.producer_key(&context)?;
+            if !distinct.contains(&key) {
+                if distinct.len() >= 32 {
+                    return Err(
+                        "local usage synchronization exceeds 32 distinct source producers".into(),
+                    );
+                }
+                distinct.push(key.clone());
+            }
+            planned.push((spec, key, scope_context, options, selection));
+        }
+    }
+    let mut scopes: Vec<ScopedLease> = Vec::with_capacity(planned.len());
+    for (spec, key, scope_context, options, selection) in planned {
+        // A single synchronization visits each distinct producer once: recent
+        // and primary quota scopes with identical options share ONE source
+        // snapshot+manifest, while differing exclusions, accounts, or report
+        // roots remain isolated by the key above.
+        let checked = scopes.iter().find(|scope| scope.source.producer == key);
         let old = previous.as_ref().and_then(|previous| {
             previous
                 .scopes
                 .iter()
-                .find(|scope| scope.spec.same_producer(&spec))
+                .find(|scope| scope.source.producer == key)
         });
         let source = if let Some(checked) = checked {
             Arc::clone(&checked.source)
@@ -300,29 +445,6 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
         {
             Arc::clone(&old.unwrap().source)
         } else {
-            let options = match spec.kind {
-                ScopeKind::Quota => {
-                    crate::window_usage::account_parse_options(&context, &spec.account_key)?
-                }
-                ScopeKind::Report => tokscale_core::local_report_scan_options(
-                    &context.report_options(None, spec.clients.clone()),
-                ),
-                _ => context.parse_options(None, spec.clients.clone()),
-            };
-            let scope_context = tokscale_core::ResolvedLocalSourceContext::capture(
-                spec.account_key
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| context.home_dir.clone()),
-                options.use_env_roots,
-                options.scanner_settings.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            let selection = if spec.kind == ScopeKind::Report {
-                LocalUsageSelection::Report
-            } else {
-                LocalUsageSelection::LocalClients
-            };
             // Keep the physical baseline from BEFORE ingestion. Later writes
             // dirty the next refresh, not the independently verified snapshot.
             let manifest =
@@ -336,7 +458,7 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
             // are immutable; its two page caches are bounded at 64KiB.
             let manifest_bytes = manifest.retained_bytes().saturating_add(128 * 1024);
             Arc::new(SourceScope {
-                producer: spec.clone(),
+                producer: key,
                 snapshot,
                 manifest: Arc::new(manifest),
                 manifest_bytes,
@@ -344,13 +466,39 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
             })
         };
         let quota_token = if spec.kind == ScopeKind::Quota {
-            let reusable = old
+            // Quota tokens are per account, not per producer: recent and
+            // primary quota scopes share one source snapshot, but the
+            // previous lease holds that Arc under BOTH entries, so the
+            // producer-keyed `old` above may be the recent entry (no token).
+            // Reuse requires the previous entry for this exact quota scope.
+            let old_quota = previous
+                .as_ref()
+                .and_then(|previous| previous.scopes.iter().find(|scope| scope.spec == spec));
+            let reusable = old_quota
                 .filter(|old| same_price && old.source.snapshot == source.snapshot)
                 .and_then(|old| old.quota_token.as_ref())
                 .filter(|token| crate::window_usage::is_live(&token.0));
             if let Some(token) = reusable {
                 Some(Arc::clone(token))
-            } else if let Some(token) = checked.and_then(|scope| scope.quota_token.as_ref()) {
+            } else if let Some(token) = scopes
+                .iter()
+                .filter(|scope| scope.spec.kind == ScopeKind::Quota)
+                .filter(|scope| {
+                    scope.spec.account_key == spec.account_key
+                        && scope.source.producer == source.producer
+                })
+                .filter(|scope| {
+                    scope.source.snapshot == source.snapshot
+                        && scope
+                            .quota_token
+                            .as_ref()
+                            .is_some_and(|token| crate::window_usage::is_live(&token.0))
+                })
+                .find_map(|scope| scope.quota_token.as_ref())
+            {
+                // Same-account aliases of one capture share one registration:
+                // minting one token per public ID would evict the first at
+                // the window lease cap despite a single producer.
                 Some(Arc::clone(token))
             } else {
                 Some(Arc::new(QuotaToken(

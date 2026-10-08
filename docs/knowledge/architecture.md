@@ -123,7 +123,7 @@ Blocking one-shot graph、model／hourly／Agents、source probe 與 source sync
 
 Graph 的 fresh cache hit 不拿 source mutex、也不掃 source。Aged hit 先釋放 cache lock，再等 lane；進 lane 後重新讀 cache，若前一個工作已更新便直接重用，否則以同一 `LocalSourceContext` 的 topology／WAL-aware change token 決定 restamp 或重算。同 year、同 root generation 的普通請求可 single-flight；排隊期間 flight 已結束的普通請求仍會重新檢查已發布 cache，避免重複 compute。`tb_refresh_graph` 則不 join 舊 flight、不重用排隊後 cache，必須在請求之後取得 lane 並獨立開始 scan，才能看到較新的輸入。
 
-Extra roots／Claude account exclusions 取代時先推進 root generation，再清 graph／window／tail 狀態。工作取得 lane 後才捕捉 generation 與 source scope；scope 在掃描中改變時，publisher 在其 publication lock 內重新比對，拒絕把舊 scope 結果放回 cache。原請求仍可收到自己開始時的結果，拒絕的是後續 cache／tail freshness publication，不是取消已在執行的 blocking FFI。
+Extra roots／Claude account exclusions 的 normalized effective registry 改變時才推進 root generation 並清 graph／window／tail 狀態；重送相同設定不使既有 lease 過期。工作取得 lane 後才捕捉 generation 與 source scope；scope 在掃描中改變時，publisher 在其 publication lock 內重新比對，拒絕把舊 scope 結果放回 cache。原請求仍可收到自己開始時的結果，拒絕的是後續 cache／tail freshness publication，不是取消已在執行的 blocking FFI。
 
 Recent tail 現在持有 local fork engine 的 disk snapshot handle，不再持有最近一小時的 raw-event vector；rate／trace 以目前時間直接查詢已發布 generation，source sync 失敗不更新 freshness stamp。尚無已發布 snapshot、root 改變或 handle stale／evicted 時回傳錯誤，不把不可用資料改成成功零值。所需 API 已在 local fork pin，ordinary macOS consumer gate 已通過；未執行的平台與未發布限制見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
 
@@ -137,7 +137,9 @@ Claude observations 在 publication 前以 serialized input-unit provenance 統�
 
 Producer decoded batches 以 1,024 rows 或 8 MiB 先到者 flush；單一 oversized record 與既有 unrelated per-file parser buffer 是明示例外，16 MiB SQLite page-cache 設定不是 process RAM 上限。Authority／dedup、source traversal、filter-dependent OpenCode fallback、f64 fingerprint 與 pricing provenance 不移到 Swift。Readable zero-byte SQLite WAL 與 absent WAL 都代表無未 checkpoint frames；不可讀 sidecar 仍失敗，非空 WAL 與 primary DB 分別驗證。LocalClients 每個完整 generation 保存 selected-row references，而非第二份 message payload；range query 用 timestamp index 只準備該範圍 facts／aliases。Initial selection、full-domain catalog／undated 與 filter-dependent Report preparation 仍可能隨 history 增長；materialized compatibility APIs 仍可回傳 vectors，不宣稱 app 資源目標已達成。
 
-Pure graph／model／hourly／Agents helper 重用既有 folds，不 rediscover source 或發 pricing HTTP；必須使用 exact producing scan-client scope 的 unpruned Report snapshot，不能先用更廣 scope 決定 ownership 再移除混合貢獻。既有 dashboard restart snapshot 不等於此 engine store。Ordinary local fork macOS gates 已通過；實際 current-corpus、steady-state 資源驗收、Windows runtime 與 publication 仍是獨立限制，不能由 safe-fixture tests 代替。
+LocalClients publication 可沿用另一個 complete、ready index 的 OpenCode selected-row references，但必須雙向比對 kind、path、immutable generation、source order 與 workspace references；空集合也需 exact match。複製與其他 lanes 的重建在同一 publication transaction、GC 之前完成。Report 不沿用 LocalClients 的 ownership decisions，也不保留跨 query 的 prepared SQLite state；首個 query 仍需準備 facts，重複 app query 由 scheduler 的 exact-result cache 合併。
+
+Pure graph／model／hourly／Agents helper 重用既有 folds，不 rediscover source 或發 pricing HTTP；必須使用 exact producing scan-client scope 的 unpruned Report snapshot，不能先用更廣 scope 決定 ownership 再移除混合貢獻。內部 trusted folds 直接消費 selected rows，省去 `sq_output` 的序列化往返；public visitor 仍先準備完整 chronological output，再呼叫外部 callback，保留 failure-before-first-callback 與 reentrancy。既有 dashboard restart snapshot 不等於此 engine store。Ordinary local fork macOS gates 已通過；實際 current-corpus、steady-state 資源驗收、Windows runtime 與 publication 仍是獨立限制，不能由 safe-fixture tests 代替。
 
 ### App-owned demand scheduler 與 native hints
 
@@ -145,11 +147,15 @@ Pure graph／model／hourly／Agents helper 重用既有 folds，不 rediscover 
 
 `tb_local_usage_sync` 只負責 source verification／ingestion、選定 pricing snapshot、發布 opaque native lease 與 watch manifest；`tb_local_usage_query` 只查已捕捉的 generation，`tb_release_local_usage` 釋放 owner。Manifest 的 wire keys 明確為 `sourceRootURL`、`watchRootURL`、`parentURL` 與 `ignoredFileURLs`，不得依賴 acronym 的自動 camel-case 轉換。Native leases／aggregate caches 同時按 bytes 與 entry count 限制；query admission 使用 capture-time 的 conservative manifest capacity，不在 clock query 重新拿 known-source verification 的 SQLite mutex。
 
+一次 sync 最多接受 64 個 public scopes、32 個 distinct producers，先完成 admission 再 ingestion。Producer identity 包含 exact context、套用預設後的 clients、`modified_after` 與 selection mode；相同 producer 共用 snapshot／manifest 與其容量計算，但各 public scope 仍有獨立 metadata。Primary quota 可省略 `clientId`；extra-account quota 必須明示 `claude`。同 producer／account 的 quota aliases 共用 compact quota token，不因 alias 數量淘汰同次 sync 的其他 token。
+
 Scheduler 保留一個 source worker 與一個 coalesced pure-query worker。Source mount 阻塞時，已捕捉的 recent scope 仍能按 wall clock 過期；monotonic clock 管理 deadlines。Active demand 的 known-input／WAL verification 是 30 秒、closed graph demand 是 5 分鐘，topology fallback 5 分鐘，完整 verification 遵守使用者的 refresh interval。FSEvents 僅作 advisory hint，以 250 ms dirty deadline 合併；事件遺失、unmount、root recovery、unsupported native path 或 stream failure 必須回到 authoritative verification，不能把缺少 event 當作 source unchanged。沒有 local demand 時不啟動 source verification。
+
+缺少首張 graph 時可先捕捉 graph-only scope、發布結果，再同步完整 demand union；只有 graph demand 時不做第二次 capture。Side capture 不改寫已安裝 union 的 freshness／manifest，也不滿足 request 後的 forced-refresh barrier。Unchanged native sync 可以回傳目前使用中的同一 token；side cleanup 不得釋放該 token。Ordinary queries 與 quota windows 都 pin lease，退役 snapshot 等所有 pins 結束才釋放。
 
 `LocalSourceHints` 僅訂閱 native manifest 的 source／nearest-existing recovery roots；broad recovery parent 中的 unrelated sibling events 不建立 demand。Parser dependencies、SQLite WAL、symlink／mount／extra roots 都參與 known-input identity；owned store、page sidecars、pricing、migration、recovery 與 dashboard snapshot 的已知 basename grammar 只在 exact owned parent 下排除，不能忽略整個可能含來源的目錄。Manifest 在 ingestion 前捕捉並保留；完成後不重設 baseline，因此讀取後新增的內容仍會在下一次 hint／known-input verification 觸發同步，而不阻止已捕捉 generation 的首次顯示。
 
-Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Scope／root revision、source／price generation、owner 與 quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。
+Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Root epoch、exact scope、source／price generation、發出 query 時的 owner 與 ordinary-query／quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。
 
 `tb_window_usage` 已 clean-cutover 為 compact `WindowUsageBatch`：request 傳 confirmed attribution declarations、account/model scope 與 exact half-open inference／current／zone／cycle jobs，response 保留 assigned／excluded／unassigned、undated／turn counts、coverage 與 source／root／price identity，不再回傳 message arrays。`DashboardModel` 不保留 raw union scans，provider quota policy 仍在 Swift／app FFI 而非 shared engine。此 wire change 需要 downstream decoder 同步遷移；詳見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
 
