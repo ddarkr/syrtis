@@ -4,6 +4,18 @@ mod tests {
     use serde_json::{json, Value};
     use std::ffi::{CStr, CString};
 
+    thread_local! {
+        static AFTER_SOURCE_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn after_source_sync() {
+        let hook = AFTER_SOURCE_SYNC.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn ffi(
         request: &Value,
         call: unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char,
@@ -194,5 +206,85 @@ mod tests {
         assert_eq!(release(refreshed_token)["released"], false);
         release(token);
         release(independent_token);
+
+        // Deterministically append AFTER real ingestion but BEFORE consumer
+        // acceptance: no timing race, mock snapshot, or quiescence assumption.
+        let exact_scope = json!([{"id":"claude","kind":"report","clients":["claude"]}]);
+        write_usage(&source, timestamp, 90);
+        let later_source = source.clone();
+        AFTER_SOURCE_SYNC.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                write_usage(&later_source, timestamp, 130);
+            }));
+        });
+        let captured = data(ffi(
+            &json!({"scopes":exact_scope,"force":true}),
+            crate::tb_local_usage_sync,
+        ));
+        let captured_token = captured["leaseToken"].as_str().unwrap();
+        assert_eq!(
+            query_at(captured_token, "claude", "graph", now)["summary"]["totalTokens"],
+            118,
+            "a late external write must not invalidate the completed snapshot"
+        );
+        assert!(
+            find_lease(captured_token).unwrap().scopes[0]
+                .source
+                .manifest
+                .check_known_sources()
+                .unwrap(),
+            "acceptance must retain the pre-ingestion dirty baseline"
+        );
+        let next = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":captured_token,"verifyTopology":false}),
+            crate::tb_local_usage_sync,
+        ));
+        let next_token = next["leaseToken"].as_str().unwrap();
+        assert_ne!(next_token, captured_token);
+        assert_eq!(next["changed"], true);
+        assert_eq!(
+            query_at(next_token, "claude", "graph", now)["summary"]["totalTokens"],
+            158,
+            "ordinary known-source verification must ingest the later write"
+        );
+        let settled = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":next_token,"verifyTopology":false}),
+            crate::tb_local_usage_sync,
+        ));
+        assert_eq!(settled["leaseToken"], next_token);
+        assert_eq!(settled["changed"], false);
+
+        // Removing scope-wide quiescence must not turn actual failed reads
+        // into successful empty coverage or damage the last-good snapshot.
+        let database =
+            PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("opencode/opencode.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, b"not a sqlite database").unwrap();
+        let corrupt = ffi(
+            &json!({"scopes":[{"id":"opencode","kind":"recent","clients":["opencode"]}]}),
+            crate::tb_local_usage_sync,
+        );
+        assert_eq!(corrupt["ok"], false, "{corrupt}");
+        assert!(!corrupt["err"].as_str().unwrap().is_empty());
+
+        let sidechain = source.parent().unwrap().join("agent-side.jsonl");
+        write_usage(&sidechain, timestamp, 1);
+        let mut row: Value = serde_json::from_slice(&std::fs::read(&sidechain).unwrap()).unwrap();
+        row["isSidechain"] = json!(true);
+        row["sessionId"] = json!("parent");
+        std::fs::write(&sidechain, row.to_string() + "\n").unwrap();
+        std::fs::create_dir(sidechain.with_extension("meta.json")).unwrap();
+        let unreadable = ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":next_token,"force":true}),
+            crate::tb_local_usage_sync,
+        );
+        assert_eq!(unreadable["ok"], false, "{unreadable}");
+        assert!(!unreadable["err"].as_str().unwrap().is_empty());
+        assert_eq!(
+            query_at(next_token, "claude", "graph", now)["summary"]["totalTokens"],
+            158
+        );
+        release(captured_token);
+        release(next_token);
     }
 }

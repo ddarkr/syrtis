@@ -323,37 +323,25 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
             } else {
                 LocalUsageSelection::LocalClients
             };
-            // Keep the physical baseline from BEFORE ingestion. Capturing it
-            // afterwards could certify newer source bytes against older facts.
-            let mut accepted = None;
-            for _ in 0..2 {
-                let manifest =
-                    tokscale_core::capture_local_source_watch_manifest(&scope_context, &options)?;
-                let snapshot = tokscale_core::synchronize_local_usage(
-                    &scope_context,
-                    options.clone(),
-                    selection,
-                )?;
-                if !manifest.check_known_sources()? {
-                    // Admission must not wait for a concurrent slow known-file
-                    // verification holding the manifest's SQLite mutex. Roots
-                    // are immutable; its two page caches are bounded at 64KiB.
-                    let manifest_bytes = manifest.retained_bytes().saturating_add(128 * 1024);
-                    accepted = Some(SourceScope {
-                        producer: spec.clone(),
-                        snapshot,
-                        manifest: Arc::new(manifest),
-                        manifest_bytes,
-                        cutoff: now_ms().saturating_sub(3_600_000),
-                    });
-                    break;
-                }
-            }
-            Arc::new(
-                accepted.ok_or(
-                    "local sources changed during synchronization; previous lease retained",
-                )?,
-            )
+            // Keep the physical baseline from BEFORE ingestion. Later writes
+            // dirty the next refresh, not the independently verified snapshot.
+            let manifest =
+                tokscale_core::capture_local_source_watch_manifest(&scope_context, &options)?;
+            let snapshot =
+                tokscale_core::synchronize_local_usage(&scope_context, options, selection)?;
+            #[cfg(test)]
+            tests::after_source_sync();
+            // Admission must not wait for a concurrent slow known-file
+            // verification holding the manifest's SQLite mutex. Roots
+            // are immutable; its two page caches are bounded at 64KiB.
+            let manifest_bytes = manifest.retained_bytes().saturating_add(128 * 1024);
+            Arc::new(SourceScope {
+                producer: spec.clone(),
+                snapshot,
+                manifest: Arc::new(manifest),
+                manifest_bytes,
+                cutoff: now_ms().saturating_sub(3_600_000),
+            })
         };
         let quota_token = if spec.kind == ScopeKind::Quota {
             let reusable = old

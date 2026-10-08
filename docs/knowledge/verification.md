@@ -156,6 +156,23 @@ Actual `AppDelegate` demo 建立 popover；因本機 menu-extra anchor 在螢幕
 
 `make check-docs` 通過 53 checker tests 與實際 knowledge validation。Reachability 只遞迴 Markdown files，directory／binary-asset links 仍檢查 existence，但不當作 Markdown 讀取；regression 同時覆蓋有效與 missing targets。這讓 pinned local engine ledger／routing 的 relative links 不再因 fixture directory 而 crash。
 
+Source-watch local regressions cover rejected directory candidates and
+symlinked SQLite database/WAL sampling. Per-source publication regressions
+preserve captured values after late source/registry/WAL changes, ingest those
+changes on the next synchronization, and reject missing or corrupt pinned
+generations. The real C ABI regression verifies a late write between ingestion
+and lease acceptance, dirty-baseline refresh, settled warm reuse, and last-good
+queries after unreadable/corrupt-source failures.
+
+macOS Rust 1.96.1 workspace tests passed (2,460 passes, six ignored); strict
+engine Clippy passed, while workspace Clippy retains the existing FFI warnings.
+Both `make selftest` and the isolated `make selftest-bundled` passed.
+The installed release app's `--launch-timeline --only graph` run published its
+real-data dashboard graph in 27.6 seconds without stopping other producers or
+excluding active sources. Native screen capture and accessibility verification
+were unavailable; no visual acceptance is claimed. Windows runtime and sustained
+resource acceptance were not exercised.
+
 
 
 ## Local build and UX acceptance
