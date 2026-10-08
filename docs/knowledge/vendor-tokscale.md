@@ -12,7 +12,7 @@ sources: [".gitmodules", "vendor/README.md", "public tokscale-core UPSTREAM at b
 
 ## 文件目的
 
-Syrtis consumes `tokscale-core` through the pinned `vendor/tokscale-core` submodule. This branch uses a reviewed local fork; the existing [public engine remote](https://github.com/Nanako0129/tokscale-core) is unchanged, and the fork has not been published. The exact upstream baseline, local patches and report numbers live in the pinned [`UPSTREAM.md`](../../vendor/tokscale-core/UPSTREAM.md); [`vendor/README.md`](../../vendor/README.md) records the exact local pin and fresh-clone limitation. Shared-engine changes are not part of Syrtis until its gitlink advances and the consumer gates pass.
+Syrtis consumes `tokscale-core` through the pinned `vendor/tokscale-core` submodule. This branch uses a reviewed local fork; the existing [public engine remote](https://github.com/Nanako0129/tokscale-core) is unchanged, and the fork has not been published. The exact upstream baseline, local patches and report numbers live in [`UPSTREAM.md`](../../vendor/tokscale-core/UPSTREAM.md); [`vendor/README.md`](../../vendor/README.md) records the local pin and fresh-clone limitation. Local vendored-engine edits are part of the tested app source even when the gitlink is unchanged.
 
 ## 目錄
 
@@ -30,13 +30,13 @@ Syrtis consumes `tokscale-core` through the pinned `vendor/tokscale-core` submod
 
 The engine's true baseline is recorded in `tokscale-core/UPSTREAM.md`; the Cargo package version is not a reliable baseline marker. The shared tree contains upstream cherry-picks plus streaming, cache, report, pricing, and defensive adaptations extracted from Syrtis. Syrtis keeps its application-specific FFI, C ABI, Swift, and build wiring outside the submodule.
 
-> **不要在 consumer branch 直接改 submodule source。** Shared Rust changes first land and pass review in `tokscale-core`; Syrtis then advances only the reviewed gitlink and runs its consumer gates. A clean build alone cannot prove that streaming or cache semantics were preserved.
+> **可直接修改 `vendor/tokscale-core` 做本地修正，並與 Syrtis 一起驗證。** 不需先建立獨立 engine commit、review 或 upstream integration；本地 build 不要求 clean submodule 或 `HEAD` 等於 gitlink。仍需 regression、streaming／materialized、cache 與受影響的 FFI／Swift 驗證，不能只以 build 成功證明語意正確。沒有明確授權，不得 commit、push 或發布。
 
 本分支已 pin reviewed local fork `890a306e908ab1e61bcd006285782768a8087593`，不是 public engine `main`。此前 public reviewed checkpoint 為 `726efd7038727055bf8915d98939b973c3db17fe`；自 `319ffa8` 起的 18 個 first-parent merge／60 個 commit 與 2026-10-02 上游同步，仍保留在下方歷史表格及 engine ledger。
 
-### Local fork integration boundary
+### Local fork integration history
 
-Resource redesign 的 app-owned source 所需 required-field projection、compact usage snapshot／query 與 source-watch manifest API 已透過 local fork gitlink 整合，普通 checkout 不再缺這些 API。Shared implementation 在 engine branch 提交，consumer 僅推進 gitlink，沒有直接修改 submodule source；engine 以最新 public main 為 base，保留 scan exclusions、Cursor JSON 與 Antigravity CLI WAL-aware pruning。
+Historical only, not a requirement for local fixes: Resource redesign 的 app-owned source 所需 required-field projection、compact usage snapshot／query 與 source-watch manifest API 已透過 local fork gitlink 整合，普通 checkout 不再缺這些 API。該次 shared implementation 在 engine branch 提交，consumer 僅推進 gitlink；engine 以最新 public main 為 base，保留 scan exclusions、Cursor JSON 與 Antigravity CLI WAL-aware pruning。
 
 本地 macOS Rust 1.96.1 engine 與 ordinary consumer gates、debug／release bundled selftest、實際 Swift → C ABI → Rust safe-fixture smoke 與 native demo surface 已通過；具體範圍、warning debt 與 UI 限制見 [`verification.md`](verification.md#local-fork-ordinary-checkout-verification)。Windows runtime 未執行，不能以 macOS 或 cross-compile 代替；Windows adoption、release 與完整資源驗收仍未完成。Remote 未修改，沒有 push／PR；新 clone 在 fork 發布前無法取得此 local pin。
 
@@ -123,20 +123,19 @@ flowchart TD
     CLASSIFY -->|defer or skip| EXPLAIN[Record rationale]
     PORT --> FIXTURE[Add old-fail/new-pass fixture]
     ADAPT --> FIXTURE
-    FIXTURE --> ENGINE[Run engine gates and review]
+    FIXTURE --> ENGINE[Run affected engine gates]
     ENGINE --> LEDGER[Update engine UPSTREAM ledger]
-    LEDGER --> PIN[Advance reviewed Syrtis gitlink]
-    PIN --> GATES[Run FFI, Swift, and smoke gates]
+    LEDGER --> GATES[Run consuming app FFI, Swift, and smoke gates]
 ```
 
 | Step | Rule |
 |---|---|
 | Reference | Re-fetch and record the upstream commit being assessed; do not use a stale plan line number as evidence |
 | Diff | Read the actual diff, including multipart commits whose title understates runtime changes |
-| Port | Apply only the selected hunk in the shared engine repository; use context-aware patching and fail loudly on mismatch |
+| Port | Apply only the selected hunk in `vendor/tokscale-core`; use context-aware patching and fail loudly on mismatch |
 | Adapt | Keep shared streaming lanes, report filters, and cache identity explicit; keep Syrtis-only FFI mapping in `crates/tb_core_ffi` |
-| Verify | Test parser output, cache rebuild, streaming behavior, and materialized parity in the engine before advancing a consumer |
-| Record | Update the exact engine ledger, then pin the reviewed engine commit and run Syrtis's consumer gates |
+| Verify | Test affected parser output, cache rebuild, streaming behavior, and materialized parity together with Syrtis's consumer gates |
+| Record | Update the exact engine ledger and report the tested source state; no separate engine commit, review, or gitlink advance is required for local fixes |
 
 ## Shared adaptation families
 
@@ -193,4 +192,4 @@ The Copilot nested-agent bookkeeping in the engine's `UPSTREAM.md` records upstr
 | Did parser output or attribution change? | Local schema decision plus stale-cache regression |
 | Does a sibling source reach all consumers? | Fingerprint, lane, mtime, and prune tests |
 | Does FFI expose a pre-aggregation filter? | C header, Rust mapper, Swift decoder, report parity fixture |
-| Is the result still selective? | Focused engine fidelity note explaining included and excluded hunks, plus an exact reviewed consumer pin |
+| Is the result still selective? | Focused engine fidelity note explaining included and excluded hunks, plus the tested engine source state (pin and local edits) |

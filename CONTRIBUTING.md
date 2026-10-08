@@ -47,7 +47,7 @@ If you use an automated coding client, it must also follow [`AGENTS.md`](AGENTS.
 | Sparkle, appcast, Homebrew, Pages, or release notes | [`release.md`](docs/knowledge/release.md) and [`workflow.md`](docs/knowledge/workflow.md) |
 | Landing site structure, deployment, or product claims | [`landing/AGENTS.md`](landing/AGENTS.md) and [`release.md`](docs/knowledge/release.md) |
 
-Durable architecture, verification, workflow, and release facts belong in `docs/knowledge/`. The engine's exact upstream baseline and local patch records belong in its pinned [`UPSTREAM.md`](vendor/tokscale-core/UPSTREAM.md); Syrtis's source and pin belong in `vendor/README.md`. A reviewed Native pin advance normally uses only the exact `tokscale-core` gitlink; when it travels with an app-owned C ABI change, as the `tb_window_usage` account parameter does, that change is named and the Windows port is notified under the `ctb.h` signature rule. Consumer gates re-establish build-decoder compatibility, and the engine's LocalOnly, CostCoverage, embedded-cost, and partial-estimation semantics are not claimed to have reached Swift.
+Durable architecture, verification, workflow, and release facts belong in `docs/knowledge/`. The engine's exact upstream baseline and local patch records belong in its [`UPSTREAM.md`](vendor/tokscale-core/UPSTREAM.md); Syrtis's source and pin belong in `vendor/README.md`. Local vendored-engine edits may accompany app changes without a separate engine commit or review. Name app-owned C ABI changes and notify the Windows port under the `ctb.h` signature rule. Consumer gates re-establish build-decoder compatibility, and the engine's LocalOnly, CostCoverage, embedded-cost, and partial-estimation semantics are not claimed to have reached Swift.
 
 ## Development environment
 
@@ -88,7 +88,7 @@ Create a topic branch from the current upstream `main` branch, and keep each bra
 
 > **Pre-aggregation:** Do not try to subtract a client after contributions have been combined into a mixed aggregate. Pass non-empty filters to the producer while client identity is still available, and preserve the documented `nil` or empty-list semantics across Swift, C, and Rust.
 
-> **Shared-engine boundary:** Land shared Rust changes and their ledger updates in `tokscale-core`, then advance Syrtis's submodule only to a reviewed engine commit. Syrtis keeps `tb_core_ffi`, the C header, Swift, root lockfile, and app wiring in this repository.
+> **Shared-engine boundary:** Local edits in `vendor/tokscale-core` are allowed and verified with Syrtis; no separate engine commit, review, or upstream integration is required. Preserve engine ledger updates and regression evidence. Syrtis keeps `tb_core_ffi`, the C header, Swift, root lockfile, and app wiring in this repository. Do not commit or push without explicit approval.
 
 | Change class | Required evidence or treatment |
 |---|---|

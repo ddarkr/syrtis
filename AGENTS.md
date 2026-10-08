@@ -24,12 +24,12 @@ Read [`docs/knowledge/README.md`](docs/knowledge/README.md) for every task befor
 | Source of truth | Add canonical project facts to `docs/knowledge/`; keep adapters as routing and guardrails. |
 | Cross-language seam | Preserve the Rust -> C ABI -> Swift contract; verify both sides when a boundary changes. |
 | Pre-aggregation | Do not attempt to remove a contribution after a mixed aggregate has been computed; pass the filter to the producer. |
-| Shared-engine boundary | Land shared Rust changes in `tokscale-core`; advance only a reviewed gitlink, and keep app-owned FFI, C ABI, Swift, and build wiring in Syrtis. |
+| Shared-engine boundary | Local edits in `vendor/tokscale-core` are allowed and verified with Syrtis; no separate engine commit, review, or upstream integration is required. Keep app-owned FFI, C ABI, Swift, and build wiring in Syrtis. |
 | Public repository | Never add private paths, credentials, machine-specific tooling details, or unpublished security work to tracked docs. |
 
 ## Authorization boundary
 
-A plan approval authorizes implementation, not integration. Do not push, merge, tag, publish, or release without a separate explicit user instruction. Do not modify a dirty main checkout. A local `.agent-local/` overlay may hold machine-specific instructions and is intentionally outside the public knowledge base.
+A plan approval authorizes implementation, not integration. Do not commit, push, merge, tag, publish, or release without a separate explicit user instruction. Do not modify a dirty main checkout. A local `.agent-local/` overlay may hold machine-specific instructions and is intentionally outside the public knowledge base.
 
 ## Handoff
 

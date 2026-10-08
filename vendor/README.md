@@ -29,9 +29,9 @@ aggregation. TokenBar owns the gitlink, root `Cargo.lock`,
 `crates/tb_core_ffi`, `Sources/CTB/include/ctb.h`, Swift code, and application
 build wiring.
 
-Do not edit shared Rust source inside the TokenBar submodule. Land and verify
-engine changes in `tokscale-core`, then advance this pin to the reviewed engine
-commit and run the TokenBar consumer gates.
+Local shared Rust edits in `vendor/tokscale-core` are allowed and must be
+verified with the consuming app. No separate engine commit, review, or
+upstream integration is required; commit or push only with explicit approval.
 
 ## Checkout
 
@@ -52,5 +52,6 @@ For an existing checkout:
 git submodule update --init --recursive
 ```
 
-The submodule must be clean and its checked-out `HEAD` must equal the gitlink
-before building or releasing.
+Local builds may use modified submodule source or a checkout differing from
+the gitlink. Record the tested source state; a gitlink alone does not capture
+uncommitted edits or make unpublished objects available to fresh clones.

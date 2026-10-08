@@ -12,11 +12,11 @@ engine's [`AGENTS.md`](tokscale-core/AGENTS.md).
 
 | Boundary | Rule |
 |---|---|
-| Pin | `vendor/tokscale-core` must be a clean gitlink at the reviewed engine commit recorded in `vendor/README.md`. |
-| Engine ownership | Do not edit shared Rust source inside the TokenBar submodule. Land and verify the engine change in `tokscale-core`, then update this consumer pin. |
+| Pin | `vendor/tokscale-core` remains a Git submodule; `vendor/README.md` records its source and pin. Local edits and a checkout differing from the gitlink are allowed for local builds. |
+| Engine ownership | Edit shared Rust directly in `vendor/tokscale-core` for local fixes and verify it with the consuming app; no separate engine commit, review, or upstream integration is required. |
 | Consumer ownership | TokenBar continues to own `crates/tb_core_ffi`, `Sources/CTB/include/ctb.h`, Swift code, build wiring, and the root `Cargo.lock`. |
-| Parity | A pin update must verify materialized and streaming behavior, cache/schema consequences, FFI mappings, and the Rust-to-Swift app gates that the change can affect. |
+| Parity | Engine edits and pin updates must verify affected materialized and streaming behavior, cache/schema consequences, FFI mappings, and Rust-to-Swift app gates. |
 | Ledger | The engine's `UPSTREAM.md` owns the exact upstream and local-patch ledger. `vendor/README.md` records only TokenBar's source and pin. |
 
-No shared-engine task may push or merge by implication from a plan. Return the
-diff and verification evidence to the user for authorization.
+Do not commit, push, merge, or publish without explicit user authorization.
+Return the diff and verification evidence to the user.
