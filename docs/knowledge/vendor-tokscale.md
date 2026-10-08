@@ -32,7 +32,7 @@ The engine's true baseline is recorded in `tokscale-core/UPSTREAM.md`; the Cargo
 
 > **不要在 consumer branch 直接改 submodule source。** Shared Rust changes first land and pass review in `tokscale-core`; Syrtis then advances only the reviewed gitlink and runs its consumer gates. A clean build alone cannot prove that streaming or cache semantics were preserved.
 
-本分支已 pin reviewed local fork `3c9c31314e137b22c9bfca932abb9c7e0c9ee155`，不是 public engine `main`。此前 public reviewed checkpoint 為 `726efd7038727055bf8915d98939b973c3db17fe`；自 `319ffa8` 起的 18 個 first-parent merge／60 個 commit 與 2026-10-02 上游同步，仍保留在下方歷史表格及 engine ledger。
+本分支已 pin reviewed local fork `890a306e908ab1e61bcd006285782768a8087593`，不是 public engine `main`。此前 public reviewed checkpoint 為 `726efd7038727055bf8915d98939b973c3db17fe`；自 `319ffa8` 起的 18 個 first-parent merge／60 個 commit 與 2026-10-02 上游同步，仍保留在下方歷史表格及 engine ledger。
 
 ### Local fork integration boundary
 
