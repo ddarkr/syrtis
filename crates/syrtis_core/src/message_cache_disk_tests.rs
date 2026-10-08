@@ -1773,6 +1773,126 @@ fn durable_keyless_rows_are_never_dropped_by_history_merge() {
     );
 }
 
+#[test]
+fn upstream_format10_claude_migration_preserves_source_free_usage() {
+    let sources = TempDir::new().unwrap();
+    let path = source(sources.path(), "session.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let wire_message = |key: &str, input| upstream10::UnifiedMessage {
+        client: "claude".into(),
+        model_id: "claude-3-5-sonnet".into(),
+        provider_id: "anthropic".into(),
+        session_id: "session".into(),
+        workspace_key: None,
+        workspace_label: None,
+        timestamp: 100,
+        date: "1970-01-01".into(),
+        tokens: upstream10::TokenBreakdown {
+            input,
+            output: 11,
+            cache_read: 42,
+            cache_write: 31,
+            cache_write_1h: 17,
+            reasoning: 3,
+        },
+        cost: 0.0,
+        cost_source: crate::CostSource::Unknown,
+        service_tier: None,
+        duration_ms: Some(123),
+        message_count: 2,
+        agent: None,
+        dedup_key: Some(key.into()),
+        session_title: Some("session title".into()),
+        parent_session_id: None,
+        is_turn_start: true,
+        model_attribution_conflicted: false,
+    };
+    // Upstream has nine entry fields, no retained-key set, and puts Claude
+    // retained ordinals plus its marker in the fallback vector.
+    let entry = (
+        "claude".to_string(),
+        2_u32,
+        CachedPath::from_path(&path),
+        SourceFingerprint::from_path(&path).unwrap(),
+        vec![
+            wire_message("live:req", 265),
+            wire_message("retained:req", 42000),
+        ],
+        vec![1_usize, usize::MAX],
+        None::<()>,
+        None::<()>,
+        None::<()>,
+    );
+    let legacy = TempDir::new().unwrap();
+    let shard = legacy
+        .path()
+        .join(CACHE_SHARD_DIRNAME)
+        .join("claude")
+        .join(format!(
+            "shard-{:02x}.bin",
+            legacy_shard_index("claude", &CachedPath::from_path(&path))
+        ));
+    fs::create_dir_all(shard.parent().unwrap()).unwrap();
+    let mut envelope = CachedShardEnvelope {
+        format_version: 10,
+        parser_namespace: "claude".into(),
+        parser_version: 2,
+        payload: encode(&vec![entry]).unwrap(),
+    };
+    let original = encode(&envelope).unwrap();
+    fs::write(&shard, &original).unwrap();
+    fs::remove_file(&path).unwrap();
+    let target = TempDir::new().unwrap();
+    crate::usage_migration::prepare(target.path(), &[legacy.path().to_path_buf()]).unwrap();
+    let cache = SourceMessageCache::open_from_root(Some(target.path()));
+    let metadata = cache.retention_metadata(identity, &path).unwrap().unwrap();
+    let found = rows(&cache, &metadata);
+    assert_eq!(
+        found
+            .iter()
+            .map(|row| (row.0.tokens.input, row.1, row.2))
+            .collect::<Vec<_>>(),
+        vec![(265, false, false), (42000, true, false)]
+    );
+    for (message, _, _) in found {
+        assert_eq!(
+            (message.tokens.cache_write_1h, message.tokens.reasoning),
+            (17, 3)
+        );
+        assert_eq!(
+            (
+                message.timestamp,
+                message.message_count,
+                message.duration_ms
+            ),
+            (100, 2, Some(123))
+        );
+        assert!(message.is_turn_start);
+        assert!(!message.input_tokens_are_cache_split);
+    }
+    crate::usage_migration::prepare(target.path(), &[legacy.path().to_path_buf()]).unwrap();
+    assert_eq!(fs::read(&shard).unwrap(), original);
+    assert_eq!(
+        rows(&cache, &metadata)
+            .iter()
+            .map(|row| row.0.tokens.input)
+            .sum::<i64>(),
+        42265
+    );
+    envelope.format_version = 11;
+    let unsupported = encode(&envelope).unwrap();
+    fs::write(&shard, &unsupported).unwrap();
+    let rejected = TempDir::new().unwrap();
+    assert!(
+        crate::usage_migration::prepare(rejected.path(), &[legacy.path().to_path_buf()]).is_err()
+    );
+    assert!(!rejected
+        .path()
+        .join("source-message-cache.sqlite3")
+        .exists());
+    assert_eq!(fs::read(shard).unwrap(), unsupported);
+}
+
 /// Source-free shard migration: a legacy file shard imports rows into a
 /// shard-only staged store with the native source absent; originals are
 /// preserved (no unlink) and re-import is idempotent via evidence.

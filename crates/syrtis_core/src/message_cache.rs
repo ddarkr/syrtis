@@ -1080,6 +1080,86 @@ pub(crate) mod format4 {
         pub retained_keys: HashSet<String>,
     }
 }
+/// Frozen upstream tokscale format-10 Claude wire. Its token lane order and
+/// entry tail differ from Syrtis format 5; never decode it as a local layout.
+pub(crate) mod upstream10 {
+    use crate::sessions::CostSource;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Deserialize, Serialize)]
+    pub(super) struct TokenBreakdown {
+        pub input: i64,
+        pub output: i64,
+        pub cache_read: i64,
+        pub cache_write: i64,
+        pub cache_write_1h: i64,
+        pub reasoning: i64,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    pub(super) struct UnifiedMessage {
+        pub client: String,
+        pub model_id: String,
+        pub provider_id: String,
+        pub session_id: String,
+        pub workspace_key: Option<String>,
+        pub workspace_label: Option<String>,
+        pub timestamp: i64,
+        pub date: String,
+        pub tokens: TokenBreakdown,
+        pub cost: f64,
+        pub cost_source: CostSource,
+        pub service_tier: Option<String>,
+        pub duration_ms: Option<i64>,
+        pub message_count: i32,
+        pub agent: Option<String>,
+        pub dedup_key: Option<String>,
+        pub session_title: Option<String>,
+        pub parent_session_id: Option<String>,
+        pub is_turn_start: bool,
+        pub model_attribution_conflicted: bool,
+    }
+
+    impl UnifiedMessage {
+        pub(super) fn into_local(self) -> Result<crate::UnifiedMessage, String> {
+            if self.client != "claude"
+                || self.service_tier.is_some()
+                || self.model_attribution_conflicted
+            {
+                return Err("unsupported upstream Claude message semantics".into());
+            }
+            Ok(crate::UnifiedMessage {
+                client: self.client,
+                model_id: self.model_id,
+                provider_id: self.provider_id,
+                session_id: self.session_id,
+                workspace_key: self.workspace_key,
+                workspace_label: self.workspace_label,
+                timestamp: self.timestamp,
+                date: self.date,
+                tokens: crate::TokenBreakdown {
+                    input: self.tokens.input,
+                    output: self.tokens.output,
+                    cache_read: self.tokens.cache_read,
+                    cache_write: self.tokens.cache_write,
+                    cache_write_1h: self.tokens.cache_write_1h,
+                    reasoning: self.tokens.reasoning,
+                },
+                cost: self.cost,
+                cost_source: self.cost_source,
+                duration_ms: self.duration_ms,
+                message_count: self.message_count,
+                agent: self.agent,
+                dedup_key: self.dedup_key,
+                dedup_aliases: Vec::new(),
+                is_turn_start: self.is_turn_start,
+                // Upstream's wire carries no cache-split provenance.
+                input_tokens_are_cache_split: false,
+            })
+        }
+    }
+}
+
 impl From<format3::TokenBreakdown> for crate::TokenBreakdown {
     fn from(old: format3::TokenBreakdown) -> Self {
         Self {

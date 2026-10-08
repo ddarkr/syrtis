@@ -1983,8 +1983,10 @@ fn transfer_shard_rows(
     if namespace != identity.namespace {
         return Err("source message cache legacy parser owner is invalid".to_string());
     }
-    let supported_format =
-        format_version == 3 || format_version == 4 || format_version == CACHE_FORMAT_VERSION;
+    let supported_format = format_version == 3
+        || format_version == 4
+        || format_version == CACHE_FORMAT_VERSION
+        || (format_version == 10 && identity.namespace == "claude" && version == 2);
     if !supported_format || !admitted(identity, version) {
         // Known pre-retention layouts and non-retaining parser misses are cold,
         // but never delete a newer/unknown retaining layout we cannot interpret.
@@ -2151,7 +2153,7 @@ struct LegacyEntry<'a> {
 impl<'de> DeserializeSeed<'de> for LegacyEntry<'_> {
     type Value = ();
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        deserializer.deserialize_tuple(8, self)
+        deserializer.deserialize_tuple(if self.format_version == 10 { 9 } else { 8 }, self)
     }
 }
 
@@ -2175,6 +2177,7 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
         let fingerprint: SourceFingerprint = legacy_field(&mut sequence)?;
         if namespace != self.identity.namespace
             || !admitted(self.identity, version)
+            || (self.format_version == 10 && (namespace != "claude" || version != 2))
             || legacy_shard_index(self.identity.namespace, &path) != self.index
         {
             return Err(serde::de::Error::custom(
@@ -2216,6 +2219,12 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
             sequence.next_element_seed(StreamSequence::<format4::UnifiedMessage, _>::new(
                 |message: format4::UnifiedMessage| writer.push(&message.into(), false, false),
             ))?
+        } else if self.format_version == 10 {
+            sequence.next_element_seed(StreamSequence::<upstream10::UnifiedMessage, _>::new(
+                |message: upstream10::UnifiedMessage| {
+                    writer.push(&message.into_local()?, false, false)
+                },
+            ))?
         } else {
             sequence.next_element_seed(StreamSequence::<UnifiedMessage, _>::new(|message| {
                 writer.push(&message, false, false)
@@ -2226,32 +2235,65 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
                 "legacy source messages are missing",
             ));
         }
-        if sequence.next_element_seed(StreamSequence::<usize,_>::new(|index| {
+        if self.format_version == 10 {
+            if sequence
+                .next_element_seed(StreamSequence::<usize, _>::new(|index| {
+                    if index == usize::MAX {
+                        return Ok(());
+                    }
+                    if index as u64 >= writer.next_ordinal {
+                        return Err("legacy retained index is invalid".to_string());
+                    }
+                    self.connection
+                        .prepare_cached(
+                            "UPDATE mc_rows SET retained=1 WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
+                        )
+                        .map_err(sql_error)?
+                        .execute(params![id, generation, index as i64])
+                        .map_err(sql_error)?;
+                    Ok(())
+                }))?
+                .is_none()
+            {
+                return Err(serde::de::Error::custom("legacy retained indices are missing"));
+            }
+            // Claude never owns Codex, Prime or OpenCode incremental metadata.
+            for _ in 0..3 {
+                if legacy_field::<Option<()>, _>(&mut sequence)?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "unexpected upstream Claude metadata",
+                    ));
+                }
+            }
+            writer.cacheable = false;
+        } else {
+            if sequence.next_element_seed(StreamSequence::<usize,_>::new(|index| {
             if index as u64 >= writer.next_ordinal { return Err("legacy fallback index is invalid".to_string()); }
             self.connection.prepare_cached(
                 "UPDATE mc_rows SET fallback=1,timestamp=?4 WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
             ).map_err(sql_error)?.execute(params![id,generation,index as i64,writer.fallback_timestamp],
             ).map_err(sql_error)?;Ok(())
         }))?.is_none() { return Err(serde::de::Error::custom("legacy fallback indices are missing")); }
-        writer.codex_incremental = sequence
-            .next_element_seed(LegacyCodexIncremental {
-                connection: self.connection,
-                source_id: id,
-                generation,
-            })?
-            .ok_or_else(|| serde::de::Error::custom("legacy resume metadata is missing"))?;
-        writer.cacheable = self.identity.namespace != ClientId::Codex.as_str()
-            || writer.codex_incremental.as_ref().is_some_and(|resume| {
-                resume.consumed_offset == fingerprint.size
-                    && resume.ends_with_newline
-                    && resume.prefix_hash == fingerprint.content_hash
-            });
-        if sequence.next_element_seed(StreamSequence::<String,_>::new(|key| {
+            writer.codex_incremental = sequence
+                .next_element_seed(LegacyCodexIncremental {
+                    connection: self.connection,
+                    source_id: id,
+                    generation,
+                })?
+                .ok_or_else(|| serde::de::Error::custom("legacy resume metadata is missing"))?;
+            writer.cacheable = self.identity.namespace != ClientId::Codex.as_str()
+                || writer.codex_incremental.as_ref().is_some_and(|resume| {
+                    resume.consumed_offset == fingerprint.size
+                        && resume.ends_with_newline
+                        && resume.prefix_hash == fingerprint.content_hash
+                });
+            if sequence.next_element_seed(StreamSequence::<String,_>::new(|key| {
             self.connection.prepare_cached(
                 "UPDATE mc_rows SET retained=1 WHERE source_id=?1 AND generation=?2 AND dedup_key=?3",
             ).map_err(sql_error)?.execute(params![id,generation,key],
             ).map_err(sql_error)?;Ok(())
         }))?.is_none() { return Err(serde::de::Error::custom("legacy retained keys are missing")); }
+        }
         let legacy_identity = CacheIdentity {
             parser_version: version,
             ..self.identity

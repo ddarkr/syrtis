@@ -428,11 +428,7 @@ fn transfer(source: &Source, root: &Path) -> Result<(), String> {
     )
     .map_err(|_| "usage migration source open failed")?;
     configure(&origin)?;
-    // Corruption surfaces here as a failed read, never as an empty success.
-    // Strong validation reuses the consumer's own generation checks
-    // (payload hashes, frozen codecs, fingerprint/metadata, Codex
-    // membership) — never a weaker count/digest-only duplicate.
-    crate::message_cache::validate_durable_store_on(&origin)?;
+    let snapshot = validated_source_snapshot(&origin)?;
 
     // Stage off to the side under the owned temp prefix (exact watch-rule
     // addition for Main). No failed transfer may leave an empty canonical
@@ -450,10 +446,11 @@ fn transfer(source: &Source, root: &Path) -> Result<(), String> {
         destination
             .pragma_update(None, "journal_mode", "DELETE")
             .map_err(|_| "usage migration staging setup failed")?;
-        let backup = rusqlite::backup::Backup::new(&origin, &mut destination)
+        let backup = rusqlite::backup::Backup::new(&snapshot, &mut destination)
             .map_err(|_| "usage migration backup failed")?;
         step_backup(&backup)?;
         drop(backup);
+        drop(snapshot);
         drop(destination);
         // Reopen (the pager still remembers DELETE) and normalize, then
         // validate the staged copy before it can become canonical.
@@ -637,6 +634,17 @@ fn pick_source_file(source: &Source) -> Result<PathBuf, String> {
         return Ok(recovery);
     }
     Err("usage migration source is absent".into())
+}
+
+fn validated_source_snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    // Validation establishes a WAL read snapshot; keep it through every backup
+    // step so another connection's writes cannot restart the copy or replace
+    // the generation we validated. WAL writers remain free to commit.
+    let snapshot = conn
+        .unchecked_transaction()
+        .map_err(|_| "usage migration source snapshot failed")?;
+    crate::message_cache::validate_durable_store_on(&snapshot)?;
+    Ok(snapshot)
 }
 
 fn step_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<(), String> {

@@ -250,6 +250,55 @@ fn migrates_wal_rows_and_marks_idempotent() {
 }
 
 #[test]
+fn backup_keeps_validated_snapshot_during_concurrent_wal_writes() {
+    let legacy = TempDir::new().unwrap();
+    seed_legacy_store(legacy.path(), 265, 42000);
+    let writer = Connection::open(legacy.path().join(DATABASE)).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             INSERT INTO mc_meta(key,value) VALUES('snapshot-test','before');
+             CREATE TABLE backup_padding(value BLOB);
+             INSERT INTO backup_padding VALUES(zeroblob(1048576));",
+        )
+        .unwrap();
+    let origin = Connection::open_with_flags(
+        legacy.path().join(DATABASE),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let snapshot = validated_source_snapshot(&origin).unwrap();
+    let target = TempDir::new().unwrap();
+    let mut destination = Connection::open(target.path().join(DATABASE)).unwrap();
+    let backup = rusqlite::backup::Backup::new(&snapshot, &mut destination).unwrap();
+    assert_eq!(backup.step(1).unwrap(), rusqlite::backup::StepResult::More);
+    writer
+        .execute(
+            "UPDATE mc_meta SET value='after' WHERE key='snapshot-test'",
+            [],
+        )
+        .unwrap();
+    step_backup(&backup).unwrap();
+    drop(backup);
+    let value = |conn: &Connection| -> String {
+        conn.query_row(
+            "SELECT value FROM mc_meta WHERE key='snapshot-test'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(value(&destination), "before");
+    assert_eq!(value(&writer), "after");
+    assert_eq!(
+        target_inputs(target.path()),
+        vec![(265, false), (42000, true)]
+    );
+    crate::message_cache::validate_durable_store_on(&destination).unwrap();
+}
+
+#[test]
 #[serial]
 fn corrupt_source_fails_closed_without_target() {
     let profile = TempDir::new().unwrap();
