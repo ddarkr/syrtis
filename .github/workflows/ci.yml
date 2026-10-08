@@ -29,28 +29,11 @@ jobs:
     runs-on: xcode-27
     steps:
       - uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
-      # The knowledge checks resolve engine SHAs and count commit ranges, which
-      # a depth-1 submodule cannot answer. Without this they return "cannot ask"
-      # and pass silently, which is how a stale delta count reached main three
-      # advances running.
-      - name: Unshallow the engine submodule
-        run: |
-          set -euo pipefail
-          if [ "$(git -C vendor/tokscale-core rev-parse --is-shallow-repository)" = "false" ]; then
-            echo "engine already complete"
-          else
-            git -C vendor/tokscale-core fetch --unshallow --quiet
-          fi
-          test "$(git -C vendor/tokscale-core rev-parse --is-shallow-repository)" = "false"
-
-      # Two knowledge checks read this repository's own history: whether the
-      # last engine pin advance touched crates/tb_core_ffi or ctb.h, and
-      # whether a document's body changed since the merge base with main
-      # without moving last_verified. A depth-1 checkout holds neither, and
-      # both checks then answer "cannot ask" and pass.
+      # The engine is owned source under crates/syrtis_core, so there is no
+      # engine submodule to unshallow. The history fetch below still matters:
+      # the last_verified gate reads this repository's own history, which a
+      # depth-1 checkout does not hold.
       - name: Fetch history for the knowledge checks
         run: |
           set -euo pipefail
@@ -127,6 +110,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.scope.outputs.docs_only != 'true'
+        with:
+          toolchain: "1.96.1"
 
       # Most PRs never touch Rust, yet rebuilt the staticlib every run: the
       # dependency cache hits, but the two workspace crates are path
@@ -136,11 +121,13 @@ jobs:
       # links the library main already built.
       #
       # Key inputs: the root manifest (it carries [profile.release]), the lock
-      # file, the FFI crate, .cargo/ (MACOSX_DEPLOYMENT_TARGET), this workflow
-      # (how cargo is invoked), the engine submodule's commit, and the exact
-      # rustc, and the runner image version, which carries the clang that
-      # compiles rusqlite's bundled C. Pushes never read this cache and always
-      # build in full, so a stale library cannot survive past the merge.
+      # file, the toolchain pin, both workspace crates (the engine is owned
+      # source under crates/syrtis_core, already covered by `crates/**`),
+      # .cargo/ (MACOSX_DEPLOYMENT_TARGET), this workflow (how cargo is
+      # invoked), and the exact rustc, and the runner image version, which
+      # carries the clang that compiles rusqlite's bundled C. Pushes never
+      # read this cache and always build in full, so a stale library cannot
+      # survive past the merge.
       #
       # A hit also skips the Rust unit tests below, so the key covers what they
       # read as well: Fixtures/ and Tests/fixtures/ (agent_usage.rs and
@@ -149,17 +136,15 @@ jobs:
       # tests.
       #
       # Each part is assigned before use: a failure inside `$(...)` in the echo
-      # would not trip `set -e`, and an empty engine term would let a PR that
-      # only moves the submodule link the previous engine.
+      # would not trip `set -e`.
       - name: Rust library cache key
         if: steps.scope.outputs.docs_only != 'true'
         id: rustlib
         run: |
           set -euo pipefail
           rustc_id=$(rustc -V | shasum | cut -c1-12)
-          engine=$(git rev-parse HEAD:vendor/tokscale-core)
           image="${ImageOS:?}-${ImageVersion:?}"
-          echo "key=rustlib-v1-${RUNNER_OS}-${RUNNER_ARCH}-${image}-${rustc_id}-${engine}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/**', '.cargo/**', '.github/workflows/ci.yml', 'Fixtures/**', 'Tests/fixtures/**') }}" >> "$GITHUB_OUTPUT"
+          echo "key=rustlib-v2-${RUNNER_OS}-${RUNNER_ARCH}-${image}-${rustc_id}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**', '.cargo/**', '.github/workflows/ci.yml', 'Fixtures/**', 'Tests/fixtures/**') }}" >> "$GITHUB_OUTPUT"
 
       # PR-only. Main always builds from source: it is the only writer of this
       # cache, so reading it there would carry an entry forward instead of
@@ -216,12 +201,11 @@ jobs:
       # turn CI red before any change. What fails here is an error-level lint,
       # which includes Clippy's deny-by-default correctness group.
       #
-      # tb_core_ffi only: vendor/tokscale-core declares `#![deny(clippy::all)]`
-      # and the toolchain is the floating stable, so a new Rust release adding
-      # a lint the engine trips would turn every PR and main red at once, and
-      # the tag gate would then hold releases on code nobody here changed. The
-      # engine's lints stay with the local gate (`cargo clippy --workspace
-      # --all-targets`) and with the upstream sync.
+      # tb_core_ffi only: crates/syrtis_core declares `#![deny(clippy::all)]`
+      # and the toolchain is pinned by rust-toolchain.toml, so an engine lint
+      # trip is a same-repo defect, not a remote-sync surprise. The engine's
+      # lints stay with the local gate (`cargo clippy --workspace
+      # --all-targets`) where they fail the same way.
       #
       # `-p` alone does not do that: the engine is a path dependency and a
       # workspace member, so cargo does not cap its lints, and Clippy still

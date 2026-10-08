@@ -1,0 +1,7393 @@
+use super::{aliases, litellm::ModelPricing};
+use crate::{provider_identity, strip_parenthesized_reasoning_tier, TokenBreakdown};
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+const PROVIDER_PREFIXES: &[&str] = &[
+    "openai/",
+    "anthropic/",
+    "google/",
+    "meta-llama/",
+    "mistralai/",
+    "minimax/",
+    "deepseek/",
+    "qwen/",
+    "cohere/",
+    "perplexity/",
+    "x-ai/",
+];
+
+const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
+    "x-ai/",
+    "xai/",
+    "anthropic/",
+    "openai/",
+    "google/",
+    "meta-llama/",
+    "mistralai/",
+    "minimax/",
+    "deepseek/",
+    "z-ai/",
+    "qwen/",
+    "cohere/",
+    "perplexity/",
+    "moonshotai/",
+];
+
+const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
+    "azure/",
+    "azure_ai/",
+    "bedrock/",
+    "vertex_ai/",
+    "together/",
+    "together_ai/",
+    "fireworks_ai/",
+    "groq/",
+    "openrouter/",
+];
+
+// Bare brand tokens ("claude", "anthropic") are blocked because they contain
+// no model information: a fuzzy hit from them can land on any model of the
+// brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
+// opus-fast key), so such a match is never trustworthy.
+//
+// Generic English words ("model", "router") are blocked for the same reason:
+// they carry no model identity, yet substring-match real priced keys
+// (`azure_ai/model_router`, `kilo/switchpoint/router`). Without this guard an
+// id whose only fuzzy-eligible remnant after suffix stripping is the word
+// `model` (e.g. `model-zero-usage-v1` -> stripped `model`) misprices at the
+// router key's rate. See `fuzzy_match_does_not_resolve_generic_model_token`.
+const FUZZY_BLOCKLIST: &[&str] = &[
+    "auto",
+    "mini",
+    "chat",
+    "base",
+    "claude",
+    "anthropic",
+    "model",
+    "router",
+];
+
+const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
+const TIERED_PRICING_THRESHOLD_128K_TOKENS: f64 = 128_000.0;
+const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
+const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
+const TIERED_PRICING_THRESHOLD_272K_TOKENS: f64 = 272_000.0;
+
+// Only these identities document one long-context rate tier for the whole
+// request. Other catalog `*_above_*` fields retain marginal semantics.
+const FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.4-pro",
+    "gpt-5.4-pro-2026-03-05",
+    "gpt-5.5",
+    "gpt-5.5-2026-04-23",
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+];
+
+const MIN_FUZZY_MATCH_LEN: usize = 5;
+
+/// Minimum length for a model name candidate after prefix/suffix stripping.
+/// Prevents false positives like "pro" or "flash" being matched alone.
+const MIN_MODEL_NAME_LEN: usize = 2;
+
+/// Maximum number of leading segments that can be treated as a routing prefix.
+/// Limits how aggressively we strip (e.g., "a-b-claude-3" strips at most "a-b-").
+const MAX_PREFIX_STRIP_SEGMENTS: usize = 2;
+
+/// Maximum number of trailing segments that can be treated as a routing suffix.
+/// Handles tier suffixes (-high, -low) and variant suffixes (-thinking, -codex, -codex-max-xhigh).
+const MAX_SUFFIX_STRIP_SEGMENTS: usize = 4;
+
+#[derive(Clone)]
+struct CachedResult {
+    pricing: ModelPricing,
+    source: String,
+    matched_key: String,
+}
+
+fn cached_result_bytes(value: &Option<CachedResult>) -> usize {
+    value.as_ref().map_or(0, |value| {
+        super::allocation_bytes(value.source.capacity(), 1)
+            .saturating_add(super::allocation_bytes(value.matched_key.capacity(), 1))
+    })
+}
+
+struct KeyModelPart {
+    key: String,
+    lower_model_part: String,
+}
+
+struct ProviderScopedModelPath<'a> {
+    provider: &'a str,
+    terminal_model_id: &'a str,
+}
+
+pub struct PricingLookup {
+    litellm: HashMap<String, ModelPricing>,
+    openrouter: HashMap<String, ModelPricing>,
+    cursor: HashMap<String, ModelPricing>,
+    sakana: HashMap<String, ModelPricing>,
+    litellm_keys: Vec<String>,
+    openrouter_keys: Vec<String>,
+    litellm_key_parts: Vec<KeyModelPart>,
+    openrouter_key_parts: Vec<KeyModelPart>,
+    litellm_lower: HashMap<String, String>,
+    /// LiteLLM keys whose whole id, after version-separator normalization, is
+    /// one of the request-wide 272K identities: the only rows
+    /// `canonical_tier_donor` may lend tiers from. Such a key has no provider
+    /// prefix by construction.
+    litellm_canonical: HashMap<String, String>,
+    openrouter_lower: HashMap<String, String>,
+    openrouter_model_part: HashMap<String, String>,
+    cursor_lower: HashMap<String, String>,
+    sakana_lower: HashMap<String, String>,
+    retained_base_bytes: usize,
+    // Dynamic string bytes are updated under the same lock as their entries.
+    lookup_cache: RwLock<(HashMap<String, Option<CachedResult>>, usize)>,
+}
+
+pub struct LookupResult {
+    pub pricing: ModelPricing,
+    pub source: String,
+    pub matched_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstimateCoverage {
+    Complete,
+    Partial,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CostEstimate {
+    pub(crate) cost: f64,
+    pub(crate) coverage: EstimateCoverage,
+}
+
+impl PricingLookup {
+    pub fn new(
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+        cursor: HashMap<String, ModelPricing>,
+    ) -> Self {
+        Self::new_with_sakana(litellm, openrouter, cursor, HashMap::new())
+    }
+
+    pub fn new_with_sakana(
+        litellm: HashMap<String, ModelPricing>,
+        openrouter: HashMap<String, ModelPricing>,
+        cursor: HashMap<String, ModelPricing>,
+        sakana: HashMap<String, ModelPricing>,
+    ) -> Self {
+        let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
+        // Fallbacks select the first eligible key. Break equal-length ties so
+        // rebuilding an unchanged catalog cannot randomly change its rates.
+        litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+        let mut openrouter_keys: Vec<String> = openrouter.keys().cloned().collect();
+        openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+        let mut litellm_lower = HashMap::with_capacity(litellm.len());
+        let mut litellm_canonical: HashMap<String, String> = HashMap::new();
+        for key in &litellm_keys {
+            let lower = key.to_lowercase();
+            let id = normalize_version_separator(&lower).unwrap_or_else(|| lower.clone());
+            if is_request_wide_identity(&id) {
+                let slot = litellm_canonical.entry(id).or_insert_with(|| key.clone());
+                if key < slot {
+                    *slot = key.clone();
+                }
+            }
+            litellm_lower.insert(lower, key.clone());
+        }
+
+        let mut openrouter_lower = HashMap::with_capacity(openrouter.len());
+        let mut openrouter_model_part = HashMap::with_capacity(openrouter.len());
+        for key in &openrouter_keys {
+            let lower = key.to_lowercase();
+            openrouter_lower.insert(lower.clone(), key.clone());
+            if let Some(model_part) = lower.split('/').next_back() {
+                if model_part != lower {
+                    openrouter_model_part.insert(model_part.to_string(), key.clone());
+                }
+            }
+        }
+
+        let mut cursor_lower = HashMap::with_capacity(cursor.len());
+        for key in cursor.keys() {
+            cursor_lower.insert(key.to_lowercase(), key.clone());
+        }
+
+        let mut sakana_lower = HashMap::with_capacity(sakana.len());
+        for key in sakana.keys() {
+            sakana_lower.insert(key.to_lowercase(), key.clone());
+        }
+
+        let build_key_parts = |keys: &[String]| -> Vec<KeyModelPart> {
+            keys.iter()
+                .map(|key| {
+                    let lower = key.to_lowercase();
+                    let model_part = lower.split('/').next_back().unwrap_or(&lower).to_string();
+                    KeyModelPart {
+                        key: key.clone(),
+                        lower_model_part: model_part,
+                    }
+                })
+                .collect()
+        };
+
+        let litellm_key_parts = build_key_parts(&litellm_keys);
+        let openrouter_key_parts = build_key_parts(&openrouter_keys);
+
+        let mut lookup = Self {
+            litellm,
+            openrouter,
+            cursor,
+            sakana,
+            litellm_keys,
+            openrouter_keys,
+            litellm_key_parts,
+            openrouter_key_parts,
+            litellm_lower,
+            litellm_canonical,
+            openrouter_lower,
+            openrouter_model_part,
+            cursor_lower,
+            sakana_lower,
+            retained_base_bytes: 0,
+            lookup_cache: RwLock::new((HashMap::with_capacity(64), 0)),
+        };
+        lookup.retained_base_bytes = lookup.catalog_retained_bytes();
+        lookup
+    }
+
+    fn catalog_retained_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for map in [&self.litellm, &self.openrouter, &self.cursor, &self.sakana] {
+            bytes = bytes.saturating_add(super::pricing_map_bytes(map));
+        }
+        for map in [
+            &self.litellm_lower,
+            &self.litellm_canonical,
+            &self.openrouter_lower,
+            &self.openrouter_model_part,
+            &self.cursor_lower,
+            &self.sakana_lower,
+        ] {
+            bytes = bytes.saturating_add(super::map_allocation_bytes(map));
+            for (key, value) in map {
+                bytes = bytes
+                    .saturating_add(super::allocation_bytes(key.capacity(), 1))
+                    .saturating_add(super::allocation_bytes(value.capacity(), 1));
+            }
+        }
+        for keys in [&self.litellm_keys, &self.openrouter_keys] {
+            bytes = bytes.saturating_add(super::allocation_bytes(
+                keys.capacity(),
+                std::mem::size_of::<String>(),
+            ));
+            for key in keys {
+                bytes = bytes.saturating_add(super::allocation_bytes(key.capacity(), 1));
+            }
+        }
+        for parts in [&self.litellm_key_parts, &self.openrouter_key_parts] {
+            bytes = bytes.saturating_add(super::allocation_bytes(
+                parts.capacity(),
+                std::mem::size_of::<KeyModelPart>(),
+            ));
+            for part in parts {
+                bytes = bytes
+                    .saturating_add(super::allocation_bytes(part.key.capacity(), 1))
+                    .saturating_add(super::allocation_bytes(part.lower_model_part.capacity(), 1));
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let cache = self.lookup_cache.read().unwrap_or_else(|p| p.into_inner());
+        self.retained_base_bytes
+            .saturating_add(super::map_allocation_bytes(&cache.0))
+            .saturating_add(cache.1)
+    }
+
+    pub fn lookup(&self, model_id: &str) -> Option<LookupResult> {
+        self.lookup_with_provider(model_id, None)
+    }
+
+    pub fn lookup_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let normalized_provider_id = normalize_provider_hint(provider_id);
+        if provider_id.is_some() && normalized_provider_id.is_none() {
+            return self.lookup_with_source_and_provider(model_id, None, provider_id);
+        }
+        let cache_key = build_lookup_cache_key(model_id, normalized_provider_id);
+        if let Some(cached) = self
+            .lookup_cache
+            .read()
+            .ok()
+            .and_then(|c| c.0.get(&cache_key).cloned())
+        {
+            return cached.map(|c| LookupResult {
+                pricing: c.pricing,
+                source: c.source,
+                matched_key: c.matched_key,
+            });
+        }
+
+        let result = self.lookup_with_source_and_provider(model_id, None, provider_id);
+
+        if let Ok(mut state) = self.lookup_cache.write() {
+            let (cache, string_bytes) = &mut *state;
+            if cache.len() >= MAX_LOOKUP_CACHE_ENTRIES {
+                // Evict ~25% of entries instead of clearing everything.
+                // This avoids a thundering-herd cache miss storm that happens
+                // when clear() wipes all entries at once.
+                let evict_count = cache.len() / 4;
+                let keys_to_remove: Vec<String> = cache.keys().take(evict_count).cloned().collect();
+                for key in keys_to_remove {
+                    if let Some((key, value)) = cache.remove_entry(&key) {
+                        *string_bytes = string_bytes
+                            .saturating_sub(super::allocation_bytes(key.capacity(), 1))
+                            .saturating_sub(cached_result_bytes(&value));
+                    }
+                }
+            }
+            let value = result.as_ref().map(|r| CachedResult {
+                pricing: r.pricing.clone(),
+                source: r.source.clone(),
+                matched_key: r.matched_key.clone(),
+            });
+            let value_bytes = cached_result_bytes(&value);
+            match cache.entry(cache_key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let old = entry.insert(value);
+                    *string_bytes = string_bytes
+                        .saturating_sub(cached_result_bytes(&old))
+                        .saturating_add(value_bytes);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    *string_bytes = string_bytes
+                        .saturating_add(super::allocation_bytes(entry.key().capacity(), 1))
+                        .saturating_add(value_bytes);
+                    entry.insert(value);
+                }
+            }
+        }
+
+        result
+    }
+
+    pub fn lookup_with_source(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+    ) -> Option<LookupResult> {
+        self.lookup_with_source_and_provider(model_id, force_source, None)
+    }
+
+    pub fn lookup_with_source_and_provider(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        self.lookup_with_source_and_provider_and_terminal_custom(
+            model_id,
+            force_source,
+            provider_id,
+            |_| None,
+        )
+    }
+
+    /// Resolve a model through the normal built-in pipeline while allowing the
+    /// owning service to add a custom candidate only at the generic terminal
+    /// fallback stage. This deliberately bypasses `lookup_cache`: the cache is
+    /// owned by the built-in datasets and must never retain a result supplied by
+    /// an unrelated custom-pricing closure.
+    pub(crate) fn lookup_with_source_and_provider_and_terminal_custom<F>(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+        terminal_custom: F,
+    ) -> Option<LookupResult>
+    where
+        F: Fn(&str) -> Option<LookupResult>,
+    {
+        let mut result = self.resolve_with_source_and_provider(
+            model_id,
+            force_source,
+            provider_id,
+            terminal_custom,
+        )?;
+        if force_source.is_none() && normalize_provider_hint(provider_id).is_some() {
+            self.borrow_canonical_long_context_tiers(&mut result);
+        }
+        Some(result)
+    }
+
+    /// A provider hint can elect a row (a reseller LiteLLM key, or an
+    /// OpenRouter endpoint) that quotes the model's base rates but omits the
+    /// long-context tiers the canonical LiteLLM row publishes, so a request past
+    /// the threshold bills at the base rate. Fill only the tier rates the
+    /// elected row leaves out, from the canonical row for the same model; the
+    /// elected row is never replaced and every rate it publishes stays.
+    ///
+    /// The donor must be a LiteLLM key with no provider prefix whose model id
+    /// equals the elected row's (after the version-separator normalization
+    /// OpenRouter matching already uses). Anything looser, including the
+    /// unhinted lookup result, can name another model or a reseller.
+    fn borrow_canonical_long_context_tiers(&self, result: &mut LookupResult) {
+        if !matches!(result.source.as_str(), "LiteLLM" | "OpenRouter") {
+            return;
+        }
+        let Some(donor) = self.canonical_tier_donor(&result.matched_key) else {
+            return;
+        };
+        borrow_missing_long_context_tiers(&mut result.pricing, donor);
+    }
+
+    /// The canonical LiteLLM row that may lend 272K tiers to the row keyed
+    /// `matched_key`, or `None` when the model is not a request-wide identity,
+    /// has no canonical row, or is that row.
+    fn canonical_tier_donor(&self, matched_key: &str) -> Option<&ModelPricing> {
+        let terminal = matched_key
+            .rsplit('/')
+            .next()
+            .unwrap_or(matched_key)
+            .to_lowercase();
+        let id = normalize_version_separator(&terminal).unwrap_or(terminal);
+        // `litellm_canonical` only holds the request-wide identities, so other
+        // vendors' tiers (Claude/Gemini 200K) are never borrowed.
+        let key = self.litellm_canonical.get(&id)?;
+        if key.eq_ignore_ascii_case(matched_key) {
+            return None;
+        }
+        self.litellm.get(key)
+    }
+
+    /// The pricing pipeline itself, before the hinted-row tier borrow that
+    /// `lookup_with_source_and_provider_and_terminal_custom` applies.
+    fn resolve_with_source_and_provider<F>(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+        terminal_custom: F,
+    ) -> Option<LookupResult>
+    where
+        F: Fn(&str) -> Option<LookupResult>,
+    {
+        let sakana_provider_id = provider_id.map(str::trim);
+        let provider_id = normalize_provider_hint(provider_id);
+        let force_source_normalized = force_source.map(str::to_ascii_lowercase);
+        let force_source = force_source_normalized.as_deref();
+        let raw_lower = model_id.to_lowercase();
+
+        // Helper to perform lookup with the given source constraint.
+        let do_lookup = |id: &str| match force_source {
+            Some("litellm") => self.lookup_litellm_only(id, provider_id),
+            Some("openrouter") => self.lookup_openrouter_only(id, provider_id),
+            Some("custom") => None,
+            _ => self.lookup_auto(id, provider_id, sakana_provider_id),
+        };
+
+        let force_custom = force_source.is_some_and(|source| source.eq_ignore_ascii_case("custom"));
+        let has_parenthesized_suffix = raw_lower
+            .strip_suffix(')')
+            .and_then(|inner| inner.rsplit_once('('))
+            .is_some();
+
+        // The complete raw id gets first refusal. This must precede tier
+        // validation and every normalization pass so an explicitly configured
+        // `(invalid)` or routed key remains authoritative. Forced upstream
+        // sources never invoke the custom callback. Use the raw id for the
+        // Claude guard too, so this direct stage does not become an unguarded
+        // terminal fallback.
+        let raw_requested_family = claude_family(&raw_lower);
+        let raw_requested_version = requested_claude_version(&raw_lower);
+        let raw_unparsed_modern_version = raw_requested_family.is_some()
+            && raw_requested_version.is_none()
+            && contains_delimited_modern_major_minor(&raw_lower);
+        let raw_unsafe_claude_resolution = |result: &LookupResult| {
+            resolves_unsafe_claude_version(
+                raw_requested_family,
+                raw_requested_version.as_deref(),
+                raw_unparsed_modern_version,
+                result,
+            )
+        };
+        if force_custom || force_source.is_none() {
+            if let Some(result) =
+                terminal_custom(&raw_lower).filter(|result| !raw_unsafe_claude_resolution(result))
+            {
+                return Some(result);
+            }
+        }
+        // Built-in exact lookup is limited to parenthesized ids so ordinary
+        // provider ranking remains unchanged for unsuffixed ids.
+        if !force_custom && has_parenthesized_suffix {
+            if let Some(result) = self
+                .lookup_exact_full(&raw_lower, force_source, provider_id, sakana_provider_id)
+                .filter(|result| !raw_unsafe_claude_resolution(result))
+            {
+                return Some(result);
+            }
+        }
+
+        // CLIProxyAPI strips `(level)` reasoning-effort suffixes before routing,
+        // so for pricing lookup we resolve to the base model regardless of tier.
+        // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
+        // `try_strip_unknown_suffix` below.
+        let raw_normalized_owned =
+            strip_parenthesized_reasoning_tier(&raw_lower).map(str::to_owned);
+
+        // Guard against silent misresolution: if the input ends with `(...)`
+        // but the contents are not a recognized CLIProxyAPI level, refuse the
+        // lookup. Falling through to `try_strip_unknown_suffix` would split on
+        // `-` and could match a shorter, unrelated model id by peeling the
+        // parenthesized fragment off (e.g. `gpt-5.2-codex(invalid)` would
+        // strip `-codex(invalid)` and resolve to `gpt-5.2`).
+        if raw_normalized_owned.is_none() && has_parenthesized_suffix {
+            return None;
+        }
+
+        let raw_ref = raw_normalized_owned.as_deref().unwrap_or(&raw_lower);
+        let canonical = aliases::resolve_alias(raw_ref).unwrap_or(raw_ref);
+        let canonical_lower = canonical.to_lowercase();
+        let lower_ref = canonical_lower.as_str();
+        let requested_family = claude_family(lower_ref);
+        let requested_version = requested_claude_version(lower_ref);
+        let unparsed_modern_version = requested_family.is_some()
+            && requested_version.is_none()
+            && contains_delimited_modern_major_minor(lower_ref);
+        let unsafe_claude_resolution = |result: &LookupResult| {
+            resolves_unsafe_claude_version(
+                requested_family,
+                requested_version.as_deref(),
+                unparsed_modern_version,
+                result,
+            )
+        };
+        let guarded_custom = |candidate: &str| {
+            terminal_custom(candidate).filter(|result| !unsafe_claude_resolution(result))
+        };
+
+        // Full custom keys and full raw model ids are authoritative before any
+        // fallback. Keep the raw form first so a routed or provider-scoped key
+        // cannot be stolen by an alias normalization.
+        if let Some(result) = guarded_custom(raw_ref) {
+            return Some(result);
+        }
+        // Static aliases are a direct lookup stage, not a fuzzy fallback. A
+        // raw dataset key still gets first refusal when the id is an alias,
+        // while non-alias ids retain the established provider-ranking pipeline.
+        if canonical_lower != raw_ref {
+            if let Some(result) = self
+                .lookup_exact_full(raw_ref, force_source, provider_id, sakana_provider_id)
+                .filter(|result| !unsafe_claude_resolution(result))
+            {
+                return Some(result);
+            }
+            if let Some(result) = guarded_custom(lower_ref) {
+                return Some(result);
+            }
+            // A Cursor-specific alias names a Cursor tier, so it prices from
+            // the Cursor catalog even when an upstream row shares the target.
+            if force_source.is_none() && aliases::uses_cursor_pricing(raw_ref) {
+                if let Some(result) = self.exact_match_cursor(lower_ref) {
+                    return Some(result);
+                }
+            }
+        }
+        let routed_terminal = strip_generic_provider_prefix(raw_ref);
+        let unknown_router_path = routed_terminal.is_some() && !has_known_provider_prefix(raw_ref);
+        let direct_result = if unknown_router_path {
+            // An unknown router path gets only a full-key exact lookup here.
+            // Broad model-part overrides (Cursor/Sakana) must wait until the
+            // terminal candidate has tried upstream exact/provider-aware
+            // resolution. Known provider prefixes keep their established
+            // provider-ranking path.
+            self.lookup_exact_full(raw_ref, force_source, provider_id, sakana_provider_id)
+        } else {
+            do_lookup(lower_ref)
+        };
+        if let Some(result) = direct_result.filter(|result| !unsafe_claude_resolution(result)) {
+            return Some(result);
+        }
+
+        // Provider-scoped paths are intentionally fail-closed after their
+        // provider-aware direct lookup. Never route them through a generic
+        // terminal or custom fallback.
+        if parse_provider_scoped_model_path(raw_ref).is_some()
+            || parse_provider_scoped_model_path(lower_ref).is_some()
+        {
+            return None;
+        }
+
+        let original_allows_sakana = sakana_identity_matches(raw_ref, sakana_provider_id);
+        let guarded_lookup = |candidate: &str| {
+            do_lookup(candidate)
+                .filter(|result| !unsafe_claude_resolution(result))
+                .filter(|result| {
+                    !result.source.eq_ignore_ascii_case("Sakana") || original_allows_sakana
+                })
+        };
+        let guarded_lookup_ref = &guarded_lookup;
+        let guarded_full_path_lookup = |candidate: &str| {
+            let result = if unknown_router_path {
+                self.lookup_exact_full(candidate, force_source, provider_id, sakana_provider_id)
+            } else {
+                do_lookup(candidate)
+            };
+            result
+                .filter(|result| !unsafe_claude_resolution(result))
+                .filter(|result| {
+                    !result.source.eq_ignore_ascii_case("Sakana") || original_allows_sakana
+                })
+        };
+
+        // Preserve the full-path suffix pass before any generic terminal
+        // fallback. For example, `azure_ai/grok-code-fast-1-high` must first
+        // try `azure_ai/grok-code-fast-1`, rather than allowing terminal fuzzy
+        // matching to choose another provider's entry.
+        if let Some(result) = try_strip_unknown_suffix(raw_ref, guarded_full_path_lookup) {
+            return Some(result);
+        }
+
+        // Generic provider-routing prefix fallback. Normalize the terminal
+        // independently because the outer alias pass cannot see `cx/k2p6`.
+        // Raw custom keys precede alias-normalized custom keys; built-in lookup
+        // then sees the same normalized candidate as a direct lookup.
+        if let Some(terminal) = routed_terminal {
+            let terminal_lookup = |candidate: &str| {
+                let normalized = normalize_terminal_candidate(candidate)?;
+                if let Some(result) = guarded_custom(candidate) {
+                    return Some(result);
+                }
+                if normalized.as_str() != candidate {
+                    if let Some(result) = guarded_custom(&normalized) {
+                        return Some(result);
+                    }
+                }
+                guarded_lookup(&normalized)
+            };
+
+            if let Some(result) = terminal_lookup(terminal) {
+                return Some(result);
+            }
+            if let Some(result) = try_strip_unknown_suffix(terminal, terminal_lookup) {
+                return Some(result);
+            }
+        }
+
+        // Try stripping unknown prefixes (e.g., antigravity-, myplugin-), with
+        // each candidate also receiving the bounded suffix pass.
+        if let Some(result) = try_strip_unknown_prefix(raw_ref, guarded_lookup_ref) {
+            return Some(result);
+        }
+
+        None
+    }
+
+    /// Resolve only the complete raw model id, without model-part, prefix,
+    /// fuzzy, or suffix fallback. Provider-scoped paths are allowed to use
+    /// their dedicated provider-aware exact route before the global fail-closed
+    /// boundary.
+    fn lookup_exact_full(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+        sakana_provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if parse_provider_scoped_model_path(model_id).is_some() {
+            return match force_source {
+                Some("litellm") => self.lookup_provider_scoped_path_litellm(model_id, provider_id),
+                Some("openrouter") => {
+                    self.lookup_provider_scoped_path_openrouter(model_id, provider_id)
+                }
+                Some("custom") => None,
+                _ => self.lookup_provider_scoped_path(model_id, provider_id),
+            };
+        }
+
+        let exact_litellm = || {
+            self.exact_match_litellm_full_for_provider(model_id, provider_id)
+                .or_else(|| self.exact_match_litellm_full(model_id))
+        };
+        let exact_openrouter = || {
+            self.exact_match_openrouter_full_for_provider(model_id, provider_id)
+                .or_else(|| self.exact_match_openrouter_full(model_id))
+        };
+
+        match force_source {
+            Some("litellm") => exact_litellm(),
+            Some("openrouter") => exact_openrouter(),
+            Some("custom") => None,
+            _ => choose_best_source_result(exact_litellm(), exact_openrouter(), provider_id)
+                .or_else(|| self.exact_match_cursor_full(model_id))
+                .or_else(|| self.exact_match_sakana_full(model_id, sakana_provider_id)),
+        }
+    }
+
+    fn lookup_auto(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        sakana_provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.lookup_provider_scoped_path(model_id, provider_id) {
+            return Some(result);
+        }
+        if parse_provider_scoped_model_path(model_id).is_some() {
+            return None;
+        }
+
+        if let Some(stripped) = strip_known_provider_prefix(model_id) {
+            let prefix_matches_hint =
+                provider_id.is_none() || model_prefix_matches_provider(model_id, provider_id);
+
+            if prefix_matches_hint {
+                if let Some(exact_litellm) = self.exact_match_litellm(model_id) {
+                    return Some(exact_litellm);
+                }
+
+                let exact_openrouter = self.exact_match_openrouter(model_id);
+                let stripped_litellm = self.exact_or_normalized_litellm(stripped, provider_id);
+
+                if let (Some(litellm), Some(openrouter)) = (&stripped_litellm, &exact_openrouter) {
+                    if has_meaningful_tier_support(&litellm.pricing)
+                        && !has_any_valid_above_tier_value(&openrouter.pricing)
+                    {
+                        return stripped_litellm;
+                    }
+                }
+
+                if let Some(result) = exact_openrouter {
+                    return Some(result);
+                }
+                if let Some(result) = stripped_litellm {
+                    return Some(result);
+                }
+            } else {
+                if let Some(result) = choose_best_source_result(
+                    self.exact_match_litellm_for_provider(stripped, provider_id),
+                    self.exact_or_normalized_openrouter_for_provider(stripped, provider_id),
+                    provider_id,
+                ) {
+                    return Some(result);
+                }
+                if let Some(result) = self.exact_or_normalized_litellm(stripped, provider_id) {
+                    return Some(result);
+                }
+            }
+        }
+
+        if let Some(result) = choose_best_source_result(
+            self.exact_match_litellm_for_provider(model_id, provider_id),
+            self.exact_or_normalized_openrouter_for_provider(model_id, provider_id),
+            provider_id,
+        ) {
+            return Some(result);
+        }
+
+        if let Some(result) = self.exact_match_litellm(model_id) {
+            return Some(result);
+        }
+        if let Some(result) = self.exact_match_openrouter(model_id) {
+            return Some(result);
+        }
+
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = choose_best_source_result(
+                self.exact_match_litellm_for_provider(&version_normalized, provider_id),
+                self.exact_match_openrouter_for_provider(&version_normalized, provider_id),
+                provider_id,
+            ) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_litellm(&version_normalized) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_openrouter(&version_normalized) {
+                return Some(result);
+            }
+        }
+
+        if let Some(normalized) = normalize_model_name(model_id) {
+            if let Some(result) = choose_best_source_result(
+                self.exact_match_litellm_for_provider(&normalized, provider_id),
+                self.exact_match_openrouter_for_provider(&normalized, provider_id),
+                provider_id,
+            ) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_litellm(&normalized) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_openrouter(&normalized) {
+                return Some(result);
+            }
+        }
+
+        if let Some(result) = self.prefix_match_litellm(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(result) = self.prefix_match_openrouter(model_id, provider_id) {
+            return Some(result);
+        }
+
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = self.prefix_match_litellm(&version_normalized, provider_id) {
+                return Some(result);
+            }
+            if let Some(result) = self.prefix_match_openrouter(&version_normalized, provider_id) {
+                return Some(result);
+            }
+        }
+
+        if let Some(result) = self.exact_match_cursor(model_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = self.exact_match_cursor(&version_normalized) {
+                return Some(result);
+            }
+        }
+
+        if let Some(result) = self.exact_match_sakana(model_id, sakana_provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = self.exact_match_sakana(&version_normalized, sakana_provider_id) {
+                return Some(result);
+            }
+        }
+
+        if !is_fuzzy_eligible(model_id) {
+            return None;
+        }
+
+        let litellm_result = self.fuzzy_match_litellm(model_id, provider_id);
+        let openrouter_result = self.fuzzy_match_openrouter(model_id, provider_id);
+
+        choose_best_source_result(litellm_result, openrouter_result, provider_id)
+    }
+
+    fn exact_or_normalized_litellm(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_litellm_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(result) = self.exact_match_litellm(model_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_litellm_for_provider(&version_normalized, provider_id)
+            {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_litellm(&version_normalized) {
+                return Some(result);
+            }
+        }
+        if let Some(normalized) = normalize_model_name(model_id) {
+            if let Some(result) = self.exact_match_litellm_for_provider(&normalized, provider_id) {
+                return Some(result);
+            }
+            if let Some(result) = self.exact_match_litellm(&normalized) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    fn lookup_litellm_only(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.lookup_provider_scoped_path_litellm(model_id, provider_id) {
+            return Some(result);
+        }
+        if parse_provider_scoped_model_path(model_id).is_some() {
+            return None;
+        }
+
+        if let Some(result) = self.exact_or_normalized_litellm(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(stripped) = strip_known_provider_prefix(model_id) {
+            if let Some(result) = self.exact_or_normalized_litellm(stripped, provider_id) {
+                return Some(result);
+            }
+        }
+        if let Some(result) = self.prefix_match_litellm(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = self.prefix_match_litellm(&version_normalized, provider_id) {
+                return Some(result);
+            }
+        }
+        if is_fuzzy_eligible(model_id) {
+            if let Some(result) = self.fuzzy_match_litellm(model_id, provider_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    fn lookup_openrouter_only(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.lookup_provider_scoped_path_openrouter(model_id, provider_id) {
+            return Some(result);
+        }
+        if parse_provider_scoped_model_path(model_id).is_some() {
+            return None;
+        }
+
+        if let Some(result) = self.exact_match_openrouter_with_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_with_provider(&version_normalized, provider_id)
+            {
+                return Some(result);
+            }
+        }
+        if let Some(normalized) = normalize_model_name(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_with_provider(&normalized, provider_id)
+            {
+                return Some(result);
+            }
+        }
+        if let Some(result) = self.prefix_match_openrouter(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) = self.prefix_match_openrouter(&version_normalized, provider_id) {
+                return Some(result);
+            }
+        }
+        if is_fuzzy_eligible(model_id) {
+            if let Some(result) = self.fuzzy_match_openrouter(model_id, provider_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    fn lookup_provider_scoped_path(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let scoped = parse_provider_scoped_model_path(model_id)?;
+        if !provider_hint_matches_scoped_provider(provider_id, scoped.provider) {
+            return None;
+        }
+
+        choose_best_source_result(
+            self.lookup_provider_scoped_path_litellm(model_id, provider_id),
+            self.lookup_provider_scoped_path_openrouter(model_id, provider_id),
+            Some(scoped.provider),
+        )
+    }
+
+    fn lookup_provider_scoped_path_litellm(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let scoped = parse_provider_scoped_model_path(model_id)?;
+        if !provider_hint_matches_scoped_provider(provider_id, scoped.provider) {
+            return None;
+        }
+
+        if let Some(result) = self.exact_match_litellm(model_id) {
+            return Some(result);
+        }
+
+        let scoped_tags = provider_identity::provider_tags(scoped.provider);
+        for prefix in RESELLER_PROVIDER_PREFIXES {
+            if !provider_prefix_matches_scoped_provider(prefix, &scoped_tags) {
+                continue;
+            }
+
+            let key = format!("{}{}", prefix, model_id);
+            if let Some(litellm_key) = self.litellm_lower.get(&key) {
+                if let Some(pricing) = self.litellm.get(litellm_key) {
+                    if let Some(result) = lookup_result_if_usable(pricing, "LiteLLM", litellm_key) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+
+        self.exact_match_litellm_for_provider(scoped.terminal_model_id, Some(scoped.provider))
+    }
+
+    fn lookup_provider_scoped_path_openrouter(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let scoped = parse_provider_scoped_model_path(model_id)?;
+        if !provider_hint_matches_scoped_provider(provider_id, scoped.provider) {
+            return None;
+        }
+
+        self.exact_match_openrouter(model_id).or_else(|| {
+            self.exact_match_openrouter_for_provider(
+                scoped.terminal_model_id,
+                Some(scoped.provider),
+            )
+        })
+    }
+
+    fn exact_match_litellm_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        exact_match_with_provider_prefixes(
+            model_id,
+            provider_id,
+            &self.litellm_key_parts,
+            &self.litellm,
+            "LiteLLM",
+        )
+    }
+
+    fn exact_match_openrouter_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        exact_match_with_provider_prefixes(
+            model_id,
+            provider_id,
+            &self.openrouter_key_parts,
+            &self.openrouter,
+            "OpenRouter",
+        )
+    }
+
+    /// [`exact_match_openrouter_for_provider`], retrying the
+    /// separator-normalized spelling when the raw one finds nothing.
+    ///
+    /// OpenRouter dots minor versions (`anthropic/claude-haiku-4.5`) where
+    /// LiteLLM and callers hyphenate (`claude-haiku-4-5`). The provider-scoped
+    /// exact stages below compare raw spellings and return early, so without
+    /// this retry a hint-matching reseller LiteLLM row can win the stage
+    /// outright while OpenRouter's first-party entry — the one the hint
+    /// actually names — never participates in arbitration at all (#1329).
+    ///
+    /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`). Upstream
+    /// tags the normalized hit with `LookupResult::with_normalization()`; this
+    /// tree's `LookupResult` carries no `evidence` field, so that call is
+    /// dropped and the result is returned unchanged. Nothing else differs.
+    fn exact_or_normalized_openrouter_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_openrouter_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_for_provider(&version_normalized, provider_id)
+            {
+                return Some(result);
+            }
+        }
+        normalize_model_name(model_id).and_then(|normalized| {
+            self.exact_match_openrouter_for_provider(&normalized, provider_id)
+        })
+    }
+
+    fn exact_match_openrouter_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        self.exact_match_openrouter_for_provider(model_id, provider_id)
+            .or_else(|| self.exact_match_openrouter(model_id))
+    }
+
+    fn exact_match_litellm(&self, model_id: &str) -> Option<LookupResult> {
+        let key = self.litellm_lower.get(model_id)?;
+        let pricing = self.litellm.get(key)?;
+        lookup_result_if_usable(pricing, "LiteLLM", key)
+    }
+
+    fn exact_match_litellm_full(&self, model_id: &str) -> Option<LookupResult> {
+        self.exact_match_litellm(model_id)
+    }
+
+    fn exact_match_litellm_full_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let result = self.exact_match_litellm_full(model_id)?;
+        if let Some(provider) = provider_id {
+            if !provider_identity::matches_provider_hint(&result.matched_key, Some(provider)) {
+                return None;
+            }
+        }
+        Some(result)
+    }
+
+    fn exact_match_openrouter_full(&self, model_id: &str) -> Option<LookupResult> {
+        let key = self.openrouter_lower.get(model_id)?;
+        let pricing = self.openrouter.get(key)?;
+        lookup_result_if_usable(pricing, "OpenRouter", key)
+    }
+
+    fn exact_match_openrouter_full_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let result = self.exact_match_openrouter_full(model_id)?;
+        if let Some(provider) = provider_id {
+            if !provider_identity::matches_provider_hint(&result.matched_key, Some(provider)) {
+                return None;
+            }
+        }
+        Some(result)
+    }
+
+    fn exact_match_openrouter(&self, model_id: &str) -> Option<LookupResult> {
+        if let Some(key) = self.openrouter_lower.get(model_id) {
+            if let Some(pricing) = self.openrouter.get(key) {
+                return lookup_result_if_usable(pricing, "OpenRouter", key);
+            }
+        }
+        if let Some(key) = self.openrouter_model_part.get(model_id) {
+            if let Some(pricing) = self.openrouter.get(key) {
+                return lookup_result_if_usable(pricing, "OpenRouter", key);
+            }
+        }
+        None
+    }
+
+    fn exact_match_cursor_full(&self, model_id: &str) -> Option<LookupResult> {
+        let key = self.cursor_lower.get(model_id)?;
+        lookup_result_if_usable(self.cursor.get(key)?, "Cursor", key)
+    }
+
+    fn exact_match_cursor(&self, model_id: &str) -> Option<LookupResult> {
+        if let Some(key) = self.cursor_lower.get(model_id) {
+            return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key);
+        }
+        if let Some(model_part) = model_id.split('/').next_back() {
+            if model_part != model_id {
+                if let Some(key) = self.cursor_lower.get(model_part) {
+                    return lookup_result_if_usable(self.cursor.get(key).unwrap(), "Cursor", key);
+                }
+            }
+        }
+        None
+    }
+
+    fn exact_match_sakana_full(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if !sakana_identity_matches(model_id, provider_id) {
+            return None;
+        }
+        let key = self.sakana_lower.get(model_id)?;
+        lookup_result_if_usable(self.sakana.get(key)?, "Sakana", key)
+    }
+
+    fn exact_match_sakana(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if !sakana_identity_matches(model_id, provider_id) {
+            return None;
+        }
+        if let Some(key) = self.sakana_lower.get(model_id) {
+            return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key);
+        }
+        if let Some(model_part) = model_id.split('/').next_back() {
+            if model_part != model_id {
+                if let Some(key) = self.sakana_lower.get(model_part) {
+                    return lookup_result_if_usable(self.sakana.get(key).unwrap(), "Sakana", key);
+                }
+            }
+        }
+        None
+    }
+
+    fn prefix_match_litellm(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_litellm_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+
+        for prefix in PROVIDER_PREFIXES {
+            let key = format!("{}{}", prefix, model_id);
+            if let Some(litellm_key) = self.litellm_lower.get(&key) {
+                if let Some(pricing) = self.litellm.get(litellm_key) {
+                    if let Some(result) = lookup_result_if_usable(pricing, "LiteLLM", litellm_key) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn prefix_match_openrouter(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_openrouter_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+
+        for prefix in PROVIDER_PREFIXES {
+            let key = format!("{}{}", prefix, model_id);
+            if let Some(or_key) = self.openrouter_lower.get(&key) {
+                if let Some(pricing) = self.openrouter.get(or_key) {
+                    if let Some(result) = lookup_result_if_usable(pricing, "OpenRouter", or_key) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn fuzzy_match_litellm(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let family = extract_model_family(model_id);
+        let mut family_matches_list: Vec<&String> = Vec::new();
+
+        for key in &self.litellm_keys {
+            let lower_key = key.to_lowercase();
+            if family_matches(&lower_key, &family) && contains_model_id(&lower_key, model_id) {
+                family_matches_list.push(key);
+            }
+        }
+
+        if let Some(result) =
+            select_best_match(&family_matches_list, &self.litellm, "LiteLLM", provider_id)
+        {
+            return Some(result);
+        }
+
+        let mut all_matches: Vec<&String> = Vec::new();
+        for key in &self.litellm_keys {
+            let lower_key = key.to_lowercase();
+            if contains_model_id(&lower_key, model_id) {
+                all_matches.push(key);
+            }
+        }
+
+        select_best_match(&all_matches, &self.litellm, "LiteLLM", provider_id)
+    }
+
+    /// Fuzzy-match OpenRouter, trying the caller's spelling and then the
+    /// separator-normalized one.
+    ///
+    /// The two datasets disagree about how a minor version is written, so one
+    /// pass over a literal substring comparison can only ever reach half of
+    /// them. [`fuzzy_match_openrouter_spelling`] holds that single pass; this
+    /// runs it twice. See the comment on the retry below for the mechanism.
+    fn fuzzy_match_openrouter(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.fuzzy_match_openrouter_spelling(model_id, provider_id) {
+            return Some(result);
+        }
+        // OpenRouter spells some minor versions with a dot where LiteLLM and
+        // callers hyphenate (`anthropic/claude-haiku-4.5` vs
+        // `claude-haiku-4-5`), and `contains_model_id` is a literal find, so
+        // the pass above never sees those keys. Retry the same fuzzy passes
+        // against the normalized spelling before giving up, the way the exact
+        // passes already do (#1329).
+        //
+        // Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`).
+        // Upstream tags the normalized hit with `with_normalization()`; this
+        // tree's `LookupResult` has no `evidence` field, so that call is
+        // dropped.
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            return self.fuzzy_match_openrouter_spelling(&version_normalized, provider_id);
+        }
+        None
+    }
+
+    /// One fuzzy pass over the OpenRouter catalog for exactly the spelling it
+    /// is given.
+    ///
+    /// Split out of [`fuzzy_match_openrouter`] so that caller can run it against
+    /// more than one spelling of the same model. It performs no normalization
+    /// of its own: `contains_model_id` is a literal find, so `claude-haiku-4-5`
+    /// reaches `anthropic/claude-haiku-4.5` only if someone converts the
+    /// spelling first.
+    fn fuzzy_match_openrouter_spelling(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        let family = extract_model_family(model_id);
+        let mut family_matches_list: Vec<&String> = Vec::new();
+
+        for key in &self.openrouter_keys {
+            let lower_key = key.to_lowercase();
+            let model_part = lower_key.split('/').next_back().unwrap_or(&lower_key);
+            if family_matches(model_part, &family) && contains_model_id(model_part, model_id) {
+                family_matches_list.push(key);
+            }
+        }
+
+        if let Some(result) = select_best_match(
+            &family_matches_list,
+            &self.openrouter,
+            "OpenRouter",
+            provider_id,
+        ) {
+            return Some(result);
+        }
+
+        let mut all_matches: Vec<&String> = Vec::new();
+        for key in &self.openrouter_keys {
+            let lower_key = key.to_lowercase();
+            let model_part = lower_key.split('/').next_back().unwrap_or(&lower_key);
+            if contains_model_id(model_part, model_id) {
+                all_matches.push(key);
+            }
+        }
+
+        select_best_match(&all_matches, &self.openrouter, "OpenRouter", provider_id)
+    }
+
+    pub fn calculate_cost(
+        &self,
+        model_id: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+    ) -> f64 {
+        let usage = TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            cache_write_1h: 0,
+        };
+        self.calculate_cost_with_provider(model_id, None, &usage)
+    }
+
+    pub(crate) fn estimate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<CostEstimate> {
+        let result = self.lookup_with_provider(model_id, provider_id)?;
+        Some(compute_cost_and_coverage_for_lookup_result(&result, usage))
+    }
+
+    pub fn calculate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> f64 {
+        self.estimate_cost_with_provider(model_id, provider_id, usage)
+            .map_or(0.0, |estimate| estimate.cost)
+    }
+}
+
+pub(crate) fn compute_cost_and_coverage_for_lookup_result(
+    result: &LookupResult,
+    usage: &TokenBreakdown,
+) -> CostEstimate {
+    let cost = if uses_full_session_long_context_tier(result) {
+        compute_full_session_long_context_cost(
+            &result.pricing,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.cache_write_1h,
+            usage.reasoning,
+        )
+    } else {
+        compute_cost(
+            &result.pricing,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.cache_write_1h,
+            usage.reasoning,
+        )
+    };
+
+    CostEstimate {
+        cost,
+        coverage: coverage_for_lookup_result(result, usage),
+    }
+}
+
+fn uses_full_session_long_context_tier(result: &LookupResult) -> bool {
+    if result.source.eq_ignore_ascii_case("Sakana") {
+        return result.matched_key.eq_ignore_ascii_case("fugu-ultra");
+    }
+
+    let terminal_model_id = result
+        .matched_key
+        .rsplit('/')
+        .next()
+        .unwrap_or(result.matched_key.as_str())
+        .to_lowercase();
+    let id = normalize_version_separator(&terminal_model_id).unwrap_or(terminal_model_id);
+    // The model identity decides, not which dataset's row won: a hinted
+    // OpenRouter row for a listed model bills the same way once it carries the
+    // tiers (see `borrow_canonical_long_context_tiers`). The identity is
+    // normalized exactly as the donor match normalizes it.
+    (result.source.eq_ignore_ascii_case("LiteLLM")
+        || result.source.eq_ignore_ascii_case("OpenRouter"))
+        && is_request_wide_identity(&id)
+}
+
+#[derive(Clone, Copy)]
+enum BucketCoverage {
+    Known,
+    Partial,
+    Unknown,
+}
+
+#[derive(Default)]
+struct CoverageFold {
+    known: bool,
+    unknown: bool,
+}
+
+impl CoverageFold {
+    fn observe(&mut self, coverage: Option<BucketCoverage>) {
+        match coverage {
+            Some(BucketCoverage::Known) => self.known = true,
+            Some(BucketCoverage::Partial) => {
+                self.known = true;
+                self.unknown = true;
+            }
+            Some(BucketCoverage::Unknown) => self.unknown = true,
+            None => {}
+        }
+    }
+
+    fn finish(self) -> EstimateCoverage {
+        if !self.known && !self.unknown {
+            EstimateCoverage::None
+        } else if !self.unknown {
+            EstimateCoverage::Complete
+        } else if self.known {
+            EstimateCoverage::Partial
+        } else {
+            EstimateCoverage::None
+        }
+    }
+}
+
+fn is_active_bucket(tokens: f64) -> bool {
+    tokens > 0.0
+}
+
+fn ordinary_bucket_coverage(
+    tokens: f64,
+    base: Option<f64>,
+    tiers: &[(f64, Option<f64>)],
+) -> Option<BucketCoverage> {
+    if !is_active_bucket(tokens) {
+        return None;
+    }
+    if base.is_some_and(is_valid_price_value) {
+        return Some(BucketCoverage::Known);
+    }
+
+    let first_valid_tier = tiers.iter().find(|(threshold, rate)| {
+        threshold.is_finite() && *threshold > 0.0 && rate.is_some_and(is_valid_price_value)
+    });
+    if first_valid_tier.is_some_and(|(threshold, _)| tokens > *threshold) {
+        Some(BucketCoverage::Partial)
+    } else {
+        Some(BucketCoverage::Unknown)
+    }
+}
+
+fn selected_long_context_bucket_coverage(
+    tokens: f64,
+    base: Option<f64>,
+    long_context: Option<f64>,
+    use_long_context_rates: bool,
+) -> Option<BucketCoverage> {
+    if !is_active_bucket(tokens) {
+        return None;
+    }
+
+    let selected_rate = if use_long_context_rates {
+        long_context
+            .filter(|value| is_valid_price_value(*value))
+            .or(base.filter(|value| is_valid_price_value(*value)))
+    } else {
+        base.filter(|value| is_valid_price_value(*value))
+    };
+    Some(if selected_rate.is_some() {
+        BucketCoverage::Known
+    } else {
+        BucketCoverage::Unknown
+    })
+}
+
+fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> EstimateCoverage {
+    let input_clamped = usage.input.max(0) as f64;
+    let output_clamped = usage.output.max(0).saturating_add(usage.reasoning.max(0)) as f64;
+    let cache_read_clamped = usage.cache_read.max(0) as f64;
+    let cache_write_clamped = usage.cache_write.max(0) as f64;
+    let cache_write_1h_clamped = (usage.cache_write_1h.max(0) as f64).min(cache_write_clamped);
+    let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
+    let mut fold = CoverageFold::default();
+
+    if uses_full_session_long_context_tier(result) {
+        let use_long_context_rates =
+            input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
+        fold.observe(selected_long_context_bucket_coverage(
+            input_clamped,
+            result.pricing.input_cost_per_token,
+            result.pricing.input_cost_per_token_above_272k_tokens,
+            use_long_context_rates,
+        ));
+        fold.observe(selected_long_context_bucket_coverage(
+            output_clamped,
+            result.pricing.output_cost_per_token,
+            result.pricing.output_cost_per_token_above_272k_tokens,
+            use_long_context_rates,
+        ));
+        fold.observe(selected_long_context_bucket_coverage(
+            cache_read_clamped,
+            result.pricing.cache_read_input_token_cost,
+            result.pricing.cache_read_input_token_cost_above_272k_tokens,
+            use_long_context_rates,
+        ));
+    } else {
+        fold.observe(ordinary_bucket_coverage(
+            input_clamped,
+            result.pricing.input_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    result.pricing.input_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.input_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    result.pricing.input_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.input_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        ));
+        fold.observe(ordinary_bucket_coverage(
+            output_clamped,
+            result.pricing.output_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    result.pricing.output_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.output_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    result.pricing.output_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.output_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        ));
+        fold.observe(ordinary_bucket_coverage(
+            cache_read_clamped,
+            result.pricing.cache_read_input_token_cost,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    result.pricing.cache_read_input_token_cost_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    result.pricing.cache_read_input_token_cost_above_272k_tokens,
+                ),
+            ],
+        ));
+    }
+
+    // Cache-write remains an independent marginal bucket, including for the
+    // full-session long-context identities. The two TTL portions are observed
+    // separately because they are priced off different table entries: a model
+    // whose table carries a cache-creation rate but no input rate would report
+    // Complete while the 1h half silently cost zero.
+    fold.observe(ordinary_bucket_coverage(
+        cache_write_5m_clamped,
+        result.pricing.cache_creation_input_token_cost,
+        &[(
+            TIERED_PRICING_THRESHOLD_200K_TOKENS,
+            result
+                .pricing
+                .cache_creation_input_token_cost_above_200k_tokens,
+        )],
+    ));
+    fold.observe(ordinary_bucket_coverage(
+        cache_write_1h_clamped,
+        result.pricing.input_cost_per_token,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                result.pricing.input_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                result.pricing.input_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                result.pricing.input_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                result.pricing.input_cost_per_token_above_272k_tokens,
+            ),
+        ],
+    ));
+
+    fold.finish()
+}
+
+/// `cache_write_1h` is the 1-hour-TTL portion of `cache_write`, not a bucket
+/// beside it. Anthropic bills a 5-minute write at 1.25x base input and a
+/// 1-hour write at 2x, so the 1h portion is subtracted from the cache-write
+/// bucket and repriced rather than added on top; passing it without
+/// subtracting would bill those tokens twice.
+pub fn compute_cost(
+    pricing: &ModelPricing,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cache_write_1h: i64,
+    reasoning: i64,
+) -> f64 {
+    let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
+    let tiered_cost = |tokens: f64, base: Option<f64>, tiers: &[(f64, Option<f64>)]| {
+        let base_price = safe_price(base);
+        let mut cost = 0.0;
+        let mut lower_bound = 0.0;
+        let mut active_price = base_price;
+
+        for (threshold, tier_price) in tiers {
+            let Some(tier_price) = tier_price.filter(|v| is_valid_price_value(*v)) else {
+                continue;
+            };
+
+            if !threshold.is_finite() || *threshold <= lower_bound {
+                continue;
+            }
+
+            if tokens <= *threshold {
+                return cost + (tokens - lower_bound).max(0.0) * active_price;
+            }
+
+            cost += (*threshold - lower_bound) * active_price;
+            lower_bound = *threshold;
+            active_price = tier_price;
+        }
+
+        cost + (tokens - lower_bound).max(0.0) * active_price
+    };
+
+    let input_clamped = input.max(0) as f64;
+    let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
+    let cache_read_clamped = cache_read.max(0) as f64;
+    let cache_write_clamped = cache_write.max(0) as f64;
+    // The parser already clamps this to the total, but `compute_cost` is
+    // `pub` and this is the one place the subtraction happens: a caller that
+    // over-reports the split would otherwise drive the 5m bucket negative,
+    // and `tiered_cost` would silently clamp that to zero, dropping the whole
+    // write from the bill instead of surfacing the bad input.
+    let cache_write_1h_clamped = (cache_write_1h.max(0) as f64).min(cache_write_clamped);
+    let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
+
+    let input_cost = tiered_cost(
+        input_clamped,
+        pricing.input_cost_per_token,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                pricing.input_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.input_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                pricing.input_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.input_cost_per_token_above_272k_tokens,
+            ),
+        ],
+    );
+    let output_cost = tiered_cost(
+        output_clamped,
+        pricing.output_cost_per_token,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                pricing.output_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.output_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                pricing.output_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.output_cost_per_token_above_272k_tokens,
+            ),
+        ],
+    );
+    // Cache-read tiers stay limited to the 200k and 272k thresholds
+    // because upstream LiteLLM does not currently declare 128k or 256k
+    // cache-read pricing for any model. If upstream begins emitting
+    // those keys, also add matching fields to `ModelPricing`,
+    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
+    // `has_meaningful_tier_support`; otherwise tier walks will silently
+    // undercost long-context cache reads on those models.
+    let cache_read_cost = tiered_cost(
+        cache_read_clamped,
+        pricing.cache_read_input_token_cost,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.cache_read_input_token_cost_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.cache_read_input_token_cost_above_272k_tokens,
+            ),
+        ],
+    );
+    let cache_write_5m_cost = tiered_cost(
+        cache_write_5m_clamped,
+        pricing.cache_creation_input_token_cost,
+        &[(
+            TIERED_PRICING_THRESHOLD_200K_TOKENS,
+            pricing.cache_creation_input_token_cost_above_200k_tokens,
+        )],
+    );
+    // A 1-hour write is 2x base input where a 5-minute write is 1.25x. LiteLLM
+    // does publish the 1h rate (`cache_creation_input_token_cost_above_1hr`),
+    // but this tree's `ModelPricing` does not carry it, and measured on LiteLLM
+    // main on 2026-10-02 every one of the 216 rows that publish it equals 2x
+    // `input_cost_per_token` (all 12 that publish a 200K 1h rate match 2x the
+    // 200K input rate too), so deriving it gives the same number. `tiered_cost`
+    // is linear in the price, so doubling the whole result is exactly doubling
+    // every tier, and the input tier ladder is reused rather than a second
+    // table of pre-doubled thresholds being invented.
+    //
+    // Each TTL bucket walks its own tier ladder from zero. That extends the
+    // approximation the function already makes -- input, cache read and cache
+    // write are each tiered independently rather than against one request
+    // context size -- and it matches how Anthropic bills the two writes as
+    // separate line items.
+    let cache_write_1h_cost = 2.0
+        * tiered_cost(
+            cache_write_1h_clamped,
+            pricing.input_cost_per_token,
+            &[
+                (
+                    TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                    pricing.input_cost_per_token_above_128k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                    pricing.input_cost_per_token_above_200k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                    pricing.input_cost_per_token_above_256k_tokens,
+                ),
+                (
+                    TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                    pricing.input_cost_per_token_above_272k_tokens,
+                ),
+            ],
+        );
+
+    input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
+}
+
+/// Apply a provider-documented long-context tier to the whole request. The
+/// selector includes input plus cache-read tokens; output and reasoning use the
+/// selected tier, while cache-write is priced independently and never selects it.
+fn compute_full_session_long_context_cost(
+    pricing: &ModelPricing,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cache_write_1h: i64,
+    reasoning: i64,
+) -> f64 {
+    let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
+    let input_clamped = input.max(0) as f64;
+    let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
+    let cache_read_clamped = cache_read.max(0) as f64;
+    let use_long_context_rates =
+        input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
+    let selected_price = |base: Option<f64>, long_context: Option<f64>| {
+        if use_long_context_rates {
+            safe_price(
+                long_context
+                    .filter(|value| is_valid_price_value(*value))
+                    .or(base),
+            )
+        } else {
+            safe_price(base)
+        }
+    };
+
+    let input_cost = input_clamped
+        * selected_price(
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
+        );
+    let output_cost = output_clamped
+        * selected_price(
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
+        );
+    let cache_read_cost = cache_read_clamped
+        * selected_price(
+            pricing.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost_above_272k_tokens,
+        );
+
+    // Cache-write is an independently reported subset and does not select the
+    // request's input-context tier.
+    let cache_write_cost = compute_cost(pricing, 0, 0, 0, cache_write, cache_write_1h, 0);
+
+    input_cost + output_cost + cache_read_cost + cache_write_cost
+}
+
+fn extract_model_family(model_id: &str) -> String {
+    let lower = model_id.to_lowercase();
+
+    if lower.contains("gpt-5") {
+        return "gpt-5".into();
+    }
+    if lower.contains("gpt-4.1") {
+        return "gpt-4.1".into();
+    }
+    if lower.contains("gpt-4o") {
+        return "gpt-4o".into();
+    }
+    if lower.contains("gpt-4") {
+        return "gpt-4".into();
+    }
+    if lower.contains("o3") {
+        return "o3".into();
+    }
+    if lower.contains("o4") {
+        return "o4".into();
+    }
+
+    if lower.contains("opus") {
+        return "opus".into();
+    }
+    if lower.contains("sonnet") {
+        return "sonnet".into();
+    }
+    if lower.contains("haiku") {
+        return "haiku".into();
+    }
+    if lower.contains("claude") {
+        return "claude".into();
+    }
+
+    if lower.contains("gemini-3") {
+        return "gemini-3".into();
+    }
+    if lower.contains("gemini-2.5") {
+        return "gemini-2.5".into();
+    }
+    if lower.contains("gemini-2") {
+        return "gemini-2".into();
+    }
+    if lower.contains("gemini") {
+        return "gemini".into();
+    }
+
+    if lower.contains("llama") {
+        return "llama".into();
+    }
+    if lower.contains("mistral") {
+        return "mistral".into();
+    }
+    if lower.contains("deepseek") {
+        return "deepseek".into();
+    }
+    if lower.contains("qwen") {
+        return "qwen".into();
+    }
+
+    lower
+        .split(['-', '_', '.'])
+        .next()
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+fn family_matches(key: &str, family: &str) -> bool {
+    if family.is_empty() {
+        return true;
+    }
+    key.contains(family)
+}
+
+fn contains_model_id(key: &str, model_id: &str) -> bool {
+    if let Some(pos) = key.find(model_id) {
+        let before_ok = pos == 0 || !key[..pos].chars().last().unwrap().is_alphanumeric();
+        let after_pos = pos + model_id.len();
+        let after_ok =
+            after_pos == key.len() || !key[after_pos..].chars().next().unwrap().is_alphanumeric();
+        before_ok && after_ok
+    } else {
+        false
+    }
+}
+
+fn normalize_model_name(model_id: &str) -> Option<String> {
+    let lower = model_id.to_lowercase();
+    let family = claude_family(&lower)?;
+
+    // Modern Claude line (major >= 4): explicit single-digit minor parsed
+    // straight from the id, in either order (claude-sonnet-4-6, opus-4.8,
+    // claude-4-6-sonnet). New minor releases need no code change.
+    if let Some(model) = normalize_claude_family_minor(&lower) {
+        return Some(model);
+    }
+
+    // Never degrade: a delimited `major(-|.)minor` version whose minor was
+    // not recognized above (4-60, 4-0, 5-0, dated 4-20250514) must stay
+    // unresolved rather than fall through to a coarser or older key.
+    if contains_delimited_modern_major_minor(&lower) {
+        return None;
+    }
+
+    // Bare modern major adjacent to the family token (claude-sonnet-5,
+    // opus-5, 4-opus). Resolves only via an exact dataset hit downstream.
+    if let Some(model) = normalize_claude_family_bare_major(&lower) {
+        return Some(model);
+    }
+
+    // Catch-alls preserved from the hardcoded matcher: a delimited `4`
+    // anywhere still maps opus/sonnet to the bare 4.0 key, and the legacy
+    // 3.x line uses irregular naming (family after the version, dotted 3.5).
+    match family {
+        "opus" if contains_delimited_fragment(&lower, "4") => Some("claude-opus-4".into()),
+        "sonnet" => {
+            if contains_delimited_fragment(&lower, "4") {
+                Some("claude-sonnet-4".into())
+            } else if contains_delimited_fragment(&lower, "3.7")
+                || contains_delimited_fragment(&lower, "3-7")
+            {
+                Some("claude-3-7-sonnet".into())
+            } else if contains_delimited_fragment(&lower, "3.5")
+                || contains_delimited_fragment(&lower, "3-5")
+            {
+                Some("claude-3.5-sonnet".into())
+            } else {
+                None
+            }
+        }
+        "haiku" => {
+            if contains_delimited_fragment(&lower, "3.5")
+                || contains_delimited_fragment(&lower, "3-5")
+            {
+                Some("claude-3.5-haiku".into())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Family tokens of the modern Claude model line.
+const CLAUDE_FAMILY_TOKENS: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+
+/// The Claude family token contained in `lower`, if any.
+fn claude_family(lower: &str) -> Option<&'static str> {
+    CLAUDE_FAMILY_TOKENS
+        .iter()
+        .copied()
+        .find(|family| lower.contains(family))
+}
+
+/// Modern Claude majors are single digits >= 4. The 3.x line uses irregular
+/// naming and is matched explicitly by the legacy branches.
+fn is_modern_claude_major(value: &str) -> bool {
+    value.len() == 1 && value.as_bytes()[0].is_ascii_digit() && value.as_bytes()[0] >= b'4'
+}
+
+/// Canonical `claude-{family}-{major}-{minor}` key parsed from an id carrying
+/// an explicit single-digit minor for a modern major (>= 4), in either
+/// `family-major-minor` (claude-sonnet-4-6, opus-4.8) or reversed
+/// `major-minor-family` (claude-4-6-sonnet, 4-8-opus) order. Generalization
+/// of the former opus-only `normalize_claude_opus_4_minor` across families.
+fn normalize_claude_family_minor(lower: &str) -> Option<String> {
+    let parts: Vec<&str> = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    for window in parts.windows(3) {
+        if CLAUDE_FAMILY_TOKENS.contains(&window[0])
+            && is_modern_claude_major(window[1])
+            && is_single_digit_minor(window[2])
+        {
+            return Some(format!("claude-{}-{}-{}", window[0], window[1], window[2]));
+        }
+        if is_modern_claude_major(window[0])
+            && is_single_digit_minor(window[1])
+            && CLAUDE_FAMILY_TOKENS.contains(&window[2])
+        {
+            return Some(format!("claude-{}-{}-{}", window[2], window[0], window[1]));
+        }
+    }
+
+    None
+}
+
+/// Canonical `claude-{family}-{major}` key for an id naming a modern major
+/// (>= 4) without a minor (claude-sonnet-5, opus-5, 4-opus). The major must
+/// be adjacent to the family token; in forward order it must not be followed
+/// by another digit run (dated `4-20250514` shapes are version-like, not
+/// bare), and in reversed order it must not itself be the minor of a
+/// preceding legacy major (claude-3-5-sonnet).
+fn normalize_claude_family_bare_major(lower: &str) -> Option<String> {
+    let parts: Vec<&str> = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+
+    for (idx, part) in parts.iter().enumerate() {
+        if !CLAUDE_FAMILY_TOKENS.contains(part) {
+            continue;
+        }
+        if let Some(major) = parts
+            .get(idx + 1)
+            .copied()
+            .filter(|p| is_modern_claude_major(p))
+        {
+            if parts.get(idx + 2).is_none_or(|next| !all_digits(next)) {
+                return Some(format!("claude-{part}-{major}"));
+            }
+        }
+        if idx >= 1
+            && is_modern_claude_major(parts[idx - 1])
+            && (idx < 2 || !all_digits(parts[idx - 2]))
+        {
+            return Some(format!("claude-{part}-{}", parts[idx - 1]));
+        }
+    }
+
+    None
+}
+
+/// True if the id carries a delimited modern `major(-|.)minor` version
+/// (4-6, 4.8, 5-0, 4-60, 4-20250514). Generalizes the former
+/// `contains_delimited_major_minor(lower, '4')` checks across all modern
+/// majors so the never-degrade contract also covers major 5 and up.
+fn contains_delimited_modern_major_minor(haystack: &str) -> bool {
+    ('4'..='9').any(|major| contains_delimited_major_minor(haystack, major))
+}
+
+/// The version-pinned canonical key a Claude id requests, used to veto
+/// fuzzy/stripped resolutions that would land on a different version.
+///
+/// - An explicit single-digit minor (claude-sonnet-4-7) always pins; this is
+///   main's opus-only minor guard generalized across families.
+/// - A bare major pins from major 5 up (claude-opus-5 must never bill as any
+///   opus 4.x key). Bare major 4 is deliberately left unpinned to preserve
+///   the long-standing behavior of e.g. `claude-opus-4` resolving to a
+///   dated or regional 4.x dataset key.
+fn requested_claude_version(lower: &str) -> Option<String> {
+    if let Some(model) = normalize_claude_family_minor(lower) {
+        return Some(model);
+    }
+    normalize_claude_family_bare_major(lower).filter(|model| !model.ends_with("-4"))
+}
+
+/// Veto for resolutions that violate the never-degrade contract:
+/// cross-family (a sonnet id billed at an opus key), cross-version (a 4-7 id
+/// billed at a 4-6 key, a major-5 id billed at a 4.x key), or any
+/// modern-Claude resolution for an id whose `major-minor` version could not
+/// be parsed (4-60, 5-0, dated forms). Exact dataset hits stay allowed: they
+/// either normalize back to the requested version or, for unparseable
+/// versions, do not normalize at all. Generalization of the former
+/// `resolves_different_claude_opus_4_minor`.
+fn resolves_unsafe_claude_version(
+    requested_family: Option<&'static str>,
+    requested_version: Option<&str>,
+    unparsed_modern_version: bool,
+    result: &LookupResult,
+) -> bool {
+    let Some(requested_family) = requested_family else {
+        return false;
+    };
+    let matched_lower = result.matched_key.to_lowercase();
+
+    if claude_family(&matched_lower).is_some_and(|family| family != requested_family) {
+        return true;
+    }
+
+    let resolved = normalize_model_name(&matched_lower);
+    if let Some(requested_version) = requested_version {
+        return resolved.is_some_and(|resolved| resolved != requested_version);
+    }
+    unparsed_modern_version && resolved.is_some()
+}
+
+fn is_single_digit_minor(value: &str) -> bool {
+    value.len() == 1 && value.as_bytes()[0].is_ascii_digit() && value.as_bytes()[0] != b'0'
+}
+
+fn normalize_version_separator(model_id: &str) -> Option<String> {
+    let mut result = String::with_capacity(model_id.len());
+    let chars: Vec<char> = model_id.chars().collect();
+    let mut changed = false;
+
+    for i in 0..chars.len() {
+        if chars[i] == '-'
+            && i > 0
+            && i < chars.len() - 1
+            && chars[i - 1].is_ascii_digit()
+            && chars[i + 1].is_ascii_digit()
+        {
+            let is_multi_digit_before = i >= 2 && chars[i - 2].is_ascii_digit();
+            let is_multi_digit_after = i + 2 < chars.len() && chars[i + 2].is_ascii_digit();
+            let looks_like_date = is_multi_digit_before || is_multi_digit_after;
+
+            if looks_like_date {
+                result.push(chars[i]);
+            } else {
+                result.push('.');
+                changed = true;
+            }
+        } else {
+            result.push(chars[i]);
+        }
+    }
+
+    if changed {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn strip_known_provider_prefix(model_id: &str) -> Option<&str> {
+    for prefix in PROVIDER_PREFIXES {
+        if let Some(stripped) = model_id.strip_prefix(prefix) {
+            if !stripped.is_empty() {
+                return Some(stripped);
+            }
+        }
+    }
+    None
+}
+
+fn has_known_provider_prefix(model_id: &str) -> bool {
+    let Some((prefix, _)) = model_id.split_once('/') else {
+        return false;
+    };
+    PROVIDER_PREFIXES
+        .iter()
+        .chain(ORIGINAL_PROVIDER_PREFIXES)
+        .chain(RESELLER_PROVIDER_PREFIXES)
+        .any(|candidate| candidate.trim_end_matches('/') == prefix)
+}
+
+/// Generic routing-prefix fallback for ids whose leading segment is not one
+/// of the curated `PROVIDER_PREFIXES` (e.g. `cx/gpt-5.5` routed through an
+/// `omniroute` proxy, or any other CLI/router-assigned alias). Returns the
+/// terminal path segment — the part after the last `/` — when the id actually
+/// contains a `/`, so `cx/gpt-5.5` resolves to `gpt-5.5`.
+///
+/// This is intentionally unconditional (unlike `strip_known_provider_prefix`,
+/// which only recognizes canonical LLM provider names): the caller only
+/// invokes it as a fallback AFTER the exact/direct lookup on the full id has
+/// already failed, so dataset keys that legitimately keep their prefix (e.g.
+/// `anthropic/claude-fable-5`) are resolved by their own exact key first and
+/// never reach this fallback.
+fn strip_generic_provider_prefix(model_id: &str) -> Option<&str> {
+    let terminal = model_id.rsplit('/').next()?;
+    if terminal.is_empty() || terminal == model_id {
+        return None;
+    }
+    Some(terminal)
+}
+
+/// Apply the same bounded reasoning-tier and static-alias normalization used
+/// by the outer lookup to a generic terminal candidate. Returning `None` for
+/// an invalid parenthesized tier keeps terminal fallback fail-closed instead of
+/// peeling the fragment through the dash-suffix helper.
+fn normalize_terminal_candidate(candidate: &str) -> Option<String> {
+    let normalized_owned = strip_parenthesized_reasoning_tier(candidate).map(str::to_owned);
+    if normalized_owned.is_none()
+        && candidate
+            .strip_suffix(')')
+            .and_then(|inner| inner.rsplit_once('('))
+            .is_some()
+    {
+        return None;
+    }
+
+    let normalized = normalized_owned.as_deref().unwrap_or(candidate);
+    Some(
+        aliases::resolve_alias(normalized)
+            .unwrap_or(normalized)
+            .to_string(),
+    )
+}
+
+fn is_valid_price_value(value: f64) -> bool {
+    value.is_finite() && value >= 0.0
+}
+
+/// Returns true if the pricing entry has at least one usable cost field
+/// (base or above-200k tier). Entries with all-None pricing (e.g.
+/// subscription-based providers like Perplexity) are useless for
+/// pay-per-token cost estimation and should be deprioritized.
+fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
+    [
+        pricing.input_cost_per_token,
+        pricing.output_cost_per_token,
+        pricing.cache_read_input_token_cost,
+        pricing.cache_creation_input_token_cost,
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_200k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_200k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .any(|opt| opt.is_some_and(is_valid_price_value))
+}
+
+fn lookup_result_if_usable(
+    pricing: &ModelPricing,
+    source: &str,
+    matched_key: &str,
+) -> Option<LookupResult> {
+    has_any_usable_pricing(pricing).then(|| LookupResult {
+        pricing: pricing.clone(),
+        source: source.into(),
+        matched_key: matched_key.into(),
+    })
+}
+
+fn has_any_valid_above_tier_value(pricing: &ModelPricing) -> bool {
+    [
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_200k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_200k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .any(is_valid_price_value)
+}
+
+fn has_meaningful_tier_support(pricing: &ModelPricing) -> bool {
+    [
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_128k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_200k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_256k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_128k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_200k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_256k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
+        ),
+    ]
+    .into_iter()
+    .any(|(base, above)| match (base, above) {
+        (Some(base), Some(above)) => base.is_finite() && base >= 0.0 && is_valid_price_value(above),
+        _ => false,
+    })
+}
+
+fn contains_delimited_fragment(haystack: &str, fragment: &str) -> bool {
+    if fragment.is_empty() {
+        return false;
+    }
+
+    for (pos, _) in haystack.match_indices(fragment) {
+        let before_ok = pos == 0 || !haystack[..pos].chars().last().unwrap().is_alphanumeric();
+        let after_pos = pos + fragment.len();
+        let after_ok = after_pos == haystack.len()
+            || !haystack[after_pos..]
+                .chars()
+                .next()
+                .unwrap()
+                .is_alphanumeric();
+
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn contains_delimited_major_minor(haystack: &str, major: char) -> bool {
+    for (pos, _) in haystack.match_indices(major) {
+        let before_ok = pos == 0 || !haystack[..pos].chars().last().unwrap().is_alphanumeric();
+        let after_pos = pos + major.len_utf8();
+        let mut after = haystack[after_pos..].chars();
+        let Some(separator) = after.next() else {
+            continue;
+        };
+        let Some(minor_start) = after.next() else {
+            continue;
+        };
+
+        if before_ok && matches!(separator, '.' | '-') && minor_start.is_ascii_digit() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_fuzzy_eligible(model_id: &str) -> bool {
+    if model_id.len() < MIN_FUZZY_MATCH_LEN {
+        return false;
+    }
+    !FUZZY_BLOCKLIST.contains(&model_id)
+}
+
+/// Attempts to find a model by progressively stripping trailing segments.
+/// Handles arbitrary suffixes (e.g., "claude-sonnet-4-5-thinking" → "claude-sonnet-4-5").
+/// This replaces the hardcoded TIER_SUFFIXES and FALLBACK_SUFFIXES approach.
+fn try_strip_unknown_suffix<F>(model_id: &str, do_lookup: F) -> Option<LookupResult>
+where
+    F: Fn(&str) -> Option<LookupResult>,
+{
+    if has_unrecognized_claude_four_minor(model_id) {
+        return None;
+    }
+
+    let parts: Vec<&str> = model_id.split('-').collect();
+
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let max_strip = std::cmp::min(parts.len() - 1, MAX_SUFFIX_STRIP_SEGMENTS);
+
+    for strip in 1..=max_strip {
+        let candidate: String = parts[..parts.len() - strip].join("-");
+
+        if candidate.len() >= MIN_MODEL_NAME_LEN {
+            if strips_claude_numeric_minor(&candidate, parts[parts.len() - strip]) {
+                continue;
+            }
+
+            if let Some(result) = do_lookup(&candidate) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+fn strips_claude_numeric_minor(candidate: &str, first_stripped_segment: &str) -> bool {
+    if !is_version_segment(first_stripped_segment) {
+        return false;
+    }
+    let claude_branded = candidate.contains("claude")
+        || candidate.contains("opus")
+        || candidate.contains("sonnet")
+        || candidate.contains("haiku");
+    if !claude_branded {
+        return false;
+    }
+    // Refuse to strip a version segment when it would either peel a minor off
+    // a still-versioned claude-4 candidate (claude-sonnet-4-5 -> claude-sonnet-4)
+    // or erode the id's only version, leaving a bare brand token
+    // (claude-2.1 -> claude). Both candidates would resolve to a different
+    // model's price. Dated forms (claude-3-5-sonnet-20241022) keep stripping:
+    // their candidate retains a version, so neither arm fires.
+    contains_delimited_fragment(candidate, "4") || !candidate.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// True for a bare version segment produced by splitting an id on `-`:
+/// digits with at most one interior dot (`4`, `6`, `2.1`, `20241022`).
+fn is_version_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() || !bytes[bytes.len() - 1].is_ascii_digit() {
+        return false;
+    }
+    let mut seen_dot = false;
+    for &byte in bytes {
+        match byte {
+            b'0'..=b'9' => {}
+            b'.' if !seen_dot => seen_dot = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn has_unrecognized_claude_four_minor(model_id: &str) -> bool {
+    (model_id.contains("claude")
+        || model_id.contains("opus")
+        || model_id.contains("sonnet")
+        || model_id.contains("haiku"))
+        && contains_delimited_major_minor(model_id, '4')
+        && !contains_delimited_fragment(model_id, "4.5")
+        && !contains_delimited_fragment(model_id, "4-5")
+        && !contains_delimited_fragment(model_id, "4.6")
+        && !contains_delimited_fragment(model_id, "4-6")
+        && !contains_delimited_fragment(model_id, "4.7")
+        && !contains_delimited_fragment(model_id, "4-7")
+}
+
+/// Attempts to find a model by progressively stripping leading segments.
+/// Handles arbitrary routing prefixes (e.g., "myplugin-claude-3.5-sonnet" → "claude-3.5-sonnet").
+/// This replaces the hardcoded STRIPPED_PREFIXES approach.
+fn try_strip_unknown_prefix<F>(model_id: &str, do_lookup: F) -> Option<LookupResult>
+where
+    F: Fn(&str) -> Option<LookupResult>,
+{
+    let parts: Vec<&str> = model_id.split('-').collect();
+
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let max_skip = std::cmp::min(parts.len() - 1, MAX_PREFIX_STRIP_SEGMENTS);
+
+    for skip in 1..=max_skip {
+        let candidate: String = parts[skip..].join("-");
+
+        if candidate.len() >= MIN_MODEL_NAME_LEN {
+            // Try candidate directly
+            if let Some(result) = do_lookup(&candidate) {
+                return Some(result);
+            }
+
+            // Try candidate with suffix stripping
+            if let Some(result) = try_strip_unknown_suffix(&candidate, &do_lookup) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+fn is_original_provider(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    ORIGINAL_PROVIDER_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn is_reseller_provider(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    RESELLER_PROVIDER_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn select_best_match(
+    matches: &[&String],
+    dataset: &HashMap<String, ModelPricing>,
+    source: &str,
+    provider_id: Option<&str>,
+) -> Option<LookupResult> {
+    if matches.is_empty() {
+        return None;
+    }
+
+    let hint_tags: Vec<String> = provider_id
+        .map(provider_identity::provider_tags)
+        .unwrap_or_default();
+
+    let provider_matches: Vec<&String> = matches
+        .iter()
+        .copied()
+        .filter(|key| provider_identity::matches_provider_hint_with_tags(key, &hint_tags))
+        .collect();
+
+    let preferred_matches = if provider_matches.is_empty() {
+        matches
+    } else {
+        provider_matches.as_slice()
+    };
+
+    // Deprioritize entries with all-None pricing (e.g. perplexity/anthropic/...
+    // which matches provider hint "anthropic" but has subscription-based pricing
+    // with no per-token cost data). If provider-specific candidates are all
+    // unusable, fall back to any priced candidate in the broader match set so
+    // fuzzy/provider-aware lookups can still resolve a valid non-provider key.
+    let preferred_with_pricing: Vec<&String> = preferred_matches
+        .iter()
+        .copied()
+        .filter(|k| dataset.get(k.as_str()).is_some_and(has_any_usable_pricing))
+        .collect();
+    let effective_matches: Vec<&String> =
+        if preferred_with_pricing.is_empty() && !provider_matches.is_empty() {
+            matches
+                .iter()
+                .copied()
+                .filter(|k| dataset.get(k.as_str()).is_some_and(has_any_usable_pricing))
+                .collect()
+        } else {
+            preferred_with_pricing
+        };
+    if effective_matches.is_empty() {
+        return None;
+    }
+    let effective_matches = effective_matches.as_slice();
+
+    let hint_is_reseller = provider_id.is_some_and(is_reseller_provider);
+    let pick = |candidates: &[&String], prefer_reseller: bool| -> Option<LookupResult> {
+        let key = if prefer_reseller {
+            candidates
+                .iter()
+                .find(|k| is_reseller_provider(k))
+                .or_else(|| candidates.first())
+        } else {
+            candidates
+                .iter()
+                .find(|k| is_original_provider(k))
+                .or_else(|| candidates.iter().find(|k| !is_reseller_provider(k)))
+                .or_else(|| candidates.first())
+        };
+        key.and_then(|k| {
+            dataset.get(k.as_str()).map(|pricing| LookupResult {
+                pricing: pricing.clone(),
+                source: source.into(),
+                matched_key: (*k).clone(),
+            })
+        })
+    };
+
+    pick(effective_matches, hint_is_reseller)
+}
+
+fn sakana_identity_matches(model_id: &str, provider_id: Option<&str>) -> bool {
+    let only_sakana_tags = |identity: &str| {
+        let tags = provider_identity::provider_tags(identity);
+        !tags.is_empty() && tags.iter().all(|tag| tag == "sakana")
+    };
+
+    if let Some((path, _)) = model_id.rsplit_once('/') {
+        if path.split('/').any(|segment| !only_sakana_tags(segment)) {
+            return false;
+        }
+    }
+
+    provider_id.is_none_or(|provider_id| provider_id.split('/').all(only_sakana_tags))
+}
+
+fn model_prefix_matches_provider(model_id: &str, provider_id: Option<&str>) -> bool {
+    let Some(hint) = provider_id else {
+        return true;
+    };
+    let Some(prefix) = model_id.split('/').next() else {
+        return false;
+    };
+    let prefix_tag = provider_identity::canonical_provider(prefix);
+    let hint_primary = provider_identity::canonical_provider(hint);
+    match (prefix_tag, hint_primary) {
+        (Some(p), Some(h)) => p == h,
+        _ => false,
+    }
+}
+
+fn parse_provider_scoped_model_path(model_id: &str) -> Option<ProviderScopedModelPath<'_>> {
+    let rest = model_id.strip_prefix("accounts/")?;
+    let (provider, rest) = rest.split_once('/')?;
+    let (scope, terminal_model_id) = rest.split_once('/')?;
+
+    if provider.is_empty() || terminal_model_id.is_empty() {
+        return None;
+    }
+
+    match scope {
+        "models" | "routers" => Some(ProviderScopedModelPath {
+            provider,
+            terminal_model_id,
+        }),
+        _ => None,
+    }
+}
+
+fn provider_hint_matches_scoped_provider(provider_id: Option<&str>, scoped_provider: &str) -> bool {
+    let Some(provider_id) = provider_id else {
+        return true;
+    };
+
+    let scoped_tags = provider_identity::provider_tags(scoped_provider);
+    let hint_tags = provider_identity::provider_tags(provider_id);
+    !scoped_tags.is_empty()
+        && scoped_tags
+            .iter()
+            .any(|scoped| hint_tags.iter().any(|hint| hint == scoped))
+}
+
+fn provider_prefix_matches_scoped_provider(prefix: &str, scoped_tags: &[String]) -> bool {
+    if scoped_tags.is_empty() {
+        return false;
+    }
+
+    provider_identity::provider_tags(prefix.trim_end_matches('/'))
+        .iter()
+        .any(|prefix_tag| scoped_tags.iter().any(|scoped| scoped == prefix_tag))
+}
+
+fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
+    provider_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
+}
+
+fn build_lookup_cache_key(model_id: &str, provider_id: Option<&str>) -> String {
+    match provider_id {
+        Some(provider) if !provider.trim().is_empty() => {
+            format!("{}|{}", provider.to_lowercase(), model_id.to_lowercase())
+        }
+        _ => model_id.to_lowercase(),
+    }
+}
+
+fn model_part_matches_exact(model_part: &str, model_id: &str) -> bool {
+    if model_part == model_id {
+        return true;
+    }
+
+    let mut suffix = model_part;
+    while let Some((_, rest)) = suffix.split_once('.') {
+        if rest == model_id {
+            return true;
+        }
+        suffix = rest;
+    }
+
+    false
+}
+
+fn choose_best_source_result(
+    litellm_result: Option<LookupResult>,
+    openrouter_result: Option<LookupResult>,
+    provider_id: Option<&str>,
+) -> Option<LookupResult> {
+    match (litellm_result, openrouter_result) {
+        (Some(l), Some(o)) => {
+            // Pick the better source, then graft any cache rates the winner is
+            // missing from the runner-up so cache-heavy usage isn't billed at $0.
+            if prefer_litellm_over_openrouter(&l, &o, provider_id) {
+                let donor = o.pricing.clone();
+                Some(backfill_cache_costs(l, &donor))
+            } else {
+                let donor = l.pricing.clone();
+                Some(backfill_cache_costs(o, &donor))
+            }
+        }
+        (Some(l), None) => Some(l),
+        (None, Some(o)) => Some(o),
+        (None, None) => None,
+    }
+}
+
+/// Returns true when the LiteLLM match should win over the OpenRouter one.
+/// Prefers the source whose key matches the provider hint, then original
+/// providers over resellers; LiteLLM breaks an otherwise exact tie.
+fn prefer_litellm_over_openrouter(
+    l: &LookupResult,
+    o: &LookupResult,
+    provider_id: Option<&str>,
+) -> bool {
+    let l_matches_provider = provider_identity::matches_provider_hint(&l.matched_key, provider_id);
+    let o_matches_provider = provider_identity::matches_provider_hint(&o.matched_key, provider_id);
+
+    if l_matches_provider && !o_matches_provider {
+        return true;
+    }
+    if o_matches_provider && !l_matches_provider {
+        return false;
+    }
+
+    let l_is_original = is_original_provider(&l.matched_key);
+    let o_is_original = is_original_provider(&o.matched_key);
+    let l_is_reseller = is_reseller_provider(&l.matched_key);
+    let o_is_reseller = is_reseller_provider(&o.matched_key);
+
+    if o_is_original && !l_is_original {
+        return false;
+    }
+    if l_is_original && !o_is_original {
+        return true;
+    }
+    if !l_is_reseller && o_is_reseller {
+        return true;
+    }
+    if !o_is_reseller && l_is_reseller {
+        return false;
+    }
+
+    true
+}
+
+/// Fill any cache-token rates the chosen pricing omits from a donor row that
+/// has them. Provider-prefixed OpenRouter entries frequently carry input/output
+/// rates but no `input_cache_read`/`input_cache_write`, which would price cache
+/// reads — typically the bulk of Claude usage — at $0. We keep the winner's
+/// input/output (which may include provider markup) and only graft the missing
+/// cache fields, so rows that already price cache are left untouched (no-op).
+fn backfill_cache_costs(mut winner: LookupResult, donor: &ModelPricing) -> LookupResult {
+    let p = &mut winner.pricing;
+    if p.cache_read_input_token_cost.is_none() && donor.cache_read_input_token_cost.is_some() {
+        p.cache_read_input_token_cost = donor.cache_read_input_token_cost;
+        if p.cache_read_input_token_cost_above_200k_tokens.is_none() {
+            p.cache_read_input_token_cost_above_200k_tokens =
+                donor.cache_read_input_token_cost_above_200k_tokens;
+        }
+        if p.cache_read_input_token_cost_above_272k_tokens.is_none() {
+            p.cache_read_input_token_cost_above_272k_tokens =
+                donor.cache_read_input_token_cost_above_272k_tokens;
+        }
+    }
+    if p.cache_creation_input_token_cost.is_none()
+        && donor.cache_creation_input_token_cost.is_some()
+    {
+        p.cache_creation_input_token_cost = donor.cache_creation_input_token_cost;
+        if p.cache_creation_input_token_cost_above_200k_tokens
+            .is_none()
+        {
+            p.cache_creation_input_token_cost_above_200k_tokens =
+                donor.cache_creation_input_token_cost_above_200k_tokens;
+        }
+    }
+    winner
+}
+
+/// Whether a version-normalized model id is one of the identities whose 272K
+/// tier OpenAI documents as request-wide.
+fn is_request_wide_identity(id: &str) -> bool {
+    FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
+        .iter()
+        .any(|key| normalize_version_separator(key).as_deref().unwrap_or(key) == id)
+}
+
+/// Give `row` the donor's 272K tier rates, all at once or not at all. Every
+/// base rate `row` publishes must be paid and equal to the donor's (a tier
+/// means nothing relative to a different base, and a paid tier on a free
+/// bucket would invent spend), and `row` must publish an input base. A 272K
+/// rate `row` already publishes is kept.
+fn borrow_missing_long_context_tiers(row: &mut ModelPricing, donor: &ModelPricing) {
+    let valid = |rate: Option<f64>| rate.is_some_and(is_valid_price_value);
+    let bases = [
+        (row.input_cost_per_token, donor.input_cost_per_token),
+        (row.output_cost_per_token, donor.output_cost_per_token),
+        (
+            row.cache_read_input_token_cost,
+            donor.cache_read_input_token_cost,
+        ),
+        (
+            row.cache_creation_input_token_cost,
+            donor.cache_creation_input_token_cost,
+        ),
+    ];
+    let same_paid_base = |own: f64, theirs: Option<f64>| {
+        own > 0.0 && theirs.is_some_and(|theirs| (own - theirs).abs() <= theirs.abs() * 1e-9)
+    };
+    if !valid(row.input_cost_per_token)
+        || !bases
+            .iter()
+            .filter_map(|(own, theirs)| {
+                own.filter(|own| is_valid_price_value(*own))
+                    .map(|own| (own, *theirs))
+            })
+            .all(|(own, theirs)| same_paid_base(own, theirs))
+    {
+        return;
+    }
+    let fill = |own: &mut Option<f64>, theirs: Option<f64>| {
+        if !valid(*own) && valid(theirs) {
+            *own = theirs;
+        }
+    };
+    fill(
+        &mut row.input_cost_per_token_above_272k_tokens,
+        donor.input_cost_per_token_above_272k_tokens,
+    );
+    fill(
+        &mut row.output_cost_per_token_above_272k_tokens,
+        donor.output_cost_per_token_above_272k_tokens,
+    );
+    fill(
+        &mut row.cache_read_input_token_cost_above_272k_tokens,
+        donor.cache_read_input_token_cost_above_272k_tokens,
+    );
+}
+
+fn exact_match_with_provider_prefixes(
+    model_id: &str,
+    provider_id: Option<&str>,
+    key_parts: &[KeyModelPart],
+    dataset: &HashMap<String, ModelPricing>,
+    source: &str,
+) -> Option<LookupResult> {
+    let provider_id = provider_id?;
+    let hint_tags = provider_identity::provider_tags(provider_id);
+
+    let matches: Vec<&String> = key_parts
+        .iter()
+        .filter(|kp| {
+            model_part_matches_exact(&kp.lower_model_part, model_id)
+                && provider_identity::matches_provider_hint_with_tags(&kp.key, &hint_tags)
+        })
+        .map(|kp| &kp.key)
+        .collect();
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    select_best_match(&matches, dataset, source, Some(provider_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup_result(matched: &str, source: &str, pricing: ModelPricing) -> LookupResult {
+        LookupResult {
+            pricing,
+            source: source.into(),
+            matched_key: matched.into(),
+        }
+    }
+
+    // A provider-matched OpenRouter row that omits cache rates must not bill
+    // cache tokens at $0 when a runner-up (LiteLLM) prices them: the winner
+    // keeps its input/output but borrows the missing cache fields. This is the
+    // claude-fable-5 case — OpenRouter `anthropic/claude-fable-5` carries only
+    // input/output, so cache reads (the bulk of Claude usage) were dropped.
+    #[test]
+    fn choose_best_backfills_cache_costs_from_runner_up() {
+        let openrouter = lookup_result(
+            "anthropic/claude-fable-5",
+            "OpenRouter",
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        let litellm = lookup_result(
+            "claude-fable-5",
+            "LiteLLM",
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                cache_read_input_token_cost: Some(0.000001),
+                cache_creation_input_token_cost: Some(0.0000125),
+                ..Default::default()
+            },
+        );
+
+        let chosen =
+            choose_best_source_result(Some(litellm), Some(openrouter), Some("anthropic")).unwrap();
+
+        // OpenRouter still wins on the provider hint, but now prices cache.
+        assert_eq!(chosen.source, "OpenRouter");
+        assert_eq!(chosen.pricing.cache_read_input_token_cost, Some(0.000001));
+        assert_eq!(
+            chosen.pricing.cache_creation_input_token_cost,
+            Some(0.0000125)
+        );
+    }
+
+    // Backfill must never overwrite cache rates the winner already carries.
+    #[test]
+    fn choose_best_keeps_existing_cache_costs() {
+        let winner = lookup_result(
+            "anthropic/claude-x",
+            "OpenRouter",
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                cache_read_input_token_cost: Some(0.000002),
+                ..Default::default()
+            },
+        );
+        let donor = lookup_result(
+            "claude-x",
+            "LiteLLM",
+            ModelPricing {
+                cache_read_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+
+        let chosen =
+            choose_best_source_result(Some(donor), Some(winner), Some("anthropic")).unwrap();
+        assert_eq!(chosen.pricing.cache_read_input_token_cost, Some(0.000002));
+    }
+
+    /// Mock LiteLLM data matching real API responses for OpenCode Zen models
+    fn mock_litellm() -> HashMap<String, ModelPricing> {
+        let mut m = HashMap::new();
+
+        // === GPT-4 models (baseline) ===
+        m.insert(
+            "gpt-4o".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000025),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(0.00000125),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-4o-mini".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000015),
+                output_cost_per_token: Some(0.0000006),
+                cache_read_input_token_cost: Some(0.000000075),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-4-turbo".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00003),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: GPT-5 family ===
+        m.insert(
+            "gpt-5.2".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000175),
+                output_cost_per_token: Some(0.000014),
+                cache_read_input_token_cost: Some(1.75e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5.1".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5.1-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5.1-codex-max".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5-nano".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-8),
+                output_cost_per_token: Some(4e-7),
+                cache_read_input_token_cost: Some(5e-9),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: Claude family (LiteLLM entries) ===
+        m.insert(
+            "claude-3-5-sonnet-20241022".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(0.0000003),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "claude-sonnet-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(3e-7),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                cache_read_input_token_cost: Some(1e-7),
+                cache_creation_input_token_cost: Some(0.00000125),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "bedrock/us.anthropic.claude-3-5-haiku-20241022-v1:0".into(),
+            ModelPricing {
+                input_cost_per_token: Some(8e-7),
+                output_cost_per_token: Some(0.000004),
+                cache_read_input_token_cost: Some(8e-8),
+                cache_creation_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "claude-opus-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                cache_read_input_token_cost: Some(5e-7),
+                cache_creation_input_token_cost: Some(0.00000625),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "claude-opus-4-1".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000015),
+                output_cost_per_token: Some(0.000075),
+                cache_read_input_token_cost: Some(0.0000015),
+                cache_creation_input_token_cost: Some(0.00001875),
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: Gemini family (LiteLLM entries) ===
+        m.insert(
+            "openrouter/google/gemini-3-pro-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                output_cost_per_token: Some(0.000012),
+                cache_read_input_token_cost: Some(2e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "vertex_ai/gemini-3-flash-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-7),
+                output_cost_per_token: Some(0.000003),
+                cache_read_input_token_cost: Some(5e-8),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: Grok (LiteLLM entry) ===
+        m.insert(
+            "xai/grok-code-fast-1-0825".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-7),
+                output_cost_per_token: Some(0.0000015),
+                cache_read_input_token_cost: Some(2e-8),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        m.insert(
+            "azure_ai/grok-code-fast-1".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000035),
+                output_cost_per_token: Some(0.0000175),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "bedrock/anthropic.claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(3e-7),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "vertex_ai/gemini-2.5-pro".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.000005),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "google/gemini-2.5-pro".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.000005),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        m
+    }
+
+    /// Mock OpenRouter data matching real API responses for OpenCode Zen models
+    fn mock_openrouter() -> HashMap<String, ModelPricing> {
+        let mut m = HashMap::new();
+
+        // === Baseline models ===
+        m.insert(
+            "openai/gpt-4o".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000025),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(0.00000125),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: Claude (OpenRouter entries) ===
+        m.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(3e-7),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "anthropic/claude-opus-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_creation_input_token_cost: Some(0.00000625),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "anthropic/claude-3.5-haiku".into(),
+            ModelPricing {
+                input_cost_per_token: Some(8e-7),
+                output_cost_per_token: Some(0.000004),
+                cache_read_input_token_cost: Some(8e-8),
+                cache_creation_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: GLM family ===
+        m.insert(
+            "z-ai/glm-4.7".into(),
+            ModelPricing {
+                input_cost_per_token: Some(4e-7),
+                output_cost_per_token: Some(0.0000015),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "z-ai/glm-4.6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(3.9e-7),
+                output_cost_per_token: Some(0.0000019),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        m.insert(
+            "moonshotai/kimi-k2".into(),
+            ModelPricing {
+                input_cost_per_token: Some(4.56e-7),
+                output_cost_per_token: Some(0.00000184),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "moonshotai/kimi-k2.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(4.5e-7),
+                output_cost_per_token: Some(0.0000025),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "moonshotai/kimi-k2.6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(9.5e-7),
+                output_cost_per_token: Some(0.000004),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "moonshotai/kimi-k2-thinking".into(),
+            ModelPricing {
+                input_cost_per_token: Some(4e-7),
+                output_cost_per_token: Some(0.00000175),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // === OpenCode Zen: Qwen family ===
+        m.insert(
+            "qwen/qwen3-coder".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2.2e-7),
+                output_cost_per_token: Some(9.5e-7),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        m
+    }
+
+    fn create_lookup() -> PricingLookup {
+        PricingLookup::new(mock_litellm(), mock_openrouter(), HashMap::new())
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - GPT-5 FAMILY
+    // All models from https://opencode.ai/docs/zen/
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_gpt_5_2() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.2").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.2");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5_1() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.1").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.1");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5_1_codex() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.1-codex").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.1-codex");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5_1_codex_max() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.1-codex-max").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.1-codex-max");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5").unwrap();
+        assert_eq!(result.matched_key, "gpt-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5_codex() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5-codex").unwrap();
+        assert_eq!(result.matched_key, "gpt-5-codex");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gpt_5_nano() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5-nano").unwrap();
+        assert_eq!(result.matched_key, "gpt-5-nano");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - CLAUDE FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_claude_sonnet_4_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_sonnet_4() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4").unwrap();
+        assert_eq!(result.matched_key, "anthropic/claude-sonnet-4");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_haiku_4_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-haiku-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-haiku-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_3_5_haiku() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-3-5-haiku").unwrap();
+        assert_eq!(result.matched_key, "anthropic/claude-3.5-haiku");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_3_5_haiku_with_dot() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-3.5-haiku").unwrap();
+        assert_eq!(result.matched_key, "anthropic/claude-3.5-haiku");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_opus_4_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-opus-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_claude_opus_4_1() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-opus-4-1").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-1");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - GLM FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_glm_4_7_free() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4.7-free").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_glm_4_6() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4.6").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.6");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_glm_4_7_with_hyphen() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4-7").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_glm_4_6_with_hyphen() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4-6").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.6");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_big_pickle() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("big-pickle").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - GEMINI FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_gemini_3_pro() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-3-pro").unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_opencode_zen_gemini_3_flash() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-3-flash").unwrap();
+        assert_eq!(result.matched_key, "vertex_ai/gemini-3-flash-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - KIMI FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_kimi_k2() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("kimi-k2").unwrap();
+        assert_eq!(result.matched_key, "moonshotai/kimi-k2");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_thinking() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("kimi-k2-thinking").unwrap();
+        assert_eq!(result.matched_key, "moonshotai/kimi-k2-thinking");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("kimi-k2.5").unwrap();
+        assert_eq!(result.matched_key, "moonshotai/kimi-k2.5");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_5_free() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("kimi-k2.5-free").unwrap();
+        assert_eq!(result.matched_key, "moonshotai/kimi-k2.5");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_6_aliases() {
+        let lookup = create_lookup();
+        for model_id in ["k2p6", "k2-p6", "kimi-k2p6", "Kimi-K2.6"] {
+            let result = lookup.lookup(model_id).unwrap();
+            assert_eq!(result.matched_key, "moonshotai/kimi-k2.6");
+            assert_eq!(result.source, "OpenRouter");
+            assert_eq!(result.pricing.input_cost_per_token, Some(9.5e-7));
+            assert_eq!(result.pricing.output_cost_per_token, Some(0.000004));
+        }
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_6_provider_hint_from_kimi_for_coding() {
+        let lookup = create_lookup();
+        let result = lookup
+            .lookup_with_provider("k2p6", Some("kimi-for-coding"))
+            .unwrap();
+        assert_eq!(result.matched_key, "moonshotai/kimi-k2.6");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_opencode_zen_kimi_k2_5_aliases_unchanged() {
+        let lookup = create_lookup();
+
+        let raw_k2p5 = lookup.lookup("k2p5").unwrap();
+        assert_eq!(raw_k2p5.matched_key, "moonshotai/kimi-k2-thinking");
+
+        let dotted = lookup.lookup("kimi-k2.5").unwrap();
+        assert_eq!(dotted.matched_key, "moonshotai/kimi-k2.5");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - QWEN FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_qwen3_coder() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("qwen3-coder").unwrap();
+        assert_eq!(result.matched_key, "qwen/qwen3-coder");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    // =========================================================================
+    // OPENCODE ZEN MODELS - GROK FAMILY
+    // =========================================================================
+
+    #[test]
+    fn test_opencode_zen_grok_code() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("grok-code").unwrap();
+        assert_eq!(result.matched_key, "xai/grok-code-fast-1-0825");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_hint_prefers_matching_pricing_source() {
+        let lookup = create_lookup();
+        let result = lookup
+            .lookup_with_provider("grok-code", Some("azure"))
+            .unwrap();
+        assert_eq!(result.matched_key, "azure_ai/grok-code-fast-1");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_hint_matches_nested_reseller_exact_key() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure/openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup_with_provider("gpt-4", Some("azure")).unwrap();
+        assert_eq!(result.matched_key, "azure/openai/gpt-4");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_hint_normalizes_openai_codex_alias() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-5.2-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "google/gpt-5.2-preview-max".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gpt-5.2", Some("openai-codex"))
+            .unwrap();
+        assert_eq!(result.matched_key, "openai/gpt-5.2-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_hint_matches_nested_google_segment_during_fuzzy_lookup() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openrouter/google/gemini-3-pro-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "vertex_ai/gemini-3-pro-preview-max".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gemini-3-pro", Some("google"))
+            .unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_cross_source_fuzzy_provider_hint_wins_over_original_provider_fallback() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks_ai/deepseek-v3-0324".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "deepseek/deepseek-v3-0324".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let result = lookup
+            .lookup_with_provider("deepseek-v3", Some("fireworks"))
+            .unwrap();
+        assert_eq!(result.matched_key, "fireworks_ai/deepseek-v3-0324");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_scoped_path_does_not_strip_into_wrong_fireworks_model() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks_ai/accounts/fireworks/models/deepseek-r1-0528-distill-qwen3-8b".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000002),
+                output_cost_per_token: Some(0.0000002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        assert!(
+            lookup
+                .lookup("accounts/fireworks/models/deepseek-v4-pro")
+                .is_none(),
+            "provider-scoped model paths should not be shortened into unrelated fuzzy matches"
+        );
+    }
+
+    #[test]
+    fn test_provider_scoped_path_matches_exact_litellm_reseller_key() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks_ai/accounts/fireworks/models/deepseek-v4-pro".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000004),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup("accounts/fireworks/models/deepseek-v4-pro")
+            .unwrap();
+
+        assert_eq!(
+            result.matched_key,
+            "fireworks_ai/accounts/fireworks/models/deepseek-v4-pro"
+        );
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_scoped_path_matches_exact_terminal_provider_key() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks_ai/deepseek-v4-pro".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000003),
+                output_cost_per_token: Some(0.0000004),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup("accounts/fireworks/models/deepseek-v4-pro")
+            .unwrap();
+
+        assert_eq!(result.matched_key, "fireworks_ai/deepseek-v4-pro");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_provider_scoped_path_does_not_use_upstream_openrouter_exact() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "deepseek/deepseek-v4-pro".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        assert!(
+            lookup
+                .lookup("accounts/fireworks/models/deepseek-v4-pro")
+                .is_none(),
+            "Fireworks-scoped usage should not be priced with upstream DeepSeek rates"
+        );
+    }
+
+    #[test]
+    fn antigravity_model_aliases_reach_priced_catalog_entries() {
+        let priced = [
+            "gemini-3.1-pro",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash-high",
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash-medium",
+        ];
+        let mut litellm = HashMap::new();
+        for model in priced {
+            litellm.insert(
+                model.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000002),
+                    output_cost_per_token: Some(0.000012),
+                    cache_read_input_token_cost: Some(0.0000002),
+                    ..Default::default()
+                },
+            );
+        }
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let cases = [
+            ("MODEL_PLACEHOLDER_M16", "gemini-3.1-pro"),
+            ("MODEL_PLACEHOLDER_M84", "gemini-3-flash-preview"),
+            ("MODEL_PLACEHOLDER_M133", "gemini-3.5-flash-high"),
+            ("gemini-3-flash-agent", "gemini-3.5-flash-high"),
+            ("gemini-3-flash-b", "gemini-3.5-flash-high"),
+            ("gemini-3-flash-a", "gemini-3.5-flash-high"),
+            ("MODEL_PLACEHOLDER_M187", "gemini-3.5-flash-extra-low"),
+            ("MODEL_PLACEHOLDER_M20", "gemini-3.5-flash-medium"),
+        ];
+
+        for (raw, expected_key) in cases {
+            let result = lookup
+                .lookup(raw)
+                .unwrap_or_else(|| panic!("unpriced alias: {raw}"));
+            assert_eq!(result.matched_key, expected_key, "raw model: {raw}");
+            assert!(result.pricing.input_cost_per_token.is_some());
+        }
+
+        assert!(
+            lookup.calculate_cost("gemini-3-flash-agent", 1_000_000, 100_000, 50_000, 0, 0) > 0.0
+        );
+    }
+
+    // =========================================================================
+    // BASELINE / LEGACY TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_exact_match_litellm() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-4o").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_exact_match_gpt_5_5_litellm() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.5").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_exact_match_openrouter() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("z-ai/glm-4.7").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_openrouter_model_part_match() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4.7").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_tier_suffix_low() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.1-codex-low").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.1-codex");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_high() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-4o-high").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_free() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("glm-4.7-free").unwrap();
+        assert_eq!(result.matched_key, "z-ai/glm-4.7");
+        assert_eq!(result.source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_tier_suffix_xhigh() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.2-xhigh").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.2");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_xhigh_gpt_5_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.5-xhigh").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_xhigh_codex_max() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.1-codex-max-xhigh").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.1-codex-max");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_parenthesized_reasoning_tier_gpt_levels() {
+        let lookup = create_lookup();
+
+        for tier in ["minimal", "low", "medium", "high", "xhigh", "auto", "none"] {
+            let id = format!("gpt-5.2({tier})");
+            let result = lookup.lookup(&id).unwrap_or_else(|| panic!("{id} miss"));
+            assert_eq!(result.matched_key, "gpt-5.2", "{id}");
+            assert_eq!(result.source, "LiteLLM", "{id}");
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_reasoning_tier_claude_and_gemini() {
+        let lookup = create_lookup();
+
+        let claude = lookup.lookup("claude-sonnet-4-5(high)").unwrap();
+        assert_eq!(claude.matched_key, "claude-sonnet-4-5");
+        assert_eq!(claude.source, "LiteLLM");
+
+        // Dot-form claude id (cliproxyapi accepts either) routes through
+        // version-separator normalization to the dashed catalog entry.
+        let claude_dot = lookup.lookup("claude-sonnet-4.5(none)").unwrap();
+        assert_eq!(claude_dot.matched_key, "claude-sonnet-4-5");
+
+        let gemini = lookup.lookup("gemini-3-pro(auto)").unwrap();
+        assert_eq!(gemini.matched_key, "openrouter/google/gemini-3-pro-preview");
+    }
+
+    #[test]
+    fn test_parenthesized_reasoning_tier_with_routing_prefix() {
+        let lookup = create_lookup();
+
+        let prefixed = lookup.lookup("myproxy-gpt-5.2(xhigh)").unwrap();
+        assert_eq!(prefixed.matched_key, "gpt-5.2");
+
+        let antigravity = lookup
+            .lookup("antigravity-claude-sonnet-4-5(high)")
+            .unwrap();
+        assert_eq!(antigravity.matched_key, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_parenthesized_reasoning_tier_unknown_value_does_not_strip() {
+        let lookup = create_lookup();
+
+        // Values outside the cliproxyapi level set must not silently
+        // misresolve via `try_strip_unknown_suffix`: without an early
+        // return, splitting on `-` would peel the parenthesized fragment
+        // off and match a shorter, unrelated model id (e.g.
+        // `gpt-5.2-codex(invalid)` collapsing to `gpt-5.2`).
+        assert!(lookup.lookup("gpt-5.2(weirdgarbage)").is_none());
+        assert!(lookup.lookup("gpt-5.2(1024)").is_none());
+        assert!(lookup.lookup("gpt-5.2()").is_none());
+        assert!(lookup.lookup("gpt-5.2-codex(invalid)").is_none());
+        assert!(lookup.lookup("myproxy-gpt-5.2(invalid)").is_none());
+
+        // The same guard must hold across model families so that the
+        // generalized stripper never misresolves a non-GPT id by peeling
+        // a parenthesized fragment off through the dash-suffix path.
+        assert!(lookup
+            .lookup("antigravity-claude-sonnet-4-5(invalid)")
+            .is_none());
+        assert!(lookup.lookup("claude-sonnet-4-5(garbage)").is_none());
+        assert!(lookup.lookup("gemini-3-pro(weird)").is_none());
+    }
+
+    #[test]
+    fn test_exact_raw_built_in_parenthesized_key_precedes_tier_validation() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.5(high)".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00003),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup.lookup("GPT-5.5(HIGH)").unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gpt-5.5(high)");
+    }
+
+    #[test]
+    fn test_missing_exact_raw_invalid_parenthesized_built_in_key_fails_closed() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00003),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        assert!(lookup.lookup("gpt-5.5(invalid)").is_none());
+    }
+
+    #[test]
+    fn test_parenthesized_reasoning_tier_cost_matches_base_model() {
+        let lookup = create_lookup();
+        let base = lookup.calculate_cost("gpt-5.2", 1_000_000, 500_000, 0, 0, 0);
+        let tiered = lookup.calculate_cost("gpt-5.2(xhigh)", 1_000_000, 500_000, 0, 0, 0);
+
+        assert!((tiered - base).abs() < f64::EPSILON);
+        assert!((tiered - 8.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_opus_4_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("opus-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_free_variant_normalizes_to_market_priced_claude_model() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5-free").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_free_variant_with_extra_suffix_falls_back_to_market_priced_model() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5-free-high").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_normalize_opus_4_6_prefers_4_6_over_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00002),
+                output_cost_per_token: Some(0.0001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("opus-4-6").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-6");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_normalize_opus_4_6_dot_prefers_4_6_over_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00002),
+                output_cost_per_token: Some(0.0001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("opus-4.6").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-6");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_normalize_opus_4_60_does_not_degrade_to_opus_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00002),
+                output_cost_per_token: Some(0.0001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        assert!(lookup.lookup("opus-4-60").is_none());
+    }
+
+    #[test]
+    fn test_normalize_opus_4_7_prefers_4_7_over_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000015),
+                output_cost_per_token: Some(0.000075),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-opus-4-7".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("opus-4-7").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-7");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_normalize_opus_4_7_dot_prefers_4_7_over_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000015),
+                output_cost_per_token: Some(0.000075),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-opus-4-7".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("opus-4.7").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-7");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    /// Regression: `aws.claude-opus-4-7` (Bedrock-style id) used to degrade
+    /// to OpenRouter's `anthropic/claude-opus-4` ($15/$75/$1.50/$18.75 per M)
+    /// because `normalize_model_name` only knew 4.5/4.6 and fell through to
+    /// the bare `claude-opus-4` branch — which OpenRouter then resolved via
+    /// `model_part` index to the legacy opus 4 entry. Result was ~3x overcharge.
+    #[test]
+    fn test_aws_opus_4_7_does_not_degrade_to_opus_4() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-7".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                cache_read_input_token_cost: Some(5e-7),
+                cache_creation_input_token_cost: Some(0.00000625),
+                ..Default::default()
+            },
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000015),
+                output_cost_per_token: Some(0.000075),
+                cache_read_input_token_cost: Some(0.0000015),
+                cache_creation_input_token_cost: Some(0.00001875),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let result = lookup.lookup("aws.claude-opus-4-7").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-7");
+        assert_ne!(result.matched_key, "anthropic/claude-opus-4");
+
+        // 8.4M input + 873K output + 41.3M cache_read + 12.1M cache_write
+        // at opus-4-7 rates should be ~$160, not ~$480 (legacy opus 4).
+        let cost = lookup.calculate_cost(
+            "aws.claude-opus-4-7",
+            8_400_000,
+            873_000,
+            41_300_000,
+            12_100_000,
+            0,
+        );
+        assert!(
+            (140.0..=180.0).contains(&cost),
+            "expected opus-4-7 priced cost around $160, got ${cost:.2}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_future_opus_minor_does_not_degrade_to_opus_4() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-opus-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000015),
+                output_cost_per_token: Some(0.000075),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        assert!(lookup.lookup("claude-opus-4-8").is_none());
+        assert!(lookup.lookup("aws.claude-opus-4-8").is_none());
+    }
+
+    #[test]
+    fn test_normalize_opus_14_6_does_not_map_to_4_6() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        assert!(lookup.lookup("opus-14-6").is_none());
+    }
+
+    #[test]
+    fn test_normalize_sonnet_14_5_does_not_map_to_4_5() {
+        assert_eq!(normalize_model_name("sonnet-14-5"), None);
+    }
+
+    #[test]
+    fn test_normalize_haiku_14_5_does_not_map_to_4_5() {
+        assert_eq!(normalize_model_name("haiku-14-5"), None);
+    }
+
+    // =========================================================================
+    // Generalized Claude family/major/minor normalization (PR #634 rework)
+    // =========================================================================
+
+    /// Synthetic dataset mirroring real LiteLLM/OpenRouter key shapes, with
+    /// deliberately adversarial gaps: bedrock-style `us.anthropic.` keys exist
+    /// for opus but not sonnet, and OpenRouter carries a pricier opus `-fast`
+    /// variant that the old fallbacks degraded other families onto.
+    fn claude_family_fixture() -> PricingLookup {
+        fn p(input: f64, output: f64) -> ModelPricing {
+            ModelPricing {
+                input_cost_per_token: Some(input),
+                output_cost_per_token: Some(output),
+                ..Default::default()
+            }
+        }
+
+        let mut litellm = HashMap::new();
+        litellm.insert("claude-opus-4".to_string(), p(15e-6, 75e-6));
+        litellm.insert("claude-opus-4-1".to_string(), p(15e-6, 75e-6));
+        litellm.insert("claude-opus-4-5".to_string(), p(5e-6, 25e-6));
+        litellm.insert("claude-opus-4-6".to_string(), p(5e-6, 25e-6));
+        litellm.insert("claude-opus-4-7".to_string(), p(5e-6, 25e-6));
+        litellm.insert("claude-opus-4-8".to_string(), p(5e-6, 25e-6));
+        litellm.insert("claude-sonnet-4".to_string(), p(3e-6, 15e-6));
+        litellm.insert("claude-sonnet-4-5".to_string(), p(3e-6, 15e-6));
+        litellm.insert("claude-sonnet-4-6".to_string(), p(3e-6, 15e-6));
+        litellm.insert("claude-haiku-4-5".to_string(), p(1e-6, 5e-6));
+        litellm.insert("us.anthropic.claude-opus-4-8".to_string(), p(5e-6, 25e-6));
+        litellm.insert("vertex_ai/claude-sonnet-4-6".to_string(), p(3e-6, 15e-6));
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert("anthropic/claude-opus-4".to_string(), p(15e-6, 75e-6));
+        openrouter.insert("anthropic/claude-opus-4.8".to_string(), p(5e-6, 25e-6));
+        openrouter.insert("anthropic/claude-opus-4.8-fast".to_string(), p(7e-6, 30e-6));
+        openrouter.insert("anthropic/claude-sonnet-4.6".to_string(), p(3e-6, 15e-6));
+        openrouter.insert("anthropic/claude-haiku-4.5".to_string(), p(1e-6, 5e-6));
+        openrouter.insert("anthropic/claude-fable-5".to_string(), p(5e-6, 25e-6));
+
+        PricingLookup::new(litellm, openrouter, HashMap::new())
+    }
+
+    #[test]
+    fn test_normalize_minor_generalizes_across_families() {
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4-7"),
+            Some("claude-sonnet-4-7".into())
+        );
+        assert_eq!(
+            normalize_model_name("sonnet-4.7"),
+            Some("claude-sonnet-4-7".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-haiku-4-6"),
+            Some("claude-haiku-4-6".into())
+        );
+        assert_eq!(
+            normalize_model_name("haiku-4.6"),
+            Some("claude-haiku-4-6".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-opus-4-9"),
+            Some("claude-opus-4-9".into())
+        );
+        assert_eq!(
+            normalize_model_name("opus-4.9"),
+            Some("claude-opus-4-9".into())
+        );
+        assert_eq!(
+            normalize_model_name("opus-5-2"),
+            Some("claude-opus-5-2".into())
+        );
+    }
+
+    #[test]
+    fn test_normalize_reversed_order_all_families() {
+        assert_eq!(
+            normalize_model_name("claude-4-8-opus"),
+            Some("claude-opus-4-8".into())
+        );
+        assert_eq!(
+            normalize_model_name("4-8-opus"),
+            Some("claude-opus-4-8".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-4-6-sonnet"),
+            Some("claude-sonnet-4-6".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-4-5-haiku"),
+            Some("claude-haiku-4-5".into())
+        );
+    }
+
+    #[test]
+    fn test_normalize_bare_modern_major() {
+        assert_eq!(
+            normalize_model_name("claude-sonnet-5"),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-opus-5"),
+            Some("claude-opus-5".into())
+        );
+        assert_eq!(
+            normalize_model_name("fable-5"),
+            Some("claude-fable-5".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-fable-5[1m]"),
+            Some("claude-fable-5".into())
+        );
+    }
+
+    /// Boundary contract preserved from main's hardcoded matcher: two-digit
+    /// minors and majors, zero minors, undelimited versions, and dated forms
+    /// must not normalize to a coarser key. (PR #634's original parser
+    /// degraded `opus-4-60` to `claude-opus-4`; main's contract is None.)
+    #[test]
+    fn test_normalize_modern_claude_boundaries() {
+        assert_eq!(normalize_model_name("opus-4-60"), None);
+        assert_eq!(normalize_model_name("sonnet-4-60"), None);
+        assert_eq!(normalize_model_name("opus-14-6"), None);
+        assert_eq!(normalize_model_name("opus4"), None);
+        assert_eq!(normalize_model_name("opus-4x"), None);
+        assert_eq!(normalize_model_name("opus-3"), None);
+        assert_eq!(normalize_model_name("claude-sonnet-5-0"), None);
+        assert_eq!(normalize_model_name("claude-opus-4-20250514"), None);
+    }
+
+    /// Legacy 3.x ids keep their irregular canonical keys; the reversed-order
+    /// and bare-major parsing must not hijack the digit pairs in them.
+    #[test]
+    fn test_normalize_legacy_line_not_hijacked_by_modern_parser() {
+        assert_eq!(
+            normalize_model_name("claude-3-5-sonnet"),
+            Some("claude-3.5-sonnet".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-3-7-sonnet-20250219"),
+            Some("claude-3-7-sonnet".into())
+        );
+        assert_eq!(
+            normalize_model_name("claude-3-5-haiku-20241022"),
+            Some("claude-3.5-haiku".into())
+        );
+    }
+
+    /// Regression (B1): a bedrock-style sonnet id must never be billed at an
+    /// opus key. Before the family guard, `us.anthropic.claude-sonnet-4-6-v1:0`
+    /// suffix-stripped down to `us.anthropic.claude` and fuzzy-matched the
+    /// dataset's `us.anthropic.claude-opus-4-8` entry ($5/M instead of $3/M).
+    #[test]
+    fn test_bedrock_sonnet_never_billed_as_opus() {
+        let lookup = claude_family_fixture();
+        let result = lookup
+            .lookup("us.anthropic.claude-sonnet-4-6-v1:0")
+            .unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-6");
+        assert_eq!(result.pricing.input_cost_per_token, Some(3e-6));
+    }
+
+    /// Regression (B2): reversed-order sonnet ids must resolve to the sonnet
+    /// key, not cross-family. Before reversed-order parsing was generalized
+    /// beyond opus, `claude-4-6-sonnet` stripped down to `claude` and
+    /// fuzzy-matched `anthropic/claude-opus-4.8-fast`.
+    #[test]
+    fn test_reversed_sonnet_resolves_canonical_not_cross_family() {
+        let lookup = claude_family_fixture();
+        for id in ["claude-4-6-sonnet", "4-6-sonnet"] {
+            let result = lookup.lookup(id).unwrap();
+            assert_eq!(result.matched_key, "claude-sonnet-4-6", "id: {id}");
+        }
+        let result = lookup.lookup("claude-4-5-haiku").unwrap();
+        assert_eq!(result.matched_key, "claude-haiku-4-5");
+    }
+
+    /// Regression (B3): the never-degrade contract that
+    /// `test_unknown_future_opus_minor_does_not_degrade_to_opus_4` pins for
+    /// opus now holds for sonnet and haiku too. Unknown minors previously
+    /// degraded: `sonnet-4-7` -> claude-sonnet-4.6, `haiku-4-6` ->
+    /// claude-haiku-4.5 (and with real data even claude-3.5-haiku).
+    #[test]
+    fn test_unknown_sonnet_haiku_minor_does_not_degrade() {
+        let lookup = claude_family_fixture();
+        for id in [
+            "sonnet-4-7",
+            "claude-sonnet-4-7",
+            "sonnet-4-60",
+            "haiku-4-6",
+            "claude-haiku-4-6",
+        ] {
+            assert!(lookup.lookup(id).is_none(), "id {id} must not degrade");
+        }
+    }
+
+    /// Regression (B4): major >= 5 ids resolve to a dataset-known exact id
+    /// when one exists, else None — never to a different major. Previously
+    /// `claude-opus-5` resolved to `anthropic/claude-opus-4.8-fast` and
+    /// `sonnet-5`/`claude-sonnet-5-0` to sonnet 4.6, while bare `opus-5`
+    /// happened to return None only because of a fuzzy length cutoff.
+    #[test]
+    fn test_major_five_never_resolves_to_different_major() {
+        let lookup = claude_family_fixture();
+        for id in [
+            "claude-opus-5",
+            "opus-5",
+            "opus-5-2",
+            "sonnet-5",
+            "claude-sonnet-5-0",
+        ] {
+            assert!(
+                lookup.lookup(id).is_none(),
+                "id {id} must not resolve to a 4.x key"
+            );
+        }
+
+        // fable-5 is dataset-known (OpenRouter) and resolves in all forms.
+        for id in [
+            "claude-fable-5",
+            "fable-5",
+            "claude-fable-5[1m]",
+            "anthropic/claude-fable-5",
+        ] {
+            let result = lookup.lookup(id).unwrap();
+            assert_eq!(result.matched_key, "anthropic/claude-fable-5", "id: {id}");
+        }
+    }
+
+    /// When the dataset later gains a major-5 key, the same ids resolve to it
+    /// with no code change — the "known version" decision is dataset-driven.
+    #[test]
+    fn test_major_five_resolves_once_dataset_knows_it() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00005),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        for id in ["claude-opus-5", "opus-5", "aws.claude-opus-5-thinking"] {
+            let result = lookup.lookup(id).unwrap();
+            assert_eq!(result.matched_key, "claude-opus-5", "id: {id}");
+        }
+    }
+
+    /// Known minors keep resolving across the id shapes seen in the wild:
+    /// dotted versions, vendor prefixes, tier/feature suffixes.
+    #[test]
+    fn test_known_minor_shapes_resolve_per_family() {
+        let lookup = claude_family_fixture();
+        let cases = [
+            ("opus-4-8", "claude-opus-4-8"),
+            ("opus-4.8", "claude-opus-4-8"),
+            ("aws.claude-opus-4-8", "claude-opus-4-8"),
+            ("claude-opus-4-8-thinking", "claude-opus-4-8"),
+            ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+            ("claude-sonnet-4.6", "claude-sonnet-4-6"),
+            ("sonnet-4-6", "claude-sonnet-4-6"),
+            ("sonnet-4.6", "claude-sonnet-4-6"),
+            ("aws.claude-sonnet-4-6-v1", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6-thinking", "claude-sonnet-4-6"),
+            ("haiku-4-5", "claude-haiku-4-5"),
+            ("haiku-4.5", "claude-haiku-4-5"),
+            ("vertex_ai/claude-sonnet-4-6", "vertex_ai/claude-sonnet-4-6"),
+        ];
+        for (id, expected) in cases {
+            let result = lookup.lookup(id).unwrap();
+            assert_eq!(result.matched_key, expected, "id: {id}");
+        }
+    }
+
+    /// Ported from PR #634: the next opus minor must prefer its own key over
+    /// the bare `claude-opus-4` catch-all, in dashed and dotted forms.
+    #[test]
+    fn test_normalize_opus_4_8_prefers_4_8_over_4() {
+        let lookup = claude_family_fixture();
+        for id in ["opus-4-8", "opus-4.8"] {
+            let result = lookup.lookup(id).unwrap();
+            assert_eq!(result.matched_key, "claude-opus-4-8", "id: {id}");
+            assert_eq!(result.source, "LiteLLM");
+        }
+    }
+
+    /// Ported from PR #634: `aws.claude-opus-4-8` must not degrade to
+    /// OpenRouter's legacy `anthropic/claude-opus-4` (~3x overcharge).
+    #[test]
+    fn test_aws_opus_4_8_does_not_degrade_to_opus_4() {
+        let lookup = claude_family_fixture();
+        let result = lookup.lookup("aws.claude-opus-4-8").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-8");
+
+        // 8.4M input + 873K output at opus-4-8 rates is ~$64, not ~$191
+        // (legacy opus 4 at $15/$75 per M).
+        let cost = lookup.calculate_cost("aws.claude-opus-4-8", 8_400_000, 873_000, 0, 0, 0);
+        assert!(
+            (60.0..=70.0).contains(&cost),
+            "expected opus-4-8 priced cost around $64, got ${cost:.2}"
+        );
+    }
+
+    /// Ported behavior from PR #707: a bare brand token carries no model
+    /// identity, so a retired `claude-2.1` that erodes to `claude` (or the bare
+    /// `claude`/`anthropic` tokens themselves) must stay unpriced rather than
+    /// fuzzy-match an opus key. Without the FUZZY_BLOCKLIST additions these
+    /// would land on `anthropic/claude-opus-4.8-fast` / legacy `claude-opus-4`.
+    #[test]
+    fn test_bare_brand_token_does_not_fuzzy_match_opus() {
+        let lookup = claude_family_fixture();
+        assert!(
+            lookup.lookup("claude").is_none(),
+            "bare 'claude' must not resolve to any opus key"
+        );
+        assert!(
+            lookup.lookup("anthropic").is_none(),
+            "bare 'anthropic' must not resolve to any opus key"
+        );
+        assert!(
+            lookup.lookup("claude-2.1").is_none(),
+            "retired claude-2.1 must not erode to 'claude' and fuzzy-match opus-fast"
+        );
+    }
+
+    /// Ported from PR #707 (the blocklist hunk's referenced test): the generic
+    /// tokens `model`/`router` carry no model identity and must never fuzzy-match
+    /// a real priced key (`azure_ai/model_router`), while an EXACT key match for a
+    /// genuine `model-router` id is still honored.
+    #[test]
+    fn fuzzy_match_does_not_resolve_generic_model_token() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "azure_ai/model_router".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.4e-7),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // The bare token must not resolve.
+        assert!(lookup.lookup("model").is_none());
+        // Ids that strip down to the bare `model` token must not misresolve.
+        assert!(lookup.lookup("model-zero-usage-v1").is_none());
+        assert!(lookup.lookup("model-nonzero-usage-v1").is_none());
+        assert!(lookup.lookup("test-model").is_none());
+
+        // But an EXACT key match is still honored — `model-router` is a real
+        // model id, not a fuzzy remnant.
+        let mut litellm2 = HashMap::new();
+        litellm2.insert(
+            "azure/model-router".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.4e-7),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup2 = PricingLookup::new(litellm2, HashMap::new(), HashMap::new());
+        assert_eq!(
+            lookup2.lookup("model-router").unwrap().matched_key,
+            "azure/model-router"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_auto() {
+        let lookup = create_lookup();
+        assert!(lookup.lookup("auto").is_none());
+    }
+
+    #[test]
+    fn test_blocklist_mini() {
+        let lookup = create_lookup();
+        assert!(lookup.lookup("mini").is_none());
+    }
+
+    #[test]
+    fn test_force_source_litellm() {
+        let lookup = create_lookup();
+        for force_source in ["litellm", "LiteLLM", "LITELLM"] {
+            let result = lookup
+                .lookup_with_source("gpt-4o", Some(force_source))
+                .unwrap();
+            assert_eq!(result.source, "LiteLLM");
+            assert_eq!(result.matched_key, "gpt-4o");
+        }
+    }
+
+    #[test]
+    fn test_force_source_openrouter() {
+        let lookup = create_lookup();
+        for force_source in ["openrouter", "OpenRouter", "OPENROUTER"] {
+            let result = lookup
+                .lookup_with_source("gpt-4o", Some(force_source))
+                .unwrap();
+            assert_eq!(result.source, "OpenRouter");
+            assert_eq!(result.matched_key, "openai/gpt-4o");
+        }
+    }
+
+    #[test]
+    fn test_case_insensitive() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("GPT-4O").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+    }
+
+    #[test]
+    fn test_fuzzy_match_gemini() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-3-pro").unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_with_fuzzy() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-3-pro-high").unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+    }
+
+    #[test]
+    fn test_nonexistent_model() {
+        let lookup = create_lookup();
+        assert!(lookup.lookup("nonexistent-model-xyz").is_none());
+    }
+
+    /// Regression (#831): router/proxy-assigned ids like `cx/gpt-5.5` (seen
+    /// from OpenCode's `omniroute` provider) carry a prefix outside the
+    /// curated `PROVIDER_PREFIXES` list, so the pricing lookup used to return
+    /// `None` instead of pricing the underlying `gpt-5.5` model.
+    #[test]
+    fn test_unknown_prefixed_model_id_strips_to_underlying_model() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("gpt-5.5").unwrap();
+        let prefixed = lookup.lookup("cx/gpt-5.5").unwrap();
+        assert_eq!(prefixed.matched_key, direct.matched_key);
+        assert_eq!(prefixed.source, direct.source);
+        assert_eq!(
+            prefixed.pricing.input_cost_per_token,
+            direct.pricing.input_cost_per_token
+        );
+        assert_eq!(
+            prefixed.pricing.output_cost_per_token,
+            direct.pricing.output_cost_per_token
+        );
+    }
+
+    /// Regression (#831): a dataset key that legitimately keeps its own
+    /// provider prefix (e.g. `anthropic/claude-fable-5`) must still resolve
+    /// through the exact/direct lookup before the generic fallback runs.
+    #[test]
+    fn test_known_prefixed_dataset_key_still_resolves_exactly() {
+        let lookup = claude_family_fixture();
+        let result = lookup.lookup("anthropic/claude-fable-5").unwrap();
+        assert_eq!(result.matched_key, "anthropic/claude-fable-5");
+    }
+
+    /// Regression (#831): an unrecognized prefix and an unrecognized
+    /// underlying model must still return `None` rather than fuzzy-matching an
+    /// unrelated pricing key.
+    #[test]
+    fn test_unknown_prefixed_unknown_model_stays_none() {
+        let lookup = create_lookup();
+        assert!(lookup.lookup("unknown/nonexistent").is_none());
+    }
+
+    /// The generic fallback must reuse the local guarded pipeline, including
+    /// provider-hint source selection and cache-rate backfill, rather than
+    /// bypassing those local adaptations when composing a terminal suffix
+    /// fallback.
+    #[test]
+    fn test_generic_prefix_fallback_keeps_provider_selection_and_cache_backfill() {
+        let pricing = |input: f64, output: f64| ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        };
+
+        let mut litellm = HashMap::new();
+        litellm.insert("alpha-model".into(), pricing(0.000001, 0.000002));
+        litellm.insert("anthropic/alpha-model".into(), pricing(0.000003, 0.000004));
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/alpha-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000006),
+                cache_read_input_token_cost: Some(0.0000007),
+                cache_creation_input_token_cost: Some(0.0000008),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let direct = lookup
+            .lookup_with_provider("alpha-model-high", Some("anthropic"))
+            .unwrap();
+        let prefixed = lookup
+            .lookup_with_provider("cx/alpha-model-high", Some("anthropic"))
+            .unwrap();
+
+        for result in [&direct, &prefixed] {
+            assert_eq!(result.matched_key, "anthropic/alpha-model");
+            assert_eq!(result.source, "LiteLLM");
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.000003));
+            assert_eq!(result.pricing.output_cost_per_token, Some(0.000004));
+            assert_eq!(result.pricing.cache_read_input_token_cost, Some(0.0000007));
+            assert_eq!(
+                result.pricing.cache_creation_input_token_cost,
+                Some(0.0000008)
+            );
+        }
+    }
+
+    /// Regression: an existing suffixed pricing fixture must resolve through
+    /// the terminal segment before the older bounded prefix fallback runs.
+    #[test]
+    fn test_generic_prefix_fallback_composes_suffixed_pricing_fixture() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("gpt-5-codex-max").unwrap();
+        let routed = lookup.lookup("cx-router-edge/gpt-5-codex-max").unwrap();
+
+        assert_eq!(routed.matched_key, direct.matched_key);
+        assert_eq!(routed.source, direct.source);
+        assert_eq!(
+            routed.pricing.input_cost_per_token,
+            direct.pricing.input_cost_per_token
+        );
+        assert_eq!(
+            routed.pricing.output_cost_per_token,
+            direct.pricing.output_cost_per_token
+        );
+        assert_eq!(
+            routed.pricing.cache_read_input_token_cost,
+            direct.pricing.cache_read_input_token_cost
+        );
+        assert_eq!(
+            routed.pricing.cache_creation_input_token_cost,
+            direct.pricing.cache_creation_input_token_cost
+        );
+    }
+
+    #[test]
+    fn cursor_specific_aliases_explicitly_select_cursor_pricing() {
+        // `cursor-grok-4.6-*` names a Cursor tier; an upstream row for the
+        // shared target `grok-4.6` must not take it over.
+        let pricing = |input: f64| ModelPricing {
+            input_cost_per_token: Some(input),
+            ..Default::default()
+        };
+        let mut cursor = HashMap::new();
+        cursor.insert("grok-4.6".into(), pricing(2e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("x-ai/grok-4.6".into(), pricing(1e-6));
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, cursor);
+
+        let result = lookup
+            .lookup("cursor-grok-4.6-high")
+            .expect("the Cursor tier alias must price");
+        assert_eq!(result.source, "Cursor");
+        assert_eq!(result.matched_key, "grok-4.6");
+
+        // The bare id is not a Cursor alias and keeps upstream precedence.
+        assert_eq!(lookup.lookup("grok-4.6").unwrap().source, "OpenRouter");
+    }
+
+    #[test]
+    fn test_generic_prefix_terminal_upstream_exact_precedes_cursor_model_part() {
+        let pricing = |input: f64| ModelPricing {
+            input_cost_per_token: Some(input),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.3-codex".into(), pricing(0.000001));
+        let mut cursor = HashMap::new();
+        cursor.insert("gpt-5.3-codex".into(), pricing(0.000009));
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), cursor);
+        for model_id in ["gpt-5.3-codex", "cx/gpt-5.3-codex", "cx/gpt-5.3-codex-high"] {
+            let result = lookup.lookup(model_id).unwrap();
+            assert_eq!(result.source, "LiteLLM");
+            assert_eq!(result.matched_key, "gpt-5.3-codex");
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.000001));
+        }
+    }
+
+    #[test]
+    fn test_generic_prefix_fallback_unknown_terminal_suffix_stays_none() {
+        let lookup = create_lookup();
+        assert!(lookup.lookup("cx/nonexistent-model-high").is_none());
+    }
+
+    #[test]
+    fn test_generic_prefix_fallback_preserves_full_path_suffix_precedence() {
+        let pricing = |input: f64| ModelPricing {
+            input_cost_per_token: Some(input),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("azure_ai/grok-code-fast-1".into(), pricing(0.0035));
+        litellm.insert("xai/grok-code-fast-1-0825".into(), pricing(0.0000002));
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("azure_ai/grok-code-fast-1-high").unwrap();
+
+        assert_eq!(result.matched_key, "azure_ai/grok-code-fast-1");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.0035));
+    }
+
+    #[test]
+    fn test_generic_prefix_fallback_resolves_terminal_alias_like_direct_lookup() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("k2p6").unwrap();
+        let routed = lookup.lookup("cx/k2p6").unwrap();
+
+        assert_eq!(routed.matched_key, direct.matched_key);
+        assert_eq!(routed.source, direct.source);
+        assert_eq!(
+            routed.pricing.input_cost_per_token,
+            direct.pricing.input_cost_per_token
+        );
+        assert_eq!(
+            routed.pricing.output_cost_per_token,
+            direct.pricing.output_cost_per_token
+        );
+    }
+
+    #[test]
+    fn test_generic_prefix_fallback_applies_terminal_reasoning_tier_guard() {
+        let lookup = create_lookup();
+        let direct = lookup.lookup("cx/k2p6").unwrap();
+        let tiered = lookup.lookup("cx/k2p6(high)").unwrap();
+
+        assert_eq!(tiered.matched_key, direct.matched_key);
+        assert!(lookup.lookup("cx/k2p6(invalid)").is_none());
+    }
+
+    #[test]
+    fn test_generic_prefix_helper_uses_terminal_segment() {
+        assert_eq!(strip_generic_provider_prefix("cx/gpt-5.5"), Some("gpt-5.5"));
+        assert_eq!(strip_generic_provider_prefix("a/b/c"), Some("c"));
+        assert_eq!(strip_generic_provider_prefix("gpt-5.5"), None);
+        assert_eq!(strip_generic_provider_prefix("cx/"), None);
+    }
+
+    #[test]
+    fn test_fallback_suffix_lookup() {
+        // Create a lookup with only the base model (no -codex variant)
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        // Note: gpt-5-codex is NOT in the pricing data
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // Looking up gpt-5-codex should fall back to gpt-5
+        let result = lookup.lookup("gpt-5-codex").unwrap();
+        assert_eq!(result.matched_key, "gpt-5");
+        assert_eq!(result.source, "LiteLLM");
+
+        // Looking up gpt-5-codex-max should also fall back to gpt-5
+        let result = lookup.lookup("gpt-5-codex-max").unwrap();
+        assert_eq!(result.matched_key, "gpt-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_fallback_suffix_with_tier_suffix() {
+        // Test that tier suffix + fallback suffix both work together
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: Some(1.25e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // gpt-5-codex-high should strip -high first, then fall back from gpt-5-codex to gpt-5
+        let result = lookup.lookup("gpt-5-codex-high").unwrap();
+        assert_eq!(result.matched_key, "gpt-5");
+        assert_eq!(result.source, "LiteLLM");
+
+        // gpt-5-codex-max-xhigh should strip -xhigh first, then fall back from gpt-5-codex-max to gpt-5
+        let result = lookup.lookup("gpt-5-codex-max-xhigh").unwrap();
+        assert_eq!(result.matched_key, "gpt-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_fallback_suffix_prefers_exact_match() {
+        // If the exact model exists, it should be used (no fallback)
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00000125),
+                output_cost_per_token: Some(0.00001),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "gpt-5-codex".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000002), // Different price to verify which one is used
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // Should use the exact match, not fall back
+        let result = lookup.lookup("gpt-5-codex").unwrap();
+        assert_eq!(result.matched_key, "gpt-5-codex");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.000002));
+    }
+
+    #[test]
+    fn test_normalize_version_separator() {
+        assert_eq!(
+            normalize_version_separator("glm-4-7"),
+            Some("glm-4.7".into())
+        );
+        assert_eq!(
+            normalize_version_separator("glm-4-6"),
+            Some("glm-4.6".into())
+        );
+        assert_eq!(
+            normalize_version_separator("claude-3-5-haiku"),
+            Some("claude-3.5-haiku".into())
+        );
+        assert_eq!(
+            normalize_version_separator("gpt-5-1-codex"),
+            Some("gpt-5.1-codex".into())
+        );
+        assert_eq!(normalize_version_separator("gpt-4o"), None);
+        assert_eq!(normalize_version_separator("claude-sonnet"), None);
+        assert_eq!(normalize_version_separator("big-pickle"), None);
+    }
+
+    #[test]
+    fn test_normalize_version_separator_preserves_dates() {
+        assert_eq!(normalize_version_separator("2024-11-20"), None);
+        assert_eq!(normalize_version_separator("model-2024-11-20"), None);
+        assert_eq!(
+            normalize_version_separator("claude-3-5-sonnet-20241022"),
+            Some("claude-3.5-sonnet-20241022".into())
+        );
+        assert_eq!(normalize_version_separator("sonnet-20241022"), None);
+        assert_eq!(normalize_version_separator("model-20241022-v1"), None);
+    }
+
+    #[test]
+    fn test_is_fuzzy_eligible() {
+        assert!(!is_fuzzy_eligible("auto"));
+        assert!(!is_fuzzy_eligible("mini"));
+        assert!(!is_fuzzy_eligible("chat"));
+        assert!(!is_fuzzy_eligible("base"));
+        assert!(!is_fuzzy_eligible("abc"));
+        assert!(is_fuzzy_eligible("gpt-4o"));
+        // Bare brand tokens carry no model information: a fuzzy hit from them
+        // can land on any model of the brand, so they are blocklisted.
+        assert!(!is_fuzzy_eligible("claude"));
+        assert!(!is_fuzzy_eligible("anthropic"));
+    }
+
+    // =========================================================================
+    // PROVIDER PREFERENCE TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_provider_preference_grok_prefers_xai_over_azure() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("grok-code").unwrap();
+        assert_eq!(result.matched_key, "xai/grok-code-fast-1-0825");
+        assert_eq!(result.source, "LiteLLM");
+        assert!(!result.matched_key.starts_with("azure"));
+    }
+
+    /// Test that documents the exact before/after behavior for grok-code provider preference.
+    /// This test explicitly verifies that the original provider (xai/) is preferred over resellers (azure_ai/).
+    #[test]
+    fn test_grok_code_prefers_xai_over_azure() {
+        // =========================================================================
+        // BEFORE FIX: grok-code → azure_ai/grok-code-fast-1 ($3.50/$17.50) ❌ reseller
+        // AFTER FIX:  grok-code → xai/grok-code-fast-1-0825 ($0.20/$1.50) ✅ original provider
+        //
+        // The azure_ai/ prefix indicates a reseller (Azure AI marketplace), which typically
+        // has higher prices. The xai/ prefix indicates the original provider (X.AI/Grok),
+        // which offers lower direct pricing. Our lookup should prefer the original provider.
+        // =========================================================================
+
+        let mut litellm = HashMap::new();
+
+        // Reseller entry: azure_ai/ prefix with higher prices ($3.50/$17.50 per 1M tokens)
+        litellm.insert(
+            "azure_ai/grok-code-fast-1".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000035),  // $3.50/1M tokens
+                output_cost_per_token: Some(0.0000175), // $17.50/1M tokens
+                cache_read_input_token_cost: None,
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        // Original provider entry: xai/ prefix with lower prices ($0.20/$1.50 per 1M tokens)
+        litellm.insert(
+            "xai/grok-code-fast-1-0825".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000002),  // $0.20/1M tokens
+                output_cost_per_token: Some(0.0000015), // $1.50/1M tokens
+                cache_read_input_token_cost: Some(0.00000002),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("grok-code").unwrap();
+
+        // Must prefer xai (original provider) over azure_ai (reseller)
+        assert!(
+            result.matched_key.starts_with("xai/"),
+            "Expected xai/ prefix (original provider) but got: {}. \
+             The lookup should prefer original providers over resellers.",
+            result.matched_key
+        );
+        assert_eq!(
+            result.matched_key, "xai/grok-code-fast-1-0825",
+            "Should match the xai/grok-code-fast-1-0825 entry, not azure_ai/grok-code-fast-1"
+        );
+
+        // Verify we got the lower price (original provider)
+        let pricing = &result.pricing;
+        assert!(
+            pricing.input_cost_per_token.unwrap() < 0.000001,
+            "Input cost should be ~$0.20/1M (0.0000002), not ~$3.50/1M (reseller price)"
+        );
+        assert!(
+            pricing.output_cost_per_token.unwrap() < 0.000005,
+            "Output cost should be ~$1.50/1M (0.0000015), not ~$17.50/1M (reseller price)"
+        );
+    }
+
+    #[test]
+    fn test_provider_preference_gemini_prefers_google_over_vertex() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-2.5-pro").unwrap();
+        assert_eq!(result.matched_key, "google/gemini-2.5-pro");
+        assert_eq!(result.source, "LiteLLM");
+        assert!(!result.matched_key.starts_with("vertex_ai"));
+    }
+
+    #[test]
+    fn test_is_original_provider() {
+        assert!(is_original_provider("xai/grok-code"));
+        assert!(is_original_provider("anthropic/claude-3"));
+        assert!(is_original_provider("openai/gpt-4"));
+        assert!(is_original_provider("google/gemini"));
+        assert!(is_original_provider("x-ai/grok"));
+        assert!(!is_original_provider("azure_ai/grok"));
+        assert!(!is_original_provider("bedrock/anthropic"));
+        assert!(!is_original_provider("vertex_ai/gemini"));
+        assert!(!is_original_provider("unknown-provider/model"));
+    }
+
+    #[test]
+    fn test_is_reseller_provider() {
+        assert!(is_reseller_provider("azure_ai/grok-code"));
+        assert!(is_reseller_provider("azure/openai/gpt-4"));
+        assert!(is_reseller_provider("bedrock/anthropic.claude"));
+        assert!(is_reseller_provider("vertex_ai/gemini"));
+        assert!(is_reseller_provider("together_ai/llama"));
+        assert!(is_reseller_provider("groq/llama"));
+        assert!(!is_reseller_provider("xai/grok"));
+        assert!(!is_reseller_provider("anthropic/claude"));
+        assert!(!is_reseller_provider("openai/gpt-4"));
+    }
+
+    // =========================================================================
+    // COST CALCULATION TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_calculate_cost_gpt_5_2() {
+        let lookup = create_lookup();
+        // 1M input, 500K output tokens
+        let cost = lookup.calculate_cost("gpt-5.2", 1_000_000, 500_000, 0, 0, 0);
+        // input: 1M * 0.00000175 = 1.75, output: 500K * 0.000014 = 7.0
+        assert!((cost - 8.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_cost_claude_sonnet_4_5() {
+        let lookup = create_lookup();
+        // 100K input, 50K output, 200K cache read
+        let cost = lookup.calculate_cost("claude-sonnet-4-5", 100_000, 50_000, 200_000, 0, 0);
+        // input: 100K * 0.000003 = 0.30, output: 50K * 0.000015 = 0.75, cache: 200K * 3e-7 = 0.06
+        assert!((cost - 1.11).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_boundary_at_200k_uses_base_rates() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000001,
+                "input_cost_per_token_above_200k_tokens": 0.000002,
+                "output_cost_per_token": 0.000003,
+                "output_cost_per_token_above_200k_tokens": 0.000004
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 200_000, 200_000, 0, 0, 0, 0);
+        let expected = 200_000.0 * 0.000001 + 200_000.0 * 0.000003;
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_above_200k_splits_input_and_output() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000001,
+                "input_cost_per_token_above_200k_tokens": 0.000002,
+                "output_cost_per_token": 0.000003,
+                "output_cost_per_token_above_200k_tokens": 0.000004
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 200_001, 200_001, 0, 0, 0, 0);
+        let expected =
+            (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003 + 1.0 * 0.000004);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_above_272k_splits_gpt_5_5_tokens() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000005,
+                "input_cost_per_token_above_272k_tokens": 0.000010,
+                "output_cost_per_token": 0.000030,
+                "output_cost_per_token_above_272k_tokens": 0.000045,
+                "cache_read_input_token_cost": 0.0000005,
+                "cache_read_input_token_cost_above_272k_tokens": 0.000001
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0, 0);
+        let expected = (272_000.0 * 0.000005 + 1.0 * 0.000010)
+            + (272_000.0 * 0.000030 + 1.0 * 0.000045)
+            + (272_000.0 * 0.0000005 + 1.0 * 0.000001);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_uses_multiple_thresholds_in_order() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000001,
+                "input_cost_per_token_above_128k_tokens": 0.000002,
+                "input_cost_per_token_above_256k_tokens": 0.000003,
+                "input_cost_per_token_above_272k_tokens": 0.000004
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0, 0);
+        let expected = (128_000.0 * 0.000001)
+            + (128_000.0 * 0.000002)
+            + (16_000.0 * 0.000003)
+            + (28_000.0 * 0.000004);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_is_applied_per_bucket() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000001,
+                "input_cost_per_token_above_200k_tokens": 0.000002,
+                "output_cost_per_token": 0.000003,
+                "output_cost_per_token_above_200k_tokens": 0.000004
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 200_001, 200_000, 0, 0, 0, 0);
+        let expected = (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    /// Anthropic bills a 5-minute cache write at 1.25x base input and a
+    /// 1-hour write at 2x. The engine reads only the total until #287, so
+    /// every write was priced at the cache-creation rate, which is the 5m
+    /// one. The expected value here is worked out by hand from the rates in
+    /// the fixture, not read back out of the function under test.
+    #[test]
+    fn one_hour_cache_writes_are_priced_at_twice_base_input() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        // 1000 tokens written, 600 of them with the 1-hour TTL.
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 600, 0);
+        let expected = 400.0 * 0.00000375 + 600.0 * 2.0 * 0.000003;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "got {cost}, expected {expected}"
+        );
+
+        // The old behaviour, still reachable by passing no 1h portion, is the
+        // number this change moves away from -- stated here so the test fails
+        // if the split silently stops applying rather than merely drifting.
+        let all_five_minute = compute_cost(&pricing, 0, 0, 0, 1000, 0, 0);
+        assert!((all_five_minute - 1000.0 * 0.00000375).abs() < 1e-12);
+        assert!(
+            cost > all_five_minute,
+            "the 1h rate is the more expensive one"
+        );
+    }
+
+    /// A transcript written before Anthropic split the field reports only the
+    /// total. Pricing it at the 5-minute rate is what the parser did for
+    /// every turn before this change, and staying on that path is what keeps
+    /// the change from rewriting history it has no evidence about.
+    #[test]
+    fn a_cache_write_with_no_reported_split_stays_on_the_five_minute_rate() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 0, 0);
+        assert!((cost - 1000.0 * 0.00000375).abs() < 1e-12);
+    }
+
+    /// The 1h bucket is priced off `input_cost_per_token`, a different table
+    /// entry from the one the 5m bucket uses. A model whose table carries the
+    /// cache-creation rate but no input rate therefore prices the 1h half at
+    /// zero, and the coverage fold has to say so -- reporting Complete while
+    /// silently undercharging is the failure this observation exists for.
+    #[test]
+    fn a_one_hour_write_with_no_input_rate_is_not_reported_as_complete() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 600, 0);
+        assert!(
+            (cost - 400.0 * 0.00000375).abs() < 1e-12,
+            "only the 5m half can be priced"
+        );
+
+        let usage = TokenBreakdown {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 1000,
+            reasoning: 0,
+            cache_write_1h: 600,
+        };
+        let result = LookupResult {
+            pricing,
+            matched_key: "test-model".to_string(),
+            source: "LiteLLM".to_string(),
+        };
+        assert_ne!(
+            coverage_for_lookup_result(&result, &usage),
+            EstimateCoverage::Complete,
+            "an unpriced 1h half must not be reported as fully covered"
+        );
+    }
+
+    /// The mirror of the test above. Coverage subtracts the 1h portion for the
+    /// same reason pricing does: when the whole write is 1h, the 5m bucket is
+    /// empty and must not demand a cache-creation rate that nothing is being
+    /// charged against. Without the subtraction here a model priced entirely
+    /// correctly -- input rate present, every token billed -- would still be
+    /// reported as incompletely covered.
+    #[test]
+    fn an_all_one_hour_write_does_not_demand_a_five_minute_rate() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003
+            }"#,
+        )
+        .unwrap();
+
+        let usage = TokenBreakdown {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 1000,
+            reasoning: 0,
+            cache_write_1h: 1000,
+        };
+        let result = LookupResult {
+            pricing,
+            matched_key: "test-model".to_string(),
+            source: "LiteLLM".to_string(),
+        };
+
+        assert!(
+            (compute_cost(&result.pricing, 0, 0, 0, 1000, 1000, 0) - 1000.0 * 2.0 * 0.000003).abs()
+                < 1e-12,
+            "every token is priced"
+        );
+        assert_eq!(
+            coverage_for_lookup_result(&result, &usage),
+            EstimateCoverage::Complete,
+            "an empty 5m bucket must not be observed against a missing rate"
+        );
+    }
+
+    /// The two numbers arrive from independent JSON fields. A payload
+    /// reporting a larger split than total would drive the 5m bucket
+    /// negative, and `tiered_cost` clamps a negative bucket to zero -- which
+    /// would drop the whole write from the bill rather than surface the bad
+    /// input. The clamp inside `compute_cost` is what prevents that.
+    #[test]
+    fn an_over_reported_one_hour_split_is_clamped_to_the_total() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000003,
+                "cache_creation_input_token_cost": 0.00000375
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 1000, 5000, 0);
+        let expected = 1000.0 * 2.0 * 0.000003;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "the whole write prices at the 1h rate, with no negative 5m bucket \
+             and no silently dropped tokens: got {cost}, expected {expected}"
+        );
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_missing_base_input_only_charges_above_threshold() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token_above_200k_tokens": 0.000002
+            }"#,
+        )
+        .unwrap();
+
+        let at_threshold = compute_cost(&pricing, 200_000, 0, 0, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 200_001, 0, 0, 0, 0, 0);
+
+        assert_eq!(at_threshold, 0.0);
+        assert!((above_threshold - 0.000002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_cache_read_applies_split() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "cache_read_input_token_cost": 0.0000001,
+                "cache_read_input_token_cost_above_200k_tokens": 0.0000002
+            }"#,
+        )
+        .unwrap();
+
+        let at_threshold = compute_cost(&pricing, 0, 0, 200_000, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 200_001, 0, 0, 0);
+
+        assert!((at_threshold - (200_000.0 * 0.0000001)).abs() < 1e-12);
+        assert!((above_threshold - (200_000.0 * 0.0000001 + 0.0000002)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_cache_write_applies_split() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "cache_creation_input_token_cost": 0.0000003,
+                "cache_creation_input_token_cost_above_200k_tokens": 0.0000004
+            }"#,
+        )
+        .unwrap();
+
+        let at_threshold = compute_cost(&pricing, 0, 0, 0, 200_000, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 0, 200_001, 0, 0);
+
+        assert!((at_threshold - (200_000.0 * 0.0000003)).abs() < 1e-12);
+        assert!((above_threshold - (200_000.0 * 0.0000003 + 0.0000004)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_without_above_rate_uses_base_for_all_tokens() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            ..Default::default()
+        };
+
+        let cost = compute_cost(&pricing, 250_000, 0, 0, 0, 0, 0);
+
+        assert!((cost - (250_000.0 * 0.000001)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_invalid_above_rate_falls_back_to_base() {
+        let pricing_negative = ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            input_cost_per_token_above_200k_tokens: Some(-0.000002),
+            ..Default::default()
+        };
+        let pricing_infinite = ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            input_cost_per_token_above_200k_tokens: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let pricing_nan = ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            input_cost_per_token_above_200k_tokens: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        let expected = 200_001.0 * 0.000001;
+        assert!((compute_cost(&pricing_negative, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_reasoning_boundary_at_200k_uses_base_output_rate() {
+        let pricing = ModelPricing {
+            output_cost_per_token: Some(0.000003),
+            output_cost_per_token_above_200k_tokens: Some(0.000004),
+            ..Default::default()
+        };
+
+        let cost = compute_cost(&pricing, 0, 199_999, 0, 0, 0, 1);
+        let expected = 200_000.0 * 0.000003;
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_invalid_above_rate_falls_back_to_base_output_reasoning() {
+        let pricing_negative = ModelPricing {
+            output_cost_per_token: Some(0.000003),
+            output_cost_per_token_above_200k_tokens: Some(-0.000004),
+            ..Default::default()
+        };
+        let pricing_infinite = ModelPricing {
+            output_cost_per_token: Some(0.000003),
+            output_cost_per_token_above_200k_tokens: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let pricing_nan = ModelPricing {
+            output_cost_per_token: Some(0.000003),
+            output_cost_per_token_above_200k_tokens: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        let expected = 200_001.0 * 0.000003;
+        assert!((compute_cost(&pricing_negative, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_invalid_above_rate_falls_back_to_base_cache_read() {
+        let pricing_negative = ModelPricing {
+            cache_read_input_token_cost: Some(0.0000001),
+            cache_read_input_token_cost_above_200k_tokens: Some(-0.0000002),
+            ..Default::default()
+        };
+        let pricing_infinite = ModelPricing {
+            cache_read_input_token_cost: Some(0.0000001),
+            cache_read_input_token_cost_above_200k_tokens: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let pricing_nan = ModelPricing {
+            cache_read_input_token_cost: Some(0.0000001),
+            cache_read_input_token_cost_above_200k_tokens: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        let expected = 200_001.0 * 0.0000001;
+        assert!((compute_cost(&pricing_negative, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_invalid_above_rate_falls_back_to_base_cache_write() {
+        let pricing_negative = ModelPricing {
+            cache_creation_input_token_cost: Some(0.0000003),
+            cache_creation_input_token_cost_above_200k_tokens: Some(-0.0000004),
+            ..Default::default()
+        };
+        let pricing_infinite = ModelPricing {
+            cache_creation_input_token_cost: Some(0.0000003),
+            cache_creation_input_token_cost_above_200k_tokens: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let pricing_nan = ModelPricing {
+            cache_creation_input_token_cost: Some(0.0000003),
+            cache_creation_input_token_cost_above_200k_tokens: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        let expected = 200_001.0 * 0.0000003;
+        assert!((compute_cost(&pricing_negative, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_provider_prefixed_non_opus_prefers_exact_openrouter_without_tier_advantage() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000123),
+                output_cost_per_token: Some(0.0000456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(resolved.source, "OpenRouter");
+        assert_eq!(resolved.matched_key, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_exact_litellm_beats_stripped_generic_match() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let resolved = lookup.lookup("openai/gpt-4").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "openai/gpt-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_override_requires_valid_base_and_above_pair() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                // Above tier exists, but corresponding base is missing.
+                // This must not qualify for provider-prefixed override.
+                input_cost_per_token: None,
+                input_cost_per_token_above_200k_tokens: Some(0.00002),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000123),
+                output_cost_per_token: Some(0.0000456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(resolved.source, "OpenRouter");
+        assert_eq!(resolved.matched_key, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_override_rejects_invalid_base_even_with_above() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(f64::NAN),
+                input_cost_per_token_above_200k_tokens: Some(0.00002),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000123),
+                output_cost_per_token: Some(0.0000456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(resolved.source, "OpenRouter");
+        assert_eq!(resolved.matched_key, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_override_allows_zero_base_with_valid_above() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                // Policy: base=0 with valid above is a valid tier pair.
+                input_cost_per_token: Some(0.0),
+                input_cost_per_token_above_200k_tokens: Some(0.00002),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000123),
+                output_cost_per_token: Some(0.0000456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_cache_only_tier_keeps_exact_openrouter() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                cache_read_input_token_cost: Some(0.0000001),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.0000002),
+                cache_creation_input_token_cost: Some(0.0000003),
+                cache_creation_input_token_cost_above_200k_tokens: Some(0.0000004),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000123),
+                output_cost_per_token: Some(0.0000456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(resolved.source, "OpenRouter");
+        assert_eq!(resolved.matched_key, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_provider_prefixed_opus_4_6_prefers_litellm_tiered_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                input_cost_per_token_above_200k_tokens: Some(0.00002),
+                output_cost_per_token: Some(0.00005),
+                output_cost_per_token_above_200k_tokens: Some(0.00006),
+                cache_read_input_token_cost: Some(0.000001),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.000002),
+                cache_creation_input_token_cost: Some(0.000003),
+                cache_creation_input_token_cost_above_200k_tokens: Some(0.000004),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.123),
+                output_cost_per_token: Some(0.456),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-opus-4-6").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-opus-4-6");
+
+        let cost = lookup.calculate_cost("anthropic/claude-opus-4-6", 200_001, 0, 0, 0, 0);
+        let expected = 200_000.0 * 0.00001 + 0.00002;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_anthropic_prefixed_sonnet_variant_uses_canonical_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(0.0000003),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-4-6-sonnet").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-sonnet-4-6");
+
+        let cost = lookup.calculate_cost("anthropic/claude-4-6-sonnet", 100, 20, 10, 5, 0);
+        let expected = 100.0 * 0.000003 + 20.0 * 0.000015 + 10.0 * 0.0000003 + 5.0 * 0.00000375;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_anthropic_prefixed_haiku_variant_uses_canonical_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000008),
+                output_cost_per_token: Some(0.000004),
+                cache_read_input_token_cost: Some(0.00000008),
+                cache_creation_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-4-5-haiku").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-haiku-4-5");
+
+        let cost = lookup.calculate_cost("anthropic/claude-4-5-haiku", 100, 20, 10, 5, 0);
+        let expected = 100.0 * 0.0000008 + 20.0 * 0.000004 + 10.0 * 0.00000008 + 5.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    /// Regression test for #336: subscription-based resellers (e.g. Perplexity) with
+    /// all-None pricing should not shadow valid entries during provider-aware lookup.
+    /// `perplexity/anthropic/claude-opus-4-6` matches provider hint "anthropic" via
+    /// its path segments, but has no per-token pricing. The lookup must fall through
+    /// to the exact `claude-opus-4-6` entry that has real pricing data.
+    #[test]
+    fn test_none_pricing_reseller_does_not_shadow_real_entry() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_creation_input_token_cost: Some(0.00000625),
+                ..Default::default()
+            },
+        );
+        // Perplexity entry: matches "anthropic" hint but has no pricing
+        litellm.insert(
+            "perplexity/anthropic/claude-opus-4-6".into(),
+            ModelPricing::default(),
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        // With provider hint "anthropic", should find the real entry, not perplexity
+        let result = lookup.lookup_with_provider("claude-opus-4-6", Some("anthropic"));
+        assert!(result.is_some(), "lookup should succeed");
+        let result = result.unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-6");
+        assert!(result.pricing.input_cost_per_token.is_some());
+
+        // Cost should be non-zero
+        let cost = lookup.calculate_cost("claude-opus-4-6", 100_000, 50_000, 0, 0, 0);
+        assert!(cost > 0.0, "cost should be positive, got {}", cost);
+    }
+
+    #[test]
+    fn test_none_pricing_provider_match_falls_back_to_priced_fuzzy_candidate() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-6-20250301".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "perplexity/anthropic/claude-opus-4-6-20250301".into(),
+            ModelPricing::default(),
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup.lookup_with_provider("claude-opus-4-6-latest", Some("anthropic"));
+        assert!(result.is_some(), "lookup should succeed via fuzzy fallback");
+        let result = result.unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-6-20250301");
+        assert_eq!(result.source, "LiteLLM");
+        assert!(result.pricing.input_cost_per_token.is_some());
+    }
+
+    /// OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
+    /// caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
+    /// never pairs them and OpenRouter dropped out of arbitration — with an
+    /// `anthropic` hint the reseller LiteLLM entry won and priced cache
+    /// writes at zero (#1329).
+    ///
+    /// Ported from upstream `junhoyeo/tokscale` PR #1338 (`2fdcf716`) with
+    /// the assertions retargeted, because the two trees settle this
+    /// differently. Upstream has no cache backfill, so once the OpenRouter
+    /// entry reaches arbitration it wins outright and upstream asserts
+    /// `source == "OpenRouter"`. This tree has `backfill_cache_costs`
+    /// (local since `8bf52d4`, never adopted upstream), so the (Some, Some)
+    /// branch keeps the hint-matching LiteLLM key as the winner and grafts
+    /// the missing rate onto it. Different mechanism, same outcome for the
+    /// user: the cache-write rate stops being zero.
+    #[test]
+    fn test_fuzzy_openrouter_crosses_version_separator_difference() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "perplexity/anthropic/claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                cache_creation_input_token_cost: Some(0.00000125),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
+            .expect("normalized OpenRouter entry should participate in arbitration");
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "perplexity/anthropic/claude-haiku-4-5");
+        assert_eq!(
+            result.pricing.cache_creation_input_token_cost,
+            Some(0.00000125),
+            "the OpenRouter donor has to reach the backfill; without the \
+             normalized retry it never enters arbitration and this stays None"
+        );
+
+        let usage = |cache_write: i64| TokenBreakdown {
+            input: 1_000,
+            output: 1_000,
+            cache_read: 0,
+            cache_write,
+            reasoning: 0,
+            cache_write_1h: 0,
+        };
+        let cost = lookup.calculate_cost_with_provider(
+            "claude-haiku-4-5",
+            Some("anthropic"),
+            &usage(1_000),
+        );
+        assert!(
+            cost > 0.001,
+            "cache writes should price above zero, got {cost}"
+        );
+        // Upstream stops at the line above. It cannot fail for the reason the
+        // test is about: input and output alone already total 0.006 here, so
+        // the assertion passes with the cache rate still missing. Price the
+        // same call with and without the writes and check the difference is
+        // the rate itself.
+        let without =
+            lookup.calculate_cost_with_provider("claude-haiku-4-5", Some("anthropic"), &usage(0));
+        assert!(
+            (cost - without - 0.00125).abs() < 1e-9,
+            "1,000 cache-write tokens must add 1.25e-6 each; delta was {}",
+            cost - without
+        );
+    }
+
+    /// Unhinted lookups hit the same wall: without any LiteLLM entry the
+    /// dotted OpenRouter key is the only candidate, and the literal
+    /// `contains` hid it entirely. Ported unchanged from upstream #1338.
+    ///
+    /// It does NOT guard the fuzzy retry in this tree, and is kept because
+    /// it is upstream's rather than because it protects anything here. The
+    /// key below is resolved by the earlier `normalize_version_separator`
+    /// exact block, so this test passes with the fuzzy retry deleted
+    /// outright — established by mutation, not assumed. The test that does
+    /// guard it is `..._reaches_a_suffixed_key` below.
+    #[test]
+    fn test_fuzzy_openrouter_version_separator_without_hint() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("fuzzy match should reach the dotted OpenRouter key");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
+    }
+
+    /// The guard for the fuzzy half of this port, which upstream's own
+    /// `..._without_hint` above cannot be in this tree: that one is settled
+    /// by the earlier `normalize_version_separator` exact block and passes
+    /// with the fuzzy retry deleted outright.
+    ///
+    /// Reaching the fuzzy stage needs a key no exact stage can match: a
+    /// dotted minor version PLUS a suffix, so only a substring comparison
+    /// can pair it with the caller's hyphenated id.
+    #[test]
+    fn test_fuzzy_openrouter_normalized_retry_reaches_a_suffixed_key() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5-preview".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("the fuzzy pass must retry the normalized spelling");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5-preview");
+    }
+
+    #[test]
+    fn test_none_pricing_exact_litellm_does_not_shadow_openrouter_model_part() {
+        let mut litellm = HashMap::new();
+        litellm.insert("claude-opus-4-6".into(), ModelPricing::default());
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                output_cost_per_token: Some(0.000025),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+        let result = lookup.lookup("claude-opus-4-6").unwrap();
+
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-opus-4-6");
+
+        let cost = lookup.calculate_cost("claude-opus-4-6", 100, 20, 0, 0, 0);
+        assert!(cost > 0.0, "cost should use priced fallback, got {cost}");
+    }
+
+    #[test]
+    fn test_none_pricing_provider_exact_does_not_shadow_stripped_priced_entry() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "anthropic/claude-sonnet-4-5".into(),
+            ModelPricing::default(),
+        );
+        litellm.insert(
+            "claude-sonnet-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("anthropic/claude-sonnet-4-5").unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+
+        let cost = lookup.calculate_cost("anthropic/claude-sonnet-4-5", 100, 20, 0, 0, 0);
+        assert!(
+            cost > 0.0,
+            "cost should use stripped priced entry, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_zero_pricing_exact_entry_is_usable() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup.lookup("free-model").unwrap();
+
+        assert_eq!(result.matched_key, "free-model");
+        assert_eq!(lookup.calculate_cost("free-model", 100, 20, 0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_estimate_coverage_partial_keeps_known_input_subtotal() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "partial-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_write: 7,
+            ..Default::default()
+        };
+
+        let estimate = lookup
+            .estimate_cost_with_provider("partial-model", Some("provider"), &usage)
+            .unwrap();
+        assert_eq!(estimate.coverage, EstimateCoverage::Partial);
+        assert!((estimate.cost - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_estimate_coverage_zero_rates_is_complete() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_read_input_token_cost: Some(0.0),
+                cache_creation_input_token_cost: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 3,
+            cache_write: 7,
+            reasoning: 2,
+            cache_write_1h: 0,
+        };
+
+        let estimate = lookup
+            .estimate_cost_with_provider("free-model", None, &usage)
+            .unwrap();
+        assert_eq!(estimate.cost, 0.0);
+        assert_eq!(estimate.coverage, EstimateCoverage::Complete);
+    }
+
+    #[test]
+    fn test_estimate_lookup_miss_returns_none() {
+        let lookup = PricingLookup::new(HashMap::new(), HashMap::new(), HashMap::new());
+        assert!(lookup
+            .estimate_cost_with_provider("nonexistent-model", None, &TokenBreakdown::default())
+            .is_none());
+    }
+
+    #[test]
+    fn test_estimate_coverage_without_active_tokens_is_none() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "free-model".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let estimate = lookup
+            .estimate_cost_with_provider("free-model", None, &TokenBreakdown::default())
+            .unwrap();
+        assert_eq!(estimate.cost, 0.0);
+        assert_eq!(estimate.coverage, EstimateCoverage::None);
+    }
+
+    #[test]
+    fn test_estimate_coverage_missing_base_crossing_valid_tier_is_partial() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "tiered-model".into(),
+            ModelPricing {
+                input_cost_per_token_above_200k_tokens: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let above = lookup
+            .estimate_cost_with_provider(
+                "tiered-model",
+                None,
+                &TokenBreakdown {
+                    input: 200_001,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(above.coverage, EstimateCoverage::Partial);
+        assert!((above.cost - 0.002).abs() < 1e-12);
+
+        let at = lookup
+            .estimate_cost_with_provider(
+                "tiered-model",
+                None,
+                &TokenBreakdown {
+                    input: 200_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(at.coverage, EstimateCoverage::None);
+        assert_eq!(at.cost, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_cost_tiered_all_buckets_with_reasoning_threshold_crossing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-opus-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                input_cost_per_token_above_200k_tokens: Some(0.000002),
+                output_cost_per_token: Some(0.000003),
+                output_cost_per_token_above_200k_tokens: Some(0.000004),
+                cache_read_input_token_cost: Some(0.0000001),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.0000002),
+                cache_creation_input_token_cost: Some(0.0000003),
+                cache_creation_input_token_cost_above_200k_tokens: Some(0.0000004),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let cost = lookup.calculate_cost("claude-opus-4-6", 200_001, 199_999, 200_001, 200_001, 2);
+
+        let expected_input = 200_000.0 * 0.000001 + 0.000002;
+        let expected_output = 200_000.0 * 0.000003 + 0.000004; // output + reasoning = 200_001
+        let expected_cache_read = 200_000.0 * 0.0000001 + 0.0000002;
+        let expected_cache_write = 200_000.0 * 0.0000003 + 0.0000004;
+        let expected =
+            expected_input + expected_output + expected_cache_read + expected_cache_write;
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_calculate_cost_unknown_model() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("nonexistent-model", 1_000_000, 500_000, 0, 0, 0);
+        assert_eq!(cost, 0.0);
+    }
+
+    // =========================================================================
+    // INTELLIGENT PREFIX/SUFFIX STRIPPING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_antigravity_prefix_gemini_3_flash() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("antigravity-gemini-3-flash").unwrap();
+        assert_eq!(result.matched_key, "vertex_ai/gemini-3-flash-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_antigravity_prefix_gemini_3_pro() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("antigravity-gemini-3-pro").unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_antigravity_prefix_with_tier_suffix() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("antigravity-gemini-3-pro-high").unwrap();
+        assert_eq!(result.matched_key, "openrouter/google/gemini-3-pro-preview");
+    }
+
+    #[test]
+    fn test_antigravity_prefix_claude() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("antigravity-claude-sonnet-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_antigravity_prefix_gpt() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("antigravity-gpt-4o").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_antigravity_prefix_case_insensitive() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("Antigravity-gpt-4o").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+    }
+
+    #[test]
+    fn test_antigravity_cost_calculation() {
+        let lookup = create_lookup();
+        let cost_with_prefix =
+            lookup.calculate_cost("antigravity-gpt-5.2", 1_000_000, 500_000, 0, 0, 0);
+        let cost_without_prefix = lookup.calculate_cost("gpt-5.2", 1_000_000, 500_000, 0, 0, 0);
+        assert!((cost_with_prefix - cost_without_prefix).abs() < 0.001);
+        assert!(cost_with_prefix > 0.0);
+    }
+
+    // New tests for intelligent detection
+
+    #[test]
+    fn test_unknown_prefix_generic() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("myplugin-gpt-4o").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+    }
+
+    #[test]
+    fn test_unknown_prefix_two_segments() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("router-v2-claude-sonnet-4-5").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_unknown_suffix_thinking() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5-thinking").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_unknown_suffix_two_segments() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-opus-4-5-thinking-pro").unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-5");
+    }
+
+    #[test]
+    fn test_prefix_and_suffix_combined() {
+        let lookup = create_lookup();
+        let result = lookup
+            .lookup("antigravity-claude-opus-4-5-thinking")
+            .unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-5");
+    }
+
+    #[test]
+    fn test_prefix_and_suffix_with_tier() {
+        let lookup = create_lookup();
+        let result = lookup
+            .lookup("antigravity-claude-opus-4-5-thinking-high")
+            .unwrap();
+        assert_eq!(result.matched_key, "claude-opus-4-5");
+    }
+
+    #[test]
+    fn test_no_false_positive_valid_model() {
+        let lookup = create_lookup();
+        // gpt-4o-mini is a valid model, should NOT strip "gpt"
+        let result = lookup.lookup("gpt-4o-mini").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_suffix_strip_high() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5-high").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_suffix_strip_xhigh() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("claude-sonnet-4-5-xhigh").unwrap();
+        assert_eq!(result.matched_key, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_suffix_strip_low() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-4o-low").unwrap();
+        assert_eq!(result.matched_key, "gpt-4o");
+    }
+
+    #[test]
+    fn test_suffix_strip_codex() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.2-codex").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.2");
+    }
+
+    #[test]
+    fn test_provider_hint_empty_and_unknown_treated_as_none() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure_ai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let r_none = lookup.lookup_with_provider("gpt-4", None).unwrap();
+        let r_empty = lookup.lookup_with_provider("gpt-4", Some("")).unwrap();
+        let r_unknown = lookup
+            .lookup_with_provider("gpt-4", Some("unknown"))
+            .unwrap();
+
+        assert_eq!(r_none.matched_key, r_empty.matched_key);
+        assert_eq!(r_none.matched_key, r_unknown.matched_key);
+    }
+
+    #[test]
+    fn test_provider_hint_mistralai_matches_mistral_keys() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "mistralai/mistral-large".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("mistral-large", Some("mistral"))
+            .unwrap();
+        assert_eq!(result.matched_key, "mistralai/mistral-large");
+    }
+
+    #[test]
+    fn test_provider_hint_minimax_matches_minimax_keys() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "minimax/minimax-m2.1".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("MiniMax-M2.1", Some("minimax"))
+            .unwrap();
+        assert_eq!(result.matched_key, "minimax/minimax-m2.1");
+    }
+
+    #[test]
+    fn test_prefixed_model_with_conflicting_provider_uses_provider_aware_path() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure/openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let r_azure = lookup
+            .lookup_with_provider("openai/gpt-4", Some("azure"))
+            .unwrap();
+        assert_eq!(
+            r_azure.matched_key, "azure/openai/gpt-4",
+            "should prefer azure key when provider_id=azure"
+        );
+
+        let r_openai = lookup
+            .lookup_with_provider("openai/gpt-4", Some("openai"))
+            .unwrap();
+        assert_eq!(
+            r_openai.matched_key, "openai/gpt-4",
+            "should use exact prefixed key when provider_id matches prefix"
+        );
+
+        let r_none = lookup.lookup_with_provider("openai/gpt-4", None).unwrap();
+        assert_eq!(
+            r_none.matched_key, "openai/gpt-4",
+            "should use exact prefixed key when no provider hint"
+        );
+    }
+
+    #[test]
+    fn test_prefixed_model_conflicting_provider_falls_back_to_stripped() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let r = lookup
+            .lookup_with_provider("openai/gpt-4", Some("azure"))
+            .unwrap();
+        assert_eq!(
+            r.matched_key, "gpt-4",
+            "with no azure-specific key, should fall back to stripped generic"
+        );
+    }
+
+    #[test]
+    fn test_compound_provider_hint_prefers_reseller_over_prefix() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure/openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let r = lookup
+            .lookup_with_provider("openai/gpt-4", Some("azure/openai"))
+            .unwrap();
+        assert_eq!(
+            r.matched_key, "azure/openai/gpt-4",
+            "compound hint azure/openai should prefer azure-specific key over openai/ prefix"
+        );
+    }
+
+    #[test]
+    fn test_source_and_provider_normalizes_unknown_hint() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let r_unknown = lookup
+            .lookup_with_source_and_provider("openai/gpt-4", None, Some("unknown"))
+            .unwrap();
+        let r_none = lookup
+            .lookup_with_source_and_provider("openai/gpt-4", None, None)
+            .unwrap();
+        assert_eq!(
+            r_unknown.matched_key, r_none.matched_key,
+            "unknown hint via source_and_provider should behave like None"
+        );
+    }
+
+    #[test]
+    fn test_gpt_5_5_uses_full_request_long_context_rates() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 270_540, 630, 7_936, 0, 0);
+        let expected = 270_540.0 * 0.000010 + 630.0 * 0.000045 + 7_936.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_provider_prefixed_gpt_5_5_uses_full_request_long_context_rates() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 271_999,
+            output: 3,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: 4,
+            cache_write_1h: 0,
+        };
+
+        let cost = lookup.calculate_cost_with_provider("openai/gpt-5.5", Some("openai"), &usage);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_threshold_includes_cache_read_and_reasoning() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 271_999, 3, 2, 0, 4);
+        let expected = 271_999.0 * 0.000010 + 7.0 * 0.000045 + 2.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_exact_threshold_stays_regular() {
+        let lookup = create_lookup();
+        let cost = lookup.calculate_cost("gpt-5.5", 272_000, 3, 0, 0, 4);
+        let expected = 272_000.0 * 0.000005 + 7.0 * 0.000030;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gpt_5_5_cache_write_does_not_select_long_context() {
+        let lookup = create_lookup();
+        let without_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 0, 0);
+        let with_cache_write = lookup.calculate_cost("gpt-5.5", 271_999, 10, 0, 10_000, 0);
+        assert!((with_cache_write - without_cache_write).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_full_request_long_context_policy_is_identity_scoped() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000005),
+            input_cost_per_token_above_272k_tokens: Some(0.000010),
+            ..Default::default()
+        };
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "openai/gpt-5.5",
+            "LiteLLM",
+            pricing.clone()
+        )));
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "fugu-ultra",
+            "Sakana",
+            pricing.clone()
+        )));
+        // The model identity decides, so an OpenRouter row for a listed model
+        // qualifies too.
+        assert!(uses_full_session_long_context_tier(&lookup_result(
+            "openai/gpt-5.5",
+            "OpenRouter",
+            pricing.clone()
+        )));
+        for (source, key) in [
+            ("LiteLLM", "gpt-5.5-pro"),
+            ("OpenRouter", "openai/gpt-5.5-pro"),
+            ("Custom", "gpt-5.5"),
+            ("Sakana", "fugu"),
+        ] {
+            assert!(!uses_full_session_long_context_tier(&lookup_result(
+                key,
+                source,
+                pricing.clone()
+            )));
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_and_gpt_6_apply_full_request_pricing_above_272k() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(0.000010),
+            input_cost_per_token_above_272k_tokens: Some(0.000020),
+            output_cost_per_token: Some(0.000050),
+            output_cost_per_token_above_272k_tokens: Some(0.000075),
+            cache_read_input_token_cost: Some(0.000001),
+            cache_read_input_token_cost_above_272k_tokens: Some(0.000002),
+            cache_creation_input_token_cost: Some(0.0000125),
+            ..Default::default()
+        };
+        let cost = |result: &LookupResult, input, output, cache_read| {
+            compute_cost_and_coverage_for_lookup_result(
+                result,
+                &TokenBreakdown {
+                    input,
+                    output,
+                    cache_read,
+                    ..Default::default()
+                },
+            )
+            .cost
+        };
+        for key in [
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "openai/gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+        ] {
+            let result = lookup_result(key, "LiteLLM", pricing.clone());
+
+            // At the 272k boundary: standard rates.
+            let actual = cost(&result, 272_000, 10_000, 0);
+            let expected = 272_000.0 * 0.000010 + 10_000.0 * 0.000050;
+            assert!((actual - expected).abs() < 1e-12, "{key} at boundary");
+
+            // One token over: the whole request at the long-context rates.
+            let actual = cost(&result, 272_001, 10_000, 0);
+            let expected = 272_001.0 * 0.000020 + 10_000.0 * 0.000075;
+            assert!((actual - expected).abs() < 1e-12, "{key} above boundary");
+
+            // Input plus cache read selects the tier.
+            let actual = cost(&result, 250_000, 10_000, 50_000);
+            let expected = 250_000.0 * 0.000020 + 10_000.0 * 0.000075 + 50_000.0 * 0.000002;
+            assert!((actual - expected).abs() < 1e-12, "{key} with cache read");
+        }
+    }
+
+    /// A LiteLLM-style row with a 272K tier on input, output and cache read.
+    fn tiered_272k(input: f64, output: f64, cache_read: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            input_cost_per_token_above_272k_tokens: Some(input * 2.0),
+            output_cost_per_token: Some(output),
+            output_cost_per_token_above_272k_tokens: Some(output * 1.5),
+            cache_read_input_token_cost: Some(cache_read),
+            cache_read_input_token_cost_above_272k_tokens: Some(cache_read * 2.0),
+            ..Default::default()
+        }
+    }
+
+    /// A row with base rates and no long-context tier.
+    fn base_only(input: f64, output: f64, cache_read: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            cache_read_input_token_cost: Some(cache_read),
+            ..Default::default()
+        }
+    }
+
+    /// Usage with only input, output and cache-read tokens.
+    fn usage_prompt(input: i64, output: i64, cache_read: i64) -> TokenBreakdown {
+        TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            ..Default::default()
+        }
+    }
+
+    /// A hinted OpenRouter row for a listed model quotes the base rates but no
+    /// 272K tier. It keeps its own rates and borrows only the canonical LiteLLM
+    /// row's tiers, so it bills exactly like the canonical row on both sides of
+    /// the threshold.
+    #[test]
+    fn hinted_row_borrows_missing_long_context_tiers_from_the_canonical_row() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(hinted.source, "OpenRouter");
+        assert_eq!(hinted.matched_key, "openai/gpt-6-astra");
+        assert_eq!(
+            hinted.pricing.input_cost_per_token_above_272k_tokens,
+            Some(2e-5)
+        );
+
+        for usage in [
+            usage_prompt(300_000, 10_000, 50_000),
+            usage_prompt(200_000, 10_000, 72_000),
+        ] {
+            let hinted = lookup.calculate_cost_with_provider("gpt-6-astra", Some("openai"), &usage);
+            let canonical = lookup.calculate_cost_with_provider("gpt-6-astra", None, &usage);
+            assert!(
+                (hinted - canonical).abs() < 1e-12,
+                "{usage:?}: {hinted} vs {canonical}"
+            );
+        }
+        // Above the threshold the whole request moves to the long-context rate.
+        let above = lookup.calculate_cost_with_provider(
+            "gpt-6-astra",
+            Some("openai"),
+            &usage_prompt(300_000, 10_000, 0),
+        );
+        assert!((above - (300_000.0 * 2e-5 + 10_000.0 * 7.5e-5)).abs() < 1e-12);
+    }
+
+    /// The same through a reseller LiteLLM key elected by its own hint.
+    #[test]
+    fn hinted_reseller_litellm_row_borrows_only_the_tier_it_omits() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.4".into(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+        let mut reseller = tiered_272k(2.5e-6, 1.5e-5, 2.5e-7);
+        reseller.cache_read_input_token_cost_above_272k_tokens = None;
+        litellm.insert("perplexity/openai/gpt-5.4".into(), reseller);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-5.4", Some("perplexity"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "perplexity/openai/gpt-5.4");
+        assert_eq!(
+            hinted.pricing.cache_read_input_token_cost_above_272k_tokens,
+            Some(5e-7)
+        );
+    }
+
+    /// A tier the elected row publishes is its own and is never replaced.
+    #[test]
+    fn hinted_row_keeps_the_tiers_it_publishes() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut own = base_only(1e-5, 5e-5, 1e-6);
+        own.input_cost_per_token_above_272k_tokens = Some(3e-5);
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), own);
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(
+            hinted.pricing.input_cost_per_token_above_272k_tokens,
+            Some(3e-5)
+        );
+        // Buckets it leaves out are still filled.
+        assert_eq!(
+            hinted.pricing.output_cost_per_token_above_272k_tokens,
+            Some(5e-5 * 1.5)
+        );
+    }
+
+    /// A row quoting zero for every base rate is a free or subscription row;
+    /// grafting paid tiers onto it would invent spend.
+    #[test]
+    fn hinted_row_quoting_zero_everywhere_is_left_alone() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(0.0, 0.0, 0.0));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("gpt-6-astra", Some("openai"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "openai/gpt-6-astra");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+        assert_eq!(
+            lookup.calculate_cost_with_provider(
+                "gpt-6-astra",
+                Some("openai"),
+                &usage_prompt(300_000, 10_000, 0)
+            ),
+            0.0
+        );
+    }
+
+    /// Only a prefix-free LiteLLM key with the same model id may lend tiers. A
+    /// reseller-prefixed row or a differently named one lends nothing.
+    #[test]
+    fn ineligible_donors_lend_nothing() {
+        for (donor_key, model) in [
+            ("azure/gpt-6-astra", "gpt-6-astra"),
+            ("gpt-6-astra-2026-09-03", "gpt-6-astra"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(donor_key.to_string(), tiered_272k(1e-5, 5e-5, 1e-6));
+            let mut openrouter = HashMap::new();
+            openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let hinted = lookup.lookup_with_provider(model, Some("openai")).unwrap();
+            assert_eq!(hinted.matched_key, "openai/gpt-6-astra", "{donor_key}");
+            assert_eq!(
+                hinted.pricing.input_cost_per_token_above_272k_tokens, None,
+                "{donor_key} must not lend tiers"
+            );
+        }
+    }
+
+    /// The donor id matches after the version-separator normalization
+    /// OpenRouter matching uses, in either spelling direction.
+    #[test]
+    fn donor_matches_across_version_separator_spellings() {
+        for (canonical, routed, model) in [
+            ("gpt-5.4", "openai/gpt-5-4", "gpt-5-4"),
+            ("gpt-5-4", "openai/gpt-5.4", "gpt-5.4"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(canonical.to_string(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+            let mut openrouter = HashMap::new();
+            openrouter.insert(routed.to_string(), base_only(2.5e-6, 1.5e-5, 2.5e-7));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+            let hinted = lookup.lookup_with_provider(model, Some("openai")).unwrap();
+            assert_eq!(hinted.matched_key, routed, "{canonical} / {routed}");
+            assert_eq!(
+                hinted.pricing.input_cost_per_token_above_272k_tokens,
+                Some(5e-6),
+                "{canonical} / {routed}"
+            );
+            // And the borrowed tier bills request-wide, like the canonical row.
+            let usage = usage_prompt(300_000, 10_000, 0);
+            let hinted_cost = lookup.calculate_cost_with_provider(model, Some("openai"), &usage);
+            let canonical_cost = lookup.calculate_cost_with_provider(canonical, None, &usage);
+            assert!(
+                (hinted_cost - canonical_cost).abs() < 1e-12,
+                "{canonical} / {routed}: {hinted_cost} vs {canonical_cost}"
+            );
+        }
+    }
+
+    /// Borrowing is for hinted, non-forced lookups only.
+    #[test]
+    fn forced_and_unhinted_lookups_do_not_borrow() {
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        let mut openrouter = HashMap::new();
+        openrouter.insert("openai/gpt-6-astra".into(), base_only(1e-5, 5e-5, 1e-6));
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let forced = lookup
+            .lookup_with_source_and_provider("gpt-6-astra", Some("openrouter"), Some("openai"))
+            .unwrap();
+        assert_eq!(forced.matched_key, "openai/gpt-6-astra");
+        assert_eq!(forced.pricing.input_cost_per_token_above_272k_tokens, None);
+
+        // Unhinted, a reseller row reached by its raw id stays as it is.
+        let mut litellm = HashMap::new();
+        litellm.insert("gpt-5.4".into(), tiered_272k(2.5e-6, 1.5e-5, 2.5e-7));
+        litellm.insert(
+            "perplexity/openai/gpt-5.4".into(),
+            base_only(2.5e-6, 1.5e-5, 2.5e-7),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let unhinted = lookup
+            .lookup_with_provider("perplexity/openai/gpt-5.4", None)
+            .unwrap();
+        assert_eq!(unhinted.matched_key, "perplexity/openai/gpt-5.4");
+        assert_eq!(
+            unhinted.pricing.input_cost_per_token_above_272k_tokens,
+            None
+        );
+    }
+
+    /// Bedrock-style keys carry their provider or region as a dotted prefix
+    /// (`openai.gpt-6-astra`, `us.openai.…`) or a `:N` suffix; none of them is
+    /// a canonical row.
+    #[test]
+    fn dotted_or_suffixed_bedrock_keys_are_not_canonical_donors() {
+        let mut litellm = HashMap::new();
+        litellm.insert("openai.gpt-6-astra".into(), tiered_272k(1e-5, 5e-5, 1e-6));
+        litellm.insert(
+            "bedrock_mantle/openai.gpt-6-astra".into(),
+            base_only(1e-5, 5e-5, 1e-6),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hinted = lookup
+            .lookup_with_provider("openai.gpt-6-astra", Some("bedrock_mantle"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "bedrock_mantle/openai.gpt-6-astra");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+    }
+
+    /// The 272K tiers come over all at once or not at all: every base the
+    /// row publishes must be paid and equal to the canonical row's.
+    #[test]
+    fn tiers_are_borrowed_all_or_nothing_against_equal_paid_bases() {
+        let donor = tiered_272k(1e-5, 5e-5, 1e-6);
+
+        let mut equal = base_only(1e-5, 5e-5, 1e-6);
+        borrow_missing_long_context_tiers(&mut equal, &donor);
+        assert_eq!(equal.input_cost_per_token_above_272k_tokens, Some(2e-5));
+        assert_eq!(
+            equal.output_cost_per_token_above_272k_tokens,
+            donor.output_cost_per_token_above_272k_tokens
+        );
+        assert_eq!(
+            equal.cache_read_input_token_cost_above_272k_tokens,
+            Some(2e-6)
+        );
+
+        let cases = [
+            ("input base differs", base_only(5e-6, 5e-5, 1e-6)),
+            ("free cache-read bucket", base_only(1e-5, 5e-5, 0.0)),
+            (
+                "cache-write base the donor does not publish",
+                ModelPricing {
+                    cache_creation_input_token_cost: Some(1.25e-5),
+                    ..base_only(1e-5, 5e-5, 1e-6)
+                },
+            ),
+        ];
+        for (label, mut row) in cases {
+            borrow_missing_long_context_tiers(&mut row, &donor);
+            assert_eq!(row.input_cost_per_token_above_272k_tokens, None, "{label}");
+            assert_eq!(row.output_cost_per_token_above_272k_tokens, None, "{label}");
+            assert_eq!(
+                row.cache_read_input_token_cost_above_272k_tokens, None,
+                "{label}"
+            );
+        }
+    }
+
+    /// Only the request-wide 272K identities borrow. A hinted Sonnet 4.5 row
+    /// with the canonical base and no tier stays as it is, although the
+    /// canonical `claude-sonnet-4-5` row publishes a 200K ladder.
+    #[test]
+    fn models_outside_the_request_wide_list_never_borrow() {
+        let canonical = ModelPricing {
+            input_cost_per_token: Some(3e-6),
+            input_cost_per_token_above_200k_tokens: Some(6e-6),
+            output_cost_per_token: Some(1.5e-5),
+            output_cost_per_token_above_200k_tokens: Some(2.25e-5),
+            cache_read_input_token_cost: Some(3e-7),
+            cache_read_input_token_cost_above_200k_tokens: Some(6e-7),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("claude-sonnet-4-5".into(), canonical);
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-sonnet-4.5".into(),
+            base_only(3e-6, 1.5e-5, 3e-7),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let hinted = lookup
+            .lookup_with_provider("claude-sonnet-4.5", Some("anthropic"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "anthropic/claude-sonnet-4.5");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_200k_tokens, None);
+        assert_eq!(hinted.pricing.output_cost_per_token_above_200k_tokens, None);
+        assert_eq!(
+            hinted.pricing.cache_read_input_token_cost_above_200k_tokens,
+            None
+        );
+
+        // A GPT model with a 272K tier that is not on the request-wide list
+        // (`gpt-5.6-cyber`) does not borrow either.
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.6-cyber".into(),
+            tiered_272k(1.25e-5, 7.5e-5, 1.25e-6),
+        );
+        litellm.insert(
+            "perplexity/openai/gpt-5.6-cyber".into(),
+            base_only(1.25e-5, 7.5e-5, 1.25e-6),
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let hinted = lookup
+            .lookup_with_provider("gpt-5.6-cyber", Some("perplexity"))
+            .unwrap();
+        assert_eq!(hinted.matched_key, "perplexity/openai/gpt-5.6-cyber");
+        assert_eq!(hinted.pricing.input_cost_per_token_above_272k_tokens, None);
+    }
+
+    /// The request-wide 272K rule follows the model identity, not the dataset
+    /// the winning row came from.
+    #[test]
+    fn full_request_rule_applies_to_a_listed_openrouter_row() {
+        let result = lookup_result(
+            "openai/gpt-6-astra",
+            "OpenRouter",
+            tiered_272k(1e-5, 5e-5, 1e-6),
+        );
+        assert!(uses_full_session_long_context_tier(&result));
+        let cost = compute_cost_and_coverage_for_lookup_result(
+            &result,
+            &usage_prompt(250_000, 10_000, 50_000),
+        )
+        .cost;
+        let expected = 250_000.0 * 2e-5 + 10_000.0 * 7.5e-5 + 50_000.0 * 2e-6;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_non_verified_identity_keeps_marginal_tier_behavior() {
+        let result = lookup_result(
+            "gpt-5.5-pro",
+            "LiteLLM",
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                ..Default::default()
+            },
+        );
+        let cost = compute_cost_and_coverage_for_lookup_result(
+            &result,
+            &TokenBreakdown {
+                input: 272_001,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                cache_write_1h: 0,
+            },
+        )
+        .cost;
+        let expected = 272_000.0 * 0.000005 + 1.0 * 0.000010 + 0.000030;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_every_terminal_custom_result_uses_claude_never_degrade_guard() {
+        let lookup = create_lookup();
+        let mismatched = || {
+            Some(lookup_result(
+                "claude-opus-4",
+                "Custom",
+                ModelPricing {
+                    input_cost_per_token: Some(0.000015),
+                    output_cost_per_token: Some(0.000075),
+                    ..Default::default()
+                },
+            ))
+        };
+
+        for id in [
+            "cx/claude-opus-4-7-thinking",
+            "cx/claude-sonnet-4-6-thinking",
+            "cx/claude-opus-4-60-thinking",
+        ] {
+            assert!(
+                lookup
+                    .lookup_with_source_and_provider_and_terminal_custom(id, None, None, |_| {
+                        mismatched()
+                    })
+                    .is_none(),
+                "unsafe custom fallback resolved: {id}"
+            );
+        }
+        assert!(lookup
+            .lookup_with_source_and_provider_and_terminal_custom(
+                "cx/claude-opus-4-7(invalid)",
+                None,
+                None,
+                |_| mismatched(),
+            )
+            .is_none());
+    }
+}

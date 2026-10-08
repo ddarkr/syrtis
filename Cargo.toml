@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tb_core_ffi", "vendor/tokscale-core"]
+members = ["crates/tb_core_ffi", "crates/syrtis_core"]
 
 [profile.release]
 lto = true

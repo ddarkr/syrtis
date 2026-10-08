@@ -734,7 +734,7 @@ private struct DashboardSnapshot {
     /// the owner's independently captured price generation instead.
     @ObservationIgnored private var modelFetchedAt: Date?
     /// Matches the engine's pricing cache TTL (`CACHE_TTL_SECS` and
-    /// `REMOTE_PRICING_TTL_SECS`, both 3600 in the pinned tokscale-core): a
+    /// `REMOTE_PRICING_TTL_SECS`, both 3600 in syrtis-core): a
     /// re-fetch sooner could not observe new prices anyway.
     static let modelReportMaxAge: TimeInterval = 3600
     /// How much of `modelReportMaxAge` a restored report must still have left

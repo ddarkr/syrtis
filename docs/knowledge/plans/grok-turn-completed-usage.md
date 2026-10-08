@@ -4,7 +4,7 @@ id: plan-grok-turn-completed-usage
 kind: plan
 scope: repository
 read_when: reviewing the completed Grok Build token-undercount implementation
-last_verified: 2026-07-28
+last_verified: 2026-10-08
 sources:
   - "public tokscale-core commit b31e394"
   - "vendor/README.md"
@@ -18,8 +18,8 @@ sources:
 > **Historical completion record：** This implementation landed in TokenBar PR
 > #77 before the shared-engine extraction. Do not execute the owned-files,
 > sequence, or handoff instructions against the current consumer checkout.
-> Future shared Rust changes land in public `tokscale-core`, update its
-> `UPSTREAM.md`, and reach TokenBar through a reviewed submodule pin.
+> Current Rust work belongs to Syrtis-owned `crates/syrtis_core`; the inherited
+> `UPSTREAM.md` is provenance, not a separate engine pin or publication gate.
 
 ## Outcome
 

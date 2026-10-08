@@ -1,5 +1,5 @@
-//! Consumer-side wiring for tokscale-core's per-client `extra_scan_paths`
-//! mechanism (`vendor/tokscale-core/src/scanner.rs:60`). The mechanism itself
+//! Consumer-side wiring for syrtis-core's per-client `extra_scan_paths`
+//! mechanism (`crates/syrtis_core/src/scanner.rs:60`). The mechanism itself
 //! is fully implemented upstream — canonical dedup, home-escape warning, and
 //! merge into the scan queue all already exist; this module only holds the
 //! process-wide registry `tb_set_extra_scan_paths` writes into and that
@@ -30,7 +30,7 @@ pub(crate) fn snapshot() -> BTreeMap<String, Vec<PathBuf>> {
 
 /// Public client ids this consumer actually wires an extra-scan-path
 /// registry entry for. Upstream's `extra_scan_paths_for()`
-/// (`vendor/tokscale-core/src/scanner.rs:412`) silently drops unknown ids and
+/// (`crates/syrtis_core/src/scanner.rs:412`) silently drops unknown ids and
 /// `supports_extra_dir_scanning()` (`:743`) excludes a few known ones — but
 /// that upstream filtering happens deep inside the scan, long after this
 /// setter has already reported success. A client id that gets this far and
@@ -67,7 +67,7 @@ enum PathShape {
 /// an unmounted volume or a config dir Claude hasn't populated yet becomes
 /// valid on its own, and the next scan picks it up. A path that exists but is
 /// not a directory never becomes one, and retaining it is worse than useless —
-/// upstream's `scan_directory` (`vendor/tokscale-core/src/scanner.rs:278`)
+/// upstream's `scan_directory` (`crates/syrtis_core/src/scanner.rs:278`)
 /// only checks `exists()` before handing the root to `WalkDir`, which yields a
 /// regular file as its own entry. A `*.jsonl` file passed here would therefore
 /// be reported as merely `unreadable` while silently contributing its contents
@@ -230,7 +230,7 @@ mod tests {
 
     fn total_claude_tokens(context: &LocalSourceContext) -> i64 {
         let options = context.parse_options(None, Some(vec!["claude".to_string()]));
-        let parsed = tokscale_core::parse_local_clients(options).unwrap();
+        let parsed = syrtis_core::parse_local_clients(options).unwrap();
         parsed
             .messages
             .iter()
@@ -560,11 +560,11 @@ mod tests {
 
         let context = context_for(primary.path());
         let before_token =
-            tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
+            syrtis_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
 
         set_claude_roots(&[&extra_root]);
         let after_token =
-            tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
+            syrtis_core::local_source_change_token(&context.parse_options(None, None)).unwrap();
 
         assert_ne!(
             before_token, after_token,
@@ -585,7 +585,7 @@ mod tests {
         let options = context.parse_options(None, None);
         assert_eq!(
             options.scanner_settings.extra_scan_paths,
-            tokscale_core::scanner::ScannerSettings::default().extra_scan_paths
+            syrtis_core::scanner::ScannerSettings::default().extra_scan_paths
         );
         assert!(options.scanner_settings.extra_scan_paths.is_empty());
     }

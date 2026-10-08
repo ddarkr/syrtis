@@ -891,7 +891,7 @@ fn save_atomic<B: Backend>(
         file.sync_all()?;
         drop(file);
         backend.before_fs(FsOperation::ReplaceFile)?;
-        tokscale_core::fs_atomic::replace_file(&temp, path)?;
+        syrtis_core::fs_atomic::replace_file(&temp, path)?;
         sync_directory(backend, directory)
     })();
     if staged.is_err() {

@@ -3,16 +3,16 @@ status: active
 id: kb-vendor-tokscale
 kind: canonical
 scope: repository
-read_when: assessing upstream commits, changing shared-engine code or its consumer pin, or changing parser output
+read_when: changing Syrtis engine code, persistent usage, parser output, or assessing an upstream-derived fix
 last_verified: 2026-10-08
-sources: [".gitmodules", "vendor/README.md", "public tokscale-core UPSTREAM at bb9a2a9", "public tokscale-core PR #2 and commit fd2f916", "public tokscale-core PR #3 and commit 84e0d66", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45", "public issue #118", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
+sources: ["Cargo.toml", "crates/syrtis_core/Cargo.toml", "crates/syrtis_core/UPSTREAM.md", "vendor/README.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45", "public issue #118", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
-# Shared tokscale engine alignment
+# Syrtis engine ownership and tokscale provenance
 
 ## 文件目的
 
-Syrtis consumes `tokscale-core` through the pinned `vendor/tokscale-core` submodule. This branch uses a reviewed local fork; the existing [public engine remote](https://github.com/Nanako0129/tokscale-core) is unchanged, and the fork has not been published. The exact upstream baseline, local patches and report numbers live in [`UPSTREAM.md`](../../vendor/tokscale-core/UPSTREAM.md); [`vendor/README.md`](../../vendor/README.md) records the local pin and fresh-clone limitation. Local vendored-engine edits are part of the tested app source even when the gitlink is unchanged.
+Syrtis owns `syrtis-core` as ordinary source in [`crates/syrtis_core`](../../crates/syrtis_core), alongside its Rust FFI and Swift app. There is no active Git submodule, consumer pin, separate engine release, or upstream-integration requirement. The implementation derives from tokscale and the former shared fork; its MIT attribution and inherited [`UPSTREAM.md`](../../crates/syrtis_core/UPSTREAM.md) remain as provenance. [`vendor/README.md`](../../vendor/README.md) records the former dependency, not a current build prerequisite.
 
 ## 目錄
 
@@ -28,17 +28,17 @@ Syrtis consumes `tokscale-core` through the pinned `vendor/tokscale-core` submod
 
 ## Current boundary
 
-The engine's true baseline is recorded in `tokscale-core/UPSTREAM.md`; the Cargo package version is not a reliable baseline marker. The shared tree contains upstream cherry-picks plus streaming, cache, report, pricing, and defensive adaptations extracted from Syrtis. Syrtis keeps its application-specific FFI, C ABI, Swift, and build wiring outside the submodule.
+The app owns parsers, scanning, persistent usage, deduplication, pricing, and report folds in `crates/syrtis_core`. The C ABI bridge remains in `crates/tb_core_ffi`, with declarations in `Sources/CTB/include/ctb.h` and decoders in Swift. Engine and consumer changes are verified together in one repository.
 
-> **可直接修改 `vendor/tokscale-core` 做本地修正，並與 Syrtis 一起驗證。** 不需先建立獨立 engine commit、review 或 upstream integration；本地 build 不要求 clean submodule 或 `HEAD` 等於 gitlink。仍需 regression、streaming／materialized、cache 與受影響的 FFI／Swift 驗證，不能只以 build 成功證明語意正確。沒有明確授權，不得 commit、push 或發布。
+> **直接修改 Syrtis-owned engine，不需另建 tokscale commit、review、pin 或 publication。** 仍需 regression、streaming／materialized、儲存遷移與受影響的 FFI／Swift 驗證；build 成功不代表使用量語意正確。沒有明確授權，不得 commit、push 或發布。
 
-本分支已 pin reviewed local fork `890a306e908ab1e61bcd006285782768a8087593`，不是 public engine `main`。此前 public reviewed checkpoint 為 `726efd7038727055bf8915d98939b973c3db17fe`；自 `319ffa8` 起的 18 個 first-parent merge／60 個 commit 與 2026-10-02 上游同步，仍保留在下方歷史表格及 engine ledger。
+Upstream parser or pricing fixes are optional inputs, selected only when useful to Syrtis. Preserve license attribution and the reason for adopted changes; do not require source equivalence with the external fork. Windows owns its own source and runtime validation.
 
 ### Local fork integration history
 
 Historical only, not a requirement for local fixes: Resource redesign 的 app-owned source 所需 required-field projection、compact usage snapshot／query 與 source-watch manifest API 已透過 local fork gitlink 整合，普通 checkout 不再缺這些 API。該次 shared implementation 在 engine branch 提交，consumer 僅推進 gitlink；engine 以最新 public main 為 base，保留 scan exclusions、Cursor JSON 與 Antigravity CLI WAL-aware pruning。
 
-本地 macOS Rust 1.96.1 engine 與 ordinary consumer gates、debug／release bundled selftest、實際 Swift → C ABI → Rust safe-fixture smoke 與 native demo surface 已通過；具體範圍、warning debt 與 UI 限制見 [`verification.md`](verification.md#local-fork-ordinary-checkout-verification)。Windows runtime 未執行，不能以 macOS 或 cross-compile 代替；Windows adoption、release 與完整資源驗收仍未完成。Remote 未修改，沒有 push／PR；新 clone 在 fork 發布前無法取得此 local pin。
+Those local-fork verification results are a historical checkpoint, scoped in [`verification.md`](verification.md#local-fork-ordinary-checkout-verification), not evidence for every later edit. The owned-source cutover removes the unavailable local gitlink from fresh-clone builds. Windows runtime, downstream adoption, release, and full resource acceptance remain independent and unverified by this cutover.
 
 Local fork 已以 disk-backed store／selection 取代歷史 parser cache 與 recent raw-event live set，app 以 compact aggregate wire 與 demand scheduler／native hints 消費捕捉的 generation。Clock-only query 不需 source rediscovery；source lane 與 provider quota request 分離。Claude input units 在 publication 前統一，changed／warm query 使用同一 canonical generation；`CACHE_FORMAT_VERSION` 4→5、Claude parser 4→5，frozen format-3/4 migration 保留 retained-only history 的 unknown provenance。大型 scope preparation 仍有 history-scaled I/O，pricing synchronization 仍可能佔 local lane；current-corpus 冷／暖／升級比較、paired resource measurements 與 app steady-state 資源目標尚未驗收，不宣稱固定 process memory 或已達成 CPU／I/O 改善。
 
@@ -109,7 +109,7 @@ Follow-up engine [PR #3](https://github.com/Nanako0129/tokscale-core/pull/3) mer
 | Presentation | Syrtis [issue #118](https://github.com/Nanako0129/syrtis/issues/118): since engine PR #46 the report-grouping fold maps `grok-<version>-build` to `grok-<version>`, and Syrtis's `ModelGrouping.groupID` applies the same rule to graph-derived surfaces (case table `Tests/fixtures/model-grouping-cases.json`). Raw ids stay in pricing, cache identity and graph keys. The rule does not repair parser attribution and never absorbs `grok-unknown`. |
 | Upstream status | [`junhoyeo/tokscale#849`](https://github.com/junhoyeo/tokscale/issues/849) remains open. Closed, unmerged [PR #924](https://github.com/junhoyeo/tokscale/pull/924) does not contain this current-schema attribution fix. |
 
-The immutable implementation ledger for the Windows-adopted attribution revision remains [`UPSTREAM.md` at `84e0d66`](https://github.com/Nanako0129/tokscale-core/blob/84e0d66413d4e0d87b734f66f7a848b3bc323258/UPSTREAM.md); the current Native pin's exact engine ledger is the [pinned `UPSTREAM.md`](../../vendor/tokscale-core/UPSTREAM.md). The Windows consumer migration reviewed the complete engine delta from `b31e394` and ran its normal gates: hosted x64 and ARM64 builds, packaged-FFI, and the 119-case cross-check, plus a same-snapshot comparison in which `totalTokens` stayed byte-identical at 333,370,649 while the model bucket count moved 4 → 3. That adoption was limited to the reviewed gitlink advance. At the historical public `726efd7` checkpoint, since the then-last released pin `319ffa8`, the range adds one additive entry point to `crates/tb_core_ffi` and the header, `tb_client_ids` (with #461; #463's `6712ed8` → `726efd7` touches no FFI), which SelfTest uses to require that every engine client id is registered in Swift; no existing entry point's signature moves. Under the signature rule the Windows port is notified with no porting obligation, the same disposition as the earlier additive `tb_set_keychain_consent` (see [`architecture.md`](architecture.md)); Windows still needs its own registry entries for the new client ids. The advance to `319ffa8` added one test there, the shared model-grouping case table, and no production code; the one-line fill for the engine's `cache_write_1h` field landed with the `044153f` → `65511b8` advance — but **advancing the Windows pin will still require that same one-line fill in its own FFI crate**, because the `TokenBreakdown` literal there is exhaustive too — and that fill is now `cache_write_1h: entry.cache_write`, not `0`; see the Current boundary section for why the direction of the error, not its size, is what makes `0` unsafe. Its crosscheck oracle pins a fixed macOS commit rather than `main` (the value is owned by the Windows repository's CI configuration and is not restated here), so this advance cannot turn that job red; the oracle's own drift does grow, and advancing the Windows pin later will surface what accumulated in between.
+The immutable implementation ledger for the Windows-adopted attribution revision remains [`UPSTREAM.md` at `84e0d66`](https://github.com/Nanako0129/tokscale-core/blob/84e0d66413d4e0d87b734f66f7a848b3bc323258/UPSTREAM.md); Syrtis retains the inherited [engine ledger](../../crates/syrtis_core/UPSTREAM.md) as provenance. The Windows consumer migration reviewed the complete engine delta from `b31e394` and ran its normal gates: hosted x64 and ARM64 builds, packaged-FFI, and the 119-case cross-check, plus a same-snapshot comparison in which `totalTokens` stayed byte-identical at 333,370,649 while the model bucket count moved 4 → 3. That adoption was limited to the reviewed gitlink advance. At the historical public `726efd7` checkpoint, since the then-last released pin `319ffa8`, the range adds one additive entry point to `crates/tb_core_ffi` and the header, `tb_client_ids` (with #461; #463's `6712ed8` → `726efd7` touches no FFI), which SelfTest uses to require that every engine client id is registered in Swift; no existing entry point's signature moves. Under the signature rule the Windows port is notified with no porting obligation, the same disposition as the earlier additive `tb_set_keychain_consent` (see [`architecture.md`](architecture.md)); Windows still needs its own registry entries for the new client ids. The advance to `319ffa8` added one test there, the shared model-grouping case table, and no production code; the one-line fill for the engine's `cache_write_1h` field landed with the `044153f` → `65511b8` advance — but **advancing the Windows pin will still require that same one-line fill in its own FFI crate**, because the `TokenBreakdown` literal there is exhaustive too — and that fill is now `cache_write_1h: entry.cache_write`, not `0`; see the Current boundary section for why the direction of the error, not its size, is what makes `0` unsafe. Its crosscheck oracle pins a fixed macOS commit rather than `main` (the value is owned by the Windows repository's CI configuration and is not restated here), so this advance cannot turn that job red; the oracle's own drift does grow, and advancing the Windows pin later will surface what accumulated in between.
 
 ## Selective-port method
 
@@ -118,24 +118,23 @@ flowchart TD
     HEAD[Refresh tokscale upstream] --> DIFF[Read each real diff]
     DIFF --> CLASSIFY{Classify each part}
     CLASSIFY -->|already present| RECORD[Record no action]
-    CLASSIFY -->|take| PORT[Apply narrow hunk in shared engine]
-    CLASSIFY -->|adapt| ADAPT[Preserve shared streaming or cache seam]
+    CLASSIFY -->|take| PORT[Apply narrow hunk in Syrtis engine]
+    CLASSIFY -->|adapt| ADAPT[Preserve durable usage and report contracts]
     CLASSIFY -->|defer or skip| EXPLAIN[Record rationale]
     PORT --> FIXTURE[Add old-fail/new-pass fixture]
     ADAPT --> FIXTURE
     FIXTURE --> ENGINE[Run affected engine gates]
-    ENGINE --> LEDGER[Update engine UPSTREAM ledger]
-    LEDGER --> GATES[Run consuming app FFI, Swift, and smoke gates]
+    ENGINE --> GATES[Run app FFI, Swift, and smoke gates]
 ```
 
 | Step | Rule |
 |---|---|
 | Reference | Re-fetch and record the upstream commit being assessed; do not use a stale plan line number as evidence |
 | Diff | Read the actual diff, including multipart commits whose title understates runtime changes |
-| Port | Apply only the selected hunk in `vendor/tokscale-core`; use context-aware patching and fail loudly on mismatch |
+| Port | Apply the selected change in `crates/syrtis_core`; preserve app-specific storage, authority, and report contracts |
 | Adapt | Keep shared streaming lanes, report filters, and cache identity explicit; keep Syrtis-only FFI mapping in `crates/tb_core_ffi` |
 | Verify | Test affected parser output, cache rebuild, streaming behavior, and materialized parity together with Syrtis's consumer gates |
-| Record | Update the exact engine ledger and report the tested source state; no separate engine commit, review, or gitlink advance is required for local fixes |
+| Record | Record the adopted change and regression evidence in Syrtis; no separate engine commit, review, or publication is required |
 
 ## Shared adaptation families
 
@@ -156,11 +155,11 @@ Which counter to advance, and when:
 
 | Change | Advance |
 |---|---|
-| Serialized message fields, the bincode layout, or a cross-client type such as `UnifiedMessage` | `CACHE_FORMAT_VERSION` — every namespace's shards go stale at once |
+| Serialized message fields, the bincode layout, or a cross-client type such as `UnifiedMessage` | `CACHE_FORMAT_VERSION` — add an exact historical decoder or validated migration before advancing it; warm eligibility changes, durable facts must remain readable |
 | Parser output, dedup keys, attribution, or parser-resume state for one client, making that client's old cached values semantically stale | `parser_version(<client>)` — only that client rebuilds |
 | A new independently fingerprinted source; post-cache pricing or report arithmetic; filesystem retry behaviour | neither |
 
-A per-client bump is the default for a parser fix. Reaching for the global one because a parser changed evicts every other client's cached transcripts for no reason, and where a namespace has retention — Claude, whose cache is the only copy of turns an in-place compact has erased — a global bump can discard data that re-parsing cannot recover. Read the `parser_version` arm's own comment before advancing it; the Claude arm carries that warning in the code.
+A per-client bump is the default for a parser fix. It invalidates warm reuse for that parser, not collected usage. Supported historical layouts remain durable across namespaces even when originals are absent; parser-version equality and resumability are not readability gates. Source synchronization reconciles fresh observations with retained facts before publishing. Every format change must preserve supported stored records or fail without replacing the last-good store; never silently discard facts on a global bump.
 
 A parser-output change must include a same-fingerprint stale-cache regression. A test that only parses a fresh source does not prove that existing users receive the correction.
 
@@ -192,4 +191,4 @@ The Copilot nested-agent bookkeeping in the engine's `UPSTREAM.md` records upstr
 | Did parser output or attribution change? | Local schema decision plus stale-cache regression |
 | Does a sibling source reach all consumers? | Fingerprint, lane, mtime, and prune tests |
 | Does FFI expose a pre-aggregation filter? | C header, Rust mapper, Swift decoder, report parity fixture |
-| Is the result still selective? | Focused engine fidelity note explaining included and excluded hunks, plus the tested engine source state (pin and local edits) |
+| Is the result still selective? | Focused fidelity note explaining included and excluded changes, plus the tested Syrtis-owned source state |

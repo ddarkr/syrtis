@@ -4555,7 +4555,7 @@ fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = tokscale_core::fs_atomic::replace_file(&tmp, path) {
+    if let Err(error) = syrtis_core::fs_atomic::replace_file(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("replace {}: {}", path.display(), error));
     }

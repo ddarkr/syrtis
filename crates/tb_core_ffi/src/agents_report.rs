@@ -1,5 +1,5 @@
 //! Per-agent (sub-agent) usage breakdown for the popover, backed by
-//! tokscale-core's `get_agents_report`. Mirrors tokscale's TUI "Agents" view,
+//! syrtis-core's `get_agents_report`. Mirrors tokscale's TUI "Agents" view,
 //! where named sub-agents are ranked by cost; messages with no agent
 //! attribution fold into a single "Main" bucket so every message is accounted
 //! for.
@@ -53,17 +53,17 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_agents_report(options))?;
+    let report = runtime.block_on(syrtis_core::get_agents_report(options))?;
 
     let data = map_report(report);
     crate::encode_local_payload(&data)
 }
 pub(crate) fn run_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
-    options: tokscale_core::ReportOptions,
-    pricing: Option<&tokscale_core::pricing::PricingService>,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
+    options: syrtis_core::ReportOptions,
+    pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> Result<crate::EncodedLocalPayload, String> {
-    let report = tokscale_core::get_agents_report_from_snapshot(snapshot, options, pricing)?;
+    let report = syrtis_core::get_agents_report_from_snapshot(snapshot, options, pricing)?;
     crate::encode_local_payload(&map_report(report))
 }
 
@@ -79,7 +79,7 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn map_report(report: tokscale_core::AgentReport) -> AgentsReportData {
+fn map_report(report: syrtis_core::AgentReport) -> AgentsReportData {
     AgentsReportData {
         entries: report
             .entries
@@ -87,7 +87,7 @@ fn map_report(report: tokscale_core::AgentReport) -> AgentsReportData {
             .map(|e| {
                 // Single source of the `total` formula; it MUST stay identical
                 // to the token-total used for the cost-then-total sort in
-                // tokscale-core's get_agents_report. The core preserves order,
+                // syrtis-core's get_agents_report. The core preserves order,
                 // so this mapper does NOT re-sort. saturating_add so #766's
                 // i64::MAX-clamped buckets (corrupt Antigravity DB) can't
                 // overflow this FFI-exposed total in debug/release.
@@ -125,8 +125,8 @@ mod tests {
     /// overflow it (a plain `+` panics in debug / wraps in release).
     #[test]
     fn total_saturates_on_overlarge_buckets() {
-        let report = tokscale_core::AgentReport {
-            entries: vec![tokscale_core::AgentReportEntry {
+        let report = syrtis_core::AgentReport {
+            entries: vec![syrtis_core::AgentReportEntry {
                 agent: "Main".to_string(),
                 clients: vec!["antigravity_cli".to_string()],
                 input: i64::MAX,

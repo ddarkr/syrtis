@@ -12,7 +12,7 @@ Read [`docs/knowledge/README.md`](docs/knowledge/README.md) for every task befor
 | Rust, C ABI, or Swift data flow | [`docs/knowledge/architecture.md`](docs/knowledge/architecture.md) |
 | Branches, reviews, merge, or release authorization | [`docs/knowledge/workflow.md`](docs/knowledge/workflow.md) |
 | Tests, fixtures, cache invalidation, or cross-language checks | [`docs/knowledge/verification.md`](docs/knowledge/verification.md) |
-| Shared tokscale engine or consumer pin | [`vendor/AGENTS.md`](vendor/AGENTS.md), [`vendor/README.md`](vendor/README.md), [`docs/knowledge/vendor-tokscale.md`](docs/knowledge/vendor-tokscale.md) |
+| Syrtis engine, usage persistence, or upstream-derived parsers | [`docs/knowledge/architecture.md`](docs/knowledge/architecture.md), [`docs/knowledge/vendor-tokscale.md`](docs/knowledge/vendor-tokscale.md) |
 | Release, Sparkle, appcast, or Homebrew | [`docs/knowledge/release.md`](docs/knowledge/release.md) |
 | GitHub prose or contributor credit | [`docs/knowledge/communication.md`](docs/knowledge/communication.md) |
 | Current maintenance priorities | [`docs/knowledge/current-state.md`](docs/knowledge/current-state.md) |
@@ -24,7 +24,7 @@ Read [`docs/knowledge/README.md`](docs/knowledge/README.md) for every task befor
 | Source of truth | Add canonical project facts to `docs/knowledge/`; keep adapters as routing and guardrails. |
 | Cross-language seam | Preserve the Rust -> C ABI -> Swift contract; verify both sides when a boundary changes. |
 | Pre-aggregation | Do not attempt to remove a contribution after a mixed aggregate has been computed; pass the filter to the producer. |
-| Shared-engine boundary | Local edits in `vendor/tokscale-core` are allowed and verified with Syrtis; no separate engine commit, review, or upstream integration is required. Keep app-owned FFI, C ABI, Swift, and build wiring in Syrtis. |
+| Engine ownership | `crates/syrtis_core` is ordinary Syrtis-owned source. Edit it with the app and verify storage, reports, FFI, and Swift together; no separate engine repository, pin, or upstream integration is required. |
 | Public repository | Never add private paths, credentials, machine-specific tooling details, or unpublished security work to tracked docs. |
 
 ## Authorization boundary

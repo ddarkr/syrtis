@@ -12,7 +12,7 @@ sources: ["public GitHub main history", "public issue #45", "public issue #118",
 
 ## 文件目的
 
-Syrtis native 已完成從 Tauri 到 SwiftUI 的出貨重寫，現在是維護期。這份文件只保留接手時需要的狀態、優先級與公開追蹤入口；完整歷史放在 [`history/`](history/README.md)，shared-engine boundary 放在 [`vendor-tokscale.md`](vendor-tokscale.md)，Syrtis 的 consumer pin 放在 [`vendor/README.md`](../../vendor/README.md)。
+Syrtis native 已完成從 Tauri 到 SwiftUI 的出貨重寫，現在是維護期。這份文件保留接手需要的狀態、優先級與公開追蹤入口；完整歷史放在 [`history/`](history/README.md)，目前 Syrtis-owned engine 的邊界放在 [`vendor-tokscale.md`](vendor-tokscale.md)，來源沿革放在 [`vendor/README.md`](../../vendor/README.md)。
 
 ## 目錄
 
@@ -34,7 +34,7 @@ Syrtis native 已完成從 Tauri 到 SwiftUI 的出貨重寫，現在是維護�
 
 ## Local fork candidate
 
-本分支已透過 reviewed local fork gitlink 補齊 resource redesign 所需 engine API；exact pin 與新 clone 無法在發布前取得 local object 的限制見 [`vendor/README.md`](../../vendor/README.md)。Ordinary macOS Rust／Swift debug／release bundled gates、實際 native bridge safe-fixture smoke 與 demo surface 已通過，範圍記於 [`verification.md`](verification.md#local-fork-ordinary-checkout-verification)。Windows runtime、downstream coordinated adoption、publication 與 current-corpus／steady-state 資源驗收未完成；remote 未修改，沒有 push／PR／release。以下 shipped baseline 保留先前 public `726efd7` checkpoint，不把 local candidate 說成已發版。
+The local implementation owns the engine as ordinary `crates/syrtis_core` source, with no submodule, separate engine publication, or reviewed-pin prerequisite. Collected usage moves into the app-owned durable store, separate from disposable legacy caches; source deletion and query-scope eviction do not authorize fact deletion. Migration and verification contracts are described in [`architecture.md`](architecture.md#compact-usage-store) and [`verification.md`](verification.md). This local source cutover is not a published release or Windows adoption; the shipped baseline below remains historical.
 
 ## Shipped baseline
 

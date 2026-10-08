@@ -1,4 +1,4 @@
-//! C-ABI bridge over tokscale-core for the Swift app.
+//! C-ABI bridge over syrtis-core for the Swift app.
 //!
 //! Contract: every entry point returns a heap-allocated, NUL-terminated JSON
 //! string; the caller must release it with `tb_free`. Entry points are
@@ -26,6 +26,8 @@ mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
+#[cfg(test)]
+mod durable_usage_tests;
 mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
@@ -104,8 +106,8 @@ impl LocalSourceContext {
         &self,
         year: Option<String>,
         clients: Option<Vec<String>>,
-    ) -> tokscale_core::ReportOptions {
-        tokscale_core::ReportOptions {
+    ) -> syrtis_core::ReportOptions {
+        syrtis_core::ReportOptions {
             home_dir: self
                 .home_dir
                 .as_ref()
@@ -113,7 +115,7 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 extra_scan_paths: extra_scan_paths::snapshot(),
                 ..Default::default()
             },
@@ -125,8 +127,8 @@ impl LocalSourceContext {
         &self,
         year: Option<String>,
         clients: Option<Vec<String>>,
-    ) -> tokscale_core::LocalParseOptions {
-        tokscale_core::LocalParseOptions {
+    ) -> syrtis_core::LocalParseOptions {
+        syrtis_core::LocalParseOptions {
             home_dir: self
                 .home_dir
                 .as_ref()
@@ -134,7 +136,7 @@ impl LocalSourceContext {
             use_env_roots: true,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
+            scanner_settings: syrtis_core::scanner::ScannerSettings {
                 extra_scan_paths: extra_scan_paths::snapshot(),
                 ..Default::default()
             },
@@ -270,7 +272,7 @@ fn serialize_agent_usage_payload(
     })
 }
 
-/// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
+/// Cap rayon's global thread pool to 2 workers. syrtis-core uses rayon for
 /// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
 /// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
 /// each idle worker busy-waits before parking, and every 10s poll wakes the
@@ -713,8 +715,7 @@ fn graph_cached_in_lane(
         (*at, *token)
     };
     let context = LocalSourceContext::current();
-    let fresh =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
+    let fresh = syrtis_core::local_source_change_token(&context.parse_options(None, None)).ok()?;
     if fresh == token {
         let mut cache = GRAPH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if ROOT_GENERATION.load(Ordering::SeqCst) != generation {
@@ -739,7 +740,7 @@ fn graph_compute(year: &str) -> Result<EncodedLocalPayload, String> {
     // both paths so the probe and report scan observe identical source roots.
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
-    let token = tokscale_core::local_source_change_token(&context.parse_options(None, None))?;
+    let token = syrtis_core::local_source_change_token(&context.parse_options(None, None))?;
     #[cfg(test)]
     tests::GRAPH_COMPUTES.fetch_add(1, Ordering::SeqCst);
     let data = encode_local_payload(&usage_graph::run(&context, year)?)?;
@@ -1001,14 +1002,14 @@ fn tail_tick_if_stale() {
 }
 
 /// Smoke probe: parse all local clients and report the message count.
-/// Proves the staticlib links and tokscale-core can read this machine.
+/// Proves the staticlib links and syrtis-core can read this machine.
 /// (Legacy Phase 0 shape: `{"ok":true,"messages":N}`, no `data` wrapper.)
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
         let _local = local_usage_guard();
         let context = LocalSourceContext::current();
-        let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
+        let json = match syrtis_core::parse_local_clients(context.parse_options(None, None)) {
             Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
             Err(e) => serde_json::json!({"ok": false, "err": e}).to_string(),
         };
@@ -1184,7 +1185,7 @@ pub extern "C" fn tb_quota_provider_ids() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn tb_client_ids() -> *mut c_char {
     guarded("tb_client_ids", || {
-        let ids: Vec<&str> = tokscale_core::ClientId::ALL
+        let ids: Vec<&str> = syrtis_core::ClientId::ALL
             .iter()
             .map(|client| client.as_str())
             .collect();

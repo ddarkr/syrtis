@@ -3,27 +3,27 @@ status: active
 id: kb-decision-0003
 kind: canonical
 scope: repository
-read_when: evaluating a tokscale commit, resolving shared-engine drift, or deciding whether to add a client
-last_verified: 2026-07-28
-sources: [".gitmodules", "vendor/README.md", "docs/knowledge/vendor-tokscale.md", "docs/knowledge/plans/tokscale-alignment.md", "public tokscale-core UPSTREAM at b31e394", "public issue #45"]
+read_when: evaluating an upstream-derived fix, preserving Syrtis adaptations, or deciding whether to add a client
+last_verified: 2026-10-08
+sources: ["Cargo.toml", "crates/syrtis_core/Cargo.toml", "vendor/README.md", "docs/knowledge/vendor-tokscale.md", "docs/knowledge/plans/tokscale-alignment.md", "public issue #45"]
 ---
 
 # ADR 0003: Selective upstream alignment
 
 ## Decision
 
-Track the moving tokscale upstream and selectively land reviewed commits or
-hunks in the public `tokscale-core` engine. TokenBar consumes only a reviewed
-engine commit through its pinned submodule; do not edit shared source on the
-consumer branch or interpret a commit title as a complete description of its
-runtime effect.
+Selectively adopt useful upstream commits or hunks into Syrtis-owned
+`crates/syrtis_core`. The engine is ordinary source in this repository:
+no separate engine commit, pin, review, publication, or source-equivalence
+gate is required. Inspect the actual change rather than treating a commit
+title as a complete description of its runtime effect.
 
 ## Selection matrix
 
 | Classification | Action |
 |---|---|
 | Already in engine | Record exact evidence and do not reapply |
-| Correctness take | Land the smallest complete upstream change and a regression fixture in `tokscale-core` |
+| Correctness take | Land the smallest complete change and a regression fixture in `crates/syrtis_core` |
 | Shared adaptation | Preserve engine streaming, cache, mtime, pricing, and report semantics while porting parser logic |
 | Defer | Keep the public rationale and wait for a product or architecture decision |
 | Skip | Record why the code is outside the shared engine's surface |
@@ -31,11 +31,11 @@ runtime effect.
 
 ## Rationale
 
-The shared engine carries streaming aggregation, cache identity, client
-filtering, pricing behavior, and platform-specific discovery that can be lost
-by a whole-file replacement even when the result compiles. Selective alignment
-keeps those changes auditable in the engine's `UPSTREAM.md`. TokenBar continues
-to own app-specific FFI, C ABI, Swift, and build wiring outside the submodule.
+The engine carries streaming aggregation, durable usage, cache identity,
+client filtering, pricing, and discovery that can be lost by whole-file
+replacement even when the result compiles. Selective adoption preserves
+those contracts. The inherited `UPSTREAM.md` is provenance; current app and
+engine ownership remain together in Syrtis.
 
 > **Schema rule：** If a selected change alters serialized parser output,
 > dedup keys, or attribution, advance the shared engine's invalidation state

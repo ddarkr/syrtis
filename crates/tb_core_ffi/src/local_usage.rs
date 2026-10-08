@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokscale_core::{LocalUsageSelection, LocalUsageSnapshot};
+use syrtis_core::{LocalUsageSelection, LocalUsageSnapshot};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_SCOPES: usize = 64;
@@ -56,12 +56,12 @@ impl Scope {
     fn parse_options(
         &self,
         context: &crate::LocalSourceContext,
-    ) -> Result<tokscale_core::LocalParseOptions, String> {
+    ) -> Result<syrtis_core::LocalParseOptions, String> {
         match self.kind {
             ScopeKind::Quota => {
                 crate::window_usage::account_parse_options(context, &self.account_key)
             }
-            ScopeKind::Report => Ok(tokscale_core::local_report_scan_options(
+            ScopeKind::Report => Ok(syrtis_core::local_report_scan_options(
                 &context.report_options(None, self.clients.clone()),
             )),
             ScopeKind::Recent => Ok(context.parse_options(None, self.clients.clone())),
@@ -73,8 +73,8 @@ impl Scope {
     ) -> Result<
         (
             ProducerKey,
-            tokscale_core::ResolvedLocalSourceContext,
-            tokscale_core::LocalParseOptions,
+            syrtis_core::ResolvedLocalSourceContext,
+            syrtis_core::LocalParseOptions,
             LocalUsageSelection,
         ),
         String,
@@ -89,7 +89,7 @@ impl Scope {
         // Quota extra accounts scan with their config dir as home; every other
         // scope scans the real home. The capture below resolves the exact
         // engine identity, including canonical clients and exclusions.
-        let scope_context = tokscale_core::ResolvedLocalSourceContext::capture(
+        let scope_context = syrtis_core::ResolvedLocalSourceContext::capture(
             self.account_key
                 .as_ref()
                 .map(PathBuf::from)
@@ -100,7 +100,7 @@ impl Scope {
         .map_err(|error| error.to_string())?;
         let mut clients = options.clients.clone().unwrap_or_default();
         if options.clients.is_none() {
-            clients = tokscale_core::ClientId::iter()
+            clients = syrtis_core::ClientId::iter()
                 .filter(|client| selection == LocalUsageSelection::Report || client.parse_local())
                 .map(|client| client.as_str().to_string())
                 .collect();
@@ -218,7 +218,7 @@ struct SyncResult<'a> {
 struct SourceScope {
     producer: ProducerKey,
     snapshot: LocalUsageSnapshot,
-    manifest: Arc<tokscale_core::LocalSourceWatchManifest>,
+    manifest: Arc<syrtis_core::LocalSourceWatchManifest>,
     manifest_bytes: usize,
     cutoff: i64,
 }
@@ -252,7 +252,7 @@ struct ScopedLease {
 }
 struct Lease {
     scopes: Vec<ScopedLease>,
-    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    pricing: Option<Arc<syrtis_core::pricing::PricingService>>,
     price_generation: u64,
     root_generation: u64,
 }
@@ -368,19 +368,18 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
         .and_then(|token| find_lease(token).ok());
     let context = crate::LocalSourceContext::current();
     let default_options = context.parse_options(None, None);
-    let resolved = tokscale_core::ResolvedLocalSourceContext::capture(
+    let resolved = syrtis_core::ResolvedLocalSourceContext::capture(
         context.home_dir.clone(),
         true,
         default_options.scanner_settings.clone(),
     )
     .map_err(|error| error.to_string())?;
     let pricing = if request.refresh_pricing {
-        crate::RUNTIME.block_on(tokscale_core::capture_local_usage_pricing(&resolved))
+        crate::RUNTIME.block_on(syrtis_core::capture_local_usage_pricing(&resolved))
     } else if let Some(previous) = &previous {
         previous.pricing.clone()
     } else {
-        tokscale_core::pricing::PricingService::load_cached_for_local_source(&resolved)
-            .map(Arc::new)
+        syrtis_core::pricing::PricingService::load_cached_for_local_source(&resolved).map(Arc::new)
     };
     let same_price = previous
         .as_ref()
@@ -399,8 +398,8 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
     let mut planned: Vec<(
         Scope,
         ProducerKey,
-        tokscale_core::ResolvedLocalSourceContext,
-        tokscale_core::LocalParseOptions,
+        syrtis_core::ResolvedLocalSourceContext,
+        syrtis_core::LocalParseOptions,
         LocalUsageSelection,
     )> = Vec::with_capacity(request.scopes.len());
     {
@@ -448,9 +447,9 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
             // Keep the physical baseline from BEFORE ingestion. Later writes
             // dirty the next refresh, not the independently verified snapshot.
             let manifest =
-                tokscale_core::capture_local_source_watch_manifest(&scope_context, &options)?;
+                syrtis_core::capture_local_source_watch_manifest(&scope_context, &options)?;
             let snapshot =
-                tokscale_core::synchronize_local_usage(&scope_context, options, selection)?;
+                syrtis_core::synchronize_local_usage(&scope_context, options, selection)?;
             #[cfg(test)]
             tests::after_source_sync();
             // Admission must not wait for a concurrent slow known-file
@@ -552,8 +551,8 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
 }
 
 fn same_pricing(
-    left: &Option<Arc<tokscale_core::pricing::PricingService>>,
-    right: &Option<Arc<tokscale_core::pricing::PricingService>>,
+    left: &Option<Arc<syrtis_core::pricing::PricingService>>,
+    right: &Option<Arc<syrtis_core::pricing::PricingService>>,
 ) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -656,7 +655,7 @@ pub(crate) fn query(json: &str) -> Result<crate::EncodedLocalPayload, String> {
         }
         Some(_) => return Err("invalid local usage year".into()),
     };
-    let options = tokscale_core::ReportOptions {
+    let options = syrtis_core::ReportOptions {
         year,
         clients: scope.spec.clients.clone(),
         ..Default::default()

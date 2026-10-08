@@ -3774,7 +3774,7 @@ fn save_store_atomic_with_mode(mode: StorageMode, path: &Path, store: &Store) ->
     save_store_atomic_with_sync(
         path,
         store,
-        |temp, destination| tokscale_core::fs_atomic::replace_file(temp, destination),
+        |temp, destination| syrtis_core::fs_atomic::replace_file(temp, destination),
         |directory| sync_directory_with_mode(mode, directory),
     )
 }
@@ -5698,7 +5698,7 @@ mod tests {
         let result = save_store_atomic_with_sync(
             &path,
             &store,
-            tokscale_core::fs_atomic::replace_file,
+            syrtis_core::fs_atomic::replace_file,
             |_directory| Err(io::Error::other("injected directory sync failure")),
         );
         assert!(result.is_ok());

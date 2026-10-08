@@ -1,0 +1,507 @@
+//! Cross-platform resolution for tokscale's user config and cache dirs.
+//!
+//! Tokscale-core needs the same path helpers tokscale-cli uses (settings
+//! and message/pricing caches read from related directories), so the
+//! resolver lives here and is re-exported from tokscale-cli for callers
+//! that already imported it from there. macOS users following the docs
+//! expect `~/.config/tokscale/` because that is what `auth.rs`,
+//! `cursor.rs`, and `antigravity.rs` already write to.
+//! `dirs::config_dir()` would instead return `~/Library/Application Support/`
+//! on macOS, splitting state across two roots and silently ignoring
+//! settings.json edits the user made via the documented path. This module
+//! enforces the unified `~/.config/tokscale/` location on macOS + Linux,
+//! while keeping the platform default on Windows.
+
+use std::path::PathBuf;
+
+/// Resolve the process home used for scanner roots.
+///
+/// Non-Windows platforms keep the existing HOME-first behavior. Windows only
+/// accepts HOME when it crosses the existing String seam losslessly and Rust
+/// recognizes it as a native absolute path (drive or UNC); all other values
+/// fall back to the platform home.
+pub(crate) fn platform_home_dir() -> Option<PathBuf> {
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+
+    home.or_else(dirs::home_dir)
+}
+
+/// Resolve the tokscale config dir, honoring `TOKSCALE_CONFIG_DIR` first.
+///
+/// Resolution order:
+/// 1. `TOKSCALE_CONFIG_DIR` taken verbatim when set to a non-empty value.
+///    Absolute paths are recommended; relative paths are accepted and
+///    resolved against the process CWD. Empty strings are treated as
+///    unset so the user gets the platform default instead of a surprise
+///    `./` write — keeps the resolver consistent with
+///    [`is_config_dir_overridden`], which also rejects empty strings.
+/// 2. macOS: `$HOME/.config/tokscale` (overrides `dirs::config_dir()`,
+///    which would return `~/Library/Application Support/` and split state
+///    across two roots — see module docs).
+/// 3. Linux: `dirs::config_dir().join("tokscale")` so XDG_CONFIG_HOME is
+///    honored. Falls through to `$HOME/.config/tokscale` when neither
+///    `XDG_CONFIG_HOME` nor `HOME` resolve.
+/// 4. Windows (and any other platform): `dirs::config_dir().join("tokscale")`.
+/// 5. Last-ditch fallback: `./.tokscale` so a missing HOME never panics.
+pub fn get_config_dir() -> PathBuf {
+    if let Some(custom) = std::env::var_os("TOKSCALE_CONFIG_DIR") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(".config").join("tokscale");
+        }
+    }
+
+    dirs::config_dir()
+        .map(|d| d.join("tokscale"))
+        .unwrap_or_else(|| PathBuf::from(".tokscale"))
+}
+
+/// Resolve the tokscale cache dir as `<config_dir>/cache`.
+///
+/// Caches (TUI display data, source-message bincode, pricing JSON, the
+/// OpenCode migration record, Wrapped fonts/images) all live under this
+/// single subdirectory so an isolated profile (`TOKSCALE_CONFIG_DIR=...`)
+/// covers everything in one shot, and so `rm -rf <cache_dir>` is always
+/// safe — no durable state mixed in.
+pub fn get_cache_dir() -> PathBuf {
+    get_config_dir().join("cache")
+}
+
+/// Resolve the app-owned durable usage root, separate from pricing/config/cache.
+///
+/// Permanent usage facts live here so they survive source deletion, cache
+/// clears, and parser upgrades. Resolution order:
+/// 1. `SYRTIS_USAGE_DIR` taken verbatim when set to a non-empty value.
+/// 2. `SYRTIS_CONFIG_DIR` joined with `usage` when set to a non-empty value,
+///    so an isolated profile (`SYRTIS_CONFIG_DIR=...`) stays hermetic.
+/// 3. `TOKSCALE_CONFIG_DIR` joined with `usage` when set to a non-empty
+///    value. Existing tests and profiles override only this variable, so
+///    ignoring it would route the durable store at the real user
+///    Application Support dir. This is a supported upgrade profile: still a
+///    dedicated `usage` subdir, never the legacy `cache` dir itself, and
+///    `TOKSCALE_CONFIG_DIR` remains a migration *input* as well.
+/// 4. `dirs::data_dir()/com.nyanako.tokenbar/usage` (macOS:
+///    `~/Library/Application Support/com.nyanako.tokenbar/usage`).
+/// 5. Last-ditch fallback: `<config_dir>/usage`.
+pub fn get_usage_dir() -> PathBuf {
+    if let Some(custom) = std::env::var_os("SYRTIS_USAGE_DIR") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    if let Some(custom) = std::env::var_os("SYRTIS_CONFIG_DIR") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom).join("usage");
+        }
+    }
+    if let Some(custom) = std::env::var_os("TOKSCALE_CONFIG_DIR") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom).join("usage");
+        }
+    }
+    dirs::data_dir()
+        .map(|d| d.join("com.nyanako.tokenbar").join("usage"))
+        .unwrap_or_else(|| get_config_dir().join("usage"))
+}
+
+/// Whether `SYRTIS_USAGE_DIR` is explicitly set in the environment.
+///
+/// Empty strings are treated as unset, matching [`is_config_dir_overridden`].
+pub fn is_usage_dir_overridden() -> bool {
+    std::env::var_os("SYRTIS_USAGE_DIR").is_some_and(|v| !v.is_empty())
+}
+
+/// Whether `SYRTIS_CONFIG_DIR` is explicitly set in the environment.
+///
+/// Empty strings are treated as unset.
+pub fn is_syrtis_config_dir_overridden() -> bool {
+    std::env::var_os("SYRTIS_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+}
+
+/// New (non-override) config dir for callers that prefer it, without legacy fallback.
+///
+/// Returns `SYRTIS_CONFIG_DIR` when set to a non-empty value, else `None`.
+/// This is the capture-friendly form of the `SYRTIS_CONFIG_DIR` branch of
+/// [`get_usage_dir`]; legacy `TOKSCALE_CONFIG_DIR` values are never returned.
+pub(crate) fn syrtis_config_dir() -> Option<PathBuf> {
+    let custom = std::env::var_os("SYRTIS_CONFIG_DIR")?;
+    if custom.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(custom))
+}
+
+/// Candidate legacy cache dirs whose usage history may be migrated.
+///
+/// Ordered by precedence: the current canonical cache dir first
+/// (`get_cache_dir()`, i.e. `~/.config/tokscale/cache` — where existing
+/// deployments actually hold their facts), then the explicit
+/// `SYRTIS_CONFIG_DIR` profile's cache subdir (a new profile pointed at an
+/// old location), then the historic platform cache dirs. The legacy
+/// `TOKSCALE_CONFIG_DIR` profile cache equals `get_cache_dir()` when that
+/// override is set, so it needs no separate entry. Platform dirs are included
+/// only when neither override is set, so an explicit hermetic profile never
+/// ingests the user's real cache locations. Entries may not exist; existence
+/// is the caller's check. Entries may repeat; the caller dedupes.
+pub fn legacy_migration_cache_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![get_cache_dir()];
+    if let Some(custom) = syrtis_config_dir() {
+        dirs.push(custom.join("cache"));
+    }
+    if !is_config_dir_overridden() && !is_syrtis_config_dir_overridden() {
+        dirs.extend(legacy_dirs_cache_dir());
+        dirs.extend(legacy_dot_cache_tokscale_dir());
+    }
+    dirs
+}
+/// Whether `TOKSCALE_CONFIG_DIR` is explicitly set in the environment.
+///
+/// Callers that want to read a legacy on-disk location during a path
+/// transition MUST gate that fallback on this returning `false`. When the
+/// override is set (CI sandbox, tests, isolated profile), the user has
+/// asked for an explicit, hermetic root — silently ingesting files from
+/// the historic `~/.cache/tokscale/` or `~/Library/Caches/tokscale/`
+/// locations defeats that contract.
+pub fn is_config_dir_overridden() -> bool {
+    std::env::var_os("TOKSCALE_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+}
+
+/// Pre-#470 cache directory at `dirs::cache_dir()/tokscale`.
+///
+/// On macOS this resolves to `~/Library/Caches/tokscale/` (where the
+/// source-message-cache, pricing caches, and opencode-migration.json
+/// historically lived). On Linux this resolves to `$XDG_CACHE_HOME/tokscale`
+///
+/// Returns `None` when `TOKSCALE_CONFIG_DIR` is set so the override stays
+/// hermetic (no legacy-data leak into isolated profiles).
+pub fn legacy_dirs_cache_dir() -> Option<PathBuf> {
+    if is_config_dir_overridden() {
+        return None;
+    }
+    dirs::cache_dir().map(|d| d.join("tokscale"))
+}
+
+/// Pre-#470 cache directory at `~/.cache/tokscale`.
+///
+/// This is where the TUI display cache (`tui-data-cache.json`) and the
+/// Wrapped image / font caches lived before #470 consolidated everything
+/// under `<config_dir>/cache`. On Linux this typically equals
+/// [`legacy_dirs_cache_dir`]; on macOS it does NOT (Library/Caches vs
+/// `.cache`), so both legacy probes need to run during migration.
+///
+/// Returns `None` when `TOKSCALE_CONFIG_DIR` is set or HOME cannot be
+/// resolved.
+pub fn legacy_dot_cache_tokscale_dir() -> Option<PathBuf> {
+    if is_config_dir_overridden() {
+        return None;
+    }
+    dirs::home_dir().map(|h| h.join(".cache").join("tokscale"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::env;
+    use std::path::Path;
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self(
+                [
+                    "TOKSCALE_CONFIG_DIR",
+                    "SYRTIS_CONFIG_DIR",
+                    "SYRTIS_USAGE_DIR",
+                    "HOME",
+                    "XDG_CONFIG_HOME",
+                ]
+                .into_iter()
+                .map(|key| (key, env::var_os(key)))
+                .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => env::set_var(key, value),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(target_os = "windows"))]
+    fn platform_home_dir_preserves_non_windows_home_value() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("HOME", "relative/home");
+        }
+
+        assert_eq!(platform_home_dir(), Some(PathBuf::from("relative/home")));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "windows")]
+    fn platform_home_dir_accepts_only_native_absolute_windows_home() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let _env = EnvGuard::capture();
+        let fallback = dirs::home_dir();
+
+        for invalid in ["", "/home/user", r"C:temp"] {
+            unsafe {
+                env::set_var("HOME", invalid);
+            }
+            assert_eq!(
+                platform_home_dir(),
+                fallback,
+                "invalid Windows HOME must fall back: {invalid:?}"
+            );
+        }
+
+        for valid in [r"C:\Users\tokscale-test", r"\\server\share\tokscale-test"] {
+            unsafe {
+                env::set_var("HOME", valid);
+            }
+            assert_eq!(
+                platform_home_dir(),
+                Some(PathBuf::from(valid)),
+                "native absolute Windows HOME must win: {valid:?}"
+            );
+        }
+
+        let non_unicode =
+            std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+        unsafe {
+            env::set_var("HOME", &non_unicode);
+        }
+        assert_eq!(
+            platform_home_dir(),
+            fallback,
+            "non-Unicode Windows HOME must fail closed because the scanner home seam is String"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn env_override_is_returned_verbatim() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-custom");
+        }
+        assert_eq!(get_config_dir(), PathBuf::from("/tmp/tokscale-custom"));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unix_default_is_dot_config_tokscale_under_home() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("TOKSCALE_CONFIG_DIR");
+            env::remove_var("XDG_CONFIG_HOME");
+            env::set_var("HOME", "/tmp/tokscale-core-paths-home");
+        }
+        assert_eq!(
+            get_config_dir(),
+            PathBuf::from("/tmp/tokscale-core-paths-home/.config/tokscale"),
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn linux_honors_xdg_config_home_when_set() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("TOKSCALE_CONFIG_DIR");
+            env::set_var("XDG_CONFIG_HOME", "/tmp/tokscale-core-paths-xdg");
+        }
+        assert_eq!(
+            get_config_dir(),
+            PathBuf::from("/tmp/tokscale-core-paths-xdg/tokscale"),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cache_dir_is_cache_subdir_of_config_dir() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-cache-test");
+        }
+        assert_eq!(
+            get_cache_dir(),
+            PathBuf::from("/tmp/tokscale-cache-test/cache")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_helpers_return_none_when_overridden() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-override");
+        }
+        assert!(legacy_dirs_cache_dir().is_none());
+        assert!(legacy_dot_cache_tokscale_dir().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_helpers_return_some_when_not_overridden() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("TOKSCALE_CONFIG_DIR");
+        }
+        assert!(
+            legacy_dirs_cache_dir().is_some(),
+            "dirs::cache_dir always resolves on test platforms"
+        );
+        assert!(
+            legacy_dot_cache_tokscale_dir().is_some(),
+            "HOME is set in test environments"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn get_config_dir_treats_empty_override_as_unset() {
+        // Empty TOKSCALE_CONFIG_DIR previously slipped through and
+        // produced PathBuf::from(""), which silently relocated cache
+        // writes to ./cache and ./.tokscale. The resolver must agree
+        // with `is_config_dir_overridden`: empty == unset.
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "");
+        }
+        let resolved = get_config_dir();
+        assert_ne!(
+            resolved,
+            PathBuf::from(""),
+            "empty override must not resolve to the empty path"
+        );
+        assert!(
+            resolved.is_absolute() || resolved == Path::new(".tokscale"),
+            "empty override must fall through to platform default, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn is_config_dir_overridden_treats_empty_string_as_unset() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "");
+        }
+        assert!(!is_config_dir_overridden());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_dir_prefers_explicit_usage_override() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("SYRTIS_USAGE_DIR", "/tmp/syrtis-usage-explicit");
+            env::set_var("SYRTIS_CONFIG_DIR", "/tmp/syrtis-config-unused");
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-unused");
+        }
+        assert_eq!(get_usage_dir(), PathBuf::from("/tmp/syrtis-usage-explicit"));
+        assert!(is_usage_dir_overridden());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_dir_follows_syrtis_config_dir_before_data_dir() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("SYRTIS_USAGE_DIR");
+            env::set_var("SYRTIS_CONFIG_DIR", "/tmp/syrtis-profile");
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-unused");
+        }
+        assert_eq!(get_usage_dir(), PathBuf::from("/tmp/syrtis-profile/usage"));
+        assert!(is_syrtis_config_dir_overridden());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_dir_supports_tokscale_profile_after_syrtis_overrides() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("SYRTIS_USAGE_DIR");
+            env::remove_var("SYRTIS_CONFIG_DIR");
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-legacy-profile");
+        }
+        assert_eq!(
+            get_usage_dir(),
+            PathBuf::from("/tmp/tokscale-legacy-profile/usage")
+        );
+        assert_ne!(
+            get_usage_dir(),
+            PathBuf::from("/tmp/tokscale-legacy-profile/cache")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_dir_treats_empty_overrides_as_unset() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("SYRTIS_USAGE_DIR", "");
+            env::set_var("SYRTIS_CONFIG_DIR", "");
+        }
+        assert!(!is_usage_dir_overridden());
+        assert!(!is_syrtis_config_dir_overridden());
+        assert_ne!(get_usage_dir(), PathBuf::from(""));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_migration_dirs_start_with_canonical_cache() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-profile");
+            env::remove_var("SYRTIS_CONFIG_DIR");
+        }
+        let dirs = legacy_migration_cache_dirs();
+        // TOKSCALE profile cache == get_cache_dir() under that override.
+        assert_eq!(dirs, vec![PathBuf::from("/tmp/tokscale-profile/cache")]);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_migration_dirs_include_syrtis_profile_cache() {
+        let _env = EnvGuard::capture();
+        unsafe {
+            env::remove_var("TOKSCALE_CONFIG_DIR");
+            env::set_var("SYRTIS_CONFIG_DIR", "/tmp/syrtis-profile");
+        }
+        let dirs = legacy_migration_cache_dirs();
+        assert_eq!(dirs[0], get_cache_dir());
+        assert_eq!(dirs[1], PathBuf::from("/tmp/syrtis-profile/cache"));
+    }
+}

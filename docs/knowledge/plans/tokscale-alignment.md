@@ -4,7 +4,7 @@ id: kb-plan-tokscale-alignment
 kind: plan
 scope: repository
 read_when: reviewing the completed selective-alignment cycle or issue #45 history
-last_verified: 2026-07-29
+last_verified: 2026-10-08
 sources: ["vendor/README.md", "public tokscale-core commit b31e394", "public issue #45", "public tokscale history", "public TokenBar-Windows PR #7", "public TokenBar PR #114", "public TokenBar-Windows PR #12", "docs/knowledge/decisions/0003-selective-upstream-alignment.md"]
 ---
 
@@ -13,8 +13,8 @@ sources: ["vendor/README.md", "public tokscale-core commit b31e394", "public iss
 > **Historical completion record：** This M15–D2 cycle finished before the
 > shared-engine extraction. Do not execute its vendor paths, ownership table,
 > ledger transitions, or milestone protocol against the current checkout.
-> Current shared Rust work lands in public `tokscale-core`, updates the engine
-> `UPSTREAM.md`, and reaches TokenBar only through a reviewed submodule pin.
+> Current Rust work belongs to Syrtis-owned `crates/syrtis_core`; the inherited
+> `UPSTREAM.md` is provenance, not a separate engine pin or publication gate.
 
 ## 文件目的
 

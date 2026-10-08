@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
-use tokscale_core::{LocalUsageQuery, LocalUsageSnapshot, UnifiedMessage};
+use syrtis_core::{LocalUsageQuery, LocalUsageSnapshot, UnifiedMessage};
 
 /// `None` is the primary account. An extra Claude account is keyed by its
 /// `CLAUDE_CONFIG_DIR`, the same string its card and its quota curve are keyed
@@ -194,7 +194,7 @@ const NO_REGISTERED_ROOTS: &str =
 fn account_options(
     context: &crate::LocalSourceContext,
     account: &Account,
-) -> Result<tokscale_core::ReportOptions, String> {
+) -> Result<syrtis_core::ReportOptions, String> {
     Ok(match account {
         None => {
             let mut options = context.report_options(None, None);
@@ -213,7 +213,7 @@ fn account_options(
                 return Err(NO_REGISTERED_ROOTS.to_string());
             }
             let excluded = nested_exclusions(dir, &roots);
-            let mut scanner_settings = tokscale_core::scanner::ScannerSettings {
+            let mut scanner_settings = syrtis_core::scanner::ScannerSettings {
                 extra_scan_paths: BTreeMap::from([(CLAUDE.to_string(), roots)]),
                 ..Default::default()
             };
@@ -222,7 +222,7 @@ fn account_options(
                     .excluded_scan_paths
                     .insert(CLAUDE.to_string(), excluded);
             }
-            tokscale_core::ReportOptions {
+            syrtis_core::ReportOptions {
                 home_dir: Some(dir.clone()),
                 use_env_roots: false,
                 // Exactly the Claude client. Rooted at `dir`, the engine also
@@ -244,9 +244,9 @@ fn account_options(
 pub(crate) fn account_parse_options(
     context: &crate::LocalSourceContext,
     account: &Account,
-) -> Result<tokscale_core::LocalParseOptions, String> {
+) -> Result<syrtis_core::LocalParseOptions, String> {
     let report = account_options(context, account)?;
-    Ok(tokscale_core::LocalParseOptions {
+    Ok(syrtis_core::LocalParseOptions {
         home_dir: report.home_dir,
         use_env_roots: report.use_env_roots,
         clients: report.clients,
@@ -267,7 +267,7 @@ static LEASES: LazyLock<Mutex<VecDeque<LeaseEntry>>> =
 struct Lease {
     account: Account,
     snapshot: LocalUsageSnapshot,
-    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    pricing: Option<Arc<syrtis_core::pricing::PricingService>>,
     root_generation: u64,
     lease_id: u64,
     price_generation: u64,
@@ -875,7 +875,7 @@ fn account_client_passes(account: &Account, row: &UnifiedMessage) -> bool {
 fn capture(context: &crate::LocalSourceContext, account: &Account) -> Result<Lease, String> {
     let root_generation = crate::root_generation();
     let options = account_parse_options(context, account)?;
-    let resolved = tokscale_core::ResolvedLocalSourceContext::capture(
+    let resolved = syrtis_core::ResolvedLocalSourceContext::capture(
         account
             .as_ref()
             .map(PathBuf::from)
@@ -886,28 +886,28 @@ fn capture(context: &crate::LocalSourceContext, account: &Account) -> Result<Lea
     .map_err(|error| error.to_string())?;
     #[cfg(test)]
     SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
-    let snapshot = tokscale_core::synchronize_local_usage(
+    let snapshot = syrtis_core::synchronize_local_usage(
         &resolved,
         options,
-        tokscale_core::LocalUsageSelection::LocalClients,
+        syrtis_core::LocalUsageSelection::LocalClients,
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("build runtime: {error}"))?;
-    let pricing = runtime.block_on(tokscale_core::capture_local_usage_pricing(&resolved));
+    let pricing = runtime.block_on(syrtis_core::capture_local_usage_pricing(&resolved));
     build_lease(account, snapshot, pricing, root_generation, None)
 }
 
 fn build_lease(
     account: &Account,
     snapshot: LocalUsageSnapshot,
-    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    pricing: Option<Arc<syrtis_core::pricing::PricingService>>,
     root_generation: u64,
     price_generation: Option<u64>,
 ) -> Result<Lease, String> {
     let mut undated_count = 0u32;
-    tokscale_core::visit_local_usage_snapshot(
+    syrtis_core::visit_local_usage_snapshot(
         &snapshot,
         LocalUsageQuery {
             until_ms: Some(1),
@@ -959,7 +959,7 @@ fn build_lease(
 pub(crate) fn register_for_scheduler(
     account: &Account,
     snapshot: LocalUsageSnapshot,
-    pricing: Option<Arc<tokscale_core::pricing::PricingService>>,
+    pricing: Option<Arc<syrtis_core::pricing::PricingService>>,
     root_generation: u64,
     price_generation: u64,
 ) -> Result<String, String> {
@@ -1186,7 +1186,7 @@ fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String
                 .collect()
         })
         .unwrap_or_default();
-    tokscale_core::visit_priced_local_usage_snapshot(
+    syrtis_core::visit_priced_local_usage_snapshot(
         &lease.snapshot,
         lease.pricing.as_deref(),
         LocalUsageQuery {
@@ -1197,7 +1197,7 @@ fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String
         },
         &|row| account_client_passes(&lease.account, row),
         &mut |row| {
-            let model = tokscale_core::canonical_model_id(&row.model_id);
+            let model = syrtis_core::canonical_model_id(&row.model_id);
             let (state, target) = classify(&request.attribution, row, &model);
             let t = &row.tokens;
             let full = row_sum(&[t.input, t.output, t.cache_read, t.cache_write, t.reasoning]);
@@ -1352,7 +1352,7 @@ fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String
     )?;
     let model_catalog = if request.include_model_catalog {
         let mut catalog = BTreeSet::new();
-        tokscale_core::visit_local_usage_snapshot(
+        syrtis_core::visit_local_usage_snapshot(
             &lease.snapshot,
             LocalUsageQuery {
                 hydrate_opencode_aliases: false,
@@ -1360,7 +1360,7 @@ fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String
             },
             &|row| account_client_passes(&lease.account, row),
             &mut |row| {
-                catalog.insert(tokscale_core::canonical_model_id(&row.model_id));
+                catalog.insert(syrtis_core::canonical_model_id(&row.model_id));
             },
         )?;
         Some(catalog.into_iter().collect())

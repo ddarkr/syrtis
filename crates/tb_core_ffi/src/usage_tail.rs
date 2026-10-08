@@ -20,7 +20,7 @@ pub struct TraceBucket {
 }
 
 struct TailSnapshot {
-    snapshot: tokscale_core::LocalUsageSnapshot,
+    snapshot: syrtis_core::LocalUsageSnapshot,
     registry_generation: u64,
     cutoff: i64,
 }
@@ -41,18 +41,18 @@ impl UsageTailer {
         self.tick_with_options(crate::LocalSourceContext::current().parse_options(None, None))
     }
 
-    fn tick_with_options(&self, options: tokscale_core::LocalParseOptions) -> Result<(), String> {
+    fn tick_with_options(&self, options: syrtis_core::LocalParseOptions) -> Result<(), String> {
         let registry_generation = crate::root_generation();
-        let context = tokscale_core::ResolvedLocalSourceContext::capture(
+        let context = syrtis_core::ResolvedLocalSourceContext::capture(
             options.home_dir.as_ref().map(PathBuf::from),
             options.use_env_roots,
             options.scanner_settings.clone(),
         )
         .map_err(|_| "live usage source context unavailable".to_string())?;
-        let snapshot = tokscale_core::synchronize_local_usage(
+        let snapshot = syrtis_core::synchronize_local_usage(
             &context,
             options,
-            tokscale_core::LocalUsageSelection::LocalClients,
+            syrtis_core::LocalUsageSelection::LocalClients,
         )?;
         let mut current = self.snapshot.lock();
         if registry_generation != crate::root_generation() {
@@ -68,7 +68,7 @@ impl UsageTailer {
 
     fn with_snapshot<T>(
         &self,
-        query: impl FnOnce(&tokscale_core::LocalUsageSnapshot, i64) -> Result<T, String>,
+        query: impl FnOnce(&syrtis_core::LocalUsageSnapshot, i64) -> Result<T, String>,
     ) -> Result<T, String> {
         let current = self.snapshot.lock();
         let current = current.as_ref().ok_or("live usage snapshot unavailable")?;
@@ -110,18 +110,18 @@ impl UsageTailer {
 }
 
 fn visit_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
     cutoff: i64,
     window_secs: i64,
     now: i64,
-    sink: &mut impl FnMut(&tokscale_core::UnifiedMessage),
+    sink: &mut impl FnMut(&syrtis_core::UnifiedMessage),
 ) -> Result<(), String> {
     let cutoff = now
         .saturating_sub(window_secs.saturating_mul(1000))
         .max(cutoff);
-    tokscale_core::visit_local_usage_snapshot(
+    syrtis_core::visit_local_usage_snapshot(
         snapshot,
-        tokscale_core::LocalUsageQuery {
+        syrtis_core::LocalUsageQuery {
             from_ms: Some(cutoff),
             chronological: true,
             hydrate_opencode_aliases: false,
@@ -133,7 +133,7 @@ fn visit_snapshot(
 }
 
 pub(crate) fn rate_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
     cutoff: i64,
     window_secs: i64,
     now: i64,
@@ -149,7 +149,7 @@ pub(crate) fn rate_from_snapshot(
 }
 
 pub(crate) fn trace_from_snapshot(
-    snapshot: &tokscale_core::LocalUsageSnapshot,
+    snapshot: &syrtis_core::LocalUsageSnapshot,
     cutoff: i64,
     window_secs: i64,
     now: i64,
@@ -187,7 +187,7 @@ pub(crate) fn trace_from_snapshot(
     Ok(out)
 }
 
-fn event_total(message: &tokscale_core::UnifiedMessage) -> i64 {
+fn event_total(message: &syrtis_core::UnifiedMessage) -> i64 {
     let tokens = &message.tokens;
     tokens
         .input
@@ -246,7 +246,7 @@ mod tests {
                 "tokens":{"input":input,"output":19,"reasoning":23,"cache":{"read":29,"write":31}}
             }).to_string()).unwrap();
         }
-        let options = tokscale_core::LocalParseOptions {
+        let options = syrtis_core::LocalParseOptions {
             home_dir: Some(home.path().to_string_lossy().into_owned()),
             clients: Some(vec!["opencode".to_string()]),
             ..Default::default()

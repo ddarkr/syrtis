@@ -1590,7 +1590,7 @@ enum SelfTest {
             "provider-split model fold omits unrecomputable throughput")
 
         // Implausible self-reported cost. A client that records its own cost
-        // (OpenCode, MiMo Code) has it taken verbatim by tokscale-core and
+        // (OpenCode, MiMo Code) has it taken verbatim by syrtis-core and
         // never priced, so this comparison against the local estimate is the
         // only thing between a unit error upstream and the number on screen.
         func costEntry(_ cost: Double, _ estimate: Double?, provider: String = "p") -> String {

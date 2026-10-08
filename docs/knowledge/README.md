@@ -12,7 +12,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 
 ## 文件目的
 
-這份索引是 Syrtis 的 canonical project knowledge entry point。它把架構、工作流程、驗證、shared tokscale engine、發版、溝通、目前狀態與歷史決策分開保存，讓人類維護者與不同 coding client 都能從同一份 project-owned source 接手。
+這份索引是 Syrtis 的 canonical project knowledge entry point。它把架構、工作流程、驗證、Syrtis-owned Rust engine、永久使用量、發版、溝通、目前狀態與歷史決策分開保存，讓人類維護者與不同 coding client 都能從同一份 project-owned source 接手。
 
 公開 contributor 從 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) 進入；該文件負責 onboarding、穩定 guardrail 與任務路由，技術與流程事實仍由本 knowledge tree 擁有。
 
@@ -38,7 +38,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 | 測試、fixture、cache、跨語言契約 | [`verification.md`](verification.md) | [`architecture.md`](architecture.md) |
 | 效能／正確性 before-after 量測、對拍 oracle | [`measurement.md`](measurement.md) | [`history/dashboard-load-performance.md`](history/dashboard-load-performance.md) |
 | Provider quota pace／historical calculation | [`plans/provider-quota-pace.md`](plans/provider-quota-pace.md) | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md)、[`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
-| tokscale engine change 或 consumer pin | [`vendor-tokscale.md`](vendor-tokscale.md) | [`vendor/README.md`](../../vendor/README.md) |
+| Syrtis engine、永久使用量或 upstream-derived parser | [`architecture.md`](architecture.md) | [`vendor-tokscale.md`](vendor-tokscale.md)、[`verification.md`](verification.md) |
 | Sparkle、appcast、Homebrew、Pages | [`release.md`](release.md) | [`workflow.md`](workflow.md) |
 | 維護期優先順序 | [`current-state.md`](current-state.md) | [`history/README.md`](history/README.md) |
 | 歷史根因或已 parked 調查 | [`history/README.md`](history/README.md) | 對應的 history 文件 |
@@ -52,6 +52,7 @@ AGENTS.md
 CLAUDE.md
 CONTRIBUTING.md
 vendor/AGENTS.md
+crates/syrtis_core/AGENTS.md
 landing/AGENTS.md
 docs/knowledge/
 ├── README.md
@@ -85,8 +86,9 @@ docs/knowledge/
 
 | Source | Authority |
 |---|---|
-| Pinned [`tokscale-core/UPSTREAM.md`](../../vendor/tokscale-core/UPSTREAM.md) | Exact shared-engine upstream baseline, selected changes, reports, and local-patch ledger; publication state is recorded in `vendor/README.md` |
-| `vendor/README.md` | Syrtis's shared-engine repository and reviewed consumer pin |
+| [`crates/syrtis_core`](../../crates/syrtis_core) | Syrtis-owned parsing, durable usage, source synchronization, pricing, and report implementation |
+| Inherited [`UPSTREAM.md`](../../crates/syrtis_core/UPSTREAM.md) | Historical upstream baseline, selected adaptations, and patch provenance; not an engine pin or publication gate |
+| `vendor/README.md` | Historical shared-engine dependency and the source ownership cutover |
 | `.github/workflows/*.yml` | Runtime CI, Pages, release, and install-count gates |
 | `Makefile` | Local build order and stale Rust static-library relink guard |
 | `Package.swift` | SwiftPM targets and linker contract |

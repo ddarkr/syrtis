@@ -1,0 +1,934 @@
+//! Pi (badlogic/pi-mono) session parser
+//!
+//! Parses JSONL files from `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`. Oh My
+//! Pi's `~/.omp/agent/sessions` root belongs to the `omp` client
+//! (`sessions::omp`), which parses it with this same parser. Current
+//! OMP builds write a `title` metadata record before the `session` header in
+//! newly-created session files; see [`PRE_SESSION_METADATA_TYPES`].
+
+use super::utils::file_modified_timestamp_ms;
+use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use crate::provider_identity::inferred_provider_from_model;
+use crate::TokenBreakdown;
+use serde::Deserialize;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+/// Pi session header (first line of JSONL)
+#[derive(Debug, Deserialize)]
+pub struct PiSessionHeader {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub id: String,
+    #[allow(dead_code)]
+    pub timestamp: Option<String>,
+    #[allow(dead_code)]
+    pub cwd: Option<String>,
+}
+
+/// Loose type-only probe for a JSONL line, used to identify pre-session
+/// metadata records without requiring their full schema.
+#[derive(Debug, Deserialize)]
+struct PiEntryTypeProbe {
+    #[serde(rename = "type")]
+    entry_type: String,
+}
+
+/// Record types OMP may write before the `session` header (e.g. an
+/// auto-generated-title record). The parser skips these while looking for
+/// `session` rather than discarding the whole file. Any other unrecognized
+/// type before `session` is still treated as a malformed file.
+const PRE_SESSION_METADATA_TYPES: &[&str] = &["title"];
+
+/// Pi session entry (subsequent lines of JSONL)
+#[derive(Debug, Deserialize)]
+pub struct PiSessionEntry {
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    #[allow(dead_code)]
+    pub id: Option<String>,
+    #[serde(rename = "parentId")]
+    #[allow(dead_code)]
+    pub parent_id: Option<String>,
+    pub timestamp: Option<String>,
+    pub message: Option<PiMessage>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PiMessage {
+    pub role: Option<String>,
+    pub usage: Option<PiUsage>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    #[serde(rename = "responseId")]
+    pub response_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiUsage {
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_read: Option<i64>,
+    pub cache_write: Option<i64>,
+    #[allow(dead_code)]
+    pub total_tokens: Option<i64>,
+}
+
+fn is_generated_id(value: &str) -> bool {
+    (value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || (value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }))
+}
+
+fn strip_generated_id(value: &str) -> Option<&str> {
+    for id_len in [36, 8] {
+        if value.len() <= id_len || value.as_bytes()[value.len() - id_len - 1] != b'-' {
+            continue;
+        }
+        let id = &value[value.len() - id_len..];
+        if is_generated_id(id) {
+            return Some(&value[..value.len() - id_len - 1]);
+        }
+    }
+    None
+}
+
+fn pi_subagent_name(session_name: &str) -> Option<String> {
+    let name = session_name.strip_prefix("subagent-")?;
+    let without_id = strip_generated_id(name).or_else(|| {
+        let (without_index, index) = name.rsplit_once('-')?;
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        strip_generated_id(without_index)
+    })?;
+
+    (!without_id.is_empty()).then(|| without_id.to_string())
+}
+
+/// How a Pi-format parser keys messages for the lanes' first-wins dedup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PiDedup {
+    /// Session-independent keys (`{client}:response:…` / `{client}:message:…`):
+    /// Pi-family branch/fork copies a parent's assistant records verbatim
+    /// into a new session file (upstream #1306), so a session-scoped key
+    /// would count every copy once per file.
+    CrossSession,
+    /// `{client}:{session_id}:{entry_id}`, as upstream keys Kimchi
+    /// (`parse_pi_format_file_with_dedup`).
+    SessionScoped,
+}
+
+/// Parse a Pi JSONL session file
+pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
+    parse_pi_format_file(path, "pi", PiDedup::CrossSession)
+}
+
+/// Parse a JSONL session file written in the Pi record format.
+///
+/// `client` is stamped on every message, namespaces its dedup key, and is the
+/// provider of last resort when the message names none and the model is not
+/// recognizable. Pi uses it as `pi`; Kimchi as `kimchi` (`sessions::kimchi`).
+pub(crate) fn parse_pi_format_file(
+    path: &Path,
+    client: &str,
+    dedup: PiDedup,
+) -> Vec<UnifiedMessage> {
+    let file = match super::utils::open_source_file(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let fallback_timestamp = file_modified_timestamp_ms(path);
+
+    let reader = BufReader::new(file);
+    let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
+    let mut buffer = Vec::with_capacity(4096);
+
+    let mut session_id: Option<String> = None;
+    let mut workspace_key: Option<String> = None;
+    let mut workspace_label: Option<String> = None;
+    let mut agent: Option<String> = None;
+    for (line_index, line) in reader.lines().enumerate() {
+        // An invalid-UTF-8 line costs only itself: `Lines` has consumed its
+        // bytes, so the next call reads the following record (upstream #1095).
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        // A UTF-8 BOM decodes cleanly, so it survives as U+FEFF glued to the
+        // front of the first record, where `str::trim` leaves it (U+FEFF is not
+        // White_Space) and the header then fails to parse — which discards the
+        // whole transcript. Strip it on the file's first physical line only;
+        // anywhere else it stays an ordinary malformed record (upstream #1134).
+        let line = if line_index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        } else {
+            &line
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if session_id.is_none() {
+            buffer.clear();
+            buffer.extend_from_slice(trimmed.as_bytes());
+            let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut buffer) {
+                Ok(probe) => probe.entry_type,
+                Err(_) => return Vec::new(),
+            };
+
+            if entry_type != "session" {
+                if PRE_SESSION_METADATA_TYPES.contains(&entry_type.as_str()) {
+                    continue;
+                }
+                return Vec::new();
+            }
+
+            buffer.clear();
+            buffer.extend_from_slice(trimmed.as_bytes());
+            let header = match simd_json::from_slice::<PiSessionHeader>(&mut buffer) {
+                Ok(h) => h,
+                Err(_) => return Vec::new(),
+            };
+
+            session_id = Some(header.id);
+            workspace_key = header.cwd.as_deref().and_then(normalize_workspace_key);
+            workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+            continue;
+        }
+
+        buffer.clear();
+        buffer.extend_from_slice(trimmed.as_bytes());
+        let entry = match simd_json::from_slice::<PiSessionEntry>(&mut buffer) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entry.entry_type == "session_info" {
+            agent = entry.name.as_deref().and_then(pi_subagent_name);
+            continue;
+        }
+
+        if entry.entry_type != "message" {
+            continue;
+        }
+
+        let message = match entry.message {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if message.role.as_deref() != Some("assistant") {
+            continue;
+        }
+
+        let usage = match message.usage {
+            Some(u) => u,
+            None => continue,
+        };
+
+        let model = match message.model {
+            Some(m) => m,
+            None => continue,
+        };
+
+        // A missing/blank provider field is recoverable: infer it from the
+        // model name (e.g. a Pi "gpt-5" message with no provider maps to
+        // "openai"), falling back to "pi" only when inference can't
+        // identify the model, rather than dropping a message that carries
+        // valid tokens.
+        let provider = match message.provider {
+            Some(p) if !p.is_empty() => p,
+            _ => inferred_provider_from_model(&model)
+                .map(str::to_string)
+                .unwrap_or_else(|| client.to_string()),
+        };
+
+        let recorded_timestamp = entry
+            .timestamp
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+            .map(|dt| dt.timestamp_millis());
+        let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
+
+        let mut unified = UnifiedMessage::new_with_agent(
+            client,
+            model,
+            provider,
+            session_id.clone().unwrap_or_else(|| "unknown".to_string()),
+            timestamp,
+            TokenBreakdown {
+                input: usage.input.unwrap_or(0).max(0),
+                output: usage.output.unwrap_or(0).max(0),
+                cache_read: usage.cache_read.unwrap_or(0).max(0),
+                cache_write: usage.cache_write.unwrap_or(0).max(0),
+                reasoning: 0,
+                cache_write_1h: 0,
+            },
+            0.0,
+            agent.clone(),
+        );
+        // Cross-session dedup key (upstream #1323, issue #1306). A Pi
+        // branch/fork writes a new session file and copies the parent's
+        // assistant records into it verbatim - same `responseId`, entry id and
+        // usage - so a key scoped to the session would count every copied
+        // record once per file. `responseId` is preferred; the entry id plus
+        // the immutable event fields is the fallback. The lanes in `lib.rs`
+        // drop repeats first-wins in scan order.
+        //
+        // Local deviation from upstream: the response key also carries the
+        // provider. `responseId` is issued by each provider, so two providers
+        // can hand out the same id, and first-wins would then drop a real
+        // message. A fork copy keeps its provider, so copies still collapse.
+        let response_key = message
+            .response_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("{client}:response:{}:{id}", unified.provider_id));
+        unified.dedup_key = match dedup {
+            PiDedup::SessionScoped => entry
+                .id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| format!("{client}:{}:{id}", unified.session_id)),
+            // Cross-session (Pi): see the comment on `response_key` above.
+            PiDedup::CrossSession => response_key.or_else(|| {
+                entry
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| {
+                        let stable_timestamp = recorded_timestamp
+                            .map(|timestamp| timestamp.to_string())
+                            .unwrap_or_else(|| "missing".to_string());
+                        format!(
+                            "{client}:message:{id}:{stable_timestamp}:{}:{}:{}:{}:{}:{}",
+                            unified.provider_id,
+                            unified.model_id,
+                            unified.tokens.input,
+                            unified.tokens.output,
+                            unified.tokens.cache_read,
+                            unified.tokens.cache_write,
+                        )
+                    })
+            }),
+        };
+        unified.set_workspace(workspace_key.clone(), workspace_label.clone());
+        messages.push(unified);
+    }
+
+    messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn create_test_file(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn test_parse_pi_jsonl_valid_assistant_message() {
+        // given
+        let content = r#"{"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"msg_001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "pi");
+        assert_eq!(messages[0].session_id, "pi_ses_001");
+        assert_eq!(messages[0].model_id, "claude-3-5-sonnet");
+        assert_eq!(messages[0].provider_id, "anthropic");
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert_eq!(messages[0].tokens.cache_read, 10);
+        assert_eq!(messages[0].tokens.cache_write, 5);
+        assert_eq!(messages[0].workspace_key, Some("/tmp".to_string()));
+        assert_eq!(messages[0].workspace_label, Some("tmp".to_string()));
+    }
+
+    #[test]
+    fn utf8_bom_before_the_header_keeps_the_transcript() {
+        // Ported from upstream #1134. Without the strip, the header fails to
+        // parse and the whole transcript is dropped.
+        let file = create_test_file(concat!(
+            "\u{feff}",
+            r#"{"type":"session","id":"session-with-bom","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-with-bom");
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn a_marker_after_the_first_record_still_costs_only_its_own_record() {
+        // Ported from upstream #1134: the strip is scoped to the first line.
+        let file = create_test_file(concat!(
+            r#"{"type":"session","id":"session-clean","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n\u{feff}",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":1,"output":1}}}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-2","timestamp":"2026-08-08T00:00:02.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-clean");
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn invalid_utf8_record_costs_only_itself() {
+        // Upstream #1095's claim for Pi's strict reader: an undecodable record
+        // must not truncate the valid records after it. The control is the
+        // same transcript with the damaged record removed.
+        let header = br#"{"type":"session","id":"session-bytes","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#;
+        let damaged = b"{\"type\":\"message\",\"id\":\"damaged\xff\xfe\"}";
+        let record = |id: &str, input: i64| {
+            format!(
+                r#"{{"type":"message","id":"{id}","timestamp":"2026-08-08T00:00:01.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{{"input":{input},"output":1}}}}}}"#
+            )
+        };
+        let write = |with_damage: bool| {
+            let mut bytes = header.to_vec();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(record("before", 10).as_bytes());
+            bytes.push(b'\n');
+            if with_damage {
+                bytes.extend_from_slice(damaged);
+                bytes.push(b'\n');
+            }
+            bytes.extend_from_slice(record("after", 20).as_bytes());
+            bytes.push(b'\n');
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            file
+        };
+
+        let control = parse_pi_file(write(false).path());
+        let damaged = parse_pi_file(write(true).path());
+
+        assert_eq!(control.len(), 2);
+        assert_eq!(damaged.len(), control.len());
+        assert_eq!(
+            damaged.iter().map(|m| m.tokens.input).collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+    }
+
+    #[test]
+    fn test_parse_pi_infers_provider_from_model_when_absent() {
+        // A missing provider must be inferred from the model name (gpt-5 ->
+        // openai), not hardcoded to the client name.
+        let content = r#"{"type":"session","id":"pi_ses_005","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"msg_001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5");
+        assert_eq!(messages[0].provider_id, "openai");
+    }
+
+    #[test]
+    fn test_parse_pi_infers_provider_from_model_when_blank() {
+        let content = r#"{"type":"session","id":"pi_ses_006","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"msg_001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"gpt-5","provider":"","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].provider_id, "openai");
+    }
+
+    #[test]
+    fn test_parse_pi_falls_back_to_pi_when_provider_unrecoverable() {
+        let content = r#"{"type":"session","id":"pi_ses_007","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"msg_001","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"totally-unrecognized-model-xyz","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].provider_id, "pi");
+    }
+
+    #[test]
+    fn test_parse_pi_subagent_session_name_as_agent() {
+        let content = r#"{"type":"session","id":"pi_subagent_001","timestamp":"2026-07-10T00:00:00.000Z","cwd":"/tmp"}
+{"type":"session_info","id":"info_001","parentId":null,"timestamp":"2026-07-10T00:00:00.100Z","name":"subagent-go-reviewer-e2e7405c-cb84-4f0a-a6da-9d987494d130-1"}
+{"type":"message","id":"msg_001","parentId":"info_001","timestamp":"2026-07-10T00:00:01.000Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].agent.as_deref(), Some("go-reviewer"));
+        assert_eq!(
+            pi_subagent_name("subagent-context-builder-208242ce-1").as_deref(),
+            Some("context-builder")
+        );
+        assert_eq!(pi_subagent_name("Refactor auth module"), None);
+    }
+
+    #[test]
+    fn test_parse_pi_skips_non_assistant_messages() {
+        // given
+        let content = r#"{"type":"session","id":"pi_ses_002","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pi_skips_missing_usage() {
+        // given
+        let content = r#"{"type":"session","id":"pi_ses_003","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic"}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pi_skips_malformed_json_lines() {
+        // given
+        let content = r#"{"type":"session","id":"pi_ses_004","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+not valid json
+{"type":"message","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"gpt-4o-mini","provider":"openai","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-4o-mini");
+        assert_eq!(messages[0].provider_id, "openai");
+    }
+
+    /// #760 regression: a message carrying valid tokens but NO provider field is
+    /// recovered (provider inferred from the model, falling back to "pi") instead
+    /// of being dropped. The pre-#760 parser did `None => continue`, silently
+    /// discarding the spend.
+    #[test]
+    fn test_parse_pi_missing_provider_recovered_not_dropped() {
+        // Model "m" yields no inferred provider, so the parser falls back to
+        // "pi" and keeps the message rather than discarding its tokens.
+        let content = r#"{"type":"session","id":"pi_ses_np","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
+{"type":"message","id":"msg_np","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"m","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "missing provider must be recovered, not dropped"
+        );
+        assert_eq!(messages[0].provider_id, "pi");
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+    }
+
+    #[test]
+    fn test_parse_pi_skips_leading_title_record() {
+        // given: current OMP builds write a `title` metadata record before
+        // `session` (tokscale#802) — the parser must skip it, not discard
+        // the whole file.
+        let content = r#"{"type":"title","v":1,"title":"Comment on GitHub issue","source":"auto","updatedAt":"2026-07-02T18:08:49.723Z"}
+{"type":"session","id":"pi_ses_005","timestamp":"2026-07-02T18:07:14.690Z","cwd":"/tmp"}
+{"type":"message","timestamp":"2026-07-02T18:08:53.229Z","message":{"role":"assistant","model":"claude-sonnet-5","provider":"anthropic","usage":{"input":2,"output":180,"cacheRead":0,"cacheWrite":70844,"totalTokens":71026}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "pi_ses_005");
+        assert_eq!(messages[0].model_id, "claude-sonnet-5");
+        assert_eq!(messages[0].provider_id, "anthropic");
+        assert_eq!(messages[0].tokens.input, 2);
+        assert_eq!(messages[0].tokens.output, 180);
+        assert_eq!(messages[0].tokens.cache_write, 70844);
+    }
+
+    #[test]
+    fn test_parse_pi_skips_multiple_leading_title_records() {
+        // given: defensive against more than one pre-session metadata line
+        // in a row (e.g. a title record rewritten by a later auto-rename).
+        let content = r#"{"type":"title","v":1,"title":"first"}
+{"type":"title","v":1,"title":"renamed"}
+{"type":"session","id":"pi_ses_006","timestamp":"2026-07-02T18:07:14.690Z","cwd":"/tmp"}
+{"type":"message","timestamp":"2026-07-02T18:08:53.229Z","message":{"role":"assistant","model":"gpt-4o-mini","provider":"openai","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "pi_ses_006");
+    }
+
+    #[test]
+    fn test_parse_pi_rejects_unknown_leading_record_type() {
+        // given: an unrecognized type before `session` is still treated as
+        // a malformed file rather than silently scanned through.
+        let content = r#"{"type":"totally_unknown_thing","foo":"bar"}
+{"type":"session","id":"pi_ses_007","timestamp":"2026-07-02T18:07:14.690Z","cwd":"/tmp"}
+{"type":"message","timestamp":"2026-07-02T18:08:53.229Z","message":{"role":"assistant","model":"gpt-4o-mini","provider":"openai","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert!(messages.is_empty());
+    }
+
+    // Ported from upstream #1323.
+
+    /// The record shape from the token-monitor synthetic repro
+    /// (Javis603/token-monitor#627, tokscale#1306): a Pi branch copies the
+    /// parent's assistant entries into a new session file verbatim —
+    /// same `message.responseId`, same entry id, same usage — and only the
+    /// session header differs.
+    fn fork_fixture(session_id: &str, extra_message: Option<&str>) -> String {
+        let copied = format!(
+            r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session_id}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}}}}"#
+        );
+        let mut lines = vec![
+            format!(
+                r#"{{"type":"session","id":"{session_id}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ),
+            copied,
+        ];
+        if let Some(message) = extra_message {
+            lines.push(message.to_string());
+        }
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn fork_copies_across_session_files_share_a_response_level_key() {
+        let parent = create_test_file(&fork_fixture("session-demo-1", None));
+        let child = create_test_file(&fork_fixture("session-demo-2", None));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 1);
+        // Session-independent identity: the key must not embed the session id.
+        let parent_key = parent_messages[0].dedup_key.as_deref().unwrap();
+        let child_key = child_messages[0].dedup_key.as_deref().unwrap();
+        assert_eq!(parent_key, child_key);
+        assert_eq!(parent_key, "pi:response:openai-codex:resp-demo-fork");
+    }
+
+    #[test]
+    fn fork_copy_plus_new_turns_only_the_prefix_collapses() {
+        // given: the child file copies the parent's record and then continues
+        // with a genuinely new response. Only the copied prefix must share a
+        // key; the new turn must survive.
+        let new_turn = r#"{"type":"message","id":"entry-child-new","parentId":"session-demo-2","timestamp":"2026-09-06T12:01:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-child-new","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":10}}}"#;
+        let parent = create_test_file(&fork_fixture("session-demo-1", None));
+        let child = create_test_file(&fork_fixture("session-demo-2", Some(new_turn)));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 2);
+        let child_keys: Vec<&str> = child_messages
+            .iter()
+            .map(|message| message.dedup_key.as_deref().unwrap())
+            .collect();
+        assert_eq!(child_keys[0], "pi:response:openai-codex:resp-demo-fork");
+        assert_eq!(
+            child_keys[1],
+            "pi:response:openai-codex:resp-demo-child-new"
+        );
+        assert!(child_keys[1] != child_keys[0]);
+    }
+
+    #[test]
+    fn different_response_ids_stay_separate_even_with_identical_content() {
+        // given: two genuinely separate calls with the same usage but
+        // different response ids must not merge (regenerate/retry case).
+        let file = create_test_file(concat!(
+            r#"{"type":"session","id":"session-demo-1","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}"#,
+            "\n",
+            r#"{"type":"message","id":"entry-a","parentId":"session-demo-1","timestamp":"2026-09-06T12:00:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-A","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#,
+            "\n",
+            r#"{"type":"message","id":"entry-b","parentId":"session-demo-1","timestamp":"2026-09-06T12:00:01.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-B","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+    }
+
+    #[test]
+    fn missing_response_id_falls_back_to_entry_identity_across_files() {
+        // given: no responseId, but the fork preserves the entry id and the
+        // immutable event fields — those form the fallback key, and it must
+        // still be session-independent.
+        let record = r#"{"type":"message","id":"entry-no-resp","parentId":"SESSION","timestamp":"2026-09-06T12:00:00.000Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","usage":{"input":100,"output":20,"cacheRead":300,"cacheWrite":0,"totalTokens":420}}}"#;
+        let make = |session: &str| {
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ) + "\n"
+                + &record.replace("SESSION", session)
+                + "\n"
+        };
+        let parent = create_test_file(&make("session-a"));
+        let child = create_test_file(&make("session-b"));
+
+        let parent_messages = parse_pi_file(parent.path());
+        let child_messages = parse_pi_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 1);
+        let parent_key = parent_messages[0].dedup_key.as_deref().unwrap();
+        let child_key = child_messages[0].dedup_key.as_deref().unwrap();
+        assert_eq!(parent_key, child_key);
+        assert!(parent_key.starts_with("pi:message:entry-no-resp:"));
+    }
+
+    #[test]
+    fn same_response_id_from_different_providers_stays_separate() {
+        // `responseId` is provider-issued; two providers can return the same
+        // id for unrelated messages, which must not collapse into one.
+        let make = |session: &str, provider: &str| {
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-{provider}","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"{provider}","model":"gpt-6-astra","responseId":"resp-shared","usage":{{"input":100,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":120}}}}}}"#
+                )
+                + "\n"
+        };
+        let a = create_test_file(&make("session-a", "openai"));
+        let b = create_test_file(&make("session-b", "openrouter"));
+
+        let key_a = parse_pi_file(a.path())[0].dedup_key.clone().unwrap();
+        let key_b = parse_pi_file(b.path())[0].dedup_key.clone().unwrap();
+        assert_ne!(key_a, key_b);
+    }
+
+    /// Pi's emitted messages, every field except the local-timezone `date`,
+    /// captured before `parse_pi_file`
+    /// was generalized into `parse_pi_format_file` for the Pi-family clients.
+    /// The refactor must leave Pi's output byte-identical.
+    const PI_OUTPUT_SNAPSHOT: &str = r##"[
+    UnifiedMessage {
+        client: "pi",
+        model_id: "claude-sonnet-4-5",
+        provider_id: "anthropic",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585602000,
+        tokens: TokenBreakdown {
+            input: 100,
+            output: 20,
+            cache_read: 30,
+            cache_write: 5,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:response:anthropic:resp_1",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+        input_tokens_are_cache_split: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "gpt-5",
+        provider_id: "openai",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585603000,
+        tokens: TokenBreakdown {
+            input: 10,
+            output: 2,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:message:m2:1785585603000:openai:gpt-5:10:2:0:0",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+        input_tokens_are_cache_split: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "mystery-model",
+        provider_id: "pi",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785585604000,
+        tokens: TokenBreakdown {
+            input: 0,
+            output: 7,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: None,
+        dedup_aliases: [],
+        is_turn_start: false,
+        input_tokens_are_cache_split: false,
+    },
+    UnifiedMessage {
+        client: "pi",
+        model_id: "gpt-5",
+        provider_id: "openai",
+        session_id: "pi_ses_snap",
+        workspace_key: Some(
+            "/tmp/snap-project",
+        ),
+        workspace_label: Some(
+            "snap-project",
+        ),
+        timestamp: 1785600000000,
+        tokens: TokenBreakdown {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        cost: 0.0,
+        cost_source: Unknown,
+        duration_ms: None,
+        message_count: 1,
+        agent: Some(
+            "reviewer",
+        ),
+        dedup_key: Some(
+            "pi:message:m4:missing:openai:gpt-5:1:1:0:0",
+        ),
+        dedup_aliases: [],
+        is_turn_start: false,
+        input_tokens_are_cache_split: false,
+    },
+]"##;
+
+    #[test]
+    fn pi_output_is_unchanged_by_the_pi_family_refactor() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"\xef\xbb\xbf").unwrap();
+        for line in [
+            r#"{"type":"title","title":"t"}"#,
+            r#"{"type":"session","id":"pi_ses_snap","timestamp":"2026-08-01T12:00:00.000Z","cwd":"/tmp/snap-project"}"#,
+            r#"{"type":"session_info","name":"subagent-reviewer-1a2b3c4d"}"#,
+            r#"{"type":"message","id":"u1","timestamp":"2026-08-01T12:00:01.000Z","message":{"role":"user"}}"#,
+            r#"{"type":"message","id":"m1","timestamp":"2026-08-01T12:00:02.000Z","message":{"role":"assistant","model":"claude-sonnet-4-5","provider":"anthropic","responseId":"resp_1","usage":{"input":100,"output":20,"cacheRead":30,"cacheWrite":5,"totalTokens":155}}}"#,
+            r#"{"type":"message","id":"m2","timestamp":"2026-08-01T12:00:03.000Z","message":{"role":"assistant","model":"gpt-5","usage":{"input":10,"output":2}}}"#,
+            r#"{"type":"message","timestamp":"2026-08-01T12:00:04.000Z","message":{"role":"assistant","model":"mystery-model","provider":"","usage":{"input":-3,"output":7}}}"#,
+            r#"{"type":"message","id":"m4","timestamp":"not-a-time","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":1,"output":1}}}"#,
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        // The record without a parseable timestamp falls back to the file's
+        // mtime, so pin it.
+        file.as_file()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_785_600_000))
+            .unwrap();
+
+        // `date` is derived from `timestamp` in the local timezone; drop it so
+        // the snapshot holds in every timezone (`timestamp` is still compared).
+        let actual = format!("{:#?}", parse_pi_file(file.path()))
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("date: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(actual, PI_OUTPUT_SNAPSHOT, "Pi output changed:\n{actual}");
+    }
+}

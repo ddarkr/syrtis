@@ -2,9 +2,8 @@
 # Major versions are ignored here and upgraded deliberately, one at a time;
 # they change behaviour (for example actions/checkout 6 → 7).
 #
-# Not covered on purpose: the vendor/tokscale-core submodule. The engine pin
-# is moved by hand (it is shared with Syrtis-Windows and its cross-check
-# oracle), never by a bot.
+# The engine is owned source under crates/syrtis_core and covered by the
+# cargo group above like every other workspace crate.
 version: 2
 updates:
   - package-ecosystem: github-actions
