@@ -26,7 +26,8 @@ pub(crate) type Account = Option<String>;
 const CLAUDE: &str = "claude";
 #[cfg(test)]
 static SCAN_COUNT: AtomicUsize = AtomicUsize::new(0);
-
+#[cfg(test)]
+static CATALOG_SCANS: AtomicUsize = AtomicUsize::new(0);
 /// The scan roots the extra config directory `dir` owns, taken from the
 /// registry the scanner actually walks rather than re-derived here.
 ///
@@ -258,6 +259,8 @@ pub(crate) fn account_parse_options(
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEASES: usize = 32;
 const MAX_LEASE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CATALOG_MODELS: usize = 1024;
+const MAX_CATALOG_BYTES: usize = 64 * 1024;
 const EXPIRED: &str = "Quota usage snapshot expired; request a new snapshot.";
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 type LeaseEntry = (String, Arc<Lease>);
@@ -273,6 +276,11 @@ struct Lease {
     price_generation: u64,
     undated_count: u32,
     bytes: usize,
+    /// Whole-history model catalog pinned to this lease's exact snapshot and
+    /// account. `None` means not yet computed; `Some` (including empty) is the
+    /// admitted result. Failures are never stored. Time-dependent folds stay
+    /// live on every request; only this window-independent set is reused.
+    catalog: Mutex<Option<Arc<Vec<String>>>>,
 }
 
 #[derive(Deserialize)]
@@ -951,6 +959,7 @@ fn build_lease(
         price_generation,
         undated_count,
         bytes,
+        catalog: Mutex::new(None),
     })
 }
 
@@ -982,12 +991,28 @@ pub(crate) fn is_live(token: &str) -> bool {
         .any(|(key, lease)| key == token && lease.root_generation == crate::root_generation())
 }
 
-// Count the captured catalog once per distinct service; its lazy lookup cache
-// can grow during reads, so admission re-measures after every use.
+// &Vec, not a slice: capacity is part of the retained byte count.
+fn catalog_bytes(catalog: &Vec<String>) -> usize {
+    catalog.iter().fold(
+        std::mem::size_of::<Vec<String>>().saturating_add(
+            catalog
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        ),
+        |bytes, model| bytes.saturating_add(model.capacity()),
+    )
+}
+
 fn retained_bytes(leases: &VecDeque<(String, Arc<Lease>)>) -> usize {
     let mut bytes = 0usize;
     for (index, (_, lease)) in leases.iter().enumerate() {
         bytes = bytes.saturating_add(lease.bytes);
+        if let Some(catalog) = lease.catalog.lock().as_ref() {
+            bytes = bytes.saturating_add(catalog_bytes(catalog));
+        }
+        // Count the captured pricing catalog once per distinct service; its
+        // lazy lookup cache can grow during reads, so admission re-measures
+        // after every use.
         if let Some(pricing) = &lease.pricing {
             if !leases.iter().take(index).any(|(_, prior)| {
                 prior
@@ -1083,8 +1108,20 @@ fn retain_lease(token: &str, lease: &Arc<Lease>, is_new: bool) -> Result<(), Str
     } else if !leases.iter().any(|(key, _)| key == token) {
         return Err(EXPIRED.into());
     }
+    // The model catalog is an optional cache on top of an admissible lease: the
+    // pricing lookup cache can grow after admission, and a previously fitting
+    // catalog can then tip an otherwise admissible lease over the registry
+    // bound. Drop this lease's catalog first and re-measure rather than
+    // clearing the lease or failing a good query. Base/pricing hard limits
+    // above are unchanged. Lock order is LEASES then catalog; fold never takes
+    // LEASES, so no inversion, and no provider/source callback runs here.
+    if retained_bytes(&leases) > MAX_LEASE_BYTES && lease.catalog.lock().is_some() {
+        *lease.catalog.lock() = None;
+    }
     while leases.len() > MAX_LEASES || retained_bytes(&leases) > MAX_LEASE_BYTES {
         if leases.len() == 1 {
+            // Base/pricing alone still exceeds the bound: the catalog drop above
+            // already excluded the optional cache as the cause.
             leases.clear();
             return Err("quota snapshot metadata exceeds byte limit".into());
         }
@@ -1351,19 +1388,45 @@ fn fold(request: &Request, lease: &Lease, token: String) -> Result<Batch, String
         },
     )?;
     let model_catalog = if request.include_model_catalog {
-        let mut catalog = BTreeSet::new();
-        syrtis_core::visit_local_usage_snapshot(
-            &lease.snapshot,
-            LocalUsageQuery {
-                hydrate_opencode_aliases: false,
-                ..Default::default()
-            },
-            &|row| account_client_passes(&lease.account, row),
-            &mut |row| {
-                catalog.insert(syrtis_core::canonical_model_id(&row.model_id));
-            },
-        )?;
-        Some(catalog.into_iter().collect())
+        let cached = lease.catalog.lock().clone();
+        if let Some(cached) = cached {
+            Some(cached.as_ref().clone())
+        } else {
+            // Whole-history traversal, independent of moving windows, scopes and
+            // prices, so one admission per lease serves every later request on
+            // the same token. Time-dependent folds above stay live every time.
+            // ponytail: oversized catalogs answer complete but stay uncached, so a
+            // huge model set traverses again next time instead of pinning RAM.
+            let mut models = BTreeSet::new();
+            syrtis_core::visit_local_usage_snapshot(
+                &lease.snapshot,
+                LocalUsageQuery {
+                    hydrate_opencode_aliases: false,
+                    ..Default::default()
+                },
+                &|row| account_client_passes(&lease.account, row),
+                &mut |row| {
+                    models.insert(syrtis_core::canonical_model_id(&row.model_id));
+                },
+            )?;
+            let catalog: Vec<String> = models.into_iter().collect();
+            // Empty is a result, not a miss: an account with no rows answers
+            // once. Failures return above and are never stored.
+            #[cfg(test)]
+            CATALOG_SCANS.fetch_add(1, Ordering::Relaxed);
+            if catalog.len() <= MAX_CATALOG_MODELS && catalog_bytes(&catalog) <= MAX_CATALOG_BYTES {
+                // Never turn a good uncached answer into a new admission failure:
+                // a near-limit lease answers complete and stays uncached.
+                let admitted = lease
+                    .bytes
+                    .saturating_add(catalog_bytes(&catalog))
+                    .saturating_add(lease.pricing.as_ref().map_or(0, |p| p.retained_bytes()));
+                if admitted <= MAX_LEASE_BYTES {
+                    *lease.catalog.lock() = Some(Arc::new(catalog.clone()));
+                }
+            }
+            Some(catalog)
+        }
     } else {
         None
     };

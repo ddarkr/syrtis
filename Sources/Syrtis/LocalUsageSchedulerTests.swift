@@ -753,6 +753,157 @@ extension LocalUsageScheduler {
                "source verification does not resurrect a collapsed model consumer")
         visibleModel.releaseLocalDemand()
         modelScheduler.stop()
+        // Demand coverage: contraction keeps installed coverage, reexpansion reuses.
+        let coverageClock = Clock()
+        let coverageSource = SchedulerFixtureSource()
+        let coverageScheduler = LocalUsageScheduler(
+            source: coverageSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { coverageClock.monotonic }, wallNow: { coverageClock.wall })
+        let coverageSession = coverageScheduler.openSession()
+        let overviewGraph = Query(kind: "graph", year: "2026")
+        let hourlyClaude = Query(kind: "hourly", year: "2026", clients: ["claude"])
+        let recentRate = Query(kind: "rate")
+        var hourlyPublications = 0
+        var initialRate = -1.0
+        await coverageSource.appendRecentEvent(
+            at: Int64(coverageClock.wall.timeIntervalSince1970 * 1000) - 59_500)
+        coverageScheduler.update(coverageSession, queries: [overviewGraph, hourlyClaude, recentRate], active: true) { query, result in
+            if query == hourlyClaude, case .success = result { hourlyPublications += 1 }
+            if query == recentRate, case .success(.rate(let value)) = result { initialRate = value }
+        }
+        await coverageScheduler.runDueWork()
+        expect(hourlyPublications == 1 && initialRate == 120, "union demand publishes hourly once and a live rate")
+        let unionSyncs = coverageScheduler.syncCount
+        let unionQueries = coverageScheduler.queryCount
+        // Contract to Overview alone: installed coverage still holds.
+        coverageScheduler.update(coverageSession, queries: [overviewGraph], active: true) { _, _ in }
+        coverageClock.advance(1)
+        await coverageScheduler.runDueWork()
+        expect(coverageScheduler.syncCount == unionSyncs && coverageScheduler.queryCount == unionQueries,
+               "contracted demand stays covered without native recollect or refold")
+        // Reexpand reports: the retained hourly replays without recollect/refold.
+        let reexpandBase = hourlyPublications
+        coverageScheduler.update(coverageSession, queries: [overviewGraph, hourlyClaude], active: true) { query, result in
+            if query == hourlyClaude, case .success = result { hourlyPublications += 1 }
+        }
+        expect(hourlyPublications == reexpandBase + 1, "reexpansion replays the retained hourly synchronously")
+        await coverageScheduler.runDueWork()
+        expect(coverageScheduler.syncCount == unionSyncs && coverageScheduler.queryCount == unionQueries
+               && hourlyPublications == reexpandBase + 1,
+               "report reexpansion reuses the installed capture without recollect or refold")
+        // Recency invariant: the dropped recent was evicted dormant, so
+        // re-adding it refolds exactly once from coverage without recollecting.
+        var ratePublications = 0
+        var lastRate = -1.0
+        let refoldBase = hourlyPublications
+        coverageScheduler.update(coverageSession, queries: [overviewGraph, hourlyClaude, recentRate], active: true) { query, result in
+            if query == hourlyClaude, case .success = result { hourlyPublications += 1 }
+            if query == recentRate, case .success(.rate(let value)) = result { ratePublications += 1; lastRate = value }
+        }
+        expect(hourlyPublications == refoldBase + 1 && ratePublications == 0,
+               "covered hourly replays synchronously while the evicted recent leaves no dormant replay")
+        await coverageScheduler.runDueWork()
+        expect(ratePublications == 1 && lastRate == 0 && coverageScheduler.syncCount == unionSyncs
+               && coverageScheduler.queryCount == unionQueries + 1,
+               "re-added recent refolds the expired zero from installed coverage without resync")
+        // Forced post-request verification stays authoritative despite coverage.
+        let forcedHourly = Task { try await coverageScheduler.acquire(hourlyClaude, session: coverageSession, force: true) }
+        while coverageScheduler.pendingAcquisitions == 0 { await Task.yield() }
+        await coverageScheduler.runDueWork()
+        let coverageForcedValue = try? await forcedHourly.value
+        let forceHistory = await coverageSource.history()
+        expect(coverageForcedValue != nil && coverageScheduler.syncCount == unionSyncs + 1 && forceHistory.0.last?.force == true,
+               "forced waiter recollects despite installed coverage")
+        // Dirty hints stay authoritative despite coverage.
+        coverageScheduler.sourcesChanged(requiresTopology: false)
+        coverageClock.advance(1)
+        await coverageScheduler.runDueWork()
+        expect(coverageScheduler.syncCount == unionSyncs + 2, "dirty hint reverifies despite installed coverage")
+        // A new source generation refolds covered demand.
+        await coverageSource.appendRecentEvent(at: Int64(coverageClock.wall.timeIntervalSince1970 * 1000))
+        coverageScheduler.sourcesChanged(requiresTopology: false)
+        coverageClock.advance(1)
+        let beforeGenerationQueries = coverageScheduler.queryCount
+        await coverageScheduler.runDueWork()
+        expect(coverageScheduler.syncCount == unionSyncs + 3 && coverageScheduler.queryCount > beforeGenerationQueries,
+               "new generation recollects and refolds covered demand")
+        // The next normally due sync carries current demand only.
+        coverageScheduler.update(coverageSession, queries: [overviewGraph, hourlyClaude], active: true) { _, _ in }
+        coverageClock.advance(30)
+        await coverageScheduler.runDueWork()
+        let dueScopes = (await coverageSource.history()).0.last?.scopes.map(\.id).sorted()
+        expect(dueScopes == [overviewGraph.scope.id, hourlyClaude.scope.id].sorted(),
+               "normally due sync reverifies current demand only, dropping dormant scopes")
+        // The contracted sync evicted the recent scope, so reexpansion must
+        // recollect; covered graph and hourly keep identities and skip refold
+        // while only the evicted recent refolds.
+        let beforeEvictedRefold = hourlyPublications
+        let beforeReexpandSyncs = coverageScheduler.syncCount
+        let beforeReexpandQueries = coverageScheduler.queryCount
+        var evictedRate = 0
+        var evictedLastRate = -1.0
+        coverageScheduler.update(coverageSession, queries: [overviewGraph, hourlyClaude, recentRate], active: true) { query, result in
+            if query == hourlyClaude, case .success = result { hourlyPublications += 1 }
+            if query == recentRate, case .success(.rate(let value)) = result { evictedRate += 1; evictedLastRate = value }
+        }
+        await coverageScheduler.runDueWork()
+        expect(coverageScheduler.syncCount == beforeReexpandSyncs + 1
+               && coverageScheduler.queryCount == beforeReexpandQueries + 1
+               && hourlyPublications == beforeEvictedRefold
+               && evictedRate == 1 && evictedLastRate == 120,
+               "reexpansion past a contracted sync recollects once and refolds the live recent")
+        // Dormant retention is bounded: only the smallest 32 survive eviction.
+        let capSource = SchedulerFixtureSource()
+        let capClock = Clock()
+        let capScheduler = LocalUsageScheduler(
+            source: capSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { capClock.monotonic }, wallNow: { capClock.wall })
+        let capSession = capScheduler.openSession()
+        let capGraph = Query(kind: "graph", year: "2026")
+        let capHourlies = (0..<40).map { Query(kind: "hourly", year: "2026", clients: ["c\($0)"]) }
+        var capPublished: Set<Query> = []
+        capScheduler.update(capSession, queries: Set([capGraph] + capHourlies), active: true) { query, result in
+            if case .success = result { capPublished.insert(query) }
+        }
+        await capScheduler.runDueWork()
+        expect(capPublished.count == 41, "wide union publishes every lens once")
+        capScheduler.update(capSession, queries: [capGraph], active: true) { _, _ in }
+        capClock.advance(1)
+        await capScheduler.runDueWork()
+        let beforeCapSyncs = capScheduler.syncCount
+        let beforeCapQueries = capScheduler.queryCount
+        capPublished.removeAll()
+        capScheduler.update(capSession, queries: Set([capGraph] + capHourlies), active: true) { query, result in
+            if case .success = result { capPublished.insert(query) }
+        }
+        await capScheduler.runDueWork()
+        expect(capPublished.count == 41, "bounded retention still republishes every lens")
+        expect(capScheduler.syncCount == beforeCapSyncs
+               && capScheduler.queryCount == beforeCapQueries + (capHourlies.count - 32),
+               "dormant retention evicts past its bound without recollecting")
+        // Owner replacement publishes fresh; final close frees everything.
+        coverageScheduler.release(coverageSession)
+        let replacementSession = coverageScheduler.openSession()
+        var replacementGraphs = 0
+        coverageScheduler.update(replacementSession, queries: [overviewGraph], active: true) { query, result in
+            if query == overviewGraph, case .success = result { replacementGraphs += 1 }
+        }
+        await coverageScheduler.runDueWork()
+        expect(replacementGraphs == 1, "replacement owner publishes its fresh capture")
+        let coverageLiveToken = (await coverageSource.history()).1.last?.leaseToken ?? ""
+        let beforeCloseSyncs = coverageScheduler.syncCount
+        let beforeCloseQueries = coverageScheduler.queryCount
+        coverageScheduler.release(replacementSession)
+        if !coverageLiveToken.isEmpty {
+            while !(await coverageSource.history()).2.contains(coverageLiveToken) { await Task.yield() }
+        }
+        coverageClock.advance(1000)
+        await coverageScheduler.runDueWork()
+        expect(replacementGraphs == 1 && coverageScheduler.syncCount == beforeCloseSyncs
+               && coverageScheduler.queryCount == beforeCloseQueries,
+               "final close releases leases and stays quiescent")
+        coverageScheduler.stop()
+        capScheduler.stop()
         LocalSourceHints.selfTest(expect)
     }
 }

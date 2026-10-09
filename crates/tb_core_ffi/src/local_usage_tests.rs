@@ -121,6 +121,32 @@ mod tests {
             38
         );
         assert_eq!(query_at(token, "claude", "agents", now)["totalMessages"], 1);
+        // Same ordinary lease, impossible year: downstream year filtering must
+        // hide the fixture rows on every lane instead of leaking the cached
+        // unfiltered fold. Fixture timestamp is `now - 30s`, so year 1900 is
+        // empty for all four lanes.
+        let empty_year = "1900";
+        let empty_graph = data(ffi(
+            &json!({"leaseToken":token,"scopeId":"all","kind":"graph","year":empty_year,"nowMs":now}),
+            crate::tb_local_usage_query,
+        ));
+        assert_eq!(empty_graph["summary"]["totalTokens"], 0);
+        let empty_models = data(ffi(
+            &json!({"leaseToken":token,"scopeId":"all","kind":"models","year":empty_year,"nowMs":now}),
+            crate::tb_local_usage_query,
+        ));
+        assert_eq!(empty_models["totalMessages"], 0);
+        let empty_hourly = data(ffi(
+            &json!({"leaseToken":token,"scopeId":"claude","kind":"hourly","year":empty_year,"nowMs":now}),
+            crate::tb_local_usage_query,
+        ));
+        assert_eq!(empty_hourly["entries"], json!([]));
+        let empty_agents = data(ffi(
+            &json!({"leaseToken":token,"scopeId":"claude","kind":"agents","year":empty_year,"nowMs":now}),
+            crate::tb_local_usage_query,
+        ));
+        assert_eq!(empty_agents["totalMessages"], 0);
+        assert_eq!(empty_agents["entries"], json!([]));
         assert_eq!(query_at(token, "live", "rate", now), 38.0);
         assert_eq!(query_at(token, "live", "trace", now)[0]["tokens"], 38);
         assert_eq!(

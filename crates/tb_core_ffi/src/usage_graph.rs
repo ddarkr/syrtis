@@ -119,7 +119,9 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let graph = runtime.block_on(syrtis_core::generate_local_graph_report(options))?;
+    // Lean app graph: identical mapped wire payload (mapping already drops
+    // `time_metrics`/`active_time_ms`), no sessionize fold.
+    let graph = runtime.block_on(syrtis_core::lean_local_graph_report(options))?;
 
     let payload = map_graph(graph);
     serde_json::to_value(payload).map_err(|e| format!("serialize usage graph: {}", e))
@@ -130,7 +132,7 @@ pub(crate) fn run_from_snapshot(
     options: syrtis_core::ReportOptions,
     pricing: Option<&syrtis_core::pricing::PricingService>,
 ) -> Result<crate::EncodedLocalPayload, String> {
-    let result = syrtis_core::generate_local_graph_from_snapshot(
+    let result = syrtis_core::lean_local_graph_from_snapshot(
         snapshot,
         options,
         pricing,

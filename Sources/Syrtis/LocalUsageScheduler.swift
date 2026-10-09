@@ -380,7 +380,10 @@ final class LocalUsageScheduler {
     }
     private var needsSync: Bool {
         let now = monotonicNow()
-        return !scopes.isEmpty && (sync == nil || syncedScopes != scopes
+        // Coverage, not equality: a contracted subset still covered by the
+        // installed scopes needs no native recollect. Expansion still syncs;
+        // force, interval, topology, pricing, and dirty hints stay authoritative.
+        return !scopes.isEmpty && (sync == nil || !scopes.isSubset(of: syncedScopes)
             || forceVerified < forceRequested || now - lastCheck >= checkInterval
             || now - lastFull >= fullVerificationInterval || now - lastTopology >= 300
             || needsPricing
@@ -394,9 +397,41 @@ final class LocalUsageScheduler {
         waiting.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
         pruneResults(); kick()
     }
+    // Dormant report retention: non-recent results stay only while their scope
+    // remains installed, identity still matches the live capture, and demand is
+    // non-empty. Recents are never retained dormant (they expire by clock).
+    // Sorted truncation bounds RAM; final close clears everything.
+    // ponytail: fixed 32-entry dormant cap, raise only with measured lens churn.
+    private static let maxDormantResults = 32
     private func pruneResults() {
         refreshDemand()
-        results = results.filter { demandedQueries.contains($0.key) }
+        // Fast path: every held result is still demanded, so there is nothing
+        // to drop and no dormant candidate to consider. Demanded entries stay
+        // regardless of identity; staleness refolds on the query path.
+        if results.allSatisfy({ demandedQueries.contains($0.key) }) { return }
+        var kept: [Query: Cached] = [:]
+        kept.reserveCapacity(results.count)
+        for (query, cached) in results where demandedQueries.contains(query) { kept[query] = cached }
+        if !scopes.isEmpty, sync != nil {
+            var dormant: [(Query, Cached)] = []
+            dormant.reserveCapacity(results.count)
+            for (query, cached) in results where !demandedQueries.contains(query) {
+                guard !query.isRecent, syncedScopes.contains(query.scope),
+                      cached.identity == identity(query) else { continue }
+                dormant.append((query, cached))
+            }
+            // Order only decides which entries survive the bound; at or under
+            // the cap every candidate is kept, so sorting cannot affect output.
+            if dormant.count > Self.maxDormantResults {
+                dormant.sort {
+                    if $0.0.scope.id != $1.0.scope.id { return $0.0.scope.id < $1.0.scope.id }
+                    if $0.0.kind != $1.0.kind { return $0.0.kind < $1.0.kind }
+                    return ($0.0.year ?? "") < ($1.0.year ?? "")
+                }
+            }
+            for (query, cached) in dormant.prefix(Self.maxDormantResults) { kept[query] = cached }
+        }
+        results = kept
     }
     /// Owner IDs demanding one query. Captured before the await; late
     /// completions intersect current IDs so a close plus reopen (fresh

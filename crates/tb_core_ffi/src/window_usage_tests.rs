@@ -816,6 +816,7 @@ mod tests {
                 price_generation: 7,
                 undated_count,
                 bytes,
+                catalog: Mutex::new(None),
             },
         )
     }
@@ -1179,6 +1180,7 @@ mod tests {
             price_generation: 8,
             undated_count: old.undated_count,
             bytes: old.bytes,
+            catalog: Mutex::new(None),
         };
         let shared = Lease {
             account: None,
@@ -1189,6 +1191,7 @@ mod tests {
             price_generation: 7,
             undated_count: old.undated_count,
             bytes: old.bytes,
+            catalog: Mutex::new(None),
         };
         let old_bytes = old.bytes;
         {
@@ -1245,6 +1248,7 @@ mod tests {
             price_generation: 0,
             undated_count: 0,
             bytes: large.bytes,
+            catalog: Mutex::new(None),
         };
         {
             let mut leases = LEASES.lock();
@@ -1341,6 +1345,324 @@ mod tests {
         );
         assert_eq!(SCAN_COUNT.load(Ordering::Relaxed), before);
         assert!(LEASES.lock().is_empty());
+        reset_registries();
+    }
+
+    fn catalog_request(account: &Account, token: &str, from_ms: i64, until_ms: i64) -> Value {
+        serde_json::json!({"accountKey":account,"fromMs":from_ms,"untilMs":until_ms,
+            "snapshotToken":token,"includeModelCatalog":true,
+            "diagnostics":{"intervals":[{"id":"all","fromMs":from_ms,"untilMs":until_ms,
+                "includeFrom":true,"includeUntil":false}],"buckets":[]}})
+    }
+
+    fn catalog_of(payload: &Value) -> Vec<String> {
+        payload["modelCatalog"]
+            .as_array()
+            .expect("model catalog lane")
+            .iter()
+            .map(|model| model.as_str().expect("model id").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn catalog_is_pinned_per_token_while_moving_windows_stay_live() {
+        let _guards = lock_registries();
+        reset_registries();
+        let (_dir, lease) = disk_fixture(&[
+            sqlite_row("a", 1000, "fixture-a", "openai", [10, 0, 0, 0, 0], 0.0),
+            sqlite_row("b", 2000, "fixture-b", "openai", [20, 0, 0, 0, 0], 0.0),
+        ]);
+        let mut expected = [
+            syrtis_core::canonical_model_id("fixture-a"),
+            syrtis_core::canonical_model_id("fixture-b"),
+        ];
+        expected.sort();
+        CATALOG_SCANS.store(0, Ordering::Relaxed);
+        LEASES.lock().push_back(("catalog".into(), Arc::new(lease)));
+        let context = crate::LocalSourceContext::for_home(std::path::PathBuf::from("/nonexistent"));
+        let first = query(&context, &catalog_request(&PRIMARY, "catalog", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&first), expected);
+        assert_eq!(
+            first["diagnostics"]["intervals"][0]["unassigned"]["tokens"],
+            10
+        );
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), 1);
+        // Moving bounds reuse the pinned catalog but refold live time windows.
+        let second = query(&context, &catalog_request(&PRIMARY, "catalog", 1000, 3001)).unwrap();
+        assert_eq!(catalog_of(&second), expected);
+        assert_eq!(
+            second["diagnostics"]["intervals"][0]["unassigned"]["tokens"],
+            30
+        );
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), 1);
+        // Declaration changes also refold live while the catalog stays pinned.
+        let mut excluded = catalog_request(&PRIMARY, "catalog", 1000, 3001);
+        excluded["attribution"] =
+            serde_json::json!([{"client":"opencode","provider":"openai","state":"excluded"}]);
+        let third = query(&context, &excluded).unwrap();
+        assert_eq!(catalog_of(&third), expected);
+        assert_eq!(
+            third["diagnostics"]["intervals"][0]["excluded"]["tokens"],
+            30
+        );
+        assert_eq!(
+            third["diagnostics"]["intervals"][0]["unassigned"]["tokens"],
+            0
+        );
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), 1);
+        assert!(retained_bytes(&LEASES.lock()) <= MAX_LEASE_BYTES);
+        reset_registries();
+    }
+
+    #[test]
+    fn catalog_does_not_survive_snapshot_model_or_account_change() {
+        let _guards = lock_registries();
+        reset_registries();
+        let (_old_dir, old) = disk_fixture(&[sqlite_row(
+            "a",
+            1000,
+            "fixture-a",
+            "openai",
+            [10, 0, 0, 0, 0],
+            0.0,
+        )]);
+        let (_new_dir, new) = disk_fixture(&[sqlite_row(
+            "b",
+            1000,
+            "fixture-b",
+            "openai",
+            [10, 0, 0, 0, 0],
+            0.0,
+        )]);
+        CATALOG_SCANS.store(0, Ordering::Relaxed);
+        {
+            let mut leases = LEASES.lock();
+            leases.push_back(("old-cat".into(), Arc::new(old)));
+            leases.push_back(("new-cat".into(), Arc::new(new)));
+        }
+        let context = crate::LocalSourceContext::for_home(std::path::PathBuf::from("/nonexistent"));
+        let old_answer =
+            query(&context, &catalog_request(&PRIMARY, "old-cat", 1000, 2000)).unwrap();
+        let new_answer =
+            query(&context, &catalog_request(&PRIMARY, "new-cat", 1000, 2000)).unwrap();
+        assert_eq!(
+            catalog_of(&old_answer),
+            [syrtis_core::canonical_model_id("fixture-a")]
+        );
+        assert_eq!(
+            catalog_of(&new_answer),
+            [syrtis_core::canonical_model_id("fixture-b")]
+        );
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), 2);
+        // A new snapshot never refreshes the old token's pinned catalog.
+        let again = query(&context, &catalog_request(&PRIMARY, "old-cat", 1000, 2000)).unwrap();
+        assert_eq!(
+            catalog_of(&again),
+            [syrtis_core::canonical_model_id("fixture-a")]
+        );
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), 2);
+        let other = Some("elsewhere".to_string());
+        assert!(
+            query(&context, &catalog_request(&other, "old-cat", 1000, 2000)).is_err(),
+            "catalog must not cross accounts"
+        );
+        reset_registries();
+    }
+
+    #[test]
+    fn empty_catalog_is_cached_and_oversized_catalogs_answer_without_retention() {
+        let _guards = lock_registries();
+        reset_registries();
+        let (_dir, lease) = disk_fixture(&[]);
+        CATALOG_SCANS.store(0, Ordering::Relaxed);
+        LEASES.lock().push_back(("empty".into(), Arc::new(lease)));
+        let context = crate::LocalSourceContext::for_home(std::path::PathBuf::from("/nonexistent"));
+        let first = query(&context, &catalog_request(&PRIMARY, "empty", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&first), Vec::<String>::new());
+        let second = query(&context, &catalog_request(&PRIMARY, "empty", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&second), Vec::<String>::new());
+        assert_eq!(
+            CATALOG_SCANS.load(Ordering::Relaxed),
+            1,
+            "empty catalog is a result, not a miss"
+        );
+        // An oversized catalog still answers complete, but is never retained:
+        // the next request traverses again instead of pinning RAM.
+        let rows: Vec<Value> = (0..MAX_CATALOG_MODELS + 8)
+            .map(|index| {
+                sqlite_row(
+                    &format!("row{index:05}"),
+                    1000,
+                    &format!("oversize-model-{index:05}"),
+                    "openai",
+                    [1, 0, 0, 0, 0],
+                    0.0,
+                )
+            })
+            .collect();
+        let (_big_dir, big) = disk_fixture(&rows);
+        LEASES.lock().push_back(("big".into(), Arc::new(big)));
+        let scans_before = CATALOG_SCANS.load(Ordering::Relaxed);
+        let big_first = query(&context, &catalog_request(&PRIMARY, "big", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&big_first).len(), MAX_CATALOG_MODELS + 8);
+        assert_eq!(
+            big_first["diagnostics"]["intervals"][0]["unassigned"]["tokens"],
+            1032
+        );
+        let moved = catalog_request(&PRIMARY, "big", 1000, 3001);
+        let big_second = query(&context, &moved).unwrap();
+        assert_eq!(catalog_of(&big_second), catalog_of(&big_first));
+        assert_eq!(big_second["coverage"]["untilMs"], 3001);
+        assert_eq!(
+            CATALOG_SCANS.load(Ordering::Relaxed),
+            scans_before + 2,
+            "oversized catalog answers complete without caching"
+        );
+        assert!(
+            LEASES
+                .lock()
+                .iter()
+                .find(|(key, _)| key == "big")
+                .expect("lease survives uncached catalog")
+                .1
+                .catalog
+                .lock()
+                .is_none(),
+            "oversized catalog is answered, never retained"
+        );
+        assert!(retained_bytes(&LEASES.lock()) <= MAX_LEASE_BYTES);
+        // An expired lease fails without touching the catalog scan.
+        invalidate();
+        assert!(query(&context, &catalog_request(&PRIMARY, "empty", 1000, 2000)).is_err());
+        assert_eq!(CATALOG_SCANS.load(Ordering::Relaxed), scans_before + 2);
+        reset_registries();
+    }
+
+    #[test]
+    fn grown_pricing_cache_discards_optional_catalog_instead_of_failing_admissible_lease() {
+        let _guards = lock_registries();
+        reset_registries();
+        // One priced fixture row with a ~4 KiB model label: cacheable under
+        // the 64 KiB catalog cap, but large enough to matter at the boundary.
+        let model = format!("tight-model-{}", "m".repeat(4096));
+        let (_dir, mut lease) = disk_fixture(&[sqlite_row(
+            "row",
+            1000,
+            &model,
+            "openai",
+            [10, 0, 0, 0, 0],
+            0.0,
+        )]);
+        lease.pricing = Some(fixture_pricing(1.0));
+        let expected = [syrtis_core::canonical_model_id(&model)];
+        // Measure admitted bytes with the identical construction fold uses, so
+        // capacities (not just lens) match the boundary exactly.
+        let mut models = BTreeSet::new();
+        syrtis_core::visit_local_usage_snapshot(
+            &lease.snapshot,
+            LocalUsageQuery {
+                hydrate_opencode_aliases: false,
+                ..Default::default()
+            },
+            &|row| account_client_passes(&lease.account, row),
+            &mut |row| {
+                models.insert(syrtis_core::canonical_model_id(&row.model_id));
+            },
+        )
+        .unwrap();
+        let catalog: Vec<String> = models.into_iter().collect();
+        assert_eq!(catalog, expected);
+        let catalog_size = catalog_bytes(&catalog);
+        assert!(
+            catalog.len() <= MAX_CATALOG_MODELS && catalog_size <= MAX_CATALOG_BYTES,
+            "fixture catalog must be cacheable"
+        );
+        // Prewarm the SAME real fold path while the lease is unregistered and
+        // small, so every window pricing lookup and the catalog traversal run
+        // through their real code before boundary placement. Parses the real
+        // request shape via serde, exactly as query() would.
+        let warm_json = catalog_request(&PRIMARY, "tight", 1000, 2000);
+        let warm: Request = serde_json::from_value(warm_json).unwrap();
+        warm.validate().unwrap();
+        fold(&warm, &lease, "warm".into()).unwrap();
+        let pricing_now = lease.pricing.as_ref().map_or(0, |p| p.retained_bytes());
+        // Place the lease exactly at the boundary: base + catalog fits, so the
+        // first registered query retains the already warmed catalog.
+        lease.bytes = MAX_LEASE_BYTES
+            .saturating_sub(pricing_now)
+            .saturating_sub(catalog_size);
+        LEASES.lock().push_back(("tight".into(), Arc::new(lease)));
+        let context = crate::LocalSourceContext::for_home(std::path::PathBuf::from("/nonexistent"));
+        let first = query(&context, &catalog_request(&PRIMARY, "tight", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&first), expected);
+        assert!(
+            LEASES
+                .lock()
+                .iter()
+                .find(|(key, _)| key == "tight")
+                .expect("lease registered")
+                .1
+                .catalog
+                .lock()
+                .is_some(),
+            "cache PRESENT before pricing growth"
+        );
+        // Grow the shared pricing cache through ONE short distinct public
+        // lookup on the registered lease's own Arc.
+        let pricing = LEASES
+            .lock()
+            .iter()
+            .find(|(key, _)| key == "tight")
+            .expect("lease registered")
+            .1
+            .pricing
+            .clone()
+            .expect("fixture pricing");
+        let before_growth = pricing.retained_bytes();
+        let _ = pricing.calculate_cost_with_provider(
+            "growth-probe-z",
+            None,
+            &syrtis_core::TokenBreakdown::default(),
+        );
+        let growth = pricing.retained_bytes().saturating_sub(before_growth);
+        assert!(growth > 0, "single probe must grow the lookup cache");
+        assert!(
+            growth < catalog_size,
+            "growth must tip only the optional cache over, not the base lease"
+        );
+        // The next query must stay successful with a complete catalog even
+        // though the optional cache no longer fits: the cache is discarded,
+        // never the lease, and the answer is recomputed uncached.
+        let second = query(&context, &catalog_request(&PRIMARY, "tight", 1000, 2000)).unwrap();
+        assert_eq!(catalog_of(&second), expected);
+        assert_eq!(
+            second["diagnostics"]["intervals"][0]["unassigned"]["tokens"],
+            10
+        );
+        assert!(
+            LEASES
+                .lock()
+                .iter()
+                .find(|(key, _)| key == "tight")
+                .expect("lease registered")
+                .1
+                .catalog
+                .lock()
+                .is_none(),
+            "cache ABSENT after growth-triggered discard"
+        );
+        assert!(
+            is_live("tight"),
+            "token stays live after optional cache discard"
+        );
+        // Moving bounds still succeed, recomputed uncached with live folds.
+        let third = query(&context, &catalog_request(&PRIMARY, "tight", 1000, 3001)).unwrap();
+        assert_eq!(catalog_of(&third), expected);
+        assert_eq!(third["coverage"]["untilMs"], 3001);
+        assert!(
+            is_live("tight"),
+            "token stays live after uncached moving-bounds query"
+        );
         reset_registries();
     }
 }

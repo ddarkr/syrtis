@@ -1082,7 +1082,7 @@ fn query_schema(conn: &Connection) -> Result<(), String> {
         DROP TABLE IF EXISTS temp.ocq_deferred_aliases;
         DROP TABLE IF EXISTS temp.ocq_connected;
         CREATE TEMP TABLE ocq_scope(source BLOB PRIMARY KEY,source_order INTEGER,kind INTEGER) WITHOUT ROWID;
-        CREATE TEMP TABLE ocq_rows(id INTEGER PRIMARY KEY,source BLOB,ordinal INTEGER,source_order INTEGER,kind INTEGER,message BLOB,payload BLOB,provider INTEGER,timestamp INTEGER);
+        CREATE TEMP TABLE ocq_rows(id INTEGER PRIMARY KEY,source BLOB,ordinal INTEGER,source_order INTEGER,kind INTEGER,message BLOB,payload BLOB,provider INTEGER,timestamp INTEGER,primary_key TEXT);
         CREATE INDEX ocq_traversal ON ocq_rows(kind DESC,source_order,ordinal);
         CREATE TEMP TABLE ocq_aliases(id INTEGER,key TEXT,timestamp INTEGER,position INTEGER,PRIMARY KEY(id,key)) WITHOUT ROWID;
         CREATE INDEX ocq_alias_identity ON ocq_aliases(key,timestamp,id);
@@ -1099,10 +1099,11 @@ fn query_schema(conn: &Connection) -> Result<(), String> {
 fn prepare_query(conn: &Connection, hydrate_aliases: bool) -> Result<(), String> {
     // Indexed usage facts were derived once at ingestion, not reconstructed by
     // a second native decode pass over unchanged historical rows.
-    sql(conn.execute_batch("INSERT INTO ocq_rows(source,ordinal,source_order,kind,message,payload,provider,timestamp)
-        SELECT m.source,m.ordinal,s.source_order,s.kind,m.message,m.payload,m.provider,m.timestamp
-        FROM oc_messages m JOIN ocq_scope s ON s.source=m.source ORDER BY s.kind DESC,s.source_order,m.ordinal;
-        INSERT INTO ocq_aliases SELECT r.id,m.primary_key,r.timestamp,-1 FROM ocq_rows r JOIN oc_messages m ON m.source=r.source AND m.ordinal=r.ordinal WHERE m.primary_key IS NOT NULL AND m.primary_key!='';
+    // Copy primary identity once; alias setup must not reread wide canonical rows.
+    sql(conn.execute_batch("INSERT INTO ocq_rows(source,ordinal,source_order,kind,message,payload,provider,timestamp,primary_key)
+        SELECT m.source,m.ordinal,s.source_order,s.kind,m.message,m.payload,m.provider,m.timestamp,m.primary_key
+        FROM ocq_scope s CROSS JOIN oc_messages m ON m.source=s.source ORDER BY s.kind DESC,s.source_order,m.ordinal;"))?;
+    sql(conn.execute_batch("INSERT INTO ocq_aliases SELECT id,primary_key,timestamp,-1 FROM ocq_rows WHERE primary_key IS NOT NULL AND primary_key!='';
         INSERT OR IGNORE INTO ocq_aliases SELECT r.id,a.key,r.timestamp,a.position FROM ocq_rows r JOIN oc_aliases a ON a.source=r.source AND a.ordinal=r.ordinal WHERE a.key!='';"))?;
     // Compact queries skip only the hydration mirror. Authority still needs
     // every alias below.
@@ -1816,7 +1817,36 @@ fn hydrate_prepared_aliases(
 
 /// Filter and fold only connection-local owned facts; callbacks may synchronize
 /// newer canonical generations without blocking on this reader.
+/// Batch scratch-only arbitration in a savepoint: one commit for the whole
+/// fold instead of one per row, rolled back on error.
 pub(crate) fn visit_prepared_opencode_snapshot_on<F, S>(
+    transaction: &Connection,
+    mode: OpenCodeSelectionMode,
+    hydrate_aliases: bool,
+    filter: &F,
+    sink: &mut S,
+) -> Result<(), String>
+where
+    F: Fn(&UnifiedMessage) -> bool,
+    S: FnMut(&UnifiedMessage),
+{
+    // Scratch-only savepoint batches arbitration into one commit instead of one
+    // per row, rolled back on error. A savepoint never takes the canonical
+    // write lock, so public callbacks can still publish mid-fold, and
+    // publication (which already holds its own write transaction) never sees
+    // an unconditional begin from shared arbitration.
+    sql(transaction.execute_batch("SAVEPOINT ocq_scratch"))?;
+    let result =
+        visit_prepared_opencode_snapshot_inner(transaction, mode, hydrate_aliases, filter, sink);
+    if result.is_err() {
+        let _ = transaction.execute_batch("ROLLBACK TO SAVEPOINT ocq_scratch; RELEASE ocq_scratch");
+    } else {
+        sql(transaction.execute_batch("RELEASE ocq_scratch"))?;
+    }
+    result
+}
+
+pub(crate) fn visit_prepared_opencode_snapshot_inner<F, S>(
     transaction: &Connection,
     mode: OpenCodeSelectionMode,
     hydrate_aliases: bool,

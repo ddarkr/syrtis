@@ -6,6 +6,11 @@ use bincode::Options;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
+/// Durable Report winner index marker. Version 1 stays LocalClients-only; a
+/// Report generation's own selected Claude/Codex references live under this
+/// version and never borrow LocalClients ownership.
+const REPORT_INDEX_VERSION: i64 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionMode {
     Report,
@@ -105,6 +110,7 @@ pub(crate) struct QueryState {
     pending_mode: std::cell::Cell<SelectionMode>,
     read_pinned: std::cell::Cell<bool>,
     indexed: std::cell::Cell<bool>,
+    report_reused: std::cell::Cell<bool>,
 }
 
 pub(crate) struct IncrementalSource {
@@ -218,6 +224,7 @@ impl QueryState {
             pending_mode: std::cell::Cell::new(SelectionMode::Report),
             read_pinned: std::cell::Cell::new(false),
             indexed: std::cell::Cell::new(false),
+            report_reused: std::cell::Cell::new(false),
         })
     }
     fn read_store_epoch(db: &Connection) -> Result<Option<[u8; 16]>, String> {
@@ -635,6 +642,8 @@ impl QueryState {
             }
             if snapshot.mode == SelectionMode::LocalClients {
                 self.build_local_index(snapshot)?;
+            } else {
+                self.build_report_index_for_publish(snapshot)?;
             }
             // Dynamic origins are recorded by the ingest owner before publish
             // (staged rows visible); completion itself is this COMMIT.
@@ -720,6 +729,7 @@ impl QueryState {
     }
     fn prepare_cache_snapshot(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
         self.indexed.set(false);
+        self.report_reused.set(false);
         self.db
             .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
             .map_err(|e| e.to_string())?;
@@ -736,7 +746,159 @@ impl QueryState {
             &self.db,
             snapshot.generation,
             hydrate_aliases,
-        )
+        )?;
+        // Report-only eligibility: baseline LocalClients applied no client
+        // filtering before arbitration (its select gate reads eligible only
+        // in Report mode), so LocalClients keeps the default eligible=1.
+        if snapshot.mode == SelectionMode::Report {
+            self.set_client_eligibility(&snapshot.clients)?;
+        }
+        crate::for_each_usage_lane(snapshot.mode, &mut |lane, _, simple, _| {
+            self.select_lane(lane, snapshot.mode, simple)
+        })
+    }
+
+    pub(crate) fn take_report_reused(&self) -> bool {
+        self.report_reused.replace(false)
+    }
+
+    /// Exact-generation Report index readiness, including empty winner sets.
+    /// Older stores prepare fully until the next capture builds the index.
+    /// LocalClients ownership is never borrowed.
+    fn report_index_ready(&self, snapshot: &UsageSnapshot) -> Result<bool, String> {
+        if snapshot.mode != SelectionMode::Report
+            || snapshot.modified_after.is_some()
+            || snapshot.selection_ignores_filter
+            || self.indexed.get()
+        {
+            return Ok(false);
+        }
+        let ready: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=?2)",
+                rusqlite::params![snapshot.generation, REPORT_INDEX_VERSION],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(ready)
+    }
+
+    /// Persist this generation's own selected Claude/Codex winner references.
+    /// Runs inside the successful publication transaction, before GC, for
+    /// every eligible Report publication regardless of the prepare flag, so
+    /// ordinary and targeted captures share it with no per-caller wiring.
+    /// Replays only C/C canonical sources (completeness-gated, losers and
+    /// zero-winner sources included), applies snapshot client eligibility
+    /// before arbitration, then selects just those two lanes. SQL-only;
+    /// idempotent on collapsed re-publish; never touches LocalClients rows.
+    fn build_report_index_for_publish(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
+        if snapshot.mode != SelectionMode::Report
+            || snapshot.modified_after.is_some()
+            || snapshot.selection_ignores_filter
+        {
+            return Ok(());
+        }
+        let built: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=?2)",
+                rusqlite::params![snapshot.generation, REPORT_INDEX_VERSION],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if built {
+            return Ok(());
+        }
+        self.db
+            .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
+            .map_err(|error| error.to_string())?;
+        self.replay_report_other_lanes(snapshot, true)?;
+        // The publish scratch holds only Claude/Codex rows, so the grok
+        // cohort fixup has no rows to read; eligibility is the same
+        // client match the fold applies, minus that no-op fixup.
+        self.set_client_eligibility_without_grok(&snapshot.clients)?;
+        self.select_lane("claude", snapshot.mode, false)?;
+        self.select_lane("codex", snapshot.mode, false)?;
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless) SELECT ?1,ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,r.workspace,r.workspace_label,r.model,r.headless FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
+                [snapshot.generation],
+            )
+            .map_err(|error| error.to_string())?;
+        self.db
+            .execute(
+                "INSERT OR IGNORE INTO sq_indexes VALUES(?1,?2)",
+                rusqlite::params![snapshot.generation, REPORT_INDEX_VERSION],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Completeness gate for one side of the lane split, without replaying
+    /// any payloads: every referenced canonical source on this side —
+    /// including duplicate losers and zero-winner sources — must still hold
+    /// its exact row count, else the query errors whole before any callback.
+    fn check_report_side_complete(
+        &self,
+        snapshot: &UsageSnapshot,
+        only_cc: bool,
+    ) -> Result<(), String> {
+        let gate = "SELECT EXISTS(SELECT 1 FROM sq_scope_sources s LEFT JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 AND (v.source_id IS NULL OR v.message_count!=(SELECT COUNT(*) FROM mc_rows r WHERE r.source_id=s.cache_source_id AND r.generation=s.cache_generation)))";
+        let missing: bool = self
+            .db
+            .query_row(gate, params![snapshot.generation, only_cc], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        if missing {
+            return Err("usage snapshot source generation unavailable or incomplete".into());
+        }
+        Ok(())
+    }
+
+    fn replay_report_other_lanes(
+        &self,
+        snapshot: &UsageSnapshot,
+        only_cc: bool,
+    ) -> Result<(), String> {
+        self.check_report_side_complete(snapshot, only_cc)?;
+        let replay = "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
+            SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,r.message,r.digest,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,v.format_version
+            FROM sq_scope_sources s JOIN mc_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal";
+        self.db
+            .execute(replay, params![snapshot.generation, only_cc])
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Copy only this generation's indexed winners into scratch. Completeness
+    /// reuses the same C/C gate as publication (losers and zero-winner
+    /// sources included) without replaying their payloads; the winner-count
+    /// match is additional, and a short copy falls back to full preparation,
+    /// which errors whole on corruption. SQL only; no history-sized Vec.
+    fn replay_report_winners(&self, snapshot: &UsageSnapshot) -> Result<bool, String> {
+        self.check_report_side_complete(snapshot, true)?;
+        let expected: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1 AND lane IN ('claude','codex') AND oc_source IS NULL",
+                [snapshot.generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        self.db
+            .execute("INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format) SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,r.message,r.digest,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,v.format_version FROM sq_decisions d JOIN mc_rows r ON r.source_id=d.cache_source_id AND r.generation=d.cache_generation AND r.ordinal=d.cache_ordinal JOIN mc_versions v ON v.source_id=r.source_id AND v.generation=r.generation JOIN sq_scope_sources s ON s.scope_generation=d.scope_generation AND s.kind IN ('cache','observed','observed-legacy') AND s.lane=d.lane AND s.cache_source_id=r.source_id AND s.cache_generation=r.generation WHERE d.scope_generation=?1 AND d.lane IN ('claude','codex') AND d.oc_source IS NULL ORDER BY d.rank", [snapshot.generation])
+            .map_err(|error| error.to_string())?;
+        let copied: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_rows WHERE lane IN ('claude','codex')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(copied == expected)
     }
 
     fn build_local_index(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
@@ -801,7 +963,35 @@ impl QueryState {
         snapshot: &UsageSnapshot,
         query: UsageQuery,
     ) -> Result<(), String> {
+        self.report_reused.set(false);
         if snapshot.mode != SelectionMode::LocalClients {
+            // Indexed Claude/Codex winners SQL-copy from this generation's
+            // own index; every other lane (including OpenCode) replays and
+            // arbitrates fresh, so the filter-dependent fallback is unchanged.
+            if self.report_index_ready(snapshot)? {
+                self.db
+                    .execute_batch(
+                        "DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;",
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.replay_report_other_lanes(snapshot, false)?;
+                if !self.replay_report_winners(snapshot)? {
+                    self.report_reused.set(false);
+                    return self.prepare_snapshot(snapshot, query.hydrate_opencode_aliases);
+                }
+                crate::usage_store::prepare_opencode_snapshot_on(
+                    &self.db,
+                    snapshot.generation,
+                    query.hydrate_opencode_aliases,
+                )?;
+                // Winners replay in durable rank order, so selection rows keep
+                // the identical traversal order a full prepare would produce.
+                self.db
+                    .execute_batch("INSERT INTO sq_selected(id) SELECT id FROM sq_rows WHERE lane IN ('claude','codex') ORDER BY id;")
+                    .map_err(|error| error.to_string())?;
+                self.report_reused.set(true);
+                return Ok(());
+            }
             return self.prepare_snapshot(snapshot, query.hydrate_opencode_aliases);
         }
         let ready: bool = self
@@ -951,6 +1141,34 @@ impl QueryState {
                 row.get(1).map_err(|error| error.to_string())?,
                 row.get(2).map_err(|error| error.to_string())?,
             )?;
+        }
+        Ok(())
+    }
+
+    fn set_client_eligibility_without_grok(&self, clients: &[String]) -> Result<(), String> {
+        if clients.is_empty() {
+            return Ok(());
+        }
+        let requested: std::collections::HashSet<&str> =
+            clients.iter().map(String::as_str).collect();
+        let mut statement = self
+            .db
+            .prepare_cached("SELECT id,client,model,provider FROM sq_rows")
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: i64 = row.get(0).map_err(|error| error.to_string())?;
+            let client: String = row.get(1).map_err(|error| error.to_string())?;
+            let model: String = row.get(2).map_err(|error| error.to_string())?;
+            let provider: String = row.get(3).map_err(|error| error.to_string())?;
+            let eligible =
+                crate::retain_for_requested_clients(&client, &model, &provider, &requested);
+            self.db
+                .prepare_cached("UPDATE sq_rows SET eligible=?2 WHERE id=?1")
+                .map_err(|error| error.to_string())?
+                .execute(params![id, eligible])
+                .map(|_| ())
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }

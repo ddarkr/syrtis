@@ -1654,6 +1654,25 @@ pub fn generate_local_graph_from_snapshot(
     })
 }
 
+/// Lean snapshot graph for app consumers that drop `time_metrics` and
+/// `active_time_ms` in mapping: same contributions/contract, no time fold.
+pub fn lean_local_graph_from_snapshot(
+    snapshot: &LocalUsageSnapshot,
+    options: ReportOptions,
+    pricing: Option<&pricing::PricingService>,
+    pricing_mode: GraphPricingMode,
+) -> Result<GraphResultWithContract, String> {
+    validate_report_snapshot(snapshot, &resolve_report_clients(&options))?;
+    let pricing = if pricing_mode == GraphPricingMode::LocalOnly {
+        None
+    } else {
+        pricing
+    };
+    lean_graph_report_with_visitor(&options, Instant::now(), pricing_mode, |filter, sink| {
+        drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
+    })
+}
+
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
     get_model_report_inner(None, options).await
 }
@@ -3193,6 +3212,9 @@ where
         return Err("usage query range is reversed".into());
     }
     (|| {
+        // Marker lifetime is owned by preparation (`prepare_query` resets at
+        // entry; `take_report_reused` consumes at dispatch). The fold keeps
+        // eligibility-before-selection and never clears here.
         query.set_client_eligibility(&snapshot.clients)?;
         let mode = snapshot.mode;
         let include_all = snapshot.clients.is_empty();
@@ -3299,12 +3321,18 @@ where
         if let Some(error) = output_error {
             return Err(error);
         }
+        // Exact-generation Report reuse: `prepare_query` SQL-copied this
+        // generation's own indexed winners, so the fold skips only their
+        // repeated arbitration. Every other lane selects fresh here.
+        let reused = query.take_report_reused();
         let mut emit_lane = |lane: &str,
                              client: Option<ClientId>,
                              simple: bool,
                              guarded: bool|
          -> Result<(), String> {
-            query.select_lane(lane, mode, simple)?;
+            if !reused || !matches!(lane, "claude" | "codex") {
+                query.select_lane(lane, mode, simple)?;
+            }
             query.visit_selected_lane(lane, options, &mut |mut message, _, _| {
                 if lane == "grok" && !query.is_indexed() && !query.grok_select(&mut message)? {
                     return Ok(());
@@ -3347,7 +3375,7 @@ where
     })()
 }
 
-fn for_each_usage_lane(
+pub(crate) fn for_each_usage_lane(
     mode: store_query::SelectionMode,
     emit_lane: &mut impl FnMut(&str, Option<ClientId>, bool, bool) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -3533,7 +3561,7 @@ async fn generate_graph_with_loaded_pricing(
     pricing: Option<&pricing::PricingService>,
     pricing_mode: GraphPricingMode,
 ) -> Result<GraphResultWithContract, String> {
-    generate_graph_with_loaded_pricing_inner(None, options, pricing, pricing_mode).await
+    generate_graph_with_loaded_pricing_inner(None, options, pricing, pricing_mode, false).await
 }
 
 async fn generate_graph_with_loaded_pricing_inner(
@@ -3541,6 +3569,7 @@ async fn generate_graph_with_loaded_pricing_inner(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_mode: GraphPricingMode,
+    lean: bool,
 ) -> Result<GraphResultWithContract, String> {
     let start = Instant::now();
     let home_dir = context
@@ -3548,7 +3577,7 @@ async fn generate_graph_with_loaded_pricing_inner(
         .map(Ok)
         .unwrap_or_else(|| get_home_dir_string(&options.home_dir))?;
     let clients = resolve_report_clients(&options);
-    graph_report_with_visitor(&options, start, pricing_mode, |filter, sink| {
+    graph_report_with_visitor_inner(&options, start, pricing_mode, lean, |filter, sink| {
         scan_report_messages(
             context, &home_dir, &clients, &options, pricing, filter, sink,
         )
@@ -3559,6 +3588,34 @@ fn graph_report_with_visitor(
     options: &ReportOptions,
     start: Instant,
     pricing_mode: GraphPricingMode,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+) -> Result<GraphResultWithContract, String> {
+    graph_report_with_visitor_inner(options, start, pricing_mode, false, visit)
+}
+
+/// Lean app graph path: identical wire payload shape with `time_metrics: None`
+/// and unset `active_time_ms`; skips the sessionize fold entirely. Only for
+/// callers whose mapping drops those fields anyway.
+pub(crate) fn lean_graph_report_with_visitor(
+    options: &ReportOptions,
+    start: Instant,
+    pricing_mode: GraphPricingMode,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+) -> Result<GraphResultWithContract, String> {
+    graph_report_with_visitor_inner(options, start, pricing_mode, true, visit)
+}
+
+fn graph_report_with_visitor_inner(
+    options: &ReportOptions,
+    start: Instant,
+    pricing_mode: GraphPricingMode,
+    lean: bool,
     visit: impl FnOnce(
         &dyn Fn(&UnifiedMessage) -> bool,
         &mut dyn FnMut(&UnifiedMessage),
@@ -3592,13 +3649,15 @@ fn graph_report_with_visitor(
     // StreamingAggregator.feed_pre_deduped() bypasses its internal dedup gate
     // since the driver already guarantees uniqueness.
     let mut day_agg = aggregator::StreamingAggregator::new();
-    let mut sess_agg = store_query::DiskTimeFold::new()?;
+    let mut sess_agg = (!lean).then(store_query::DiskTimeFold::new).transpose()?;
     let mut coverage = CostCoverageFold::default();
 
     let mut fold = |message: &UnifiedMessage| {
         coverage.observe(message);
         day_agg.feed_pre_deduped(message);
-        sess_agg.feed(message);
+        if let Some(sess_agg) = sess_agg.as_mut() {
+            sess_agg.feed(message);
+        }
     };
     visit(&msg_filter, &mut fold)?;
 
@@ -3608,15 +3667,24 @@ fn graph_report_with_visitor(
     };
 
     let contributions = day_agg.finalize();
-    let (time_metrics, daily_active_time) = sess_agg.finish(sessionize::DEFAULT_IDLE_GAP_MS)?;
+
+    // Finalize the optional time fold BEFORE capturing elapsed: the full-graph
+    // contract bills sessionize work inside `meta.processing_time_ms`, exactly
+    // like the pre-lean baseline. The lean path skips the fold entirely.
+    let timed = if let Some(sess_agg) = sess_agg {
+        Some(sess_agg.finish(sessionize::DEFAULT_IDLE_GAP_MS)?)
+    } else {
+        None
+    };
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
     let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
-    result.time_metrics = Some(time_metrics);
-
-    for contribution in &mut result.contributions {
-        if let Some(&ms) = daily_active_time.get(&contribution.date) {
-            contribution.active_time_ms = Some(ms);
+    if let Some((time_metrics, daily_active_time)) = timed {
+        result.time_metrics = Some(time_metrics);
+        for contribution in &mut result.contributions {
+            if let Some(&ms) = daily_active_time.get(&contribution.date) {
+                contribution.active_time_ms = Some(ms);
+            }
         }
     }
 
@@ -3710,6 +3778,22 @@ pub async fn generate_local_graph_report_with_contract(
     generate_graph_with_loaded_pricing(options, pricing.as_deref(), GraphPricingMode::BestEffort)
         .await
 }
+/// Lean one-shot app graph: identical mapped wire payload, no sessionize fold.
+pub async fn lean_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
+    let pricing = resolve_graph_pricing(GraphPricingMode::BestEffort, || async {
+        Ok(load_pricing_for_local_parse().await)
+    })
+    .await?;
+    generate_graph_with_loaded_pricing_inner(
+        None,
+        options,
+        pricing.as_deref(),
+        GraphPricingMode::BestEffort,
+        true,
+    )
+    .await
+    .map(GraphResultWithContract::into_graph)
+}
 
 pub async fn generate_local_graph_report_with_source_context(
     context: &ResolvedLocalSourceContext,
@@ -3724,6 +3808,7 @@ pub async fn generate_local_graph_report_with_source_context(
         options,
         pricing.as_deref(),
         GraphPricingMode::BestEffort,
+        false,
     )
     .await
 }
@@ -3746,6 +3831,7 @@ pub async fn generate_local_graph_report_local_only_with_source_context(
         options,
         None,
         GraphPricingMode::LocalOnly,
+        false,
     )
     .await
 }
@@ -15359,7 +15445,22 @@ mod tests {
     /// checkpoints off, so the only copy of the message is in the WAL.
     #[cfg(not(windows))]
     #[test]
+    #[serial_test::serial]
     fn test_modified_after_parses_antigravity_cli_db_only_when_db_or_wal_is_fresh() {
+        // Hermetic durable store: `use_env_roots: false` keeps scan roots under
+        // the explicit home, but the usage dir still binds from ambient env, so
+        // without this a concurrent env-mutating test can relocate or contend
+        // the store mid-ingest (mirrors the adjacent streaming AGY test).
+        // `SYRTIS_USAGE_DIR` has top precedence in `resolve_usage_dir`, so it
+        // stays put under parallel non-serial `HOME`/`TOKSCALE_CONFIG_DIR`
+        // mutators; `#[serial]` excludes the remaining serial mutators.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let usage_dir = cache_home.path().join("usage");
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+            ("SYRTIS_USAGE_DIR", usage_dir.as_os_str()),
+        ]);
         let temp_dir = tempfile::TempDir::new().unwrap();
         let conversations_dir = temp_dir
             .path()
