@@ -221,6 +221,35 @@ The process-attributed physical-write counter medians decreased from 87.9 to 12.
 
 
 
+### Report-query and lens-reuse performance experiment
+
+The ordinary and targeted publishers prepare an exact-generation Report v2 selected-row index before GC. Regression cases cover client eligibility before Claude／Codex arbitration, duplicates across separate source IDs, synthetic-only shared identities, complete zero-winner markers, unchanged publication reuse, old-marker fallback, deleted duplicate losers and corrupt winners. Graph／model／hourly／Agents must agree, while OpenCode predicate changes still recompute fallback authority. TEMP batching retains failure-before-callback and reentrancy; public graph APIs retain session/time metrics.
+
+Quota catalog cases cover moving bounds, distinct accounts and snapshots, empty and oversized catalogs, expired leases and pricing growth near the registry budget. Optional catalog retention cannot truncate a response or introduce a valid-response failure. Scheduler cases cover covered lens switches, scope additions, force and dirty recollection, dormant-result eviction, recent-event expiry, root／price／owner changes, late publication and final-close lease release.
+
+A fresh release C ABI comparison used 120 Claude files／2,880 events and 2,000 OpenCode events, frozen synthetic pricing and isolated source／store roots. Graph／model／hourly／Agents totals were exactly 127,440 tokens／4,880 messages. Repeated graph and quota calls matched the baseline; narrowed quota bounds changed diagnostics without changing the catalog. Normalization removes only volatile timing／generation fields and order-insensitive client lists; token and cost changes remain detectable. A same-key correction increased totals to 127,450; truncation, complete source removal and a new source-free process retained those totals. Superseded and released leases failed closed.
+
+The actual Swift scheduler linked against the fresh Rust static archive, not a replacement source. For the models → graph → models → graph sequence, source-sync count stayed 1 instead of the baseline's 1 → 2, and pure-query count stayed 3 instead of 4 → 6. Forced refresh still performed a new synchronization. The isolated bundled app's graph-only launch probe reached DashboardModel's graph milestone; it did not run provider polling or save a dashboard restart snapshot. This is execution evidence, not visual UI acceptance.
+
+The paired comparison used four old／new pairs in alternating orders, two seconds before each process, and cold plus fresh-process warm stages. Every one of the 16 runs matched the exact normalized baseline oracle. The query bundle is graph first／repeat plus models／hourly／Agents; source synchronization is measured separately. All pairs passed the preregistered limits: at least 20% cold query improvement, no more than 5% warm query regression, and no more than 25% cold peak-RSS regression. Worst cold query improvement was 37.1%; largest cold peak-RSS increase was 7.2%.
+
+| Synthetic metric (median) | Baseline | Optimized |
+|---|---|---|
+| Cold report-query bundle | 413.8 ms | 255.8 ms |
+| Fresh-process warm report-query bundle | 410.3 ms | 260.0 ms |
+| Cold repeated quota fold | 104.6 ms | 55.3 ms |
+| Warm repeated quota fold | 102.0 ms | 56.8 ms |
+| Warm narrowed quota interval | 51.5 ms | 1.1 ms |
+| Cold source synchronization | 504.1 ms | 553.2 ms |
+| Warm source synchronization | 204.5 ms | 211.7 ms |
+| Cold peak RSS | 102.9 MiB | 102.7 MiB |
+| Warm peak RSS | 95.0 MiB | 83.9 MiB |
+
+Cold synchronization pays the once-per-generation Claude／Codex index build; its median increased 9.7%. One optimized cold capture took 2,107.0 ms and remains in the raw results; its cause is not established. The initial variants missed the query threshold, and runtime sampling identified fingerprint-order wide-row reads and a second canonical read for primary identity. Scope-first loading and TEMP identity projection removed that repeated work without changing authority decisions. No raw run or outlier was discarded. These short synthetic measurements do not establish improved initial first paint, production-corpus latency, sustained RAM reduction, GUI／FSEvents behavior or Windows acceptance. Screen-capture and Accessibility permissions were unavailable; actual native model execution is not visual evidence. Diagnostic sources and raw evidence remain outside the public repository.
+
+Final `cargo test --workspace --locked` passed 2,517 top-level cases plus one child-process lock check, with six ignored. Workspace Clippy passed with the existing FFI warnings (15 library／22 test-target); exact task-owned Rust formatting, both `make selftest` and `make selftest-bundled`, isolated bundle signature verification and the knowledge checker (19 self-tests plus repository validation) passed. Rust language-server diagnostics were unavailable, so compiler／Clippy checks provided Rust verification; Swift scheduler diagnostics retained the baseline's three SwiftLint errors and eight warnings, not a clean lint result.
+
+
 ## Local build and UX acceptance
 
 > **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
