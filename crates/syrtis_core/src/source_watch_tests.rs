@@ -566,3 +566,409 @@ fn vfs_probe_does_not_drop_producer_locks() {
     assert!(child.success());
     producer.execute_batch("ROLLBACK").unwrap();
 }
+
+fn changed_paths(value: LocalSourceVerification) -> (Vec<PathBuf>, Arc<LocalSourceWatchManifest>) {
+    match value {
+        LocalSourceVerification::Changed { paths, manifest } => (paths, manifest),
+        _ => panic!("expected Changed plan"),
+    }
+}
+
+#[test]
+fn verify_changes_collects_file_change_with_pre_ingestion_baseline() {
+    let home = TempDir::new().unwrap();
+    let context = context(home.path(), Default::default());
+    let session = context
+        .resolve_client_path(ClientId::Jcode)
+        .unwrap()
+        .join("session_a.json");
+    write(&session, b"{\"a\":1}");
+    let baseline = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    assert!(matches!(
+        baseline.verify_changes().unwrap(),
+        LocalSourceVerification::Unchanged
+    ));
+    // Same size and mtime, different sampled content: metadata alone misses it.
+    let modified = fs::metadata(&session).unwrap().modified().unwrap();
+    fs::write(&session, b"{\"a\":2}").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&session)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(baseline.check_known_sources().unwrap());
+    let (paths, replacement) = changed_paths(baseline.verify_changes().unwrap());
+    assert_eq!(paths, vec![session.clone()]);
+    // Replacement already holds pre-ingestion observations: still clean, and a
+    // late write after the read dirties it for the next check.
+    assert!(!replacement.check_known_sources().unwrap());
+    assert!(matches!(
+        replacement.verify_changes().unwrap(),
+        LocalSourceVerification::Unchanged
+    ));
+    fs::write(&session, b"{\"messages\":[\"late write\"]}").unwrap();
+    assert!(replacement.check_known_sources().unwrap());
+    // The immutable original never advanced past the first change.
+    assert!(baseline.check_known_sources().unwrap());
+}
+
+#[test]
+fn verify_changes_rediscovers_topology_new_delete_replace_and_wal() {
+    let home = TempDir::new().unwrap();
+    let context = context(home.path(), Default::default());
+    let missing = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    // New directory children are periodic-discovery scope, not known-file dirt.
+    fs::create_dir_all(context.resolve_client_path(ClientId::Jcode).unwrap()).unwrap();
+    assert!(matches!(
+        missing.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+    let session = context
+        .resolve_client_path(ClientId::Jcode)
+        .unwrap()
+        .join("session_b.json");
+    write(&session, b"{}");
+    let baseline = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    // Nested new files need explicit topology discovery; metadata alone must
+    // not claim detection, so only known probes participate.
+    fs::write(
+        context
+            .resolve_client_path(ClientId::Jcode)
+            .unwrap()
+            .join("unseen_child.json"),
+        b"{}",
+    )
+    .unwrap();
+    assert!(matches!(
+        baseline.verify_changes().unwrap(),
+        LocalSourceVerification::Unchanged
+    ));
+    fs::remove_file(&session).unwrap();
+    assert!(matches!(
+        baseline.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+    write(&session, b"{}");
+    let restored = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    let old_session = session.with_extension("preserved");
+    fs::rename(&session, &old_session).unwrap();
+    write(&session, b"{ }");
+    assert!(matches!(
+        restored.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+    let database = context.resolve_client_path(ClientId::Zcode).unwrap();
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let producer = Connection::open(&database).unwrap();
+    producer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE usage(value INTEGER); INSERT INTO usage VALUES(1);").unwrap();
+    let watched = capture_local_source_watch_manifest(&context, &options("zcode")).unwrap();
+    producer.execute("INSERT INTO usage VALUES(2)", []).unwrap();
+    assert!(matches!(
+        watched.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+}
+
+#[test]
+fn verify_changes_rediscovers_retained_drift_and_overflows_bounded_plan() {
+    let home = TempDir::new().unwrap();
+    let context = context(home.path(), Default::default());
+    let session = context
+        .resolve_client_path(ClientId::Jcode)
+        .unwrap()
+        .join("session_a.json");
+    write(&session, b"{}");
+    for index in 0..257 {
+        write(
+            &context
+                .resolve_client_path(ClientId::Jcode)
+                .unwrap()
+                .join(format!("session_overflow_{index:03}.json")),
+            b"{}",
+        );
+    }
+    let baseline = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    for index in 0..257 {
+        fs::write(
+            context
+                .resolve_client_path(ClientId::Jcode)
+                .unwrap()
+                .join(format!("session_overflow_{index:03}.json")),
+            b"{ }",
+        )
+        .unwrap();
+    }
+    assert!(baseline.check_known_sources().unwrap());
+    assert!(matches!(
+        baseline.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+    let clean = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    // Retained publication invalidates despite byte-identical live sources.
+    let source = context
+        .resolve_client_path(ClientId::Claude)
+        .unwrap()
+        .join("project/session.jsonl");
+    let row = |id: &str| {
+        serde_json::json!({
+        "type": "assistant", "timestamp": "2026-01-01T00:00:00Z", "requestId": id,
+        "message": { "id": id, "model": "claude-sonnet-4", "usage": { "input_tokens": 10, "output_tokens": 3 } }
+    })
+        .to_string()
+            + "\n"
+    };
+    write(&source, (row("message-1") + &row("message-2")).as_bytes());
+    crate::synchronize_local_usage(
+        &context,
+        options("claude"),
+        crate::LocalUsageSelection::LocalClients,
+    )
+    .unwrap();
+    fs::write(&source, row("message-2")).unwrap();
+    let claude_before = capture_local_source_watch_manifest(&context, &options("claude")).unwrap();
+    crate::synchronize_local_usage(
+        &context,
+        options("claude"),
+        crate::LocalUsageSelection::LocalClients,
+    )
+    .unwrap();
+    assert!(matches!(
+        claude_before.verify_changes().unwrap(),
+        LocalSourceVerification::Rediscover
+    ));
+    assert!(matches!(
+        clean.verify_changes().unwrap(),
+        LocalSourceVerification::Unchanged
+    ));
+    assert!(clean.retained_bytes() < 1024 * 1024);
+}
+
+#[test]
+fn verify_changes_rejects_unreadable_store_explicitly() {
+    let home = TempDir::new().unwrap();
+    let context = context(home.path(), Default::default());
+    let session = context
+        .resolve_client_path(ClientId::Jcode)
+        .unwrap()
+        .join("session_a.json");
+    write(&session, b"{}");
+    let baseline = capture_local_source_watch_manifest(&context, &options("jcode")).unwrap();
+    assert!(matches!(
+        baseline.verify_changes().unwrap(),
+        LocalSourceVerification::Unchanged
+    ));
+    let cache = context.usage_dir();
+    fs::rename(
+        cache.join("source-message-cache.sqlite3"),
+        cache.join("preserved.sqlite3"),
+    )
+    .unwrap();
+    assert!(baseline.verify_changes().is_err());
+}
+
+fn incremental_claude_row(id: &str, input: i64) -> String {
+    serde_json::json!({
+        "type":"assistant","timestamp":"2026-01-01T00:00:00Z","requestId":id,
+        "message":{"id":id,"model":"claude-sonnet-4",
+            "usage":{"input_tokens":input,"output_tokens":3}}
+    })
+    .to_string()
+        + "\n"
+}
+
+fn incremental_codex_token(total: i64) -> String {
+    serde_json::json!({
+        "type":"event_msg","timestamp":"2026-01-01T00:00:00Z",
+        "payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":total*5,"output_tokens":total*2},
+            "last_token_usage":{"input_tokens":5,"output_tokens":2}
+        }}
+    })
+    .to_string()
+        + "\n"
+}
+
+fn incremental_rows(snapshot: &crate::LocalUsageSnapshot) -> Vec<crate::UnifiedMessage> {
+    let mut rows = Vec::new();
+    crate::visit_local_usage_snapshot(
+        snapshot,
+        crate::LocalUsageQuery::default(),
+        &|_| true,
+        &mut |message| rows.push(message.clone()),
+    )
+    .unwrap();
+    rows
+}
+
+#[test]
+fn targeted_sources_match_full_ingestion_with_duplicates_and_multiple_changes() {
+    for mode in [
+        crate::LocalUsageSelection::Report,
+        crate::LocalUsageSelection::LocalClients,
+    ] {
+        let home = TempDir::new().unwrap();
+        let context = context(home.path(), Default::default());
+        let claude = context
+            .resolve_client_path(ClientId::Claude)
+            .unwrap()
+            .join("project/session.jsonl");
+        let duplicate = claude.with_file_name("duplicate.jsonl");
+        let codex = context
+            .resolve_client_path(ClientId::Codex)
+            .unwrap()
+            .join("2026/01/01/rollout-proof.jsonl");
+        let initial_claude = incremental_claude_row("first", 10);
+        write(&claude, initial_claude.as_bytes());
+        write(&duplicate, initial_claude.as_bytes());
+        let initial_codex = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"proof\",\"source\":\"cli\",\"cwd\":\"/fixture\",\"model_provider\":\"openai\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\"}}\n"
+        ).to_string() + &incremental_codex_token(1);
+        write(&codex, initial_codex.as_bytes());
+        let options = LocalParseOptions {
+            clients: Some(vec!["claude".into(), "codex".into()]),
+            ..Default::default()
+        };
+        let initial = crate::synchronize_local_usage(&context, options.clone(), mode).unwrap();
+        assert_eq!(
+            incremental_rows(&initial)
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            20
+        );
+        fs::write(
+            &claude,
+            initial_claude + &incremental_claude_row("second", 20),
+        )
+        .unwrap();
+        fs::write(&codex, initial_codex + &incremental_codex_token(2)).unwrap();
+        let targeted = crate::try_synchronize_local_usage_sources(
+            &context,
+            options.clone(),
+            mode,
+            &initial,
+            &[claude.clone(), codex.clone()],
+        )
+        .unwrap()
+        .expect("existing primary sources are eligible");
+        let observed = incremental_rows(&targeted);
+        assert_eq!(
+            observed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            50
+        );
+        let full = crate::synchronize_local_usage(&context, options.clone(), mode).unwrap();
+        assert_eq!(
+            serde_json::to_value(&observed).unwrap(),
+            serde_json::to_value(incremental_rows(&full)).unwrap()
+        );
+        assert!(
+            crate::try_synchronize_local_usage_sources(
+                &context,
+                options.clone(),
+                mode,
+                &initial,
+                std::slice::from_ref(&claude),
+            )
+            .unwrap()
+            .is_none(),
+            "superseded base must not be revived"
+        );
+        assert!(
+            crate::try_synchronize_local_usage_sources(
+                &context,
+                options.clone(),
+                mode,
+                &full,
+                &[claude.with_extension("meta.json")],
+            )
+            .unwrap()
+            .is_none(),
+            "a sibling is not a primary source"
+        );
+        assert!(
+            crate::try_synchronize_local_usage_sources(
+                &context,
+                self::options("claude"),
+                mode,
+                &full,
+                std::slice::from_ref(&claude),
+            )
+            .unwrap()
+            .is_none(),
+            "changed producer scope must rediscover"
+        );
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&codex)
+            .unwrap()
+            .write_all(b"{\"type\":")
+            .unwrap();
+        assert!(crate::try_synchronize_local_usage_sources(
+            &context,
+            options.clone(),
+            mode,
+            &full,
+            &[codex],
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::to_value(&observed).unwrap(),
+            serde_json::to_value(incremental_rows(&full)).unwrap(),
+            "failed parse keeps the last completed scope readable"
+        );
+    }
+}
+
+#[test]
+fn targeted_claude_corrections_and_truncation_preserve_collected_usage() {
+    let home = TempDir::new().unwrap();
+    let context = context(home.path(), Default::default());
+    let source = context
+        .resolve_client_path(ClientId::Claude)
+        .unwrap()
+        .join("project/session.jsonl");
+    write(
+        &source,
+        (incremental_claude_row("first", 10) + &incremental_claude_row("second", 20)).as_bytes(),
+    );
+    let mode = crate::LocalUsageSelection::Report;
+    let initial = crate::synchronize_local_usage(&context, options("claude"), mode).unwrap();
+    fs::write(&source, incremental_claude_row("second", 40)).unwrap();
+    let targeted = crate::try_synchronize_local_usage_sources(
+        &context,
+        options("claude"),
+        mode,
+        &initial,
+        std::slice::from_ref(&source),
+    )
+    .unwrap()
+    .unwrap();
+    let observed = incremental_rows(&targeted);
+    assert_eq!(
+        observed
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<i64>(),
+        56
+    );
+    let full = crate::synchronize_local_usage(&context, options("claude"), mode).unwrap();
+    assert_eq!(
+        serde_json::to_value(&observed).unwrap(),
+        serde_json::to_value(incremental_rows(&full)).unwrap()
+    );
+    fs::remove_file(source).unwrap();
+    let retained = crate::synchronize_local_usage(&context, options("claude"), mode).unwrap();
+    assert_eq!(
+        incremental_rows(&retained)
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<i64>(),
+        56
+    );
+}

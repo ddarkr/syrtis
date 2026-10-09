@@ -49,8 +49,8 @@ pub use source_context::{
     RemoteSourceScopeTokenV1, ResolvedLocalSourceContext, SourceContextUnavailable,
 };
 pub use source_watch::{
-    capture_local_source_watch_manifest, LocalSourceOwnedWriteRule, LocalSourceWatchManifest,
-    LocalSourceWatchRoot,
+    capture_local_source_watch_manifest, LocalSourceOwnedWriteRule, LocalSourceVerification,
+    LocalSourceWatchManifest, LocalSourceWatchRoot,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2443,15 +2443,99 @@ pub fn synchronize_local_usage(
     options: LocalParseOptions,
     selection: LocalUsageSelection,
 ) -> Result<LocalUsageSnapshot, String> {
-    let clients = options.clients.unwrap_or_else(|| {
+    let clients = local_usage_clients(options.clients, selection);
+    ingest_local_usage(context, &clients, options.modified_after, selection)
+}
+
+fn local_usage_clients(
+    clients: Option<Vec<String>>,
+    selection: LocalUsageSelection,
+) -> Vec<String> {
+    clients.unwrap_or_else(|| {
         let mut clients: Vec<String> = ClientId::iter()
             .filter(|client| selection == LocalUsageSelection::Report || client.parse_local())
             .map(|client| client.as_str().to_string())
             .collect();
         clients.push("synthetic".to_string());
         clients
-    });
-    ingest_local_usage(context, &clients, options.modified_after, selection)
+    })
+}
+
+/// Recollect verified changes to existing Claude/Codex primary files while
+/// carrying the previous scope's immutable source descriptors. The caller
+/// must authoritatively verify all known inputs and retain periodic discovery.
+/// Unsupported plans return `None`; actual read/publication failures return
+/// errors and leave the previous completed scope available.
+pub fn try_synchronize_local_usage_sources(
+    context: &ResolvedLocalSourceContext,
+    options: LocalParseOptions,
+    selection: LocalUsageSelection,
+    previous: &LocalUsageSnapshot,
+    changed_paths: &[PathBuf],
+) -> Result<Option<LocalUsageSnapshot>, String> {
+    use sha2::{Digest, Sha256};
+    if changed_paths.is_empty()
+        || changed_paths.len() > 256
+        || options.modified_after.is_some()
+        || selection == LocalUsageSelection::UnifiedCompatibility
+        || previous.root != context.usage_dir()
+    {
+        return Ok(None);
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for path in changed_paths {
+        if !unique.insert(path) {
+            return Ok(None);
+        }
+    }
+    let clients = local_usage_clients(options.clients, selection);
+    let scope = Sha256::digest(
+        bincode::serialize(&(context.identity_string(), &clients, None::<u64>, selection))
+            .map_err(|error| error.to_string())?,
+    );
+    if previous.scope.as_slice() != scope.as_slice() {
+        return Ok(None);
+    }
+    let query = store_query::QueryState::open(context.usage_dir())?;
+    let Some(sources) = query.incremental_sources(previous, changed_paths)? else {
+        return Ok(None);
+    };
+    // A plan covers existing regular primary files only. Missing/replaced
+    // paths and parser dependency changes take the authoritative path.
+    for path in changed_paths {
+        if !std::fs::metadata(path)
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Ok(None);
+        }
+    }
+    let mut snapshot =
+        query.begin_scope(context.usage_dir(), context, &clients, None, selection)?;
+    if !query.copy_scope_sources(previous, &snapshot)? {
+        return Ok(None);
+    }
+    let mut cache = message_cache::SourceMessageCache::open_from_root(Some(context.usage_dir()));
+    cache.ensure_open()?;
+    for (path, source) in changed_paths.iter().zip(sources) {
+        match source.client {
+            ClientId::Claude => store_query::stage_claude(
+                &query,
+                &mut cache,
+                path,
+                context.home_dir(),
+                source.index,
+            )?,
+            ClientId::Codex => {
+                store_query::stage_codex(&query, &mut cache, path, source.index, source.headless)?
+            }
+            _ => unreachable!("incremental plan only admits Claude and Codex"),
+        }
+    }
+    cache.check()?;
+    query.publish(&mut snapshot)?;
+    query.record_completed_origins(&snapshot, context)?;
+    Ok(Some(snapshot))
 }
 
 fn scan_usage_sources(

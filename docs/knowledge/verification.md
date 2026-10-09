@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-08
+last_verified: 2026-10-09
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -200,6 +200,24 @@ The durable-migration loading regression now has two failing-before/passing-afte
 | Installed release binary, actual durable root | 40.3 seconds |
 
 These runs prove graph publication, not GUI appearance or sustained resource acceptance. The installed app was replaced and restarted after explicit approval; screen capture and accessibility access were unavailable, so no visual acceptance is claimed. Private diagnostic data and rollback material remain outside the repository.
+
+### Incremental source synchronization experiment
+
+Existing same-identity Claude／Codex primary-file changes reuse the previous exact scope's immutable source references and recollect only the changed primaries. Permanent fixtures cover Report／LocalClients parity, copied duplicates, multiple changed files, stale and mismatched scopes, sibling fallback, incomplete Codex reads, Claude same-key corrections and retained facts after truncation／deletion. Manifest fixtures cover sampled content changes with preserved mtime／size, immutable pre-ingestion baselines, late writes, missing／replaced files, WAL changes, retained-history drift and bounded-plan overflow. The actual C ABI regression also exercises a write after targeted ingestion and observes it only in the next capture.
+
+A fresh release C ABI smoke over isolated synthetic roots preserved exact totals through append (348 → 446 tokens), same-key correction (506 tokens), new-source discovery and source deletion (624 tokens). Graph／hourly／models／Agents matched authoritative ingestion; clock-only rate expiry returned zero, and an incomplete Codex write failed without invalidating the last-good scope. No provider request or Keychain access was used.
+
+The actual Swift `TBCore.localUsageSync`／`localUsageQuery`／`releaseLocalUsage` implementation linked against the fresh Rust static archive and exercised 76 → 154 tokens, unchanged lease reuse and clock-only rate expiry. Final workspace tests passed 2,507 top-level cases plus one child-process lock check, with six ignored; workspace Clippy passed with the existing FFI warning counts (15 library／22 test-target warnings). Both `make selftest` and the isolated `make selftest-bundled` passed. Exact task-owned Rust formatting and the knowledge checker (19 self-tests plus repository validation) passed.
+
+The same fresh release binary compared authoritative full synchronization with targeted synchronization using equivalent restored source／store seeds. Each workload ran four pairs in both orders (full → targeted, targeted → full, repeated), with a fixed two-second pause before each arm. Each mutation appended one Claude and one Codex event. All report oracles matched; every pair improved synchronization time and remained below the preregistered +5% synchronization-plus-graph regression limit.
+
+| Synthetic workload | Full sync median | Targeted sync median | Median paired sync improvement | Worst paired sync improvement | Full sync + graph median | Targeted sync + graph median |
+|---|---|---|---|---|---|---|
+| 1,200 files／2,400 events | 766.5 ms | 145.1 ms | 81.1% | 80.7% | 807.9 ms | 186.7 ms |
+| 48 files／12,288 events | 154.5 ms | 119.1 ms | 23.0% | 21.4% | 291.7 ms | 259.2 ms |
+
+The process-attributed physical-write counter medians decreased from 87.9 to 12.3 MiB and from 24.0 to 21.4 MiB respectively. Physical-read counters were zero on these warm workloads and cannot establish reduced logical reads. Peak RSS medians were effectively unchanged (29.6 → 29.7 MiB and 52.8 → 53.2 MiB); no memory improvement is claimed. These short synthetic runs do not prove GUI／FSEvents latency, real-corpus performance, cold-load improvement, Windows behavior or sustained resource acceptance. Raw measurements and temporary diagnostic material remain outside the public repository.
+
 
 
 

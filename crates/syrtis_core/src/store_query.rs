@@ -107,6 +107,12 @@ pub(crate) struct QueryState {
     indexed: std::cell::Cell<bool>,
 }
 
+pub(crate) struct IncrementalSource {
+    pub(crate) client: ClientId,
+    pub(crate) index: usize,
+    pub(crate) headless: bool,
+}
+
 impl QueryState {
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         let db = crate::usage_store::open_database(root)?;
@@ -312,6 +318,118 @@ impl QueryState {
             selection_ignores_filter: context.selection_ignores_report_filter(),
             modified_after,
         })
+    }
+    /// Resolve primary sources without changing the published scope. Siblings,
+    /// archives and lanes with warm-first ordering require full ingestion.
+    pub(crate) fn incremental_sources(
+        &self,
+        snapshot: &UsageSnapshot,
+        paths: &[PathBuf],
+    ) -> Result<Option<Vec<IncrementalSource>>, String> {
+        if self.pin(snapshot).is_err() {
+            return Ok(None);
+        }
+        let result = (|| {
+            let mut statement = self
+                .db
+                .prepare(
+                    "SELECT kind,lane,source_order,tag,headless,phase,workspace,workspace_label
+                 FROM sq_scope_sources WHERE scope_generation=?1 AND path=?2",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut sources = Vec::with_capacity(paths.len());
+            for path in paths {
+                let encoded = bincode::options()
+                    .serialize(&crate::message_cache::CachedPath::from_path(path))
+                    .map_err(|error| error.to_string())?;
+                let mut rows = statement
+                    .query(params![snapshot.generation, encoded])
+                    .map_err(|error| error.to_string())?;
+                let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+                    return Ok(None);
+                };
+                let kind = row.get_ref(0).map_err(|error| error.to_string())?;
+                let kind = kind.as_str().map_err(|error| error.to_string())?;
+                let lane = row.get_ref(1).map_err(|error| error.to_string())?;
+                let lane = lane.as_str().map_err(|error| error.to_string())?;
+                let index: usize = row.get(2).map_err(|error| error.to_string())?;
+                let tag: bool = row.get(3).map_err(|error| error.to_string())?;
+                let headless: bool = row.get(4).map_err(|error| error.to_string())?;
+                let phase: i32 = row.get(5).map_err(|error| error.to_string())?;
+                if kind != "cache"
+                    || tag
+                    || phase != 0
+                    || !matches!(
+                        row.get_ref(6).map_err(|error| error.to_string())?,
+                        rusqlite::types::ValueRef::Null
+                    )
+                    || !matches!(
+                        row.get_ref(7).map_err(|error| error.to_string())?,
+                        rusqlite::types::ValueRef::Null
+                    )
+                {
+                    return Ok(None);
+                }
+                let client = match lane {
+                    "claude" if !headless => ClientId::Claude,
+                    "codex" => ClientId::Codex,
+                    _ => return Ok(None),
+                };
+                if rows.next().map_err(|error| error.to_string())?.is_some() {
+                    return Ok(None);
+                }
+                sources.push(IncrementalSource {
+                    client,
+                    index,
+                    headless,
+                });
+            }
+            Ok(Some(sources))
+        })();
+        let released = self.unpin();
+        released?;
+        result
+    }
+
+    /// Carry immutable descriptors, not historical message payloads. Recheck
+    /// admission under the write transaction before copying the base scope.
+    pub(crate) fn copy_scope_sources(
+        &self,
+        previous: &UsageSnapshot,
+        next: &UsageSnapshot,
+    ) -> Result<bool, String> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| error.to_string())?;
+        let current: Option<i64> = transaction
+            .query_row(
+                "SELECT current_generation FROM sq_scopes WHERE scope_key=?1",
+                [&previous.scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if current != Some(previous.generation)
+            || previous.scope != next.scope
+            || Self::read_store_epoch(&transaction)? != Some(previous.store_epoch)
+        {
+            return Ok(false);
+        }
+        self.admit_staging(&transaction)?;
+        transaction
+            .execute(
+                "INSERT INTO sq_scope_sources
+             SELECT ?1,kind,lane,source_order,path,cache_source_id,cache_generation,
+                    generation,tag,headless,workspace,workspace_label,phase
+             FROM sq_scope_sources WHERE scope_generation=?2",
+                params![next.generation, previous.generation],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

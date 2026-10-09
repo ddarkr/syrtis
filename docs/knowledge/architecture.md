@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-08
+last_verified: 2026-10-09
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -162,6 +162,10 @@ Pure graph／model／hourly／Agents helper 重用既有 folds，不 rediscover 
 一次 sync 最多接受 64 個 public scopes、32 個 distinct producers，先完成 admission 再 ingestion。Producer identity 包含 exact context、套用預設後的 clients、`modified_after` 與 selection mode；相同 producer 共用 snapshot／manifest 與其容量計算，但各 public scope 仍有獨立 metadata。Primary quota 可省略 `clientId`；extra-account quota 必須明示 `claude`。同 producer／account 的 quota aliases 共用 compact quota token，不因 alias 數量淘汰同次 sync 的其他 token。
 
 Scheduler 保留一個 source worker 與一個 coalesced pure-query worker。Source mount 阻塞時，已捕捉的 recent scope 仍能按 wall clock 過期；monotonic clock 管理 deadlines。Active demand 的 known-input／WAL verification 是 30 秒、closed graph demand 是 5 分鐘，topology fallback 5 分鐘，完整 verification 遵守使用者的 refresh interval。FSEvents 僅作 advisory hint，以 250 ms dirty deadline 合併；事件遺失、unmount、root recovery、unsupported native path 或 stream failure 必須回到 authoritative verification，不能把缺少 event 當作 source unchanged。沒有 local demand 時不啟動 source verification。
+
+Known-input verification can produce a bounded change plan instead of only a dirty boolean. Existing same-identity Claude／Codex primary files use `try_synchronize_local_usage_sources`: validate the exact unpruned producer scope and current store epoch, copy immutable source descriptors into a new scope, and run the existing parser／durable reconciliation only for changed primary files. The plan admits at most 256 paths; dependency-only changes, unsupported lanes, SQLite／WAL, missing／replaced inputs, retained-history drift, topology requests and manual forced refresh use authoritative full ingestion. The replacement watch manifest keeps observations taken before ingestion, so a later write remains dirty for the next sync. No C ABI signature or Swift request shape changes.
+
+This is targeted source synchronization, not history-independent ingestion. Verification still visits all known probes; changed-source parser／generation work and LocalClients selection can scale with history, and Report queries still prepare and fold historical facts. New nested children require topology hints or periodic discovery, not a clean known-file check. Synthetic paired evidence and remaining acceptance limits are recorded in [`verification.md`](verification.md#incremental-source-synchronization-experiment).
 
 缺少首張 graph 時可先捕捉 graph-only scope、發布結果，再同步完整 demand union；只有 graph demand 時不做第二次 capture。Side capture 不改寫已安裝 union 的 freshness／manifest，也不滿足 request 後的 forced-refresh barrier。Unchanged native sync 可以回傳目前使用中的同一 token；side cleanup 不得釋放該 token。Ordinary queries 與 quota windows 都 pin lease，退役 snapshot 等所有 pins 結束才釋放。
 

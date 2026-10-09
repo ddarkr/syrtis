@@ -235,6 +235,14 @@ mod tests {
                 .unwrap(),
             "acceptance must retain the pre-ingestion dirty baseline"
         );
+        // The changed-source path must also keep a write that arrives after
+        // its own ingestion dirty, without delaying this captured result.
+        let later_source = source.clone();
+        AFTER_SOURCE_SYNC.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                write_usage(&later_source, timestamp, 170);
+            }));
+        });
         let next = data(ffi(
             &json!({"scopes":exact_scope,"previousLeaseToken":captured_token,"verifyTopology":false}),
             crate::tb_local_usage_sync,
@@ -247,6 +255,22 @@ mod tests {
             158,
             "ordinary known-source verification must ingest the later write"
         );
+        let later = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":next_token,"verifyTopology":false}),
+            crate::tb_local_usage_sync,
+        ));
+        assert_eq!(
+            query_at(
+                later["leaseToken"].as_str().unwrap(),
+                "claude",
+                "graph",
+                now
+            )["summary"]["totalTokens"],
+            198,
+            "a late write after targeted ingestion belongs to the next capture"
+        );
+        release(next_token);
+        let next_token = later["leaseToken"].as_str().unwrap();
         let settled = data(ffi(
             &json!({"scopes":exact_scope,"previousLeaseToken":next_token,"verifyTopology":false}),
             crate::tb_local_usage_sync,
@@ -282,7 +306,7 @@ mod tests {
         assert!(!unreadable["err"].as_str().unwrap().is_empty());
         assert_eq!(
             query_at(next_token, "claude", "graph", now)["summary"]["totalTokens"],
-            158
+            198
         );
         release(captured_token);
         release(next_token);

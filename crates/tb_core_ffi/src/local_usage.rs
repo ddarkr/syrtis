@@ -430,26 +430,45 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
                 .iter()
                 .find(|scope| scope.source.producer == key)
         });
+        let verification = if checked.is_none() && !request.force && !request.verify_topology {
+            // An unavailable baseline takes the authoritative capture path;
+            // it must never be treated as verified unchanged.
+            old.and_then(|old| old.source.manifest.verify_changes().ok())
+        } else {
+            None
+        };
         let source = if let Some(checked) = checked {
             Arc::clone(&checked.source)
-        } else if !request.force
-            && !request.verify_topology
-            && old.is_some_and(|old| {
-                // Errors must propagate rather than become matching fingerprints.
-                old.source
-                    .manifest
-                    .check_known_sources()
-                    .is_ok_and(|changed| !changed)
-            })
-        {
+        } else if matches!(
+            verification,
+            Some(syrtis_core::LocalSourceVerification::Unchanged)
+        ) {
             Arc::clone(&old.unwrap().source)
         } else {
-            // Keep the physical baseline from BEFORE ingestion. Later writes
-            // dirty the next refresh, not the independently verified snapshot.
-            let manifest =
-                syrtis_core::capture_local_source_watch_manifest(&scope_context, &options)?;
-            let snapshot =
-                syrtis_core::synchronize_local_usage(&scope_context, options, selection)?;
+            let incremental = match verification {
+                Some(syrtis_core::LocalSourceVerification::Changed { paths, manifest }) => {
+                    syrtis_core::try_synchronize_local_usage_sources(
+                        &scope_context,
+                        options.clone(),
+                        selection,
+                        &old.unwrap().source.snapshot,
+                        &paths,
+                    )?
+                    .map(|snapshot| (manifest, snapshot))
+                }
+                _ => None,
+            };
+            // Both paths keep their physical baseline from BEFORE ingestion.
+            // A later write remains dirty for the next synchronization.
+            let (manifest, snapshot) = if let Some(incremental) = incremental {
+                incremental
+            } else {
+                let manifest =
+                    syrtis_core::capture_local_source_watch_manifest(&scope_context, &options)?;
+                let snapshot =
+                    syrtis_core::synchronize_local_usage(&scope_context, options, selection)?;
+                (Arc::new(manifest), snapshot)
+            };
             #[cfg(test)]
             tests::after_source_sync();
             // Admission must not wait for a concurrent slow known-file
@@ -459,7 +478,7 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
             Arc::new(SourceScope {
                 producer: key,
                 snapshot,
-                manifest: Arc::new(manifest),
+                manifest,
                 manifest_bytes,
                 cutoff: now_ms().saturating_sub(3_600_000),
             })

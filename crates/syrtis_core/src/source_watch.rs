@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -34,6 +34,22 @@ pub struct LocalSourceWatchManifest {
     ignored_rules: Vec<LocalSourceOwnedWriteRule>,
     known: Mutex<KnownStore>,
 }
+
+/// Targeted-change plan. `Unchanged` reuses the old manifest, `Changed`
+/// carries only same-identity regular-file changes plus a replacement holding
+/// exactly the pre-ingestion observations, `Rediscover` falls back to
+/// authoritative whole ingestion. Never recursive discovery.
+pub enum LocalSourceVerification {
+    Unchanged,
+    Changed {
+        paths: Vec<PathBuf>,
+        manifest: Arc<LocalSourceWatchManifest>,
+    },
+    Rediscover,
+}
+
+/// Maximum eligible file changes in one targeted plan; overflow rediscovers.
+const MAX_CHANGED_PATHS: usize = 256;
 
 impl LocalSourceWatchManifest {
     pub fn watch_roots(&self) -> &[LocalSourceWatchRoot] {
@@ -91,6 +107,96 @@ impl LocalSourceWatchManifest {
             changed |= KnownStore::retained_revision(&store.db)? != revision;
         }
         Ok(changed)
+    }
+
+    /// Full authoritative metadata check with a targeted-change plan. Every
+    /// known probe is observed, store admission is verified before and after,
+    /// and retained-history drift forces rediscovery. Only existing
+    /// same-identity regular-file changes are eligible; anything else dirty
+    /// (topology, absent/created/deleted/replaced, database/WAL) rediscovers.
+    /// `Unchanged` creates no replacement store and reuses this baseline. `Changed`
+    /// carries a replacement holding exactly these pre-ingestion observations,
+    /// so late writes after this read still dirty the replacement.
+    pub fn verify_changes(&self) -> Result<LocalSourceVerification, String> {
+        let store = self
+            .known
+            .lock()
+            .map_err(|_| "source manifest lock unavailable")?;
+        store.admit()?;
+        let mut statement = store
+            .db
+            .prepare("SELECT path,kind,state FROM temp.watch_known ORDER BY path")
+            .map_err(|_| "source manifest metadata unavailable")?;
+        let mut rows = statement
+            .query([])
+            .map_err(|_| "source manifest metadata unavailable")?;
+        let mut fresh: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+        let mut rediscover = false;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| "source manifest metadata read failed")?
+        {
+            let path = row
+                .get_ref(0)
+                .map_err(|_| "source manifest path read failed")?;
+            let path: CachedPath =
+                bincode::deserialize(path.as_blob().map_err(|_| "source manifest path invalid")?)
+                    .map_err(|_| "source manifest path invalid")?;
+            let kind: i64 = row.get(1).map_err(|_| "source manifest kind read failed")?;
+            let kind = ProbeKind::from_tag(kind)?;
+            let state = row
+                .get_ref(2)
+                .map_err(|_| "source manifest fingerprint read failed")?;
+            let state: Option<ObservedFile> = bincode::deserialize(
+                state
+                    .as_blob()
+                    .map_err(|_| "source manifest fingerprint invalid")?,
+            )
+            .map_err(|_| "source manifest fingerprint invalid")?;
+            let path = path.into_path_buf();
+            let current = observe(&path, kind)?;
+            if current == state {
+                continue;
+            }
+            let eligible = kind == ProbeKind::File
+                && matches!((&state, &current), (Some(old), Some(now)) if old.identity == now.identity);
+            if !eligible {
+                rediscover = true;
+                continue;
+            }
+            // ponytail: cap resident changed paths at 256; overflow rediscovers.
+            if fresh.len() < MAX_CHANGED_PATHS {
+                fresh.insert(
+                    path,
+                    bincode::serialize(&current)
+                        .map_err(|_| "source manifest fingerprint encoding failed")?,
+                );
+            } else {
+                rediscover = true;
+            }
+        }
+        drop(rows);
+        drop(statement);
+        store.admit()?;
+        if let Some(revision) = store.retained_revision {
+            rediscover |= KnownStore::retained_revision(&store.db)? != revision;
+        }
+        if rediscover {
+            return Ok(LocalSourceVerification::Rediscover);
+        }
+        if fresh.is_empty() {
+            return Ok(LocalSourceVerification::Unchanged);
+        }
+        let manifest = Arc::new(LocalSourceWatchManifest {
+            roots: self.roots.clone(),
+            ignored: self.ignored.clone(),
+            ignored_rules: self.ignored_rules.clone(),
+            known: Mutex::new(store.fork(&fresh)?),
+        });
+        Ok(LocalSourceVerification::Changed {
+            paths: fresh.into_keys().collect(),
+            manifest,
+        })
     }
 
     /// Includes spare native capacities, SQLite-owned cache/schema/statement
@@ -335,6 +441,91 @@ impl KnownStore {
             )
             .map_err(|_| "source manifest fingerprint staging failed")?;
         Ok(())
+    }
+
+    /// Fresh disk-backed TEMP store bound to the same canonical database and
+    /// epoch as `source`. Reuses the small page cache; no rescanner runs here.
+    fn open_raw(root: &Path, source: &KnownStore) -> Result<Self, String> {
+        let db = crate::usage_store::open_database(root)?;
+        db.execute_batch("PRAGMA main.cache_size=-64; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-64;
+            CREATE TEMP TABLE watch_known(path BLOB PRIMARY KEY,kind INTEGER NOT NULL,state BLOB NOT NULL) WITHOUT ROWID;")
+            .map_err(|_| "source manifest metadata initialization failed")?;
+        let epoch = Self::epoch(&db)?.ok_or("source manifest store epoch absent")?;
+        if epoch != source.epoch {
+            return Err("source manifest store epoch changed".into());
+        }
+        Ok(Self {
+            db,
+            path: source.path.clone(),
+            epoch,
+            retained_revision: source.retained_revision,
+            #[cfg(windows)]
+            file_identity: WindowsFileIdentity {
+                volume: source.file_identity.volume,
+                file_id: source.file_identity.file_id,
+            },
+        })
+    }
+
+    /// Replacement manifest store after a Changed plan. New disk-backed TEMP
+    /// table holds the full pre-ingestion baseline; only eligible changes are
+    /// refreshed to these observations. Never re-observes, so late writes
+    /// after the read stay dirty on the replacement. Roots and exclusions are
+    /// cloned by the caller; the old baseline is never mutated.
+    fn fork(&self, fresh: &BTreeMap<PathBuf, Vec<u8>>) -> Result<KnownStore, String> {
+        let root = self
+            .path
+            .parent()
+            .ok_or("source manifest store root absent")?;
+        let forked = KnownStore::open_raw(root, self)?;
+        forked
+            .db
+            .execute_batch("BEGIN")
+            .map_err(|_| "source manifest staging failed")?;
+        let mut source = self
+            .db
+            .prepare("SELECT path,kind,state FROM temp.watch_known")
+            .map_err(|_| "source manifest metadata unavailable")?;
+        let mut rows = source
+            .query([])
+            .map_err(|_| "source manifest metadata unavailable")?;
+        let mut insert = forked
+            .db
+            .prepare("INSERT INTO temp.watch_known VALUES(?1,?2,?3)")
+            .map_err(|_| "source manifest fingerprint staging failed")?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| "source manifest metadata read failed")?
+        {
+            let path = row
+                .get_ref(0)
+                .map_err(|_| "source manifest path read failed")?;
+            let path = path.as_blob().map_err(|_| "source manifest path invalid")?;
+            let kind: i64 = row.get(1).map_err(|_| "source manifest kind read failed")?;
+            let state = row
+                .get_ref(2)
+                .map_err(|_| "source manifest fingerprint read failed")?;
+            let state = state
+                .as_blob()
+                .map_err(|_| "source manifest fingerprint invalid")?;
+            let decoded: CachedPath =
+                bincode::deserialize(path).map_err(|_| "source manifest path invalid")?;
+            let state = fresh
+                .get(&decoded.into_path_buf())
+                .map_or(state, Vec::as_slice);
+            insert
+                .execute(rusqlite::params![path, kind, state])
+                .map_err(|_| "source manifest fingerprint staging failed")?;
+        }
+        drop(rows);
+        drop(source);
+        drop(insert);
+        forked
+            .db
+            .execute_batch("COMMIT")
+            .map_err(|_| "source manifest publication failed")?;
+        forked.admit()?;
+        Ok(forked)
     }
 }
 
