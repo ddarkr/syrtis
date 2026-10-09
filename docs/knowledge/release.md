@@ -4,8 +4,8 @@ id: kb-release
 kind: canonical
 scope: repository
 read_when: changing release scripts, code signing, appcast, Sparkle, Homebrew, Pages, packaged Info.plist, or post-release notes
-last_verified: 2026-09-27
-sources: [".github/workflows/release.yml", "scripts/check_ci_gate.sh", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "scripts/bundle.sh", "scripts/build-sparkle.sh", "scripts/make_appcast.sh", "scripts/render_notes_html.sh", "appcast.xml", "Makefile", "docs/knowledge/plans/provider-quota-pace.md", "Sources/Syrtis/SelfTest.swift", "public release history"]
+last_verified: 2026-10-09
+sources: [".github/workflows/release.yml", "scripts/check_ci_gate.sh", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/pages.yml", ".github/workflows/update-install-count.yml", "scripts/bundle.sh", "scripts/build-sparkle.sh", "scripts/make_appcast.sh", "scripts/render_notes_html.sh", "appcast.xml", "Makefile", "docs/knowledge/plans/provider-quota-pace.md", "Sources/Syrtis/SelfTest.swift", "Sources/Syrtis/UpdaterService.swift", "public release history"]
 ---
 
 # Release and delivery
@@ -118,6 +118,8 @@ Release builds are signed with the maintainer's Developer ID Application certifi
 The feed is a single multi-item appcast. Stable items are channel-less; prerelease items carry the beta channel. The generator reads the existing feed, preserves prior items and signatures, and keeps a bounded history instead of overwriting the feed with one item.
 
 This matters because a single-item writer can hide a still-valid stable version when a bridge or prerelease item is added. The appcast fix uses Sparkle's `generate_appcast` and keeps the application-side channel toggle as a lazy delegate for a possible future beta lane.
+
+Automatic update checks are temporarily disabled in [`UpdaterService.swift`](../../Sources/Syrtis/UpdaterService.swift): the app disables Sparkle's automatic checks before starting the updater, including for installations with a previously enabled preference, and no longer runs its own launch or periodic probes. Settings → **Check Now** still starts the interactive update flow. The feed and release publication paths are unchanged.
 
 ## Sparkle is compiled here, not taken from the prebuilt artifact
 

@@ -3,13 +3,11 @@ import Observation
 import ServiceManagement
 import Sparkle
 
-/// Sparkle auto-updates. Only armed when running from an assembled .app
+/// Manual Sparkle updates. Only armed when running from an assembled .app
 /// bundle — the bare SwiftPM executable (dev runs, --selftest, CI) has no
 /// Info.plist feed/key and Sparkle would refuse to start.
 ///
-/// Besides the interactive check, a silent probe runs at launch and every
-/// six hours; when it finds a newer version the popover footer grows a
-/// one-click update button bound to `availableVersion`.
+/// Automatic checks are temporarily disabled; Settings → Check Now remains available.
 @MainActor
 @Observable
 final class UpdaterService: NSObject, SPUUpdaterDelegate {
@@ -21,28 +19,14 @@ final class UpdaterService: NSObject, SPUUpdaterDelegate {
     private(set) var availableVersion: String?
 
     @ObservationIgnored private var controller: SPUStandardUpdaterController?
-    @ObservationIgnored private var probeTask: Task<Void, Never>?
 
     private override init() {
         super.init()
         guard Self.isAvailable else { return }
         controller = SPUStandardUpdaterController(
-            startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
-        probeTask = Task { [weak self] in
-            // Let the updater session finish starting before the first probe
-            // (a check fired straight from init gets swallowed), retry once
-            // shortly after, then settle into a slow cadence.
-            try? await Task.sleep(for: .seconds(5))
-            while !Task.isCancelled {
-                self?.controller?.updater.checkForUpdateInformation()
-                try? await Task.sleep(for: .seconds(60))
-                if self?.availableVersion != nil { break }
-            }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(6 * 3600))
-                self?.controller?.updater.checkForUpdateInformation()
-            }
-        }
+            startingUpdater: false, updaterDelegate: self, userDriverDelegate: nil)
+        controller?.updater.automaticallyChecksForUpdates = false
+        controller?.startUpdater()
     }
 
     /// The interactive Sparkle flow (update dialog with install button).
