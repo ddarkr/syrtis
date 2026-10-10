@@ -132,6 +132,7 @@ final class LocalUsageScheduler {
     private(set) var lastError: String?
     private(set) var syncCount = 0
     private var sourcePending = false
+    private var capturingScopes: Set<LocalUsageScope> = []
     var sourceHintDiagnostics: LocalSourceHints.Diagnostics { hints.diagnostics }
     private(set) var queryCount = 0
     var pendingAcquisitions: Int { waiting.count }
@@ -598,6 +599,8 @@ final class LocalUsageScheduler {
     /// capture was dropped (owner close, root change, no demand overlap):
     /// expired generations are never revived, stale outputs never admitted.
     private func syncScopes(_ requested: Set<LocalUsageScope>) async -> Bool {
+        capturingScopes = requested
+        defer { capturingScopes.removeAll() }
         refreshDemand()
         let epoch = rootEpoch
         // Exact admission: only this capture's requested scopes and the owner
@@ -835,6 +838,9 @@ final class LocalUsageScheduler {
                 guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
                       key == identity(query),
                       !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
+                // Native ingestion may replace this scope before its new lease returns.
+                // The pending capture owns recovery (or its own authoritative failure).
+                guard !capturingScopes.contains(query.scope) else { continue }
                 lastError = String(describing: error); retryAt = monotonicNow() + 10
                 previousLeaseUsable = false; syncedScopes.removeAll()
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {

@@ -175,7 +175,11 @@ This is targeted source synchronization, not history-independent ingestion. Veri
 
 `LocalSourceHints` 僅訂閱 native manifest 的 source／nearest-existing recovery roots；broad recovery parent 中的 unrelated sibling events 不建立 demand。Parser dependencies、SQLite WAL、symlink／mount／extra roots 都參與 known-input identity；owned store、page sidecars、pricing、migration、recovery 與 dashboard snapshot 的已知 basename grammar 只在 exact owned parent 下排除，不能忽略整個可能含來源的目錄。Manifest 在 ingestion 前捕捉並保留；完成後不重設 baseline，因此讀取後新增的內容仍會在下一次 hint／known-input verification 觸發同步，而不阻止已捕捉 generation 的首次顯示。
 
+FSEvents 會遞迴涵蓋 watch anchor 的子目錄。`LocalSourceHints` 因此只向 native stream 註冊未被其他 anchor 覆蓋的最小集合，保留原始 source／recovery roots 作逐事件的 exact filter。`WatchRoot` 為每個 anchor 開啟整條 ancestor chain；重複註冊被覆蓋的子目錄會耗盡 process file descriptors，讓 authoritative source discovery 返回 `Too many open files`。移除冗餘 anchor 不停用事件提示，也不擴大可建立 demand 的來源範圍。
+
 Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Root epoch、exact scope、source／price generation、發出 query 時的 owner 與 ordinary-query／quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。Query 成功與失敗都必須符合目前的 clock bucket；過期 bucket 的 late error 不得清除有效 lease、發布錯誤或阻止目前 bucket 重新查詢。
+
+Native ingestion 可在 sync 返回 replacement lease 前替換 engine scope。Scheduler 追蹤 in-flight capture 的 exact scopes；這段期間舊 snapshot 的 query failure 由 replacement capture 接管，不提前失敗 last-good display 或 invalidate 正在建立的 lease。Recent clock queries 仍可讀取有效舊 generation；新 capture 完成後以新 identity 重查。沒有 replacement 的 current query failure，以及 replacement source failure，仍明確回報。
 
 `tb_window_usage` 已 clean-cutover 為 compact `WindowUsageBatch`：request 傳 confirmed attribution declarations、account/model scope 與 exact half-open inference／current／zone／cycle jobs，response 保留 assigned／excluded／unassigned、undated／turn counts、coverage 與 source／root／price identity，不再回傳 message arrays。`DashboardModel` 不保留 raw union scans，provider quota policy 仍在 Swift／app FFI 而非 shared engine。此 wire change 需要 downstream decoder 同步遷移；詳見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
 

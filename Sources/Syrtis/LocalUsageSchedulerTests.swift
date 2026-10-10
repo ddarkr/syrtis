@@ -1012,6 +1012,49 @@ extension LocalUsageScheduler {
         expect(expiredErrorRates == [120, 120] && expiredErrorFailures == 0,
                "current recent bucket remains readable after the expired query failure")
         expiredErrorScheduler.stop()
+        // Ingestion can replace an engine scope before its new lease returns.
+        // A failed old query must wait for that capture, not poison the view.
+        let recaptureSource = SchedulerFixtureSource()
+        let recaptureClock = Clock()
+        let recaptureScheduler = LocalUsageScheduler(
+            source: recaptureSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { recaptureClock.monotonic }, wallNow: { recaptureClock.wall })
+        let recaptureSession = recaptureScheduler.openSession()
+        var recaptureRates: [Double] = []
+        var recaptureFailures = 0
+        await recaptureSource.appendRecentEvent(
+            at: Int64(recaptureClock.wall.timeIntervalSince1970 * 1000))
+        recaptureScheduler.update(recaptureSession, queries: [expiredErrorRate], active: true) { _, result in
+            if case .success(.rate(let value)) = result { recaptureRates.append(value) }
+            if case .failure = result { recaptureFailures += 1 }
+        }
+        await recaptureScheduler.runDueWork()
+        recaptureClock.advance(31)
+        await recaptureSource.appendRecentEvent(
+            at: Int64(recaptureClock.wall.timeIntervalSince1970 * 1000))
+        await recaptureSource.pauseNextSync()
+        recaptureScheduler.sourcesChanged(requiresTopology: false)
+        let recaptureTurn = Task { await recaptureScheduler.runDueWork() }
+        await recaptureSource.waitForPausedSync()
+        await recaptureSource.failNextQuery(kind: "rate")
+        await recaptureScheduler.runClockWork()
+        expect(recaptureFailures == 0 && recaptureScheduler.lastError == nil && recaptureRates == [120],
+               "in-flight replacement owns old-snapshot query failures without failing last-good display")
+        await recaptureSource.resumeSync()
+        await recaptureTurn.value
+        expect(recaptureRates == [120, 120] && recaptureFailures == 0,
+               "replacement capture republishes recent usage after old-snapshot failure")
+        recaptureClock.advance(11)
+        await recaptureSource.failNextQuery(kind: "rate")
+        await recaptureScheduler.runClockWork()
+        expect(recaptureFailures == 1 && recaptureScheduler.lastError != nil,
+               "current-snapshot query failure still reaches the view when no replacement is running")
+        recaptureClock.advance(31)
+        await recaptureSource.failNextSync()
+        await recaptureScheduler.runDueWork()
+        expect(recaptureFailures == 2 && recaptureScheduler.lastError != nil,
+               "replacement source failure remains visible rather than being treated as success")
+        recaptureScheduler.stop()
         LocalSourceHints.selfTest(expect)
     }
 }
