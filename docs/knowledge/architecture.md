@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-09
+last_verified: 2026-10-10
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -163,7 +163,7 @@ App-only graph folds 不建立未被 wire response 使用的 session/time metric
 
 一次 sync 最多接受 64 個 public scopes、32 個 distinct producers，先完成 admission 再 ingestion。Producer identity 包含 exact context、套用預設後的 clients、`modified_after` 與 selection mode；相同 producer 共用 snapshot／manifest 與其容量計算，但各 public scope 仍有獨立 metadata。Primary quota 可省略 `clientId`；extra-account quota 必須明示 `claude`。同 producer／account 的 quota aliases 共用 compact quota token，不因 alias 數量淘汰同次 sync 的其他 token。
 
-Scheduler 保留一個 source worker 與一個 coalesced pure-query worker。Source mount 阻塞時，已捕捉的 recent scope 仍能按 wall clock 過期；monotonic clock 管理 deadlines。Active demand 的 known-input／WAL verification 是 30 秒、closed graph demand 是 5 分鐘，topology fallback 5 分鐘，完整 verification 遵守使用者的 refresh interval。FSEvents 僅作 advisory hint，以 250 ms dirty deadline 合併；事件遺失、unmount、root recovery、unsupported native path 或 stream failure 必須回到 authoritative verification，不能把缺少 event 當作 source unchanged。沒有 local demand 時不啟動 source verification。
+Scheduler 保留一個 source worker，以及各自 coalesced 的 recent（rate／trace）與 historical（graph／models／hourly／Agents）query workers。Ordinary ingestion 完成後不等待 historical query。Source mount 阻塞時，已捕捉的 recent scope 仍能按 wall clock 過期；historical query 阻塞時，source worker 也能同步新增觀察並發布新的 recent generation。Monotonic clock 管理 deadlines。Active demand 的 known-input／WAL verification 是 30 秒、closed graph demand 是 5 分鐘，topology fallback 5 分鐘，完整 verification 遵守使用者的 refresh interval。FSEvents 僅作 advisory hint，以 250 ms dirty deadline 合併；事件遺失、unmount、root recovery、unsupported native path 或 stream failure 必須回到 authoritative verification，不能把缺少 event 當作 source unchanged。沒有 local demand 時不啟動 source verification。
 
 Demand 是 installed exact producing scopes 的子集合時，lens 切換不重新 source sync；scope additions、force、dirty hints 與 authoritative verification deadlines 仍觸發原本的 recollection。Scheduler 可保留最多 32 個 dormant non-recent exact results，但只能在同一 capture identity、scope 仍 installed 且存在 local demand 時重用；active results 不為此上限被移除。Recent rate／trace 不保留 dormant result，重新顯示仍按當下 wall clock refold；下一次 source sync 只收集當下 demand，final close 釋放 leases 並停止 local work。
 
@@ -171,11 +171,11 @@ Known-input verification can produce a bounded change plan instead of only a dir
 
 This is targeted source synchronization, not history-independent ingestion. Verification still visits all known probes; changed-source parser／generation work and LocalClients selection can scale with history, and Report queries still prepare and fold historical facts. New nested children require topology hints or periodic discovery, not a clean known-file check. Synthetic paired evidence and remaining acceptance limits are recorded in [`verification.md`](verification.md#incremental-source-synchronization-experiment).
 
-缺少首張 graph 時可先捕捉 graph-only scope、發布結果，再同步完整 demand union；只有 graph demand 時不做第二次 capture。Side capture 不改寫已安裝 union 的 freshness／manifest，也不滿足 request 後的 forced-refresh barrier。Unchanged native sync 可以回傳目前使用中的同一 token；side cleanup 不得釋放該 token。Ordinary queries 與 quota windows 都 pin lease，退役 snapshot 等所有 pins 結束才釋放。
+缺少首張 graph 且沒有 historical query worker 時，可先捕捉 graph-only scope、發布結果，再同步完整 demand union；只有 graph demand 時不做第二次 capture。已有 historical worker 時直接同步 union，不在 source lane 重做 staged graph，避免慢查詢阻塞 recent ingestion。Side capture 不改寫已安裝 union 的 freshness／manifest，也不滿足 request 後的 forced-refresh barrier。Unchanged native sync 可以回傳目前使用中的同一 token；side cleanup 不得釋放該 token。Ordinary queries 與 quota windows 都 pin lease，退役 snapshot 等所有 pins 結束才釋放。
 
 `LocalSourceHints` 僅訂閱 native manifest 的 source／nearest-existing recovery roots；broad recovery parent 中的 unrelated sibling events 不建立 demand。Parser dependencies、SQLite WAL、symlink／mount／extra roots 都參與 known-input identity；owned store、page sidecars、pricing、migration、recovery 與 dashboard snapshot 的已知 basename grammar 只在 exact owned parent 下排除，不能忽略整個可能含來源的目錄。Manifest 在 ingestion 前捕捉並保留；完成後不重設 baseline，因此讀取後新增的內容仍會在下一次 hint／known-input verification 觸發同步，而不阻止已捕捉 generation 的首次顯示。
 
-Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Root epoch、exact scope、source／price generation、發出 query 時的 owner 與 ordinary-query／quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。
+Clock-only deadlines 重新查 moving rate／trace、local midnight／timezone 的 graph buckets，並刷新可見 quota window 與 staleness；不重新 parse unchanged sources。手動 refresh 的 barrier 必須由 request 後另一次 source verification 滿足，不能 join request 前開始的 scan。Root epoch、exact scope、source／price generation、發出 query 時的 owner 與 ordinary-query／quota pins 同時守住 late publication；失敗保留 last-good display，但不把 failed／partial coverage 改成成功零值。Query 成功與失敗都必須符合目前的 clock bucket；過期 bucket 的 late error 不得清除有效 lease、發布錯誤或阻止目前 bucket 重新查詢。
 
 `tb_window_usage` 已 clean-cutover 為 compact `WindowUsageBatch`：request 傳 confirmed attribution declarations、account/model scope 與 exact half-open inference／current／zone／cycle jobs，response 保留 assigned／excluded／unassigned、undated／turn counts、coverage 與 source／root／price identity，不再回傳 message arrays。`DashboardModel` 不保留 raw union scans，provider quota policy 仍在 Swift／app FFI 而非 shared engine。此 wire change 需要 downstream decoder 同步遷移；詳見 [`vendor-tokscale.md`](vendor-tokscale.md#current-boundary)。
 

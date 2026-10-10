@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-09
+last_verified: 2026-10-10
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -151,6 +151,17 @@ The integrated owned-engine workspace, including loading-pipeline changes, passe
 The final release Swift bridge also exercised source-specific boundaries: Droid cumulative rewrites, empty input, restoration, and source removal retained 1,200 tokens and two messages without summing obsolete allocations; Roo UI compaction followed by sibling-only annotation changes and source removal retained 280 tokens and two messages; Kiro execution failure and removal retained eight tokens and one authoritative execution without reviving a second lower-authority snapshot. Fresh processes observed the same totals. The permanent Roo regression additionally distinguishes preserved archived annotations from refreshed live annotations.
 
 A fresh release Swift → C ABI → Rust smoke of the integrated code preserved 116 tokens and two messages after truncation, then 244 tokens and three messages after a new turn, complete source-directory deletion, two fresh source-free processes, and restored duplicate transcripts. Each capture also accepted a primary quota scope without `clientId`. This smoke used isolated synthetic roots, not live account data or GUI acceptance.
+
+### Live-rate freshness isolation
+
+Automatic scheduler regression 以同一個 paused graph query 驗證 recent rate 的 `120 → 0 → 120`：先按 wall clock 過期，再同步新增事件，兩次發布都必須發生在 historical query 釋放之前。初次隔離比較中，baseline scheduler 有三個失敗斷言，修正後的 scheduler runner 通過 88 個 checks。Bounded wall-time guards 只限制失敗等待，不以 query ordering 或 mock callback 次數作為正確性證據。
+
+實際 `DashboardModel → LiveUsageDataSource → Swift C ABI → Rust` smoke 在初次隔離及整合 Report-index／covered-lens reuse 後都使用隔離 synthetic roots 與 automatic scheduling。初始 rate 為 38；graph query 保持阻塞時，clock expiry 得到 0、新事件得到 118、手動 refresh 得到 158，source pending 在 ingestion 完成後解除。釋放舊 graph 後，manual refresh 完成且沒有 local error。原有 request-after-source barrier、owner／root／lease admission 與 first-paint pinning 不變；native fixture 另驗證 shared capture 的 228、replacement 的 268 與 clock expiry 的 0。
+
+另一個 paused recent-query fixture 在 await 期間跨越 clock bucket 後才回傳 failure，要求 last-good rate 與有效 lease 不被該過期錯誤清除，且目前 bucket 仍可重新查詢。缺少 error-side bucket admission 時兩個斷言失敗；query 的成功與失敗都保留 clock identity 檢查。Covered-lens reuse 與 dormant-result regressions 保留，不能用 live-rate lane split 取消既有 performance contract。
+
+這是 actual model／scheduler／native bridge 的短程 correctness 證據，不是 visible UI、current-corpus latency 或 steady-state resource acceptance。
+
 
 ### Phase 1 證據與未通過的 gate
 

@@ -417,6 +417,11 @@ mod tests {
             shared_sync["scopes"][1]["sourceGeneration"],
             "same producer must publish one source generation: {shared_sync}"
         );
+        assert_eq!(
+            query_at(&shared_token, "live", "rate", now),
+            228.0,
+            "shared recent+quota capture must serve the fresh rate"
+        );
         let refresh = data(ffi(
             &json!({"scopes":shared,"previousLeaseToken":shared_token,"verifyTopology":false}),
             crate::tb_local_usage_sync,
@@ -427,6 +432,16 @@ mod tests {
         assert_ne!(
             refresh["scopes"][0]["sourceGeneration"], shared_sync["scopes"][0]["sourceGeneration"],
             "late write must advance the next generation for both scopes"
+        );
+        assert_eq!(
+            query_at(&refresh_token, "live", "rate", now),
+            268.0,
+            "late write must reach the recent rate on the next refresh"
+        );
+        assert_eq!(
+            query_at(&refresh_token, "live", "rate", now.saturating_add(61_000)),
+            0.0,
+            "recent rate must expire by the clock without a resync"
         );
         release(&shared_token);
         release(&refresh_token);

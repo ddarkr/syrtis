@@ -60,7 +60,8 @@ final class LocalUsageScheduler {
     private var sync: LocalUsageSyncResult?
     private var syncedScopes: Set<LocalUsageScope> = []
     private var worker: Task<Void, Never>?
-    private var queryWorker: Task<Void, Never>?
+    private var recentQueryWorker: Task<Void, Never>?
+    private var historyQueryWorker: Task<Void, Never>?
     private var deadline: Task<Void, Never>?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var rootEpoch: UInt64 = 0
@@ -347,11 +348,18 @@ final class LocalUsageScheduler {
     }
 
     /// Deterministic tests drive real transitions without timer sleeps.
+    /// The source worker owns ingestion only: it launches both pure query
+    /// lanes without awaiting them, so a blocked graph/models query never
+    /// holds source verification. runDueWork then awaits the full turn
+    /// (worker plus clock lanes) for deterministic test seams.
     func runDueWork() async {
-        if let worker { await worker.value; return }
-        let task = Task { await self.runWorker() }
-        worker = task
-        await task.value
+        if let worker { await worker.value }
+        else {
+            let task = Task { await self.runWorker() }
+            worker = task
+            await task.value
+        }
+        await runClockWork()
     }
 
     private func refreshDemand() {
@@ -510,11 +518,17 @@ final class LocalUsageScheduler {
         if demandedScopes.isEmpty && !owners.values.contains(where: { $0.clock != nil }) { return }
         let now = monotonicNow()
         if worker == nil, now >= retryAt, needsSync { worker = Task { await self.runWorker() } }
-        let queryMissing = demandedQueries.contains {
-            syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
+        let recentMissing = demandedQueries.contains {
+            $0.isRecent && syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
         }
-        if queryWorker == nil, now >= retryAt, queryMissing || now >= nextClockDeadline {
-            _ = startQueryWorker()
+        let historyMissing = demandedQueries.contains {
+            !$0.isRecent && syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
+        }
+        if recentQueryWorker == nil, now >= retryAt, recentMissing || now >= nextClockDeadline {
+            _ = startRecentQueryWorker()
+        }
+        if historyQueryWorker == nil, now >= retryAt, historyMissing {
+            _ = startHistoryQueryWorker()
         } else if now >= nextClockDeadline { tickClock() }
         armDeadline()
     }
@@ -554,7 +568,12 @@ final class LocalUsageScheduler {
             let reportStages = unpublishedGraphs()
             let epoch = rootEpoch
             let stagedScopes = Set(reportStages.map { $0.query.scope })
-            if !reportStages.isEmpty, stagedScopes != scopes {
+            // A live history lane already owns its graph query: staging a
+            // second graph here would run slow native I/O on the ingestion
+            // lane and hold the union behind it. First paint (no history
+            // worker yet) still stages; a resync while history is blocked
+            // skips staging and lets the union ingest first.
+            if !reportStages.isEmpty, stagedScopes != scopes, historyQueryWorker == nil {
                 if let side = await sideCapture(stagedScopes) {
                     for stage in reportStages {
                         guard !stopped, epoch == rootEpoch else { break }
@@ -568,7 +587,12 @@ final class LocalUsageScheduler {
                 guard await syncScopes(scopes) else { return }
             }
         }
-        await runClockWork()
+        // Ingestion done: launch both pure query lanes without awaiting
+        // them, so the source worker (and sourcePending) releases even
+        // while a slow history query is blocked. runDueWork awaits the
+        // full turn; the automatic kick path coalesces via the workers.
+        _ = startRecentQueryWorker()
+        _ = startHistoryQueryWorker()
     }
     /// One native capture over exactly these scopes. Returns false when the
     /// capture was dropped (owner close, root change, no demand overlap):
@@ -730,28 +754,59 @@ final class LocalUsageScheduler {
         }
     }
     /// Pure captured queries remain schedulable while mounted source I/O blocks.
-    func runClockWork() async { await startQueryWorker().value }
+    /// Recent (rate/trace) starts first on its own lane so a paused slow
+    /// history query cannot hold clock-driven live updates behind it; both
+    /// lanes are awaited so history suspension stays observable here.
+    func runClockWork() async {
+        let recent = startRecentQueryWorker()
+        let history = startHistoryQueryWorker()
+        await recent.value
+        await history.value
+    }
 
-    private func startQueryWorker() -> Task<Void, Never> {
-        if let queryWorker { return queryWorker }
+    private func startRecentQueryWorker() -> Task<Void, Never> {
+        if let recentQueryWorker { return recentQueryWorker }
         let task = Task {
-            defer { queryWorker = nil; tickClock(); kick() }
-            await runQueries()
+            defer { recentQueryWorker = nil; tickClock(); kick() }
+            await runQueries(recentOnly: true)
         }
-        queryWorker = task
+        recentQueryWorker = task
         return task
     }
 
-    private func runQueries() async {
+    private func startHistoryQueryWorker() -> Task<Void, Never> {
+        if let historyQueryWorker { return historyQueryWorker }
+        let task = Task {
+            defer { historyQueryWorker = nil; kick() }
+            await runQueries(recentOnly: false)
+        }
+        historyQueryWorker = task
+        return task
+    }
+
+    private func runQueries(recentOnly: Bool) async {
         guard !stopped, let snapshot = sync else { return }
         refreshDemand()
         let epoch = rootEpoch
-        // Graph first paint already published above; remaining turns skip it.
-        for query in demandedQueries.sorted(by: { $0.kind == "graph" && $1.kind != "graph" }) {
-            guard epoch == rootEpoch, !stopped else { return }
+        // First paint already stages above; remaining turns keep
+        // deterministic order so pure query turns are reproducible. The
+        // recent lane carries only rate/trace; history covers the rest.
+        var ordered = Array(demandedQueries.lazy.filter { $0.isRecent == recentOnly })
+        ordered.sort {
+            if $0.kind != $1.kind { return $0.kind < $1.kind }
+            if $0.scope.id != $1.scope.id { return $0.scope.id < $1.scope.id }
+            if $0.year != $1.year { return ($0.year ?? "") < ($1.year ?? "") }
+            return ($0.windowSecs ?? -1) < ($1.windowSecs ?? -1)
+        }
+        for query in ordered {
+            guard epoch == rootEpoch, !stopped, sync?.leaseToken == snapshot.leaseToken else { return }
             guard demandedQueries.contains(query), syncedScopes.contains(query.scope) else { continue }
             let issueDemanderIDs = demanders(of: query)
             guard !issueDemanderIDs.isEmpty else { continue }
+            // Request-time bucket: a stale completion is dropped and re-issued
+            // under the current bucket instead of publishing old data. Recent
+            // buckets by the 10s clock, history by day/timezone: the lane
+            // split only unblocks recent, it never weakens admission.
             let key = identity(query)
             if results[query]?.identity == key { continue }
             let token = snapshot.leaseToken
@@ -763,20 +818,23 @@ final class LocalUsageScheduler {
                     leaseToken: token, scopeId: query.scope.id, kind: query.kind,
                     year: query.year, clients: query.clients, windowSecs: query.windowSecs,
                     nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
-                guard epoch == rootEpoch, !stopped, demandedQueries.contains(query),
-                      syncedScopes.contains(query.scope), sync?.leaseToken == token,
-                      key == identity(query),
-                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
+                guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
+                guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
+                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
+                if key != identity(query) {
+                    results.removeValue(forKey: query)
+                    continue
+                }
                 results[query] = Cached(value: value, identity: key)
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
                     owner.callback?(query, .success(value))
                 }
                 resumeReadyWaiters()
             } catch {
-                guard epoch == rootEpoch, !stopped, demandedQueries.contains(query),
-                      syncedScopes.contains(query.scope), sync?.leaseToken == token,
+                guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
+                guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
                       key == identity(query),
-                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
+                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
                 lastError = String(describing: error); retryAt = monotonicNow() + 10
                 previousLeaseUsable = false; syncedScopes.removeAll()
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {

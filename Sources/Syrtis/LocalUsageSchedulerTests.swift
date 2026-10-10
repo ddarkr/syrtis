@@ -20,6 +20,8 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var pauseNextQueryFlag = false
     private var pausedQuery: CheckedContinuation<Void, Never>?
     private var queryPauseObservers: [CheckedContinuation<Void, Never>] = []
+    private var pausedQueryKind: String?
+    private var pausedQueryKinds: Set<String> = []
     private var failNext = false
     private var failQueryKinds: Set<String> = []
     private var recentEventMs: Int64 = 0
@@ -44,8 +46,10 @@ private actor SchedulerFixtureSource: UsageDataSource {
     func isWindowPaused() -> Bool { pausedWindow != nil }
     func resumeWindowQuery() { pausedWindow?.resume(); pausedWindow = nil }
     func pauseNextQuery() { pauseNextQueryFlag = true }
+    func pauseNextQuery(kind: String) { pauseNextQueryFlag = true; pausedQueryKinds.insert(kind) }
     func isQueryPaused() -> Bool { pausedQuery != nil }
-    func resumeQuery() { pausedQuery?.resume(); pausedQuery = nil }
+    func pausedQueryKindForTesting() -> String? { pausedQueryKind }
+    func resumeQuery() { pausedQuery?.resume(); pausedQuery = nil; pausedQueryKind = nil; pausedQueryKinds.removeAll() }
     func waitForPausedQuery() async {
         if pausedQuery != nil { return }
         await withCheckedContinuation { queryPauseObservers.append($0) }
@@ -109,8 +113,10 @@ private actor SchedulerFixtureSource: UsageDataSource {
         // and a later query must not consume another query's failure.
         let shouldFail = failQueryKinds.contains(request.kind)
         if shouldFail { failQueryKinds.remove(request.kind) }
-        if pauseNextQueryFlag {
+        if pauseNextQueryFlag, pausedQueryKinds.isEmpty || pausedQueryKinds.contains(request.kind) {
             pauseNextQueryFlag = false
+            pausedQueryKinds.removeAll()
+            pausedQueryKind = request.kind
             await withCheckedContinuation { continuation in
                 pausedQuery = continuation
                 for observer in queryPauseObservers { observer.resume() }
@@ -904,6 +910,108 @@ extension LocalUsageScheduler {
                "final close releases leases and stays quiescent")
         coverageScheduler.stop()
         capScheduler.stop()
+        // A blocked slow history query cannot hold live updates: pause only
+        // the graph query, force a genuine history miss via clockChanged so
+        // the next turn reaches it, age the event past 60s, then run the
+        // recent lane while history is genuinely paused. Exact real values:
+        // the seed publishes 120, the recent lane expires 120 to a real 0
+        // with trace while the graph stays blocked.
+        let stalledSource = SchedulerFixtureSource()
+        let stalledClock = Clock()
+        let stalledScheduler = LocalUsageScheduler(
+            source: stalledSource, observesSources: false, automaticallySchedules: true,
+            monotonicNow: { stalledClock.monotonic }, wallNow: { stalledClock.wall })
+        let stalledSession = stalledScheduler.openSession()
+        let stalledRate = Query(kind: "rate")
+        let stalledTrace = Query(kind: "trace", windowSecs: 600)
+        let stalledGraph = Query(kind: "graph", year: "2026")
+        var stalledRates: [Double] = []
+        // Seed before demand lands so the first automatic sync ingests it.
+        await stalledSource.appendRecentEvent(at: Int64(stalledClock.wall.timeIntervalSince1970 * 1000))
+        stalledScheduler.update(stalledSession, queries: [stalledGraph, stalledRate, stalledTrace], active: true) { query, result in
+            if query == stalledRate, case .success(.rate(let value)) = result { stalledRates.append(value) }
+        }
+        let stalledSeedDeadline = Date().addingTimeInterval(5)
+        while Date() < stalledSeedDeadline {
+            if stalledRates == [120] { break }
+            await Task.yield()
+        }
+        expect(stalledRates == [120], "seed publishes the live positive rate")
+        // Genuine history miss on the next automatic turn: arm the
+        // kind-scoped graph pause, then age the event past the 60s live
+        // window and drop the cached graph so the automatic turn must
+        // issue the slow history query and block on it. The recent lane
+        // must still expire 120 to a real 0 with trace while it stays
+        // paused: automatic kick coalesces the lanes, so no manual clock
+        // lane can be awaited directly while history is blocked.
+        await stalledSource.pauseNextQuery(kind: "graph")
+        stalledClock.advance(61)
+        stalledScheduler.clockChanged()
+        let expiryDeadline = Date().addingTimeInterval(5)
+        while Date() < expiryDeadline {
+            if stalledRates == [120, 0] { break }
+            await Task.yield()
+        }
+        expect(stalledRates == [120, 0], "recent expiry publishes 0 while the slow history query stays blocked")
+        let stalledStillPaused = await stalledSource.isQueryPaused()
+        let stalledPausedKind = await stalledSource.pausedQueryKindForTesting()
+        expect(stalledStillPaused && stalledPausedKind == "graph",
+               "the paused query is genuinely the slow history lane")
+        // SAME graph query is still paused: the automatic source turn must
+        // ingest via the union only (no second staged graph on the source
+        // worker) and the recent lane must republish the live 120. Both
+        // guards expire finitely (finite failure on the unfixed lane split,
+        // which holds recent behind the blocked history query).
+        await stalledSource.appendRecentEvent(at: Int64(stalledClock.wall.timeIntervalSince1970 * 1000))
+        stalledScheduler.sourcesChanged(requiresTopology: false)
+        stalledClock.advance(1)
+        var resyncObserved = false
+        let resyncDeadline = Date().addingTimeInterval(5)
+        while Date() < resyncDeadline {
+            if stalledRates == [120, 0, 120] { resyncObserved = true; break }
+            await Task.yield()
+        }
+        let resyncStillPaused = await stalledSource.isQueryPaused()
+        expect(resyncStillPaused, "source resync completes while the slow history query stays blocked")
+        expect(resyncObserved, "new-event resync observed before the history release (bounded guard)")
+        await stalledSource.resumeQuery()
+        await stalledScheduler.runDueWork()
+        expect(stalledRates == [120, 0, 120],
+               "blocked history still lets the live header expire 120 to 0 then resync to 120 on a new event")
+        stalledScheduler.stop()
+        // A late error from an expired recent bucket must not clear the
+        // still-valid lease or replace the header's last good rate.
+        let expiredErrorSource = SchedulerFixtureSource()
+        let expiredErrorClock = Clock()
+        let expiredErrorScheduler = LocalUsageScheduler(
+            source: expiredErrorSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { expiredErrorClock.monotonic }, wallNow: { expiredErrorClock.wall })
+        let expiredErrorSession = expiredErrorScheduler.openSession()
+        let expiredErrorRate = Query(kind: "rate")
+        var expiredErrorRates: [Double] = []
+        var expiredErrorFailures = 0
+        await expiredErrorSource.appendRecentEvent(
+            at: Int64(expiredErrorClock.wall.timeIntervalSince1970 * 1000))
+        expiredErrorScheduler.update(expiredErrorSession, queries: [expiredErrorRate], active: true) { _, result in
+            if case .success(.rate(let value)) = result { expiredErrorRates.append(value) }
+            if case .failure = result { expiredErrorFailures += 1 }
+        }
+        await expiredErrorScheduler.runDueWork()
+        expiredErrorClock.advance(11)
+        await expiredErrorSource.failNextQuery(kind: "rate")
+        await expiredErrorSource.pauseNextQuery(kind: "rate")
+        let expiredErrorTurn = Task { await expiredErrorScheduler.runClockWork() }
+        await expiredErrorSource.waitForPausedQuery()
+        expiredErrorClock.advance(11)
+        expiredErrorScheduler.clockChanged()
+        await expiredErrorSource.resumeQuery()
+        await expiredErrorTurn.value
+        expect(expiredErrorFailures == 0 && expiredErrorScheduler.lastError == nil && expiredErrorRates == [120],
+               "expired recent-bucket error does not replace the header's last good rate")
+        await expiredErrorScheduler.runDueWork()
+        expect(expiredErrorRates == [120, 120] && expiredErrorFailures == 0,
+               "current recent bucket remains readable after the expired query failure")
+        expiredErrorScheduler.stop()
         LocalSourceHints.selfTest(expect)
     }
 }
