@@ -160,6 +160,10 @@ Automatic scheduler regression 以同一個 paused graph query 驗證 recent rat
 
 另一個 paused recent-query fixture 在 await 期間跨越 clock bucket 後才回傳 failure，要求 last-good rate 與有效 lease 不被該過期錯誤清除，且目前 bucket 仍可重新查詢。缺少 error-side bucket admission 時兩個斷言失敗；query 的成功與失敗都保留 clock identity 檢查。Covered-lens reuse 與 dormant-result regressions 保留，不能用 live-rate lane split 取消既有 performance contract。
 
+Header regressions also exercise eviction before a paused replacement capture returns, no repeated old-scope queries, genuine installed-lease failure and retry, reopening a popover model, and failed replacement ingestion followed by recovery. Recovery must clear all affected model errors even if a historical query's source generation is unchanged. The replacement-owned error and unchanged-generation recovery assertions failed before their respective scheduler fixes.
+
+A separate isolated synthetic `DashboardModel → LocalUsageScheduler → LiveUsageDataSource → C ABI → Rust` executable paused the source wrapper after native replacement completed but before the scheduler received its lease. The initial header was 38 tok/min; an actual stale native query retained 38 without a false model error or repeated query, and replacement publication produced 138. An injected source-read failure then retained 138 and its genuine error; successful unchanged-generation native synchronization cleared the error. This bounded smoke used explicit scheduler turns, not visible UI or current-corpus acceptance.
+
 這是 actual model／scheduler／native bridge 的短程 correctness 證據，不是 visible UI、current-corpus latency 或 steady-state resource acceptance。
 
 

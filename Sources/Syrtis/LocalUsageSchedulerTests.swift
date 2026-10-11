@@ -24,6 +24,7 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var pausedQueryKinds: Set<String> = []
     private var failNext = false
     private var failQueryKinds: Set<String> = []
+    private var invalidateNextSync = false
     private var recentEventMs: Int64 = 0
     private var lastScopeIDs: [String]?
     private var lastToken: String?
@@ -56,6 +57,10 @@ private actor SchedulerFixtureSource: UsageDataSource {
     }
     func failNextSync() { failNext = true }
     func failNextQuery(kind: String) { failQueryKinds.insert(kind) }
+    func invalidateBeforeNextSync() { invalidateNextSync = true }
+    func evictCurrentLease() {
+        if let lastToken { capturedRecentEvents[lastToken] = nil }
+    }
     func waitForReleaseCount(_ count: Int) async {
         if releases.count >= count { return }
         await withCheckedContinuation { releaseObservers.append((count, $0)) }
@@ -66,6 +71,10 @@ private actor SchedulerFixtureSource: UsageDataSource {
     }
     func localUsageSync(_ request: LocalUsageSyncRequest) async throws -> LocalUsageSyncResult {
         syncRequests.append(request)
+        if invalidateNextSync {
+            invalidateNextSync = false
+            evictCurrentLease()
+        }
         // Capture at entry, before a blocked source read. An event appended
         // while this is paused belongs only to the post-request verification.
         let capturedGeneration = generation
@@ -1012,6 +1021,93 @@ extension LocalUsageScheduler {
         expect(expiredErrorRates == [120, 120] && expiredErrorFailures == 0,
                "current recent bucket remains readable after the expired query failure")
         expiredErrorScheduler.stop()
+        // Native replacement can evict a scope before the awaiting sync
+        // returns its lease. A failed old rate is owned by that capture.
+        let replacementSource = SchedulerFixtureSource()
+        let replacementClock = Clock()
+        let replacementScheduler = LocalUsageScheduler(
+            source: replacementSource, observesSources: false,
+            monotonicNow: { replacementClock.monotonic }, wallNow: { replacementClock.wall })
+        let replacementRateSession = replacementScheduler.openSession()
+        let replacementModel = DashboardModel(
+            cachesSnapshot: false, source: replacementSource,
+            scheduler: replacementScheduler, localSession: replacementRateSession)
+        await replacementSource.appendRecentEvent(
+            at: Int64(replacementClock.wall.timeIntervalSince1970 * 1000))
+        replacementModel.configureLocalDemand(view: .daily, clients: [], models: false)
+        await replacementScheduler.runDueWork()
+        expect(replacementModel.liveRate == 120, "header receives its first real rate")
+        await replacementSource.invalidateBeforeNextSync()
+        await replacementSource.pauseNextSync()
+        replacementClock.advance(31)
+        replacementScheduler.sourcesChanged(requiresTopology: false)
+        replacementClock.advance(1)
+        await replacementSource.waitForPausedSync()
+        await replacementScheduler.runClockWork()
+        let pendingQueryCount = replacementScheduler.queryCount
+        for _ in 0..<20 { await Task.yield() }
+        expect(replacementModel.localError == nil && replacementModel.liveRate == 120,
+               "replacement-owned stale rate preserves last-good header without a false error")
+        expect(replacementScheduler.queryCount == pendingQueryCount,
+               "replacement-owned stale query waits for ingestion instead of spinning")
+        await replacementSource.resumeSync()
+        await replacementScheduler.runDueWork()
+        expect(replacementModel.liveRate == 120 && replacementModel.localError == nil,
+               "replacement capture restores header publication")
+        // A genuinely evicted installed lease must report failure, wait for
+        // the retry deadline, then synchronize without recycling that lease.
+        await replacementSource.evictCurrentLease()
+        replacementClock.advance(11)
+        await replacementScheduler.runClockWork()
+        expect(replacementModel.localError != nil && replacementModel.liveRate == 120,
+               "current lease failure remains visible and keeps last-good rate")
+        let failedQueryCount = replacementScheduler.queryCount
+        await replacementScheduler.runClockWork()
+        expect(replacementScheduler.queryCount == failedQueryCount,
+               "invalid lease cannot be queried again before resynchronization")
+        replacementClock.advance(11)
+        await replacementScheduler.runDueWork()
+        expect(replacementModel.liveRate == 120 && replacementModel.localError == nil,
+               "evicted lease automatically recovers by synchronizing")
+        let recoveryHistory = await replacementSource.history()
+        expect(recoveryHistory.0.last?.previousLeaseToken == nil,
+               "recovery does not offer the rejected lease for reuse")
+        replacementModel.releaseLocalDemand()
+        let reopenedSession = replacementScheduler.openSession()
+        let reopenedModel = DashboardModel(
+            cachesSnapshot: false, source: replacementSource,
+            scheduler: replacementScheduler, localSession: reopenedSession)
+        reopenedModel.configureLocalDemand(view: .daily, clients: [], models: false)
+        await replacementScheduler.runDueWork()
+        expect(reopenedModel.liveRate == 120 && reopenedModel.localError == nil,
+               "reopened popover model gets a fresh first rate")
+        await replacementSource.appendRecentEvent(
+            at: Int64(replacementClock.wall.timeIntervalSince1970 * 1000))
+        replacementScheduler.sourcesChanged(requiresTopology: false)
+        replacementClock.advance(1)
+        await replacementScheduler.runDueWork()
+        expect(reopenedModel.liveRate == 120 && reopenedModel.localError == nil,
+               "failed-capture fixture starts with fresh positive usage")
+        await replacementSource.invalidateBeforeNextSync()
+        await replacementSource.failNextSync()
+        await replacementSource.pauseNextSync()
+        replacementClock.advance(11)
+        replacementScheduler.sourcesChanged(requiresTopology: false)
+        replacementClock.advance(1)
+        await replacementSource.waitForPausedSync()
+        await replacementScheduler.runClockWork()
+        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 120,
+               "old query failure waits for the replacement capture outcome")
+        await replacementSource.resumeSync()
+        await replacementScheduler.runDueWork()
+        expect(reopenedModel.localError != nil && reopenedModel.liveRate == 120,
+               "replacement ingestion failure is reported without inventing zero usage")
+        replacementClock.advance(11)
+        await replacementScheduler.runDueWork()
+        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 120,
+               "failed replacement recovers the reopened header on the next synchronization")
+        reopenedModel.releaseLocalDemand()
+        replacementScheduler.stop()
         LocalSourceHints.selfTest(expect)
     }
 }

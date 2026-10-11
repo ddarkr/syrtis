@@ -59,6 +59,7 @@ final class LocalUsageScheduler {
     private var results: [Query: Cached] = [:]
     private var sync: LocalUsageSyncResult?
     private var syncedScopes: Set<LocalUsageScope> = []
+    private var capturingScopes: Set<LocalUsageScope> = []
     private var worker: Task<Void, Never>?
     private var recentQueryWorker: Task<Void, Never>?
     private var historyQueryWorker: Task<Void, Never>?
@@ -611,6 +612,8 @@ final class LocalUsageScheduler {
         let full = forceVerified < forceBarrier || now - lastFull >= fullVerificationInterval
         let topology = topologyRequired || full || now - lastTopology >= 300 || sync == nil
         let pricing = needsPricing
+        capturingScopes = requested
+        defer { capturingScopes.removeAll() }
         do {
             syncCount += 1
             let captured = try await source.localUsageSync(LocalUsageSyncRequest(
@@ -670,7 +673,12 @@ final class LocalUsageScheduler {
             retryAt = forceRequested > forceBarrier ? 0 : monotonicNow() + min(10, checkInterval)
             failWaiters(error, throughForce: forceBarrier)
             for (session, owner) in owners where contains(session) {
-                for query in owner.queries { owner.callback?(query, .failure(error)) }
+                for query in owner.queries {
+                    // Last-good display stays in the consumer, but a failed
+                    // capture must revalidate every query on recovery.
+                    results.removeValue(forKey: query)
+                    owner.callback?(query, .failure(error))
+                }
             }
             return false
         }
@@ -833,8 +841,15 @@ final class LocalUsageScheduler {
             } catch {
                 guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
                 guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
-                      key == identity(query),
                       !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
+                // Native ingestion can evict this generation before its new
+                // lease returns. Stop querying the old scope; the capture
+                // owns its eventual success or failure, not this old query.
+                if capturingScopes.contains(query.scope) {
+                    syncedScopes.remove(query.scope)
+                    continue
+                }
+                guard key == identity(query) else { continue }
                 lastError = String(describing: error); retryAt = monotonicNow() + 10
                 previousLeaseUsable = false; syncedScopes.removeAll()
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
