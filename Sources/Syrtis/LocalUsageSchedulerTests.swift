@@ -1108,6 +1108,114 @@ extension LocalUsageScheduler {
                "failed replacement recovers the reopened header on the next synchronization")
         reopenedModel.releaseLocalDemand()
         replacementScheduler.stop()
+        // Hint plumbing: bounded coalesced file evidence rides the plain
+        // dirty sync, overflow/topology/periodic syncs verify authoritatively.
+        let hintClock = Clock()
+        let hintSource = SchedulerFixtureSource()
+        let hintScheduler = LocalUsageScheduler(
+            source: hintSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { hintClock.monotonic }, wallNow: { hintClock.wall })
+        let hintSession = hintScheduler.openSession()
+        let hintGraph = Query(kind: "graph", year: "2026")
+        hintScheduler.update(hintSession, queries: [hintGraph], active: true) { _, _ in }
+        await hintScheduler.runDueWork()
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///a"])
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///b"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == ["file:///a", "file:///b"],
+               "coalesced hints ride the plain dirty sync sorted")
+        hintScheduler.sourcesChanged(requiresTopology: false,
+                                     changedFileURLs: (0..<300).map { "file:///f\($0)" })
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///after"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == nil,
+               "overflowing hints stay dropped when later names arrive before the sync")
+        hintScheduler.sourcesChanged(requiresTopology: false)
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///later"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == nil,
+               "unnamed changes stay authoritative beside later named callbacks")
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///c"])
+        hintScheduler.sourcesChanged(requiresTopology: true)
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        let topologyRequest = (await hintSource.history()).0.last
+        expect(topologyRequest?.verifyTopology == true && topologyRequest?.changedFileURLs == nil,
+               "topology fallback drops named evidence")
+        // Continuous hints never postpone the periodic full check.
+        hintScheduler.fullVerificationInterval = 60
+        hintClock.advance(59)
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///d"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        let fullRequest = (await hintSource.history()).0.last
+        expect(fullRequest?.force == true && fullRequest?.changedFileURLs == nil,
+               "periodic full verification survives continuous hints")
+        // Failed hinted syncs retry the same evidence, not an empty sync.
+        hintScheduler.fullVerificationInterval = 100_000
+        await hintSource.failNextSync()
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///e"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        hintClock.advance(11)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == ["file:///e"],
+               "failed hinted sync requeues its evidence for the retry")
+        // Late hints during an in-flight capture queue for the next sync.
+        await hintSource.pauseNextSync()
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///f"])
+        hintClock.advance(1)
+        let hintedWork = Task { await hintScheduler.runDueWork() }
+        await hintSource.waitForPausedSync()
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///g"])
+        await hintSource.resumeSync()
+        await hintedWork.value
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == ["file:///g"],
+               "late hints survive in-flight capture for the next sync")
+        // Frequent named events must not starve the all-known-input deadline.
+        hintClock.advance(10)
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///h"])
+        await hintScheduler.runDueWork()
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        expect((await hintSource.history()).0.last?.changedFileURLs == ["file:///h"],
+               "named events remain targeted before the known-input deadline")
+        hintClock.advance(10)
+        hintScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///i"])
+        hintClock.advance(1)
+        await hintScheduler.runDueWork()
+        let knownRequest = (await hintSource.history()).0.last
+        expect(knownRequest?.changedFileURLs == nil && knownRequest?.force == false,
+               "continuous named events cannot postpone active all-known-input verification")
+        hintScheduler.stop()
+        // History order: graph before hourly/agents, models last.
+        let orderClock = Clock()
+        let orderSource = SchedulerFixtureSource()
+        let orderScheduler = LocalUsageScheduler(
+            source: orderSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { orderClock.monotonic }, wallNow: { orderClock.wall })
+        let orderSession = orderScheduler.openSession()
+        let orderGraph = Query(kind: "graph", year: "2026")
+        let orderAgents = Query(kind: "agents", year: "2026", clients: ["claude"])
+        let orderHourly = Query(kind: "hourly", year: "2026", clients: ["claude"])
+        let orderModels = Query(kind: "models", year: "2026")
+        orderScheduler.update(orderSession,
+                              queries: [orderModels, orderAgents, orderHourly, orderGraph],
+                              active: false) { _, _ in }
+        await orderScheduler.runDueWork()
+        let kinds = (await orderSource.history()).1.map(\.kind)
+        let graphFirst = kinds.firstIndex(of: "graph") ?? .max
+        expect(kinds.firstIndex(of: "graph") == graphFirst && graphFirst < (kinds.firstIndex(of: "agents") ?? .max)
+               && graphFirst < (kinds.firstIndex(of: "hourly") ?? .max)
+               && (kinds.firstIndex(of: "models") ?? .min) > (kinds.firstIndex(of: "agents") ?? .max)
+               && (kinds.firstIndex(of: "models") ?? .min) > (kinds.firstIndex(of: "hourly") ?? .max),
+               "history runs graph before agents/hourly and models last")
+        orderScheduler.stop()
         LocalSourceHints.selfTest(expect)
     }
 }

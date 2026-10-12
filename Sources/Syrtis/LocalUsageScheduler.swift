@@ -70,6 +70,12 @@ final class LocalUsageScheduler {
     private var checkedSequence: UInt64 = 0
     private var dirtyAt: TimeInterval?
     private var topologyRequired = true
+    /// Bounded coalesced file evidence from FSEvents; never postpones the
+    /// periodic full check and never survives force/topology/side syncs.
+    private var pendingHintURLs: Set<String>?
+    /// Sticky until consumed: an unnamed or overflowed batch stays dropped,
+    /// since later names cannot replace the missing evidence.
+    private var pendingHintsOverflowed = false
     private var forceRequested: UInt64 = 0
     private var forceVerified: UInt64 = 0
     private var lastCheck = -TimeInterval.infinity
@@ -313,10 +319,22 @@ final class LocalUsageScheduler {
         return value
     }
 
-    func sourcesChanged(requiresTopology: Bool) {
+    func sourcesChanged(requiresTopology: Bool, changedFileURLs: [String]? = nil) {
         dirtySequence &+= 1
         dirtyAt = dirtyAt ?? monotonicNow()
         topologyRequired = topologyRequired || requiresTopology
+        if requiresTopology || changedFileURLs == nil {
+            // The stronger fallback owns the sync: named evidence is
+            // meaningless beside topology or unbounded verification.
+            pendingHintURLs = nil
+            pendingHintsOverflowed = true
+        } else if let urls = changedFileURLs, !pendingHintsOverflowed {
+            var merged = pendingHintURLs ?? []
+            merged.formUnion(urls)
+            // ponytail: fixed 256-path bound; overflow drops names, flags keep fallback.
+            if merged.count > 256 { pendingHintURLs = nil; pendingHintsOverflowed = true }
+            else { pendingHintURLs = merged }
+        }
         kick()
     }
 
@@ -328,6 +346,8 @@ final class LocalUsageScheduler {
         previousLeaseUsable = false
         let replaced = sync
         sync = nil; results.removeAll(); syncedScopes.removeAll()
+        pendingHintURLs = nil
+        pendingHintsOverflowed = false
         if let replaced { retire(replaced) }
         topologyRequired = true; dirtySequence &+= 1; dirtyAt = nil
         kick()
@@ -612,6 +632,15 @@ final class LocalUsageScheduler {
         let full = forceVerified < forceBarrier || now - lastFull >= fullVerificationInterval
         let topology = topologyRequired || full || now - lastTopology >= 300 || sync == nil
         let pricing = needsPricing
+        // A named event cannot satisfy the periodic all-known-input check.
+        // Force, topology, pricing and overdue checks omit names.
+        // Capture-then-clear: hints arriving during this await queue for the
+        // next sync instead of mutating the in-flight request.
+        let hinted = pendingHintsOverflowed ? nil : pendingHintURLs
+        pendingHintURLs = nil
+        pendingHintsOverflowed = false
+        let checkDue = now - lastCheck >= checkInterval
+        let hintedURLs = (!full && !topology && !pricing && !checkDue) ? hinted?.sorted() : nil
         capturingScopes = requested
         defer { capturingScopes.removeAll() }
         do {
@@ -619,8 +648,8 @@ final class LocalUsageScheduler {
             let captured = try await source.localUsageSync(LocalUsageSyncRequest(
                 scopes: requested.sorted { $0.id < $1.id },
                 previousLeaseToken: previousLeaseUsable ? sync?.leaseToken : nil,
-                force: full, verifyTopology: topology, refreshPricing: pricing))
-            // A capture stays valid while any issuing demander still demands
+                force: full, verifyTopology: topology, refreshPricing: pricing,
+                changedFileURLs: hintedURLs))
             // its exact scopes; unrelated removals elsewhere keep overlap.
             refreshDemand()
             let admitted = !stopped && epoch == rootEpoch
@@ -634,10 +663,12 @@ final class LocalUsageScheduler {
             sync = captured
             syncedScopes = requested
             previousLeaseUsable = true
-            lastCheck = monotonicNow(); checkedSequence = sequence
-            if full { lastFull = lastCheck }
-            if topology { lastTopology = lastCheck; topologyRequired = false }
-            if pricing { lastPricing = lastCheck }
+            let completedAt = monotonicNow()
+            if hintedURLs == nil { lastCheck = completedAt }
+            checkedSequence = sequence
+            if full { lastFull = completedAt }
+            if topology { lastTopology = completedAt; topologyRequired = false }
+            if pricing { lastPricing = completedAt }
             forceVerified = max(forceVerified, forceBarrier)
             if checkedSequence == dirtySequence { dirtyAt = nil }
             lastError = nil; retryAt = 0
@@ -655,8 +686,8 @@ final class LocalUsageScheduler {
                                && monotonicNow() - lastHintInstall >= 300) {
                     installedManifest = manifest
                     lastHintInstall = monotonicNow()
-                    hints.install(manifest) { [weak self] topology in
-                        self?.sourcesChanged(requiresTopology: topology)
+                    hints.install(manifest) { [weak self] topology, urls in
+                        self?.sourcesChanged(requiresTopology: topology, changedFileURLs: urls)
                     }
                 }
             }
@@ -668,6 +699,18 @@ final class LocalUsageScheduler {
             refreshDemand()
             guard epoch == rootEpoch, issueScopes.isSubset(of: demandedScopes),
                   !issueDemanderIDs.isDisjoint(with: demanders(ofScopes: issueScopes)) else { return false }
+            // The failed sync consumed the captured names: requeue them so the
+            // retry still verifies the same evidence instead of dropping it.
+            if let hinted, !full, !topology, !pricing, !pendingHintsOverflowed {
+                var merged = pendingHintURLs ?? []
+                merged.formUnion(hinted)
+                if merged.count > 256 {
+                    pendingHintURLs = nil
+                    pendingHintsOverflowed = true
+                } else {
+                    pendingHintURLs = merged
+                }
+            }
             lastError = String(describing: error)
             previousLeaseUsable = false; syncedScopes.removeAll()
             retryAt = forceRequested > forceBarrier ? 0 : monotonicNow() + min(10, checkInterval)
@@ -791,6 +834,16 @@ final class LocalUsageScheduler {
         historyQueryWorker = task
         return task
     }
+    /// History lane order: first paint, visible lenses, deferred aggregates.
+    /// Unknown kinds sort last lexically so a new lens cannot jump the graph.
+    private static func historyPriority(_ kind: String) -> (Int, String) {
+        switch kind {
+        case "graph": return (0, kind)
+        case "hourly", "agents": return (1, kind)
+        case "models": return (2, kind)
+        default: return (3, kind)
+        }
+    }
 
     private func runQueries(recentOnly: Bool) async {
         guard !stopped, let snapshot = sync else { return }
@@ -799,9 +852,11 @@ final class LocalUsageScheduler {
         // First paint already stages above; remaining turns keep
         // deterministic order so pure query turns are reproducible. The
         // recent lane carries only rate/trace; history covers the rest.
+        // Graph paints first, then the visible hourly/agents lenses, then
+        // models: lexical order would run agents before the graph it annotates.
         var ordered = Array(demandedQueries.lazy.filter { $0.isRecent == recentOnly })
         ordered.sort {
-            if $0.kind != $1.kind { return $0.kind < $1.kind }
+            if $0.kind != $1.kind { return Self.historyPriority($0.kind) < Self.historyPriority($1.kind) }
             if $0.scope.id != $1.scope.id { return $0.scope.id < $1.scope.id }
             if $0.year != $1.year { return ($0.year ?? "") < ($1.year ?? "") }
             return ($0.windowSecs ?? -1) < ($1.windowSecs ?? -1)
