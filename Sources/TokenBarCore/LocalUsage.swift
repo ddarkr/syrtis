@@ -27,16 +27,21 @@ public struct LocalUsageSyncRequest: Codable, Sendable {
     public let force: Bool
     public let verifyTopology: Bool
     public let refreshPricing: Bool
+    /// Advisory only: exact FSEvents regular-file URLs, bounded to 256.
+    /// Rust verifies metadata; force/topology/periodic syncs omit it.
+    public let changedFileURLs: [String]?
 
     public init(
         scopes: [LocalUsageScope], previousLeaseToken: String? = nil,
-        force: Bool = false, verifyTopology: Bool = true, refreshPricing: Bool = false
+        force: Bool = false, verifyTopology: Bool = true, refreshPricing: Bool = false,
+        changedFileURLs: [String]? = nil
     ) {
         self.scopes = scopes
         self.previousLeaseToken = previousLeaseToken
         self.force = force
         self.verifyTopology = verifyTopology
         self.refreshPricing = refreshPricing
+        self.changedFileURLs = changedFileURLs
     }
 }
 

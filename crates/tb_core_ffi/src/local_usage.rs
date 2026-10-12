@@ -155,6 +155,8 @@ struct SyncRequest {
     verify_topology: bool,
     #[serde(default)]
     refresh_pricing: bool,
+    #[serde(rename = "changedFileURLs", default)]
+    changed_file_urls: Option<Vec<String>>,
 }
 fn yes() -> bool {
     true
@@ -430,10 +432,24 @@ pub(crate) fn synchronize(json: &str) -> Result<crate::EncodedLocalPayload, Stri
                 .iter()
                 .find(|scope| scope.source.producer == key)
         });
+        let hinted = request
+            .changed_file_urls
+            .as_deref()
+            .filter(|hints| !hints.is_empty());
         let verification = if checked.is_none() && !request.force && !request.verify_topology {
             // An unavailable baseline takes the authoritative capture path;
-            // it must never be treated as verified unchanged.
-            old.and_then(|old| old.source.manifest.verify_changes().ok())
+            // it must never be treated as verified unchanged. Periodic full
+            // verification is never postponed by hints: a hinted sync still
+            // runs the authoritative scan when the field is absent, and falls
+            // back to it whenever a hint is unsafe or proves nothing.
+            if let (Some(old), Some(hints)) = (old, hinted) {
+                old.source
+                    .manifest
+                    .verify_hinted_changes(scope_context.home_dir(), hints)
+                    .ok()
+            } else {
+                old.and_then(|old| old.source.manifest.verify_changes().ok())
+            }
         } else {
             None
         };

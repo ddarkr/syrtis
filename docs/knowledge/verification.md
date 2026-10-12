@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-10
+last_verified: 2026-10-12
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -264,6 +264,25 @@ Cold synchronization pays the once-per-generation Claude／Codex index build; it
 
 Final `cargo test --workspace --locked` passed 2,517 top-level cases plus one child-process lock check, with six ignored. Workspace Clippy passed with the existing FFI warnings (15 library／22 test-target); exact task-owned Rust formatting, both `make selftest` and `make selftest-bundled`, isolated bundle signature verification and the knowledge checker (19 self-tests plus repository validation) passed. Rust language-server diagnostics were unavailable, so compiler／Clippy checks provided Rust verification; Swift scheduler diagnostics retained the baseline's three SwiftLint errors and eight warnings, not a clean lint result.
 
+
+### Named source hint verification
+
+The optional `changedFileURLs` sync field is verified at the Swift／C ABI／Rust seam. Native fixtures cover same-key rewrites, unchanged authoritative reuse, malformed hints, parser sibling drift, replaced files, later unhinted changes and rejection of a replaced lease. Scheduler fixtures cover bounded coalescing, sticky unnamed／overflow fallback, retry／in-flight events, active all-known-input deadlines under continuous hints, forced verification and graph-before-hourly／Agents-before-models issue order. Existing report arbitration, corruption and completeness fixtures remain the semantic guards for metadata-only publication scratch.
+
+A production release-library smoke used 500 historical Claude rows plus a recent event: graph 19,038 → 19,146, rate 38 → 146 → clock-expired 0, empty-year graph 0. Graph／models／hourly／Agents outputs after the changed capture matched unchanged and forced captures, excluding only the generated-at timestamp.
+
+An actual automatic Swift scheduler linked the fresh static archive and used `LiveUsageDataSource` with a real FSEvents stream over an established synthetic file. Appending an event published graph／rate 38 → 146 in 306.1 ms, then the rate expired to 0; a post-request forced refresh read 194 graph tokens, with no current query errors. The typed native request contained named event evidence. Newly created fixture roots also emitted structural flags and correctly took the authoritative fallback instead of the named path; named hints are not promised for every OS event.
+
+Four synthetic pairs compared the same release binary with all-known verification versus named verification, alternating arm order and pausing two seconds before each arm. Each fresh isolated arm contained 601 Claude files with 1,101 initial messages and appended one event to the existing primary. Each arm asserted 35,838 → 35,946 graph tokens, recent expiry, and changed／warm／forced report equality.
+
+| Median synthetic metric | All-known verification | Named verification |
+|---|---|---|
+| Changed-source synchronization | 113.573 ms | 81.916 ms |
+| Synchronization plus first graph query | 127.240 ms | 95.410 ms |
+
+All four named arms improved both metrics; the 245.433 ms all-known synchronization outlier remains included. These fresh isolated synthetic arms do not prove production-corpus latency, first paint, sustained CPU／RAM improvements, or visible GUI acceptance. Replacement-manifest copying and historical parser／report work remain history-scaled; Claude append parsing and reversible delta aggregation were not introduced.
+
+`cargo test --workspace --locked` passed 2,518 top-level tests plus one child-process lock check, with six ignored. Workspace Clippy passed with the existing FFI warnings (15 library／22 test-target). `make selftest` and `make selftest-bundled` passed; the bundled gate used the default throwaway identifier, not shipping preferences. Exact task-owned Rust formatting and isolated bundle signature verification passed. Rust LSP was unavailable; compiler／Clippy supplied Rust verification. No installed application, commit, remote publication or Windows runtime was involved.
 
 ## Local build and UX acceptance
 

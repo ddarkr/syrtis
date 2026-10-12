@@ -857,17 +857,22 @@ impl QueryState {
         Ok(())
     }
 
+    /// Publish-time Claude/Codex arbitration needs metadata only. Final visitors
+    /// reload validated payloads through the persisted cache references.
+    /// Other lanes are folded directly during preparation and still need bytes.
     fn replay_report_other_lanes(
         &self,
         snapshot: &UsageSnapshot,
         only_cc: bool,
     ) -> Result<(), String> {
         self.check_report_side_complete(snapshot, only_cc)?;
-        let replay = "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
-            SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,r.message,r.digest,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,v.format_version
-            FROM sq_scope_sources s JOIN mc_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal";
         self.db
-            .execute(replay, params![snapshot.generation, only_cc])
+            .execute(
+                "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
+                SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 THEN NULL ELSE r.message END,CASE WHEN ?2 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,v.format_version
+                FROM sq_scope_sources s JOIN mc_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal",
+                params![snapshot.generation, only_cc],
+            )
             .map(|_| ())
             .map_err(|error| error.to_string())
     }

@@ -199,6 +199,133 @@ impl LocalSourceWatchManifest {
         })
     }
 
+    /// Targeted hint verification. Rust parses every file URL, validates each
+    /// hint against this captured baseline, and observes only the named rows.
+    /// Hints are never trusted as changed evidence: every returned path is
+    /// freshly observed with its parser dependency siblings (Claude
+    /// `.meta.json`/mirror variants/parent sessions, Jcode journals, Roo
+    /// histories, Droid/Kimi/Kiro/Grok siblings). Unknown, empty, over-cap,
+    /// malformed, non-file, absent, created, deleted, replaced, directory,
+    /// database, WAL, dependency-drift, or retained-revision-drift input
+    /// returns `Rediscover`, never a narrowed plan; empty input keeps the
+    /// authoritative `verify_changes`. `Unchanged` is never returned: only a
+    /// full scan may claim nothing changed. `Changed` carries a replacement
+    /// holding exactly these pre-ingestion observations, so late writes after
+    /// this read still dirty the replacement.
+    pub fn verify_hinted_changes(
+        &self,
+        home_dir: &Path,
+        hints: &[String],
+    ) -> Result<LocalSourceVerification, String> {
+        if hints.is_empty() || hints.len() > MAX_CHANGED_PATHS {
+            return self.verify_changes();
+        }
+        // Decode with the same URL parser as the FFI file_url emitter, so a
+        // hint that cannot round-trip an emitted watch URL falls back.
+        let mut candidates = Vec::with_capacity(hints.len());
+        for hint in hints {
+            let url = reqwest::Url::parse(hint).map_err(|_| "hint unavailable")?;
+            if url.scheme() != "file"
+                || url.host_str().is_some_and(|host| !host.is_empty())
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Ok(LocalSourceVerification::Rediscover);
+            }
+            candidates.push(url.to_file_path().map_err(|_| "hint unavailable")?);
+        }
+        let store = self
+            .known
+            .lock()
+            .map_err(|_| "source manifest lock unavailable")?;
+        store.admit()?;
+        // Avoid materializing every known probe for a bounded hint batch.
+        let mut statement = store
+            .db
+            .prepare("SELECT kind,state FROM temp.watch_known WHERE path=?1")
+            .map_err(|_| "source manifest metadata unavailable")?;
+        let mut baseline =
+            |path: &Path| -> Result<Option<(ProbeKind, Option<ObservedFile>)>, String> {
+                let key = bincode::serialize(&CachedPath::from_path(path))
+                    .map_err(|_| "source manifest path encoding failed")?;
+                let row: Option<(i64, Vec<u8>)> = statement
+                    .query_row([key], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()
+                    .map_err(|_| "source manifest metadata read failed")?;
+                row.map(|(kind, state)| {
+                    Ok((
+                        ProbeKind::from_tag(kind)?,
+                        bincode::deserialize(&state)
+                            .map_err(|_| "source manifest fingerprint invalid")?,
+                    ))
+                })
+                .transpose()
+            };
+        if let Some(revision) = store.retained_revision {
+            if KnownStore::retained_revision(&store.db)? != revision {
+                return Ok(LocalSourceVerification::Rediscover);
+            }
+        }
+        let mut fresh: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+        // ponytail: byte-exact known-row match; alias spellings rediscover.
+        for candidate in &candidates {
+            let Some((kind, state)) = baseline(candidate)? else {
+                return Ok(LocalSourceVerification::Rediscover);
+            };
+            if kind != ProbeKind::File {
+                return Ok(LocalSourceVerification::Rediscover);
+            }
+            // Parser siblings live in their own known rows; a hint naming only
+            // the primary must still verify each derivable sibling of the
+            // CURRENT path. A new sibling appearing (or an old one
+            // changing/disappearing) is observed here and forces rediscovery.
+            // Derivations that are not baseline rows belong to other clients
+            // and are ignored; a coincidental match only rediscovers.
+            for sibling in hint_sibling_paths(candidate, home_dir) {
+                if sibling == *candidate {
+                    continue;
+                }
+                let Some((sibling_kind, sibling_state)) = baseline(&sibling)? else {
+                    continue;
+                };
+                if observe(&sibling, sibling_kind)? != sibling_state {
+                    return Ok(LocalSourceVerification::Rediscover);
+                }
+            }
+            let current = observe(candidate, kind)?;
+            let eligible = matches!((&state, &current), (Some(old), Some(now)) if old.identity == now.identity);
+            if !eligible || current == state {
+                // Unchanged, absent/created/deleted, replaced, or unreadable:
+                // the hint proves nothing beyond this row, so fall back to the
+                // authoritative scan, which still discovers unhinted changes.
+                return Ok(LocalSourceVerification::Rediscover);
+            }
+            // ponytail: hints are pre-capped at 256, so this map cannot overflow.
+            fresh.insert(
+                candidate.clone(),
+                bincode::serialize(&current)
+                    .map_err(|_| "source manifest fingerprint encoding failed")?,
+            );
+        }
+        drop(statement);
+        store.admit()?;
+        if let Some(revision) = store.retained_revision {
+            if KnownStore::retained_revision(&store.db)? != revision {
+                return Ok(LocalSourceVerification::Rediscover);
+            }
+        }
+        let manifest = Arc::new(LocalSourceWatchManifest {
+            roots: self.roots.clone(),
+            ignored: self.ignored.clone(),
+            ignored_rules: self.ignored_rules.clone(),
+            known: Mutex::new(store.fork(&fresh)?),
+        });
+        Ok(LocalSourceVerification::Changed {
+            paths: fresh.into_keys().collect(),
+            manifest,
+        })
+    }
+
     /// Includes spare native capacities, SQLite-owned cache/schema/statement
     /// memory and a conservative connection/allocator reserve. Historical
     /// dependencies stay in SQLite TEMP files, not in the resident manifest.
@@ -725,6 +852,38 @@ pub fn capture_local_source_watch_manifest(
         ignored_rules,
         known: Mutex::new(store),
     })
+}
+
+/// Parser sibling paths for a hinted primary, mirroring capture's frozen
+/// dependency enumeration through the same fingerprint entry points (no new
+/// parser path). Derivations that fail yield nothing. The caller only honors
+/// siblings that are baseline rows; a coincidental match merely rediscovers.
+fn hint_sibling_paths(path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let mut fingerprints = Vec::new();
+    // Mirror capture exactly: Claude resolves parents with home samples.
+    if let Some(FingerprintStatus::Changed(fingerprint)) =
+        SourceFingerprint::check_claude_code_path_with_home_samples_only(path, None, Some(home_dir))
+    {
+        fingerprints.push(fingerprint);
+    }
+    for fingerprint in [
+        SourceFingerprint::from_droid_path(path),
+        SourceFingerprint::from_kimi_path(path),
+        SourceFingerprint::from_roo_path(path),
+        SourceFingerprint::from_jcode_path(path),
+        SourceFingerprint::from_grok_path(path),
+        SourceFingerprint::from_kiro_path(path),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        fingerprints.push(fingerprint);
+    }
+    fingerprints
+        .into_iter()
+        .flat_map(|fingerprint| fingerprint.related_files)
+        .map(|related| related.path.into_path_buf())
+        .collect()
 }
 
 fn database_filename(path: &Path) -> bool {

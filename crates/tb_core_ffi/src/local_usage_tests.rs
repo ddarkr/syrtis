@@ -547,4 +547,163 @@ mod tests {
         let fanned_token = fanned["leaseToken"].as_str().unwrap().to_owned();
         release(&fanned_token);
     }
+    #[test]
+    fn hinted_sync_matches_authoritative_outputs_and_never_hides_errors() {
+        if std::env::var_os("SYRTIS_LOCAL_HINTS_CHILD").is_none() {
+            let root = tempfile::TempDir::new().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "local_usage::tests::hinted_sync_matches_authoritative_outputs_and_never_hides_errors", "--nocapture"])
+                .env_clear().env("SYRTIS_LOCAL_HINTS_CHILD","1")
+                .env("HOME",root.path()).env("TOKSCALE_CONFIG_DIR",root.path().join("config"))
+                .env("XDG_CONFIG_HOME",root.path().join("xdg-config"))
+                .env("XDG_DATA_HOME",root.path().join("xdg-data"))
+                .env("APPDATA",root.path().join("roaming"))
+                .env("LOCALAPPDATA",root.path().join("local"))
+                .env("TOKSCALE_PRICING_CACHE_ONLY","1").env("TZ","UTC");
+            for key in ["SystemRoot", "SystemDrive"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let source = root.join(".claude/projects/hints/session.jsonl");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let now = now_ms();
+        let timestamp = now.saturating_sub(30_000);
+        write_usage(&source, timestamp, 10);
+        let exact_scope = json!([{"id":"claude","kind":"report","clients":["claude"]}]);
+        let url = reqwest::Url::from_file_path(&source).unwrap().to_string();
+        // Baseline capture, then an append consumed through the hinted path.
+        let forced = data(ffi(
+            &json!({"scopes":exact_scope,"force":true}),
+            crate::tb_local_usage_sync,
+        ));
+        let forced_token = forced["leaseToken"].as_str().unwrap().to_owned();
+        assert_eq!(
+            query_at(&forced_token, "claude", "graph", now)["summary"]["totalTokens"],
+            38
+        );
+        write_usage(&source, timestamp, 50);
+        let hinted = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":forced_token,
+                "verifyTopology":false,"changedFileURLs":[url]}),
+            crate::tb_local_usage_sync,
+        ));
+        let hinted_token = hinted["leaseToken"].as_str().unwrap().to_owned();
+        assert_ne!(hinted_token, forced_token);
+        assert_eq!(hinted["changed"], true);
+        assert_eq!(
+            query_at(&hinted_token, "claude", "graph", now)["summary"]["totalTokens"],
+            78
+        );
+        // Authoritative control on a twin append must agree exactly.
+        let authoritatively = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":hinted_token,"verifyTopology":false}),
+            crate::tb_local_usage_sync,
+        ));
+        assert_eq!(authoritatively["leaseToken"], hinted_token);
+        assert_eq!(authoritatively["changed"], false);
+        write_usage(&source, timestamp, 90);
+        let authoritative = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":hinted_token,"force":true}),
+            crate::tb_local_usage_sync,
+        ));
+        let authoritative_token = authoritative["leaseToken"].as_str().unwrap().to_owned();
+        assert_eq!(
+            query_at(&authoritative_token, "claude", "graph", now)["summary"]["totalTokens"],
+            118
+        );
+        // Each write replaces the single fixture row, so the message count
+        // stays 1 while the token total tracks the latest input.
+        assert_eq!(
+            query_at(&authoritative_token, "claude", "models", now)["totalMessages"],
+            1
+        );
+        assert_eq!(
+            ffi(
+                &json!({"leaseToken":hinted_token,"scopeId":"claude","kind":"models","nowMs":now}),
+                crate::tb_local_usage_query,
+            )["ok"],
+            false,
+            "replacement must reject the previous generation"
+        );
+        // Malformed and unknown hints fall back to the authoritative scan and
+        // never hide a real change or error.
+        write_usage(&source, timestamp, 130);
+        let malformed = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":authoritative_token,
+                "verifyTopology":false,"changedFileURLs":["not a url", "/tmp/unknown.jsonl"]}),
+            crate::tb_local_usage_sync,
+        ));
+        let malformed_token = malformed["leaseToken"].as_str().unwrap().to_owned();
+        assert_ne!(malformed_token, authoritative_token);
+        assert_eq!(
+            query_at(&malformed_token, "claude", "graph", now)["summary"]["totalTokens"],
+            158
+        );
+        // Dependency drift forces the authoritative fallback path: a new Claude
+        // `.meta.json` sibling dirties a known baseline row, so the hinted
+        // primary must not take the narrowed plan even though the primary
+        // itself is unchanged and totals stay put.
+        let sibling = source.parent().unwrap().join("session.meta.json");
+        std::fs::write(&sibling, "{}").unwrap();
+        let drifted = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":malformed_token,
+                "verifyTopology":false,"changedFileURLs":[url]}),
+            crate::tb_local_usage_sync,
+        ));
+        let drifted_token = drifted["leaseToken"].as_str().unwrap().to_owned();
+        // No token/changed claim: identical content may legitimately reuse the
+        // snapshot. The totals assertion below proves no loss or error.
+        assert_eq!(
+            query_at(&drifted_token, "claude", "graph", now)["summary"]["totalTokens"],
+            158
+        );
+        std::fs::remove_file(&sibling).unwrap();
+        // Replacement (delete + recreate with new content) must not take the
+        // targeted path: the stale hint observes a new identity and falls back
+        // to the authoritative scan, which discovers the recreated file.
+        std::fs::remove_file(&source).unwrap();
+        write_usage(&source, timestamp, 170);
+        let stale_hint = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":drifted_token,
+                "verifyTopology":false,"changedFileURLs":[url]}),
+            crate::tb_local_usage_sync,
+        ));
+        let replaced_token = stale_hint["leaseToken"].as_str().unwrap().to_owned();
+        assert_ne!(replaced_token, drifted_token);
+        assert_eq!(
+            query_at(&replaced_token, "claude", "graph", now)["summary"]["totalTokens"],
+            198,
+            "replacement must be rediscovered with new content, never trusted by hint"
+        );
+        // Unhinted change is still discovered by the later full check: append
+        // without any hint, then verify the periodic scan picks it up.
+        write_usage(&source, timestamp, 200);
+        let unhinted = data(ffi(
+            &json!({"scopes":exact_scope,"previousLeaseToken":replaced_token,"verifyTopology":false}),
+            crate::tb_local_usage_sync,
+        ));
+        let unhinted_token = unhinted["leaseToken"].as_str().unwrap().to_owned();
+        assert_ne!(unhinted_token, replaced_token);
+        assert_eq!(
+            query_at(&unhinted_token, "claude", "graph", now)["summary"]["totalTokens"],
+            228
+        );
+        release(&forced_token);
+        release(&hinted_token);
+        release(&authoritative_token);
+        release(&malformed_token);
+        release(&drifted_token);
+        release(&unhinted_token);
+    }
 }

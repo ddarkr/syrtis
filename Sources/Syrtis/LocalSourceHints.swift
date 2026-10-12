@@ -30,7 +30,7 @@ final class LocalSourceHints {
 
     func install(
         _ manifest: LocalSourceWatchManifest,
-        onDirty: @escaping @MainActor @Sendable (_ requiresTopology: Bool) -> Void
+        onDirty: @escaping @MainActor @Sendable (_ requiresTopology: Bool, _ changedFileURLs: [String]?) -> Void
     ) {
         stop()
         let installedEpoch = epoch
@@ -43,7 +43,7 @@ final class LocalSourceHints {
         )
         guard !filter.anchors.isEmpty else {
             // An empty manifest needs no stream; invalid roots must not disappear silently.
-            if filter.hasUnsupportedPaths { onDirty(true) }
+            if filter.hasUnsupportedPaths { onDirty(true, nil) }
             else { diagnostics.state = .stopped }
             return
         }
@@ -53,7 +53,9 @@ final class LocalSourceHints {
                 self.diagnostics.state = .partial
                 self.diagnostics.failure = .eventPath
             }
-            onDirty(hint.topology)
+            // Topology/overflow hints verify authoritatively; only safely
+            // bounded file mutations travel as named evidence, never trusted.
+            onDirty(hint.topology, hint.topology ? nil : hint.changedFileURLs)
         }
         self.relay = relay
         var context = FSEventStreamContext(
@@ -98,7 +100,7 @@ final class LocalSourceHints {
             relay.cancel()
             self.relay = nil
             diagnostics.failure = .streamCreation
-            onDirty(true)
+            onDirty(true, nil)
             return
         }
         FSEventStreamSetDispatchQueue(created, queue)
@@ -108,13 +110,13 @@ final class LocalSourceHints {
             FSEventStreamRelease(created)
             self.relay = nil
             diagnostics.failure = .streamStart
-            onDirty(true)
+            onDirty(true, nil)
             return
         }
         stream = Stream(created)
         diagnostics.watchedRootCount = filter.anchors.count
         diagnostics.state = filter.hasUnsupportedPaths ? .partial : .watching
-        if filter.hasUnsupportedPaths { onDirty(true) }
+        if filter.hasUnsupportedPaths { onDirty(true, nil) }
     }
 
     func stop() {
@@ -231,9 +233,38 @@ final class LocalSourceHints {
         expect(invalidNativeHint("/fixture/home/unrelated/") == nil
                && invalidNativeHint("/fixture/home/.agent/sessions/")?.invalidPath == true,
                "raw invalid UTF8 events only request fallback inside exact source scopes")
+        let plainFlags = UInt32(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile)
+        let structuralFlags = UInt32(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemIsFile)
+        expect(hint("/fixture/home/.agent/sessions/log", plainFlags)?.changedFileURLs
+               == ["file:///fixture/home/.agent/sessions/log"],
+               "plain regular-file mutation names its exact evidence")
+        expect(hint("/fixture/home/.agent/sessions/log", structuralFlags)?.changedFileURLs == nil
+               && hint("/fixture/home/.agent/sessions/log", structuralFlags)?.topology == true,
+               "rename stays flag-only so verification owns the new identity")
+        expect(hint("/fixture/db", UInt32(kFSEventStreamEventFlagItemIsDir))?.changedFileURLs == nil,
+               "coarse parent hints stay flag-only and never name a child")
+        var coalesced = hint("/fixture/home/.agent/sessions/a", plainFlags)!
+        coalesced.merge(hint("/fixture/home/.agent/sessions/b", plainFlags)!)
+        expect(coalesced.topology == false && coalesced.changedFileURLs?.count == 2,
+               "coalescing keeps bounded named evidence with flag priority")
+        let unnamed = hint("/fixture/db", UInt32(kFSEventStreamEventFlagItemIsDir))!
+        var mixed = coalesced
+        mixed.merge(unnamed)
+        mixed.merge(coalesced)
+        expect(mixed.changedFileURLs == nil,
+               "coarse changes cannot be lost beside later named file changes")
+        var reverse = unnamed
+        reverse.merge(coalesced)
+        expect(reverse.changedFileURLs == nil,
+               "coalescing preserves unnamed verification in either event order")
+        var overflowed = Hint(topology: false, paths: ["file:///fixture/home/.agent/sessions/0"])
+        for index in 1..<300 {
+            overflowed.merge(Hint(topology: false, paths: ["file:///fixture/home/.agent/sessions/\(index)"]))
+        }
+        expect(overflowed.topology == false && overflowed.changedFileURLs == nil,
+               "overflowing named evidence falls back to authoritative verification")
         Relay.selfTest(filter: filter, expect: expect)
     }
-
     /// Byte equality avoids Swift String's canonical-Unicode-equivalence path collisions.
     private struct NativePath: Hashable, Sendable {
         let bytes: [UInt8]
@@ -283,10 +314,25 @@ final class LocalSourceHints {
     private struct Hint: Sendable {
         var topology: Bool
         var invalidPath = false
+        /// Exact admitted regular-file URLs. Always re-verified, never trusted.
+        var paths: Set<String> = []
+        private var overflowed = false
+        /// Sorted for deterministic delivery; nil when flag-only or overflowed.
+        var changedFileURLs: [String]? { overflowed || paths.isEmpty ? nil : paths.sorted() }
         mutating func merge(_ other: Hint) {
             topology = topology || other.topology
             invalidPath = invalidPath || other.invalidPath
+            overflowed = overflowed || other.overflowed || paths.isEmpty || other.paths.isEmpty
+            // Overflowing named evidence falls back to authoritative
+            // verification for the whole batch; the merged flags keep the
+            // stronger fallback and later names cannot resurrect it.
+            if !overflowed {
+                paths.formUnion(other.paths)
+                if paths.count > Self.maxPaths { overflowed = true; paths.removeAll() }
+            }
         }
+        // ponytail: fixed 256-path bound; raise only with measured Rust verify wins.
+        private static let maxPaths = 256
     }
 
     private struct Filter: Sendable {
@@ -391,12 +437,26 @@ final class LocalSourceHints {
             let structural = UInt32(kFSEventStreamEventFlagItemCreated
                 | kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed
                 | kFSEventStreamEventFlagItemIsSymlink)
+            // Only a plain regular-file modification names evidence; created,
+            // deleted, renamed, directory, and coarse-parent events stay
+            // flag-only so Rust verifies authoritatively instead of trusting them.
+            let namesFile = flags & UInt32(kFSEventStreamEventFlagItemIsFile) != 0
+                && flags & UInt32(kFSEventStreamEventFlagItemIsDir) == 0
+                && flags & structural == 0
+            func fileHint() -> Hint {
+                guard namesFile, let url = Self.fileURLString(for: path) else { return Hint(topology: false) }
+                return Hint(topology: false, paths: [url])
+            }
             for root in roots {
                 if path == root.source {
-                    return Hint(topology: flags & structural != 0)
+                    if flags & structural != 0 { return Hint(topology: true) }
+                    // A replaced file root is a new identity, not a mutation.
+                    if !root.isDirectory { return fileHint() }
+                    return Hint(topology: false)
                 }
                 if root.isDirectory && root.source.contains(path) {
-                    return Hint(topology: flags & structural != 0)
+                    if flags & structural != 0 { return Hint(topology: true) }
+                    return fileHint()
                 }
                 // Recover a missing root only from its own ancestor chain, not siblings
                 // beneath a broad nearest-existing anchor (which may be the home directory).
@@ -413,6 +473,12 @@ final class LocalSourceHints {
                 }
             }
             return nil
+        }
+
+        /// Rust owns file-URL parsing; only validated UTF8 paths become URLs here.
+        private static func fileURLString(for path: NativePath) -> String? {
+            guard let string = String(bytes: path.bytes, encoding: .utf8) else { return nil }
+            return URL(fileURLWithPath: string).absoluteString
         }
     }
 
