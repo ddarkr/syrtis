@@ -323,7 +323,9 @@ fn suffix(path: &Path, value: &str) -> PathBuf {
 
 pub(crate) fn configure_connection(conn: &Connection) -> Result<(), String> {
     sql(conn.busy_timeout(Duration::from_secs(5)))?;
-    sql(conn.execute_batch("PRAGMA cache_size=-16384; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON;"))
+    // RAM over latency: 256 KiB main + 64 KiB temp soft budgets (not a hard
+    // process cap), coherent with source_watch's 64 KiB precedent.
+    sql(conn.execute_batch("PRAGMA cache_size=-256; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-64; PRAGMA mmap_size=0; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON;"))
 }
 
 pub(crate) fn admit_schema(conn: &Connection) -> Result<(), String> {
@@ -676,69 +678,124 @@ impl SourceWriter<'_> {
 /// candidates missing from the new read are carried from the previous
 /// generation of the same (path, kind) identity, keyed by stable dedup key.
 /// Same-key updates use the fresh observation; removed-row facts persist.
+/// Fresh membership is a FILE TEMP key-or-alias table and prior rows stream
+/// in bounded ordinal pages; carried rows never rejoin the membership set.
 fn carry_missing_opencode_candidates(
     conn: &Connection,
     key: &[u8],
     previous: &[u8],
 ) -> Result<(), String> {
-    let mut statement =
-        sql(conn.prepare("SELECT candidate FROM oc_rows WHERE source=?1 ORDER BY ordinal"))?;
-    let mut rows = sql(statement.query([previous]))?;
-    let mut prior: Vec<OpenCodeCandidate> = Vec::new();
-    while let Some(row) = sql(rows.next())? {
-        prior.push(decode_row(row, 0)?);
-    }
-    drop(rows);
-    drop(statement);
+    // Guard before any decode: same-generation syncs carry nothing.
     if previous == key {
         return Ok(());
     }
-    if prior.is_empty() {
+    let has_prior: bool = sql(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM oc_rows WHERE source=?1)",
+        [previous],
+        |row| row.get(0),
+    ))?;
+    if !has_prior {
         return Ok(());
     }
-    let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut scan =
-        sql(conn.prepare("SELECT candidate FROM oc_rows WHERE source=?1 ORDER BY ordinal"))?;
-    let mut scan_rows = sql(scan.query([key]))?;
-    while let Some(row) = sql(scan_rows.next())? {
-        let candidate: OpenCodeCandidate = decode_row(row, 0)?;
-        if let Some(key) = candidate.message.dedup_key.as_deref() {
-            live.insert(key.to_string());
+    // Fresh cohort key-or-alias membership only, on FILE TEMP so no
+    // whole-history Rust set exists. Carried rows never join it.
+    sql(conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS oc_carry_live(key TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM oc_carry_live;",
+    ))?;
+    sql(conn.execute_batch("SAVEPOINT oc_carry"))?;
+    let result = (|| -> Result<(), String> {
+        // Seal the fresh cohort before any append shares this source key.
+        let mut scan =
+            sql(conn.prepare("SELECT candidate FROM oc_rows WHERE source=?1 ORDER BY ordinal"))?;
+        let mut scan_rows = sql(scan.query([key]))?;
+        while let Some(row) = sql(scan_rows.next())? {
+            let candidate: OpenCodeCandidate = decode_row(row, 0)?;
+            if let Some(identity) = candidate.message.dedup_key.as_deref() {
+                sql(conn.execute(
+                    "INSERT OR IGNORE INTO temp.oc_carry_live VALUES(?1)",
+                    [identity],
+                ))?;
+            }
+            for alias in &candidate.message.dedup_aliases {
+                sql(conn.execute(
+                    "INSERT OR IGNORE INTO temp.oc_carry_live VALUES(?1)",
+                    [alias],
+                ))?;
+            }
         }
-        for alias in &candidate.message.dedup_aliases {
-            live.insert(alias.clone());
-        }
-    }
-    drop(scan_rows);
-    drop(scan);
-    let mut writer = SourceWriter {
-        conn,
-        source: key,
-        ordinal: sql(conn.query_row(
+        drop(scan_rows);
+        drop(scan);
+        // Bounded SQL row appends under the outer oc_carry savepoint: no
+        // SourceWriter oc_batch savepoint, so >1024 carried rows stay valid.
+        let mut next_ordinal: i64 = sql(conn.query_row(
             "SELECT COALESCE(MAX(ordinal),-1)+1 FROM oc_rows WHERE source=?1",
             [key],
             |row| row.get(0),
-        ))?,
-        rows: 0,
-        bytes: 0,
-    };
-    sql(conn.execute_batch("SAVEPOINT oc_carry"))?;
-    for candidate in prior {
-        let seen = candidate
-            .message
-            .dedup_key
-            .as_deref()
-            .is_some_and(|key| live.contains(key))
-            || candidate
-                .message
-                .dedup_aliases
-                .iter()
-                .any(|alias| live.contains(alias));
-        if !seen {
-            writer.push(candidate)?;
+        ))?;
+        // Ordinal-paged prior stream: each SELECT finishes before any INSERT,
+        // and appends use the fresh source key, so they never re-enter the
+        // previous-generation scan. A page of 64 bounds decoded bytes per
+        // iteration; gaps are fine because paging resumes after the last
+        // seen ordinal.
+        let mut after: i64 = -1;
+        loop {
+            let batch: Vec<(i64, OpenCodeCandidate)> = {
+                let mut paged = sql(conn.prepare(
+                    "SELECT ordinal,candidate FROM oc_rows WHERE source=?1 AND ordinal>?2 ORDER BY ordinal LIMIT 64",
+                ))?;
+                let mut paged_rows = sql(paged.query(params![previous, after]))?;
+                let mut batch = Vec::new();
+                while let Some(row) = sql(paged_rows.next())? {
+                    let ordinal: i64 = sql(row.get(0))?;
+                    batch.push((ordinal, decode_row(row, 1)?));
+                }
+                drop(paged_rows);
+                drop(paged);
+                batch
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for (ordinal, candidate) in batch {
+                after = ordinal;
+                let mut seen = false;
+                if let Some(identity) = candidate.message.dedup_key.as_deref() {
+                    seen = sql(conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM temp.oc_carry_live WHERE key=?1)",
+                        [identity],
+                        |row| row.get(0),
+                    ))?;
+                }
+                for alias in &candidate.message.dedup_aliases {
+                    if seen {
+                        break;
+                    }
+                    seen = sql(conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM temp.oc_carry_live WHERE key=?1)",
+                        [alias],
+                        |row| row.get(0),
+                    ))?;
+                }
+                if !seen {
+                    sql(conn.execute(
+                        "INSERT INTO oc_rows VALUES(?1,?2,?3)",
+                        params![key, next_ordinal, encode(&candidate)?],
+                    ))?;
+                    next_ordinal += 1;
+                }
+            }
         }
-    }
-    sql(conn.execute_batch("RELEASE oc_carry"))
+        Ok(())
+    })();
+    match result {
+        Ok(()) => sql(conn.execute_batch("RELEASE oc_carry")),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK TO oc_carry; RELEASE oc_carry");
+            sql(conn.execute_batch("DROP TABLE IF EXISTS temp.oc_carry_live"))?;
+            Err(error)
+        }
+    }?;
+    sql(conn.execute_batch("DROP TABLE IF EXISTS temp.oc_carry_live"))
 }
 
 fn transfer_source(conn: &Connection, path: &Path, key: &[u8], sqlite: bool) -> Result<(), String> {
@@ -3624,5 +3681,173 @@ mod tests {
             .map(|row| decode::<UnifiedMessage>(&row.unwrap()).unwrap().tokens.input)
             .sum();
         assert_eq!(total, 30);
+    }
+    #[test]
+    fn carried_missing_update_delete_empty_keep_alias_and_multiplicity_across_batch_boundary() {
+        // Fresh update/delete keep exact retained/dedup totals; the carry
+        // streams the prior generation in bounded ordinal pages, so a changed
+        // source missing >1024 rows still carries everything without any
+        // whole-history Rust collection.
+        let scratch = Connection::open("").unwrap();
+        configure_connection(&scratch).unwrap();
+        schema(&scratch).unwrap();
+        let fresh: Vec<u8> = vec![7; 32];
+        let previous: Vec<u8> = vec![9; 32];
+        let seed = opencode::parse_opencode_candidate(
+            (
+                "seed".into(),
+                "session".into(),
+                usage(Some("seed"), 1, 0.0, 1_700_000_000_000.0).to_string(),
+                None,
+            ),
+            false,
+        )
+        .unwrap();
+        let candidate = |dedup: &str, aliases: &[&str], input: i64| OpenCodeCandidate {
+            message: {
+                let mut message = opencode::parse_opencode_candidate(
+                    (
+                        dedup.into(),
+                        "session".into(),
+                        usage(Some(dedup), input, 0.0, 1_700_000_000_000.0).to_string(),
+                        None,
+                    ),
+                    false,
+                )
+                .unwrap()
+                .message;
+                message.dedup_aliases = aliases.iter().map(|alias| alias.to_string()).collect();
+                message
+            },
+            fingerprint: seed.fingerprint.clone(),
+            embedded_id: Some(dedup.into()),
+            is_v1: false,
+        };
+        let prior_total: i64 = 2200;
+        for ordinal in 0..prior_total {
+            // Even ordinals share one alias; ordinal 6 duplicates the key of
+            // ordinal 5 (without the alias) to pin identical carried
+            // multiplicity.
+            let (dedup, aliases) = if ordinal == 6 {
+                ("row-0005".to_string(), vec![])
+            } else if ordinal % 2 == 0 {
+                (format!("row-{ordinal:04}"), vec!["shared-alias"])
+            } else {
+                (format!("row-{ordinal:04}"), vec![])
+            };
+            scratch
+                .execute(
+                    "INSERT INTO oc_rows VALUES(?1,?2,?3)",
+                    params![
+                        previous,
+                        ordinal,
+                        encode(&candidate(&dedup, &aliases, ordinal + 1)).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        // Fresh generation: same-key updates (row-0001, row-0002), an
+        // alias-only join (fresh-alias-holder via shared-alias), one new row.
+        for (ordinal, dedup, aliases, input) in [
+            (0, "row-0001", &[][..], 10_001),
+            (1, "row-0002", &[][..], 10_002),
+            (2, "fresh-alias-holder", &["shared-alias"][..], 10_003),
+            (3, "fresh-new", &[][..], 10_004),
+        ] {
+            scratch
+                .execute(
+                    "INSERT INTO oc_rows VALUES(?1,?2,?3)",
+                    params![
+                        fresh,
+                        ordinal,
+                        encode(&candidate(dedup, aliases, input)).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        carry_missing_opencode_candidates(&scratch, &fresh, &previous).unwrap();
+        let rows: Vec<(i64, OpenCodeCandidate)> = {
+            let mut statement = scratch
+                .prepare("SELECT ordinal,candidate FROM oc_rows WHERE source=?1 ORDER BY ordinal")
+                .unwrap();
+            let mut rows = statement.query([&fresh]).unwrap();
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                out.push((row.get(0).unwrap(), decode_row(row, 1).unwrap()));
+            }
+            out
+        };
+        // Odd prior ordinals except 1 carry, plus the even ordinal-6
+        // duplicate: 1100 carried rows after the 4 fresh ones.
+        assert_eq!(rows.len(), 1104);
+        assert_eq!(rows[0].1.message.dedup_key.as_deref(), Some("row-0001"));
+        assert_eq!(rows[0].1.message.tokens.input, 10_001);
+        assert_eq!(rows[1].1.message.dedup_key.as_deref(), Some("row-0002"));
+        assert_eq!(rows[3].1.message.dedup_key.as_deref(), Some("fresh-new"));
+        let carried: Vec<&OpenCodeCandidate> = rows
+            .iter()
+            .skip(4)
+            .map(|(_, candidate)| candidate)
+            .collect();
+        // Updates use fresh facts; row-0000 and every shared-alias even row
+        // join through the alias, so none of them carry.
+        assert!(carried
+            .iter()
+            .all(|candidate| candidate.message.dedup_key.as_deref() != Some("row-0001")));
+        assert!(carried
+            .iter()
+            .all(|candidate| candidate.message.dedup_key.as_deref() != Some("row-0002")));
+        assert!(carried
+            .iter()
+            .all(|candidate| candidate.message.dedup_key.as_deref() != Some("row-0000")));
+        assert_eq!(
+            carried
+                .iter()
+                .filter(|candidate| candidate.message.dedup_key.as_deref() == Some("row-0005"))
+                .count(),
+            2
+        );
+        let carried_inputs: i64 = carried
+            .iter()
+            .map(|candidate| candidate.message.tokens.input)
+            .sum();
+        let expected: i64 = (0..prior_total)
+            .filter(|ordinal| {
+                *ordinal == 6 || (*ordinal % 2 == 1 && *ordinal != 1 && *ordinal != 2)
+            })
+            .map(|ordinal| ordinal + 1)
+            .sum();
+        assert_eq!(carried_inputs, expected);
+        // Identical carried multiplicity keeps ordinal order: the two row-0005
+        // facts are adjacent in prior order.
+        let positions: Vec<usize> = carried
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.message.dedup_key.as_deref() == Some("row-0005"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[1] - positions[0], 1);
+        // Empty fresh carries the whole prior generation; the
+        // same-generation guard decodes nothing and writes nothing.
+        let empty: Vec<u8> = vec![11; 32];
+        carry_missing_opencode_candidates(&scratch, &empty, &previous).unwrap();
+        let empty_count: i64 = scratch
+            .query_row(
+                "SELECT COUNT(*) FROM oc_rows WHERE source=?1",
+                [&empty],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_count, prior_total);
+        carry_missing_opencode_candidates(&scratch, &empty, &empty).unwrap();
+        let empty_again: i64 = scratch
+            .query_row(
+                "SELECT COUNT(*) FROM oc_rows WHERE source=?1",
+                [&empty],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_again, prior_total);
     }
 }

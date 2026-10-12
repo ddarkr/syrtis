@@ -44,11 +44,12 @@ final class TrayAnimator {
 #if DEBUG
     private let cpuTest = TrayAnimationCPUTestConfiguration.current
 #endif
-    /// Frame sets keyed by "<style>|<dark|light>".
-    /// Cat and parrot load at init; sand sets load on first use
-    /// (`loadSandFramesIfNeeded`), since 1,152 frames are wasted on everyone
-    /// who never picks the style.
-    private var frames: [String: [NSImage]]
+    /// Only the currently demanded frame set is held ("anim-cat2",
+    /// "anim-sand2-light", …). Style/level/theme switches discard the
+    /// obsolete set; gauge styles and the stopped state hold nothing. Static
+    /// (animation-disabled) state holds just the first frame.
+    private var heldKey: String?
+    private var heldFrames: [NSImage] = []
     private var quotaTask: Task<Void, Never>?
     private var presentedAnimationKey: String?
     private var isStopped = true
@@ -78,12 +79,7 @@ final class TrayAnimator {
         self.cachedQuotaRemaining = source.allowsQuotaCachePersistence
             ? UserDefaults.standard.object(forKey: Self.lastRemainingKey) as? Double
             : nil
-        var sets: [String: [NSImage]] = [:]
-        for (style, dir) in [("cat", "anim-cat2"), ("parrot", "anim-parrot")] {
-            sets["\(style)|dark"] = Self.loadFrames(directory: dir)
-            sets["\(style)|light"] = Self.loadFrames(directory: "\(dir)-light")
-        }
-        frames = sets
+        // Frame sets load on demand in refreshIcon; nothing is retained here.
     }
 
     /// The bar's frame box. Art is fitted into it, never stretched to it.
@@ -91,7 +87,7 @@ final class TrayAnimator {
 
     /// PNG frames sorted by name (frame-00 … frame-NN), sized for the bar.
     /// Internal so the settings window's menu-bar mock can render the same
-    /// frame sets.
+    /// frame sets. Keeps loadFrames API compatibility: single directory load.
     static func loadFrames(directory: String) -> [NSImage] {
         let urls = Bundle.tokenBarResources.urls(
             forResourcesWithExtension: "png", subdirectory: directory) ?? []
@@ -102,6 +98,26 @@ final class TrayAnimator {
                 image.size = barSize(for: image)
                 return image
             }
+    }
+
+    /// Canonical bundle directory for a demanded animated style. Unknown
+    /// styles fall back to the cat set, matching the tray's safe fallback.
+    nonisolated static func frameDirectory(style: String, dark: Bool, level: Int = 0) -> String {
+        let base: String
+        switch style {
+        case "parrot": base = "anim-parrot"
+        case sandStyle: base = "anim-sand\(min(max(level, 0), sandLevels - 1))"
+        case "cat": base = "anim-cat2"
+        default: base = "anim-cat2"
+        }
+        return base + (dark ? "" : "-light")
+    }
+
+    /// Consumer-visible demand probe: which single frame set an icon state
+    /// needs, so tests can assert obsolete sets are discarded without
+    /// touching retained storage. Unknown styles report the cat fallback.
+    nonisolated static func demandedFrames(style: String, dark: Bool, level: Int = 0, animated: Bool = true) -> (key: String, staticOnly: Bool) {
+        (frameDirectory(style: style, dark: dark, level: level), !animated)
     }
 
     /// `frameBox`-bounded logical size preserving the art's own aspect ratio.
@@ -212,6 +228,7 @@ final class TrayAnimator {
         controller?.setAppearanceChangeHandler(nil)
         controller?.stopTrayAnimation()
         presentedAnimationKey = nil
+        releaseHeldFrames()
     }
 
     private var currentStyle: String {
@@ -396,11 +413,7 @@ final class TrayAnimator {
         notify()
     }
 
-    private func currentFrames() -> [NSImage] {
-        let dark = controller?.isDarkAppearance ?? true
-        return frames["\(frameStyle(currentStyle))|\(dark ? "dark" : "light")"]
-            ?? frames["cat|dark"] ?? []
-    }
+    private func currentFrames() -> [NSImage] { heldFrames }
 
     private var animateEnabled: Bool {
 #if DEBUG
@@ -507,36 +520,67 @@ final class TrayAnimator {
 
     private var sandLevelShown: Int?
 
-    private func loadSandFramesIfNeeded() {
-        guard frames["sand0|dark"] == nil else { return }
-        for level in 0..<Self.sandLevels {
-            frames["sand\(level)|dark"] = Self.loadFrames(directory: "anim-sand\(level)")
-            frames["sand\(level)|light"] = Self.loadFrames(directory: "anim-sand\(level)-light")
-        }
-    }
-
-    /// The frame-set key for a style: the sand style resolves to its level.
-    /// `load` already holds the pace-scaled rate; every threshold is below the
-    /// cap, so `load * 10_000` reads it back without a second pace lookup.
-    private func frameStyle(_ style: String) -> String {
-        guard style == Self.sandStyle else { return style }
-        loadSandFramesIfNeeded()
+    /// The demanded sand level. `load` already holds the pace-scaled rate;
+    /// every threshold is below the cap, so `load * 10_000` reads it back
+    /// without a second pace lookup. Hysteresis preserved.
+    private func demandedSandLevel() -> Int {
         let level = Self.sandLevel(tokensPerMinute: load * 10_000, current: sandLevelShown)
         sandLevelShown = level
-        return "sand\(level)"
+        return level
+    }
+
+    /// First frame only, for animation-disabled state — avoids retaining a
+    /// full animated set as a still icon.
+    static func loadFirstFrame(directory: String) -> [NSImage] {
+        let urls = Bundle.tokenBarResources.urls(
+            forResourcesWithExtension: "png", subdirectory: directory) ?? []
+        guard let first = urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first,
+              let image = NSImage(contentsOf: first) else { return [] }
+        image.size = barSize(for: image)
+        return [image]
+    }
+
+    /// The held set for the demanded directory, loading on key change and
+    /// discarding the obsolete set. Static state keys separately so toggling
+    /// animation back on reloads the full set instead of animating one frame.
+    /// Unknown/empty directories fall back to the cat set.
+    private func useDemandedSet(directory: String, staticOnly: Bool) -> [NSImage] {
+        let key = directory + (staticOnly ? "|static" : "")
+        if heldKey == key { return heldFrames }
+        var loaded = staticOnly ? Self.loadFirstFrame(directory: directory) : Self.loadFrames(directory: directory)
+        var resolvedKey = key
+        if loaded.isEmpty {
+            let fallback = "anim-cat2" + (directory.hasSuffix("-light") ? "-light" : "")
+            if fallback != directory {
+                loaded = staticOnly ? Self.loadFirstFrame(directory: fallback) : Self.loadFrames(directory: fallback)
+                resolvedKey = fallback + (staticOnly ? "|static" : "")
+            }
+        }
+        heldKey = resolvedKey
+        heldFrames = loaded
+        return loaded
+    }
+
+    /// Drops the held set when the tray no longer shows frames (gauge style
+    /// or stopped). The renderer's own stop already clears its arrays.
+    private func releaseHeldFrames() {
+        heldKey = nil
+        heldFrames = []
     }
 
     private func refreshIcon() {
         guard !isStopped else { return }
         let style = currentStyle
         if QuotaIconStyle(rawValue: style) != nil {
+            releaseHeldFrames()
             renderGaugeIcon()
             return
         }
 
         let dark = controller?.isDarkAppearance ?? true
-        let frameKey = "\(frameStyle(style))|\(dark ? "dark" : "light")"
-        let set = frames[frameKey] ?? frames["cat|dark"] ?? []
+        let level = style == Self.sandStyle ? demandedSandLevel() : 0
+        let directory = Self.frameDirectory(style: style, dark: dark, level: level)
+        let set = useDemandedSet(directory: directory, staticOnly: !animateEnabled)
         guard let first = set.first else {
             controller?.setAnimatedFrames([], speed: animationSpeed)
             return
@@ -548,8 +592,8 @@ final class TrayAnimator {
             return
         }
 
-        if presentedAnimationKey != frameKey {
-            presentedAnimationKey = frameKey
+        if presentedAnimationKey != heldKey {
+            presentedAnimationKey = heldKey
             controller?.setAnimatedFrames(set, speed: animationSpeed)
         } else {
             controller?.setAnimationSpeed(animationSpeed)

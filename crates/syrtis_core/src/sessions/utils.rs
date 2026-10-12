@@ -380,11 +380,16 @@ pub(crate) fn source_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
 /// Open a SQLite file for read-only access with no mutex (single-threaded parser use).
 /// Returns `None` if the file cannot be opened — the caller treats that as "no sessions".
 pub(crate) fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
-    observe_sqlite(Connection::open_with_flags(
+    let conn = observe_sqlite(Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ))
-    .ok()
+    .ok()?;
+    observe_sqlite(conn.execute_batch(
+        "PRAGMA cache_size=-256; PRAGMA temp.cache_size=-64; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;",
+    ))
+    .ok()?;
+    Some(conn)
 }
 
 /// Read a file into bytes, returning `None` on any I/O error instead of propagating.

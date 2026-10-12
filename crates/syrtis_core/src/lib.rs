@@ -2700,6 +2700,29 @@ fn ingest_local_usage_inner(
             }
         }};
     }
+    macro_rules! ingest_streamed {
+        ($client:expr, $visit:expr) => {
+            ingest_streamed!($client, $visit, SourceFingerprint::from_path_samples_only);
+        };
+        ($client:expr, $visit:expr, $fingerprint:expr) => {
+            ingest_streamed!($client, $visit, $fingerprint, scan_result.get($client));
+        };
+        ($client:expr, $visit:expr, $fingerprint:expr, $paths:expr) => {{
+            let client = $client;
+            store_query::ingest_sources_streamed(
+                &query,
+                &mut cache,
+                CacheIdentity::for_client(client),
+                $paths,
+                client.as_str(),
+                mode,
+                $fingerprint,
+                $visit,
+                |path| store_query::local_dedups(client, path),
+                false,
+            )?;
+        }};
+    }
     ingest!(
         ClientId::Copilot,
         sessions::copilot::parse_copilot_file,
@@ -2709,46 +2732,32 @@ fn ingest_local_usage_inner(
         false,
         false
     );
-    if let Some(path) = &scan_result.copilot_desktop_db {
+    if let Some(path) = scan_result.copilot_desktop_db.as_deref() {
         let identity = CacheIdentity::for_client(ClientId::Copilot);
-        let fingerprint = SourceFingerprint::from_copilot_desktop_path(path);
-        if let Some(metadata) =
-            store_query::cache_hit(&cache, identity, path, fingerprint.as_ref(), false)?
-        {
+        let index = scan_result.get(ClientId::Copilot).len();
+        let before = SourceFingerprint::from_copilot_desktop_path(path);
+        let hit = store_query::cache_hit(&cache, identity, path, before.as_ref(), false)?;
+        if let Some(metadata) = hit {
             store_query::stage_cached(
-                &query,
-                &cache,
-                identity,
-                path,
-                &metadata,
-                "copilot",
-                scan_result.get(ClientId::Copilot).len(),
-                0,
-                true,
-                false,
+                &query, &cache, identity, path, &metadata, "copilot", index, 0, true, false,
             )?;
         } else {
+            // Special source index/tag are part of the lane contract: index
+            // `len(copilot files)` with tag=true, staged unconditionally like
+            // before (no LocalClients gate on this lane).
             std::fs::File::open(path).map_err(|error| error.to_string())?;
-            let messages = sessions::utils::source_read_scope(path, || {
-                sessions::copilot_desktop::parse_copilot_desktop_db(path)
-            })?;
-            if SourceFingerprint::from_copilot_desktop_path(path) != fingerprint {
-                return Err(
-                    "Copilot source changed during ingestion; previous generation retained".into(),
-                );
-            }
-            store_query::stage_source(
+            store_query::stage_streamed_source(
                 &query,
                 &mut cache,
                 identity,
                 path,
-                fingerprint,
-                messages,
+                before,
+                SourceFingerprint::from_copilot_desktop_path,
+                |sink| sessions::copilot_desktop::visit_copilot_desktop_db(path, sink),
                 "copilot",
-                scan_result.get(ClientId::Copilot).len(),
+                index,
                 0,
                 true,
-                false,
             )?;
         }
     }
@@ -2761,14 +2770,14 @@ fn ingest_local_usage_inner(
         sessions::droid::parse_droid_file,
         SourceFingerprint::from_droid_path
     );
-    ingest!(
+    ingest_streamed!(
         ClientId::OpenClaw,
-        sessions::openclaw::parse_openclaw_transcript
+        sessions::openclaw::visit_openclaw_transcript
     );
-    ingest!(ClientId::Pi, sessions::pi::parse_pi_file);
-    ingest!(ClientId::Kimchi, sessions::kimchi::parse_kimchi_file);
-    ingest!(ClientId::Senpi, sessions::senpi::parse_senpi_file);
-    ingest!(ClientId::Omp, sessions::omp::parse_omp_file);
+    ingest_streamed!(ClientId::Pi, sessions::pi::visit_pi_file);
+    ingest_streamed!(ClientId::Kimchi, sessions::pi::visit_kimchi_file);
+    ingest_streamed!(ClientId::Senpi, sessions::pi::visit_senpi_file);
+    ingest_streamed!(ClientId::Omp, sessions::pi::visit_omp_file);
     ingest!(
         ClientId::Kimi,
         parse_kimi_source,
@@ -2816,20 +2825,17 @@ fn ingest_local_usage_inner(
         false,
         false
     );
-    ingest!(
+    ingest_streamed!(
         ClientId::MiMoCode,
-        sessions::micode::parse_micode_sqlite,
+        sessions::micode::visit_micode_sqlite,
         SourceFingerprint::from_sqlite_path
     );
     ingest!(ClientId::Mux, sessions::mux::parse_mux_file);
-    ingest!(
+    ingest_streamed!(
         ClientId::Zcode,
-        sessions::zcode::parse_zcode_sqlite,
+        sessions::zcode::visit_zcode_sqlite,
         SourceFingerprint::from_sqlite_path,
-        scan_result.zcode_db.as_slice(),
-        false,
-        false,
-        false
+        scan_result.zcode_db.as_slice()
     );
     ingest!(
         ClientId::Kiro,

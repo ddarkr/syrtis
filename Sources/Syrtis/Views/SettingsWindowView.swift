@@ -490,25 +490,12 @@ private struct MenuBarMock: View {
                 style: gauge, remaining: remaining, dark: dark, coloring: coloring,
                 stale: stale))
         } else {
-            let frames = PreviewFrames.frames(
-                style: animationStyle, dark: dark,
+            PreviewIcon(
+                style: animationStyle, dark: dark, animate: animateTray,
+                interval: frameInterval,
                 level: TrayAnimator.sandLevel(
                     tokensPerMinute: (AnimationPace(rawValue: paceRaw) ?? .default)
                         .scaled(tokensPerMin ?? 0)))
-            if frames.isEmpty {
-                Image(systemName: "chart.bar.fill")
-                    .font(.system(size: 12))
-            } else if animateTray {
-                let interval = frameInterval
-                TimelineView(.periodic(from: .now, by: interval)) { timeline in
-                    let index = Int(
-                        timeline.date.timeIntervalSinceReferenceDate / interval)
-                        % frames.count
-                    Image(nsImage: frames[index])
-                }
-            } else {
-                Image(nsImage: frames[0])
-            }
         }
     }
 
@@ -524,23 +511,55 @@ private struct MenuBarMock: View {
     private static let clock = Date.now.formatted(date: .omitted, time: .shortened)
 }
 
-/// Cat/parrot frame sets for the mock strips, loaded once per
-/// (style, appearance) from the same bundle directories TrayAnimator uses.
-@MainActor
-private enum PreviewFrames {
-    private static var cache: [String: [NSImage]] = [:]
+/// One demanded preview icon: holds only the visible style/level/theme set
+/// (first frame when static), discarding it when hidden or when the demand
+/// changes. Replaces the old unbounded per-directory PreviewFrames cache,
+/// which kept every previewed cohort alive for the process lifetime.
+private struct PreviewIcon: View {
+    let style: String
+    let dark: Bool
+    let animate: Bool
+    let interval: TimeInterval
+    let level: Int
 
-    static func frames(style: String, dark: Bool, level: Int = 0) -> [NSImage] {
-        let base: String
-        switch style {
-        case "parrot": base = "anim-parrot"
-        case TrayAnimator.sandStyle: base = "anim-sand\(level)"
-        default: base = "anim-cat2"
+    @State private var frames: [NSImage] = []
+
+    private var demand: (key: String, staticOnly: Bool) {
+        TrayAnimator.demandedFrames(style: style, dark: dark, level: level, animated: animate)
+    }
+
+    var body: some View {
+        Group {
+            if frames.isEmpty {
+                Image(systemName: "chart.bar.fill")
+                    .font(.system(size: 12))
+            } else if animate {
+                TimelineView(.periodic(from: .now, by: interval)) { timeline in
+                    let index = Int(
+                        timeline.date.timeIntervalSinceReferenceDate / interval)
+                        % frames.count
+                    Image(nsImage: frames[index])
+                }
+            } else {
+                Image(nsImage: frames[0])
+            }
         }
-        let directory = base + (dark ? "" : "-light")
-        if let hit = cache[directory] { return hit }
-        let loaded = TrayAnimator.loadFrames(directory: directory)
-        cache[directory] = loaded
-        return loaded
+        // Keyed by the single demanded set: a style/level/theme/animate
+        // change cancels the old load and retains only the new one. Hidden
+        // views drop their frames via onDisappear.
+        .task(id: demand.key + (demand.staticOnly ? "|static" : "|anim")) {
+            let loaded = demand.staticOnly
+                ? TrayAnimator.loadFirstFrame(directory: demand.key)
+                : TrayAnimator.loadFrames(directory: demand.key)
+            if loaded.isEmpty {
+                let fallback = TrayAnimator.frameDirectory(style: "cat", dark: dark)
+                frames = demand.staticOnly
+                    ? TrayAnimator.loadFirstFrame(directory: fallback)
+                    : TrayAnimator.loadFrames(directory: fallback)
+            } else {
+                frames = loaded
+            }
+        }
+        .onDisappear { frames = [] }
     }
 }

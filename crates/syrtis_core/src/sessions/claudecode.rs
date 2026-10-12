@@ -88,7 +88,7 @@ fn claude_scratch_database(storage: ClaudeStorage) -> Result<Connection, String>
                 );
             }
             database
-                .execute_batch("PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-2048")
+                .execute_batch("PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-64")
                 .map_err(|error| error.to_string())?;
             let target = String::new();
             #[cfg(test)]
@@ -100,7 +100,7 @@ fn claude_scratch_database(storage: ClaudeStorage) -> Result<Connection, String>
                 .execute("ATTACH DATABASE ?1 AS scratch", [target])
                 .map_err(|error| error.to_string())?;
             database
-                .execute_batch("PRAGMA scratch.cache_size=-2048")
+                .execute_batch("PRAGMA scratch.cache_size=-64")
                 .map_err(|error| error.to_string())?;
         }
     }

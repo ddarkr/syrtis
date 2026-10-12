@@ -166,15 +166,21 @@ public struct KeychainConsentResult: Decodable, Equatable, Sendable {
 /// thread; async calls dispatch their blocking work. `agentUsage()` additionally
 /// performs provider network requests.
 public enum TBCore {
-    /// Copy the FFI string out of the heap buffer and free it, so decoding never
-    /// races the C allocation. Returns nil for a NULL pointer. This is the single
-    /// legal consumer of a tb_* return pointer — `tb_free` happens here exactly
-    /// once, on every path (the `defer`), which is what keeps the boundary free
-    /// of leaks and double-frees.
+    /// Take ownership of the FFI buffer without copying: the returned Data
+    /// references the Rust CString bytes directly, and `tb_free` runs exactly
+    /// once as the Data deallocator. Returns nil for a NULL pointer. This is
+    /// the single legal consumer of a tb_* return pointer — freeing anywhere
+    /// else would double-free, and copying here would duplicate every response.
+    /// Only Rust-allocated pointers may enter; tb_free reclaims CString memory,
+    /// never a Foundation allocation.
     private static func takeBytes(_ raw: UnsafeMutablePointer<CChar>?) -> Data? {
         guard let raw else { return nil }
-        defer { tb_free(raw) }
-        return Data(bytes: raw, count: strlen(raw))
+        let count = strlen(raw)
+        return Data(
+            bytesNoCopy: UnsafeMutableRawPointer(raw),
+            count: count,
+            deallocator: .custom { _, _ in tb_free(raw) }
+        )
     }
 
     /// Decode a bare JSON payload returned by a tb_* entry point, then free it.

@@ -207,7 +207,8 @@ impl QueryState {
             }
             transaction.commit().map_err(|error| error.to_string())?;
         }
-        db.execute_batch("PRAGMA temp.cache_size=-2048;
+        // 64 KiB TEMP budget, aligned with the durable-store TEMP budget; RAM over sort latency.
+        db.execute_batch("PRAGMA temp.cache_size=-64;
             CREATE TEMP TABLE sq_rows(id INTEGER PRIMARY KEY,lane TEXT NOT NULL,source_order INTEGER NOT NULL,phase INTEGER NOT NULL,retained INTEGER NOT NULL,global_storage INTEGER NOT NULL,session TEXT NOT NULL,workspace BLOB NOT NULL,dedup TEXT,model TEXT NOT NULL,workspace_label BLOB NOT NULL,timestamp INTEGER NOT NULL,payload BLOB,client TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',headless INTEGER NOT NULL DEFAULT 0,payload_digest BLOB,eligible INTEGER NOT NULL DEFAULT 1,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER);
             CREATE INDEX sq_lane_order ON sq_rows(lane,phase,source_order,id);
             CREATE INDEX sq_session ON sq_rows(lane,session);
@@ -790,8 +791,11 @@ impl QueryState {
     /// ordinary and targeted captures share it with no per-caller wiring.
     /// Replays only C/C canonical sources (completeness-gated, losers and
     /// zero-winner sources included), applies snapshot client eligibility
-    /// before arbitration, then selects just those two lanes. SQL-only;
-    /// idempotent on collapsed re-publish; never touches LocalClients rows.
+    /// before arbitration, then selects just those two lanes. The replay is
+    /// metadata-only: arbitration and the durable decision rows read only
+    /// ordering/attribution columns, so message/digest BLOBs stay in durable
+    /// facts and never enter publish scratch. SQL-only; idempotent on
+    /// collapsed re-publish; never touches LocalClients rows.
     fn build_report_index_for_publish(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
         if snapshot.mode != SelectionMode::Report
             || snapshot.modified_after.is_some()
@@ -831,6 +835,13 @@ impl QueryState {
                 "INSERT OR IGNORE INTO sq_indexes VALUES(?1,?2)",
                 rusqlite::params![snapshot.generation, REPORT_INDEX_VERSION],
             )
+            .map_err(|error| error.to_string())?;
+        // Cold publication keeps only winner references: release the
+        // arbitration scratch so no history-sized rows stay resident on the
+        // publishing connection. Later reads replay from durable facts
+        // (indexed winners or full preparation), which prepare clears first.
+        self.db
+            .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1822,6 +1833,90 @@ pub(crate) fn stage_source(
         query, cache, identity, path, &metadata, lane, index, phase, tag, false,
     )
 }
+/// Stream one source into the cache without ever holding its messages in a
+/// `Vec`. Rows flow straight from the visitor into a query-scratch lane, the
+/// fingerprint is re-verified before the cache write commits, and the scratch
+/// lane is released once the generation is durable. Any producer, read-scope,
+/// or fingerprint failure returns before `write_source` commits, so the scope
+/// publishes nothing partial; the transactional `write_source` rolls back
+/// mid-commit producer failures the same way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_streamed_source(
+    query: &QueryState,
+    cache: &mut SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+    before: Option<SourceFingerprint>,
+    refingerprint: impl Fn(&Path) -> Option<SourceFingerprint>,
+    visit: impl FnOnce(&mut dyn FnMut(UnifiedMessage) -> Result<(), String>) -> Result<(), String>,
+    lane: &str,
+    index: usize,
+    phase: i32,
+    tag: bool,
+) -> Result<(), String> {
+    let scratch = format!("{lane}-parse-{index}");
+    query
+        .db
+        .execute(
+            "DELETE FROM sq_rows WHERE lane=?1",
+            params![scratch.as_str()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    // Parse outside the cache write transaction; flatten the nested
+    // read-scope observation so I/O failures abort with nothing published.
+    let streamed = sessions::utils::source_read_scope(path, || {
+        visit(&mut |message| query.push(&scratch, 0, phase, false, false, &message))
+    });
+    let result = (|| {
+        streamed??;
+        if refingerprint(path) != before {
+            return Err(format!(
+                "{lane} source changed during ingestion; previous generation retained"
+            ));
+        }
+        let fingerprint = before.ok_or_else(|| {
+            format!("{lane} source fingerprint unavailable; previous scope retained")
+        })?;
+        let metadata = cache.write_source(
+            identity,
+            path,
+            fingerprint,
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |db, metadata| {
+                query.register_cache_on(db, path, metadata, lane, index, phase, tag, false)
+            },
+            |writer| {
+                query.visit(&scratch, &mut |message, _, _| {
+                    writer.push(&message, false, false)
+                })
+            },
+        )?;
+        // Ingestion scratch for this source is durable now: release its
+        // TEMP rows so later sources in the same scope stage bounded.
+        query
+            .db
+            .execute(
+                "DELETE FROM sq_rows WHERE lane=?1",
+                params![scratch.as_str()],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        stage_cached(
+            query, cache, identity, path, &metadata, lane, index, phase, tag, false,
+        )
+    })();
+    if result.is_err() {
+        let _ = query.db.execute(
+            "DELETE FROM sq_rows WHERE lane=?1",
+            params![scratch.as_str()],
+        );
+    }
+    result
+}
 
 pub(crate) fn local_dedups(client: ClientId, path: &Path) -> bool {
     matches!(
@@ -1929,6 +2024,16 @@ pub(crate) fn stage_claude(
                 })
             },
         )?;
+        // Ingestion scratch for this source is durable now: release its
+        // TEMP rows so later sources in the same scope stage bounded.
+        query
+            .db
+            .execute(
+                "DELETE FROM sq_rows WHERE lane=?1",
+                params![scratch.as_str()],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
         stage_cached(
             query, cache, identity, path, &metadata, "claude", index, 0, false, false,
         )
@@ -2027,8 +2132,15 @@ pub(crate) fn stage_codex(
     };
     let mut append = append;
     if append.is_some() && (!outcome.parse_succeeded || outcome.unresolved_model_events) {
-        scratch.push_str("-full");
-        turn_ids.clear()?;
+        // The full retry parses under a fresh scratch lane; drop the stale
+        // incremental attempt's rows so only the retried payload stages.
+        let stale = std::mem::take(&mut scratch);
+        query
+            .db
+            .execute("DELETE FROM sq_rows WHERE lane=?1", params![stale.as_str()])
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        scratch = format!("{stale}-full");
         outcome = parse(
             &scratch,
             0,
@@ -2089,25 +2201,79 @@ pub(crate) fn stage_codex(
             Ok(())
         },
     )?;
+    // Ingestion scratch for this source is durable now: release its
+    // TEMP rows so later sources in the same scope stage bounded.
+    query
+        .db
+        .execute(
+            "DELETE FROM sq_rows WHERE lane=?1",
+            params![scratch.as_str()],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
     stage_cached(
         query, cache, identity, path, &metadata, "codex", index, 0, false, headless,
     )
 }
 
+/// Absent sources keep their durable facts: carry the last-good generation
+/// forward instead of failing the scope. Returns true when the source is gone
+/// and the caller should skip staging it.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ingest_sources(
+fn carry_absent_source(
+    query: &QueryState,
+    cache: &SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+    lane: &str,
+    index: usize,
+    tag: bool,
+    before: &Option<SourceFingerprint>,
+) -> Result<bool, String> {
+    if before.is_some() {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(history) = cache.retention_metadata(identity, path)? {
+                query.observe_cache(path, &history, lane, index, tag)?;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Shared lane workflow for materialized and streamed producers: warm-hit
+/// partition, absent retention, presence gate, and per-miss cold staging. Only
+/// the cold step differs per producer, so both lanes share this loop instead
+/// of duplicating it.
+#[allow(clippy::too_many_arguments)]
+fn ingest_sources_inner<F, T, S>(
     query: &QueryState,
     cache: &mut SourceMessageCache,
     identity: CacheIdentity,
     paths: &[std::path::PathBuf],
     lane: &str,
     mode: SelectionMode,
-    fingerprint: impl Fn(&Path) -> Option<SourceFingerprint>,
-    parse: impl Fn(&Path) -> Vec<UnifiedMessage>,
-    tag: impl Fn(&Path) -> bool,
+    fingerprint: &F,
+    tag: &T,
     allow_empty: bool,
-    remove_empty: bool,
-) -> Result<(), String> {
+    mut stage_cold: S,
+) -> Result<(), String>
+where
+    F: Fn(&Path) -> Option<SourceFingerprint>,
+    T: Fn(&Path) -> bool,
+    S: FnMut(
+        &QueryState,
+        &mut SourceMessageCache,
+        &Path,
+        Option<SourceFingerprint>,
+        usize,
+        i32,
+        bool,
+    ) -> Result<(), String>,
+{
     // Report mode historically gives warm hits first claim, then cold sources
     // in traversal order. Persist the partition instead of an all-misses Vec.
     let hit_first = mode == SelectionMode::Report
@@ -2142,40 +2308,22 @@ pub(crate) fn ingest_sources(
                 false,
             )?;
         } else if !hit_first {
-            // Absent sources keep their durable facts: carry the last-good
-            // generation forward instead of failing the scope. Inaccessible
-            // (present but unreadable) sources still fail closed.
-            if before.is_none() {
-                match std::fs::symlink_metadata(path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some(history) = cache.retention_metadata(identity, path)? {
-                            query.observe_cache(path, &history, lane, index, tag(path))?;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            std::fs::File::open(path).map_err(|error| error.to_string())?;
-            let messages = sessions::utils::source_read_scope(path, || parse(path))?;
-            if fingerprint(path) != before {
-                return Err(format!(
-                    "{lane} source changed during ingestion; previous generation retained"
-                ));
-            }
-            stage_source(
+            // Inaccessible (present but unreadable) sources still fail closed
+            // below; absent ones keep durable facts via the carried cohort.
+            if carry_absent_source(
                 query,
                 cache,
                 identity,
                 path,
-                before,
-                messages,
                 lane,
                 index,
-                0,
                 tag(path),
-                remove_empty,
-            )?;
+                &before,
+            )? {
+                continue;
+            }
+            std::fs::File::open(path).map_err(|error| error.to_string())?;
+            stage_cold(query, cache, path, before, index, 0, tag(path))?;
         }
     }
     if hit_first {
@@ -2184,18 +2332,50 @@ pub(crate) fn ingest_sources(
                 continue;
             }
             let before = fingerprint(path);
-            if before.is_none() {
-                match std::fs::symlink_metadata(path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some(history) = cache.retention_metadata(identity, path)? {
-                            query.observe_cache(path, &history, lane, index, tag(path))?;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
+            if carry_absent_source(
+                query,
+                cache,
+                identity,
+                path,
+                lane,
+                index,
+                tag(path),
+                &before,
+            )? {
+                continue;
             }
             std::fs::File::open(path).map_err(|error| error.to_string())?;
+            stage_cold(query, cache, path, before, index, 1, tag(path))?;
+        }
+    }
+    cache.check()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ingest_sources(
+    query: &QueryState,
+    cache: &mut SourceMessageCache,
+    identity: CacheIdentity,
+    paths: &[std::path::PathBuf],
+    lane: &str,
+    mode: SelectionMode,
+    fingerprint: impl Fn(&Path) -> Option<SourceFingerprint>,
+    parse: impl Fn(&Path) -> Vec<UnifiedMessage>,
+    tag: impl Fn(&Path) -> bool,
+    allow_empty: bool,
+    remove_empty: bool,
+) -> Result<(), String> {
+    ingest_sources_inner(
+        query,
+        cache,
+        identity,
+        paths,
+        lane,
+        mode,
+        &fingerprint,
+        &tag,
+        allow_empty,
+        |query, cache, path, before, index, phase, tag| {
             let messages = sessions::utils::source_read_scope(path, || parse(path))?;
             if fingerprint(path) != before {
                 return Err(format!(
@@ -2211,13 +2391,56 @@ pub(crate) fn ingest_sources(
                 messages,
                 lane,
                 index,
-                1,
-                tag(path),
+                phase,
+                tag,
                 remove_empty,
-            )?;
-        }
-    }
-    cache.check()
+            )
+        },
+    )
+}
+
+/// Streaming twin of [`ingest_sources`]: the visitor pushes each row without
+/// ever holding the whole source in a `Vec`. Partition, retention, presence,
+/// and warm-hit order are the shared seam above; only the cold step streams.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ingest_sources_streamed(
+    query: &QueryState,
+    cache: &mut SourceMessageCache,
+    identity: CacheIdentity,
+    paths: &[std::path::PathBuf],
+    lane: &str,
+    mode: SelectionMode,
+    fingerprint: impl Fn(&Path) -> Option<SourceFingerprint>,
+    visit: impl Fn(&Path, &mut dyn FnMut(UnifiedMessage) -> Result<(), String>) -> Result<(), String>,
+    tag: impl Fn(&Path) -> bool,
+    allow_empty: bool,
+) -> Result<(), String> {
+    ingest_sources_inner(
+        query,
+        cache,
+        identity,
+        paths,
+        lane,
+        mode,
+        &fingerprint,
+        &tag,
+        allow_empty,
+        |query, cache, path, before, index, phase, tag| {
+            stage_streamed_source(
+                query,
+                cache,
+                identity,
+                path,
+                before,
+                &fingerprint,
+                |sink| visit(path, sink),
+                lane,
+                index,
+                phase,
+                tag,
+            )
+        },
+    )
 }
 
 /// Report-only timestamp state; explicit public sessionize collectors remain
@@ -2239,7 +2462,7 @@ impl Drop for DiskTimeFold {
 impl DiskTimeFold {
     pub(crate) fn new() -> Result<Self, String> {
         let db = Connection::open("").map_err(|error| error.to_string())?;
-        db.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-2048;
+        db.execute_batch("PRAGMA cache_size=-64; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-64;
             CREATE TABLE times(id INTEGER PRIMARY KEY,client TEXT NOT NULL,session TEXT NOT NULL,timestamp INTEGER NOT NULL);
             CREATE INDEX times_session ON times(client,session,timestamp,id);
             CREATE TABLE intervals(client TEXT NOT NULL,session TEXT NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,active INTEGER NOT NULL);
@@ -3722,5 +3945,73 @@ mod tests {
         assert!(replacement.pin(&old).is_err());
         replacement.pin(&current).unwrap();
         replacement.unpin().unwrap();
+    }
+    #[test]
+    #[serial_test::serial]
+    fn streamed_sink_abort_publishes_nothing_partial() {
+        // Pi sink abort: the visitor stops at the first sink Err, the cache
+        // write never commits, and the scope keeps no published rows.
+        let root = TempDir::new().unwrap();
+        let cache_root = root.path().join("cache");
+        let mut cache = SourceMessageCache::open_from_root(Some(&cache_root));
+        cache.ensure_open().unwrap();
+        let context = ResolvedLocalSourceContext::capture(
+            Some(root.path().join("home")),
+            false,
+            crate::scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let source = root.path().join("pi.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"pi_abort\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/tmp\"}\n",
+                "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"provider\":\"openai\",\"usage\":{\"input\":10,\"output\":1}}}\n",
+                "{\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"provider\":\"openai\",\"usage\":{\"input\":20,\"output\":2}}}\n",
+            ),
+        )
+        .unwrap();
+        let staged = query(&cache_root);
+        let mut snapshot = staged
+            .begin_scope(
+                &cache_root,
+                &context,
+                &["pi".to_string()],
+                None,
+                SelectionMode::Report,
+            )
+            .unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Pi);
+        let before = SourceFingerprint::from_path_samples_only(&source);
+        let error = stage_streamed_source(
+            &staged,
+            &mut cache,
+            identity,
+            &source,
+            before,
+            SourceFingerprint::from_path_samples_only,
+            |sink| {
+                sessions::pi::visit_pi_file(&source, &mut |message| {
+                    sink(message)?;
+                    Err("injected sink abort".to_string())
+                })
+            },
+            "pi",
+            0,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("injected sink abort"));
+        assert!(cache.metadata(identity, &source).unwrap().is_none());
+        staged.publish(&mut snapshot).unwrap();
+        let reader = query(&cache_root);
+        reader.pin(&snapshot).unwrap();
+        reader.replay_snapshot(&snapshot).unwrap();
+        reader
+            .select_lane("pi", SelectionMode::Report, true)
+            .unwrap();
+        assert!(inputs(&reader, "pi", None, None).is_empty());
+        reader.unpin().unwrap();
     }
 }

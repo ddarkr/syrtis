@@ -1028,7 +1028,7 @@ fn open_codex_scratch(schema: &str) -> Result<rusqlite::Connection, String> {
     database
         .execute_batch(
             "PRAGMA temp_store=FILE;
-             PRAGMA temp.cache_size=-2048;
+             PRAGMA temp.cache_size=-64;
              PRAGMA temp.cache_spill=ON;",
         )
         .map_err(|error| format!("configuring Codex scratch: {error}"))?;

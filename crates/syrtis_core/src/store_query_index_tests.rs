@@ -1271,3 +1271,109 @@ fn synthetic_only_scope_survives_shared_dedup_key() {
     .unwrap();
     assert!(rejected.is_empty());
 }
+#[test]
+fn metadata_report_index_matches_full_replay_and_rejects_loser_loss() {
+    // Uncertain edge: the metadata-only cold replay must arbitrate exactly
+    // like the full payload replay (same winner order/references), and a
+    // lost loser row must fail the repeated fold whole before any callback —
+    // proving losers still gate completeness. Winner corruption is covered
+    // by repeated_mixed_report_queries_reuse_indexed_winners; the empty
+    // marker case by report_reuse_keeps_corrections_and_retention.
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(home.join(".claude/projects/-home-early")).unwrap();
+    std::fs::create_dir_all(home.join(".claude/projects/-home-late")).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let clients = vec!["claude".to_string(), "codex".to_string()];
+    // Same dedup key across two claude sources: early source wins, late rows
+    // lose. The codex lane contributes one uncontested winner, so the
+    // metadata replay must arbitrate both lanes and both eligibility inputs.
+    std::fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    write_report_codex(&home.join(".codex/sessions/rollout.jsonl"), "session-a", 30);
+    write_report_claude(
+        &home.join(".claude/projects/-home-early/session.jsonl"),
+        &[("shared-turn", 12)],
+    );
+    write_report_claude(
+        &home.join(".claude/projects/-home-late/session.jsonl"),
+        &[("shared-turn", 10), ("shared-turn", 11)],
+    );
+    let publisher = query(root.path());
+    let snapshot = report_snapshot(&publisher, root.path(), &context, &clients);
+    let mut folded = report_inputs(&snapshot);
+    folded.sort_unstable();
+    assert_eq!(folded, vec![12, 30]);
+    // Differential proof: rebuild the same generation's arbitration from the
+    // full payload replay and require identical winner references in order.
+    let indexed: Vec<(String, i64, i64, i64)> = query(root.path())
+        .db
+        .prepare(
+            "SELECT lane, cache_source_id, cache_generation, cache_ordinal FROM sq_decisions WHERE scope_generation=?1 AND lane IN ('claude','codex') AND oc_source IS NULL ORDER BY rank",
+        )
+        .unwrap()
+        .query_map([snapshot.generation], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(indexed.len(), 2);
+    let verifier = query(root.path());
+    verifier.pin(&snapshot).unwrap();
+    // Full payload arbitration of the same generation, without touching the
+    // durable index: replay all canonical rows, apply the same Report
+    // eligibility, and arbitrate both lanes exactly as publication did.
+    verifier.replay_snapshot(&snapshot).unwrap();
+    verifier.set_client_eligibility(&snapshot.clients).unwrap();
+    verifier
+        .select_lane("claude", SelectionMode::Report, false)
+        .unwrap();
+    verifier
+        .select_lane("codex", SelectionMode::Report, false)
+        .unwrap();
+    let replayed: Vec<(String, i64, i64, i64)> = verifier
+        .db
+        .prepare(
+            "SELECT r.lane, r.cache_source_id, r.cache_generation, r.cache_ordinal FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    verifier.unpin().unwrap();
+    assert_eq!(replayed, indexed);
+    // Deleting one canonical loser row trips the completeness gate before
+    // any callback, even though the repeated fold only copies winners.
+    let cache_path = root.path().join("source-message-cache.sqlite3");
+    let loser: Option<(i64, i64, i64)> = rusqlite::Connection::open(&cache_path)
+        .unwrap()
+        .query_row(
+            "SELECT r.source_id, r.generation, r.ordinal FROM sq_scope_sources s JOIN mc_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND s.lane='claude' AND NOT EXISTS(SELECT 1 FROM sq_decisions d WHERE d.scope_generation=?1 AND d.cache_source_id=r.source_id AND d.cache_generation=r.generation AND d.cache_ordinal=r.ordinal) LIMIT 1",
+            [snapshot.generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .unwrap();
+    let (loser_source, loser_generation, loser_ordinal) =
+        loser.expect("late source keeps canonical loser rows beside the early winner");
+    rusqlite::Connection::open(&cache_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM mc_rows WHERE source_id = ?1 AND generation = ?2 AND ordinal = ?3",
+            rusqlite::params![loser_source, loser_generation, loser_ordinal],
+        )
+        .unwrap();
+    let mut seen = 0usize;
+    let result =
+        crate::visit_local_usage_snapshot(&snapshot, UsageQuery::compact(), &|_| true, &mut |_| {
+            seen += 1
+        });
+    assert!(result.is_err());
+    assert_eq!(seen, 0);
+}

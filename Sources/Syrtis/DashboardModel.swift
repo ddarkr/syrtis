@@ -449,6 +449,7 @@ private struct DashboardSnapshot {
         graphFetchToken &+= 1; _ = beginHourlyRequest(); _ = beginModelRequest()
         fulfillRestoreGate()
         modelReport = nil; hourly = nil; agents = nil; trace = []
+        statsMemoGeneratedAt = nil; statsMemoSelected = nil; statsMemoValue = nil
         if scheduler != nil, ownsLastSnapshot, let snapshot = Self.lastSnapshot {
             replaceLastSnapshot(DashboardSnapshot(
                 payload: snapshot.payload, stats: snapshot.stats, payloadCapturedAt: snapshot.payloadCapturedAt,
@@ -1262,7 +1263,7 @@ private struct DashboardSnapshot {
         self.payload = payload
         acceptedPayloadYear = Self.identityYear(year)
         graphFetchFailed = false
-        statsMemoGeneratedAt = nil
+        statsMemoGeneratedAt = nil; statsMemoSelected = nil; statsMemoValue = nil
         stats = UsageStats(payload: payload, selectedClients: Set(payload.summary.clients))
         knownYears = Set(knownYears + payload.years.map(\.year)).sorted(by: >)
         Self.recordLocalRecordClients(payload.summary.clients)

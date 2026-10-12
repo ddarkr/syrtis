@@ -9,8 +9,8 @@ use super::{
     UnifiedMessage,
 };
 use crate::{provider_identity, TokenBreakdown};
-use serde::Deserialize;
-use std::collections::HashMap;
+use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// MiMo Code message structure (from SQLite data column)
@@ -78,7 +78,7 @@ pub struct MiMoCodeTime {
     pub completed: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 struct MiMoCodeSqliteFingerprint {
     created_bits: u64,
     completed_bits: Option<u64>,
@@ -130,6 +130,154 @@ fn merge_duplicate_workspace(
     }
 }
 
+fn encode_fingerprint(fingerprint: &MiMoCodeSqliteFingerprint) -> Result<Vec<u8>, String> {
+    bincode::serialize(fingerprint).map_err(|error| error.to_string())
+}
+
+/// File-backed dedup scratch: one fingerprint row per distinct message, so the
+/// source history never multiplies Rust heap. Rows carry first-seen order plus
+/// the merge state that used to live beside the materialized Vec.
+struct MiMoRows {
+    database: Connection,
+    next_ordinal: i64,
+}
+
+impl MiMoRows {
+    fn open() -> Result<Self, String> {
+        let database = Connection::open_in_memory()
+            .map_err(|error| format!("opening MiMo scratch: {error}"))?;
+        // Same small-cache policy as the source opener (main 256 KiB, TEMP 64
+        // KiB, FILE-backed, no mmap): only TEMP tables use this pager.
+        database
+            .execute_batch(
+                "PRAGMA cache_size=-256; PRAGMA temp.cache_size=-64; \
+                 PRAGMA temp_store=FILE; PRAGMA mmap_size=0;",
+            )
+            .map_err(|error| format!("configuring MiMo scratch: {error}"))?;
+        let disk_temp: bool = database
+            .query_row(
+                "SELECT (SELECT temp_store FROM pragma_temp_store) = 1 \
+                 AND sqlite_compileoption_used('TEMP_STORE=3') = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("checking MiMo scratch storage: {error}"))?;
+        if !disk_temp {
+            return Err("MiMo scratch requires file-backed SQLite TEMP storage".into());
+        }
+        database
+            .execute_batch(
+                "CREATE TEMP TABLE rows (
+                     fingerprint BLOB PRIMARY KEY,
+                     ordinal INTEGER NOT NULL,
+                     message BLOB NOT NULL,
+                     has_embedded_message_id INTEGER NOT NULL,
+                     has_workspace_conflict INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 BEGIN;",
+            )
+            .map_err(|error| format!("creating MiMo scratch: {error}"))?;
+        Ok(Self {
+            database,
+            next_ordinal: 0,
+        })
+    }
+
+    fn fold(
+        &mut self,
+        fingerprint: &MiMoCodeSqliteFingerprint,
+        has_message_id: bool,
+        unified: UnifiedMessage,
+        workspace_root: Option<&str>,
+    ) -> Result<(), String> {
+        let key = encode_fingerprint(fingerprint)?;
+        let stored: Option<(Vec<u8>, bool, bool)> = self
+            .database
+            .query_row(
+                "SELECT message, has_embedded_message_id, has_workspace_conflict \
+                 FROM temp.rows WHERE fingerprint=?1",
+                [key.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("reading MiMo scratch: {error}"))?;
+        let Some((bytes, stored_has_id, stored_conflict)) = stored else {
+            let ordinal = self.next_ordinal;
+            self.next_ordinal += 1;
+            let message = bincode::serialize(&unified).map_err(|error| error.to_string())?;
+            self.database
+                .execute(
+                    "INSERT INTO temp.rows(fingerprint, ordinal, message, \
+                     has_embedded_message_id, has_workspace_conflict) \
+                     VALUES(?1, ?2, ?3, ?4, 0)",
+                    rusqlite::params![key, ordinal, message, i64::from(has_message_id)],
+                )
+                .map_err(|error| format!("writing MiMo scratch: {error}"))?;
+            return Ok(());
+        };
+        let mut current: UnifiedMessage =
+            bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+        let mut state = MiMoCodeSqliteDedupState {
+            has_embedded_message_id: stored_has_id,
+            has_workspace_conflict: stored_conflict,
+        };
+        let duplicate_authoritative = unified.has_authoritative_cost();
+        if has_message_id && !state.has_embedded_message_id {
+            state.has_embedded_message_id = true;
+            current.dedup_key.clone_from(&unified.dedup_key);
+        }
+        merge_duplicate_workspace(&mut current, &mut state, workspace_root);
+        if duplicate_authoritative {
+            current.mark_provider_reported_cost();
+        }
+        let message = bincode::serialize(&current).map_err(|error| error.to_string())?;
+        self.database
+            .execute(
+                "UPDATE temp.rows SET message=?2, has_embedded_message_id=?3, \
+                 has_workspace_conflict=?4 WHERE fingerprint=?1",
+                rusqlite::params![
+                    key,
+                    message,
+                    i64::from(state.has_embedded_message_id),
+                    i64::from(state.has_workspace_conflict)
+                ],
+            )
+            .map_err(|error| format!("writing MiMo scratch: {error}"))?;
+        Ok(())
+    }
+
+    fn emit(
+        self,
+        sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut statement = self
+            .database
+            .prepare("SELECT message FROM temp.rows ORDER BY ordinal")
+            .map_err(|error| format!("reading MiMo scratch: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("reading MiMo scratch: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("reading MiMo scratch: {error}"))?
+        {
+            let bytes: Vec<u8> = row
+                .get(0)
+                .map_err(|error| format!("reading MiMo scratch: {error}"))?;
+            let message: UnifiedMessage =
+                bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+            sink(message)?;
+        }
+        Ok(())
+    }
+}
+
 /// Normalize an epoch `time.created`/`time.completed` value to milliseconds.
 ///
 /// MiMo Code is expected to store epoch milliseconds (matching OpenCode), but
@@ -158,8 +306,30 @@ fn micode_duration_ms(time: &MiMoCodeTime) -> Option<i64> {
 }
 
 pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::new();
+    // Compatibility collector: the sink never fails, so a visit error can only
+    // come from scratch setup/fold/emit; drop the prefix like other wrappers.
+    if visit_micode_sqlite(db_path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
+
+/// Stream one source database through `sink` without retaining its history in
+/// Rust heap. Dedup state lives in a file-backed SQLite scratch table keyed by
+/// the exact legacy fingerprint; only the current row plus one stored
+/// candidate are materialized when a duplicate merges.
+pub(crate) fn visit_micode_sqlite(
+    db_path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
     let Some(conn) = open_readonly_sqlite(db_path) else {
-        return Vec::new();
+        return Ok(());
     };
 
     let modern_query = r#"
@@ -198,7 +368,7 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         )
     }) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(()),
     };
 
     let rows = match super::utils::observe_sqlite(stmt.query_map([], |row| {
@@ -211,12 +381,10 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     .map(super::utils::source_rows)
     {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(()),
     };
 
-    let mut messages: Vec<UnifiedMessage> = Vec::new();
-    let mut fingerprint_indices: HashMap<MiMoCodeSqliteFingerprint, usize> = HashMap::new();
-    let mut dedup_states: Vec<MiMoCodeSqliteDedupState> = Vec::new();
+    let mut scratch = MiMoRows::open()?;
 
     // Namespace ONLY the row-id fallback by the database. MiMo Code uses
     // channel-suffixed databases (mimocode.db and mimocode-<channel>.db), and a
@@ -329,28 +497,10 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             .or(embedded_workspace_root.as_deref());
         set_workspace_from_root(&mut unified, workspace_root);
 
-        if let Some(index) = fingerprint_indices.get(&fingerprint).copied() {
-            let dedup_state = &mut dedup_states[index];
-            if message_id.is_some() && !dedup_state.has_embedded_message_id {
-                dedup_state.has_embedded_message_id = true;
-                messages[index].dedup_key = unified.dedup_key;
-            }
-            merge_duplicate_workspace(&mut messages[index], dedup_state, workspace_root);
-            if provider_cost.is_some() {
-                messages[index].mark_provider_reported_cost();
-            }
-            continue;
-        }
-
-        dedup_states.push(MiMoCodeSqliteDedupState {
-            has_embedded_message_id: message_id.is_some(),
-            has_workspace_conflict: false,
-        });
-        fingerprint_indices.insert(fingerprint, messages.len());
-        messages.push(unified);
+        scratch.fold(&fingerprint, message_id.is_some(), unified, workspace_root)?;
     }
 
-    messages
+    scratch.emit(sink)
 }
 
 #[cfg(test)]
@@ -945,5 +1095,113 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].cost, 0.0);
         assert!(messages[0].has_authoritative_cost());
+    }
+
+    // A >1024-row duplicate fold pins mixed fingerprint/embedded-id/workspace
+    // states: first-seen order wins, late embedded ids promote the dedup key,
+    // conflicting workspaces clear, and provider-cost authority survives.
+    #[test]
+    fn visitor_folds_thousands_of_duplicates_with_exact_merge_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("many_dupes.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);")
+            .unwrap();
+        for (session, directory) in [
+            ("ses_a", "/Users/alice/repo-a"),
+            ("ses_b", "/Users/bob/repo-b"),
+        ] {
+            conn.execute(
+                "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+                rusqlite::params![session, directory],
+            )
+            .unwrap();
+        }
+        // Fingerprint X: both copies share tokens/cost/timestamps so the exact
+        // legacy fingerprint collides. The first copy has no embedded id and
+        // ses_a workspace; the second carries a late embedded id, an explicit
+        // zero cost (same 0.0 value, but provider-reported), and a conflicting
+        // ses_b workspace.
+        let x_plain = r#"{
+            "role": "assistant", "modelID": "mimo-v2.5-pro", "providerID": "mimo",
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        let x_embedded = r#"{
+            "id": "msg_x", "role": "assistant", "modelID": "mimo-v2.5-pro",
+            "providerID": "mimo", "cost": 0.0,
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        // Fingerprint Y: distinct tokens/cost so it never collides with X.
+        let y_plain = r#"{
+            "role": "assistant", "modelID": "mimo-v2.5-pro", "providerID": "mimo",
+            "tokens": { "input": 30, "output": 7 },
+            "time": { "created": 1700000001000.0 }
+        }"#;
+        for index in 0..1100 {
+            // Row ids sort Y before X (x_ > y_ would flip first-seen order), so
+            // prefix them to keep insertion order == ORDER BY m.id order.
+            let (row, session, data) = match index % 3 {
+                0 => (format!("a_x_plain_{index:04}"), "ses_a", x_plain),
+                1 => (format!("b_x_embedded_{index:04}"), "ses_b", x_embedded),
+                _ => (format!("c_y_{index:04}"), "ses_a", y_plain),
+            };
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![row, session, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut visited = Vec::new();
+        visit_micode_sqlite(&db_path, &mut |message| {
+            visited.push(message);
+            Ok(())
+        })
+        .unwrap();
+        let materialized = parse_micode_sqlite(&db_path);
+        assert_eq!(visited, materialized);
+        assert_eq!(visited.len(), 2);
+        // X folds first: late embedded id promotes the key, the ses_a/ses_b
+        // conflict clears the workspace, and the duplicate's explicit zero cost
+        // marks the survivor authoritative.
+        assert_eq!(visited[0].dedup_key.as_deref(), Some("msg_x"));
+        assert_eq!(visited[0].workspace_key, None);
+        assert!(visited[0].has_authoritative_cost());
+        assert_eq!(visited[1].tokens.input, 30);
+        assert!(!visited[1].has_authoritative_cost());
+    }
+
+    /// Callback failures abort the fold: no partial sink publication counts as
+    /// success and the error surfaces to the caller.
+    #[test]
+    fn visitor_callback_failure_propagates_without_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sink_failure.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        let data_json = r#"{
+            "role": "assistant", "modelID": "mimo-v2.5-pro", "providerID": "mimo",
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        for row in ["first", "second"] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![row, "ses_1", data_json],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut delivered = 0;
+        let error = visit_micode_sqlite(&db_path, &mut |_| {
+            delivered += 1;
+            Err("sink rejected micode message".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "sink rejected micode message");
+        assert_eq!(delivered, 1);
     }
 }

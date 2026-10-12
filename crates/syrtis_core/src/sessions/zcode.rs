@@ -8,7 +8,7 @@
 use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, open_readonly_sqlite};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
-use std::collections::HashMap;
+use rusqlite::Connection;
 use std::path::Path;
 
 const CLIENT_ID: &str = "zcode";
@@ -134,9 +134,20 @@ const LEGACY_QUERY: &str = r#"
     ORDER BY COALESCE(mu.completed_at, mu.started_at, 0), mu.id
 "#;
 
-pub fn parse_zcode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+/// Stream ZCode usage rows to `sink` without retaining per-row messages,
+/// turn ids, or per-turn maps in memory.
+///
+/// `is_turn_start` needs the earliest start-anchored timestamp per turn, but
+/// rows arrive ordered by completion. A bounded two-pass scan stages only
+/// `(turn_id, timestamp, ordinal)` in a file-backed scratch table, then the
+/// second pass marks the winner per turn. Ties keep the first row in query
+/// order, matching the old `HashMap` pass's strict `<` replacement.
+pub(crate) fn visit_zcode_sqlite(
+    db_path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
     let Some(conn) = open_readonly_sqlite(db_path) else {
-        return Vec::new();
+        return Ok(());
     };
 
     let fallback_timestamp = file_modified_timestamp_ms(db_path);
@@ -180,191 +191,342 @@ pub fn parse_zcode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     // A query that prepares is the one this schema supports; only a prepare
     // failure means "try the older spelling". A database that understands
     // neither is not a ZCode usage store.
-    let Some(mut stmt) = [MODERN_QUERY, LEGACY_QUERY].into_iter().find_map(|query| {
-        super::utils::prepare_source_sqlite(
-            &conn,
-            query,
-            &[
-                (
-                    "model_usage",
-                    &[
-                        "id",
-                        "session_id",
-                        "turn_id",
-                        "model_id",
-                        "started_at",
-                        "completed_at",
-                        "duration_ms",
-                        "input_tokens",
-                        "output_tokens",
-                        "reasoning_tokens",
-                        "cache_read_input_tokens",
-                        "cache_creation_input_tokens",
-                        "computed_total_tokens",
-                        "agent",
-                        "mode",
-                    ],
-                ),
-                ("session", &["id", "directory", "path"]),
-            ],
-        )
-        .ok()
-    }) else {
-        return Vec::new();
-    };
-    let rows: Vec<ZcodeUsageRow> = match super::utils::observe_sqlite(stmt.query_map([], |row| {
-        Ok(ZcodeUsageRow {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            turn_id: row.get(2)?,
-            model_id: row.get(3)?,
-            started_at: row.get(4)?,
-            completed_at: row.get(5)?,
-            duration_ms: row.get(6)?,
-            input_tokens: row.get(7)?,
-            output_tokens: row.get(8)?,
-            reasoning_tokens: row.get(9)?,
-            cache_read_input_tokens: row.get(10)?,
-            cache_creation_input_tokens: row.get(11)?,
-            computed_total_tokens: row.get(12)?,
-            agent: row.get(13)?,
-            mode: row.get(14)?,
-            session_directory: row.get(15)?,
-            session_path: row.get(16)?,
-        })
-    }))
-    .map(super::utils::source_rows)
-    {
-        // A row that fails to decode is skipped, matching upstream's
-        // `sqlite_for_each_row_on`.
-        Ok(rows) => rows.filter_map(Result::ok).collect(),
-        Err(_) => return Vec::new(),
+    let active_query = [MODERN_QUERY, LEGACY_QUERY]
+        .into_iter()
+        .find(|query| super::utils::prepare_source_sqlite(&conn, query, ZCODE_SCHEMA).is_ok());
+    let Some(active_query) = active_query else {
+        return Ok(());
     };
 
-    let mut messages = Vec::new();
-    // Parallel to `messages`: each row's turn_id (if any), so is_turn_start
-    // can be assigned in a second pass once every row's start-anchored
-    // timestamp is known (see below).
-    let mut turn_ids: Vec<Option<String>> = Vec::new();
+    let scratch = open_zcode_scratch()?;
 
-    for row in rows {
-        let session_id = row.session_id.unwrap_or_else(|| "unknown".to_string());
-        let model_id = row
-            .model_id
-            .as_deref()
-            .map(canonicalize_model)
-            .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-        let timestamp = resolve_zcode_timestamp(
-            row.started_at,
-            row.completed_at,
-            row.duration_ms,
-            fallback_timestamp,
-        );
-
-        let raw_input = row.input_tokens.unwrap_or(0);
-        let raw_output = row.output_tokens.unwrap_or(0);
-        let raw_cache_read = row.cache_read_input_tokens.unwrap_or(0);
-        let raw_cache_write = row.cache_creation_input_tokens.unwrap_or(0);
-        let raw_reasoning = row.reasoning_tokens.unwrap_or(0);
-
-        let (net_input, net_output) = match row.computed_total_tokens {
-            Some(total) => normalize_zcode_input_and_output(
-                raw_input,
-                raw_output,
-                raw_cache_read,
-                raw_cache_write,
-                raw_reasoning,
-                Some(total),
-            ),
-            // When `computed_total_tokens` is NULL, distinguish two cases:
-            // 1. Legacy schema (column doesn't exist): unconditionally subtract,
-            //    since every sampled row in a real ZCode database is confirmed
-            //    cache/reasoning-inclusive.
-            // 2. Modern schema but this row's value is NULL: can't detect shape,
-            //    so pass through unchanged (the normalize function's default when
-            //    total is None). Subtracting unconditionally here would undercount
-            //    rows that are already cache-exclusive.
-            None if is_legacy_schema => (
-                subtract_overlap(
-                    raw_input,
-                    raw_cache_read.max(0).saturating_add(raw_cache_write.max(0)),
-                ),
-                subtract_overlap(raw_output, raw_reasoning),
-            ),
-            None => normalize_zcode_input_and_output(
-                raw_input,
-                raw_output,
-                raw_cache_read,
-                raw_cache_write,
-                raw_reasoning,
-                None,
-            ),
-        };
-
-        let tokens = TokenBreakdown {
-            input: net_input,
-            output: net_output,
-            cache_read: raw_cache_read.max(0),
-            cache_write: raw_cache_write.max(0),
-            cache_write_1h: 0,
-            reasoning: raw_reasoning.max(0),
-        };
-
-        if tokens.total() == 0 {
-            continue;
+    // Both passes read under one explicit read transaction so a concurrent
+    // writer between passes cannot change the winning started_at or make a
+    // pass-two row miss its pass-one lookup. Read-only handle: BEGIN (not
+    // BEGIN IMMEDIATE); ROLLBACK is best-effort since the txn ends at return.
+    super::utils::observe_sqlite(conn.execute_batch("BEGIN;"))
+        .map_err(|error| format!("starting ZCode source read transaction: {error}"))?;
+    let visit = (|| -> Result<(), String> {
+        let mut upsert = scratch
+            .prepare(
+                "INSERT INTO temp.turn_earliest(turn_id, ts, ord) VALUES (?1, ?2, ?3)
+             ON CONFLICT(turn_id) DO UPDATE SET ts = excluded.ts, ord = excluded.ord
+             WHERE excluded.ts < turn_earliest.ts
+                OR (excluded.ts = turn_earliest.ts AND excluded.ord < turn_earliest.ord)",
+            )
+            .map_err(|error| format!("creating ZCode scratch statement: {error}"))?;
+        // First pass: earliest start-anchored timestamp (and winning ordinal)
+        // per turn over exactly the rows the second pass will publish. Row
+        // callbacks stay unobserved here: decoding happens again in pass two,
+        // so only pass two may fail the generation.
+        let mut ordinal: i64 = 0;
+        {
+            let mut stmt = super::utils::prepare_source_sqlite(&conn, active_query, ZCODE_SCHEMA)
+                .map_err(|_| "ZCode source query failed".to_string())?;
+            let mapped = super::utils::observe_sqlite(stmt.query_map([], zcode_row))
+                .map_err(|_| "ZCode source query failed".to_string())?;
+            for row in mapped {
+                match row {
+                    Ok(row) => {
+                        let Some((message, turn_id)) =
+                            zcode_message_from_row(row, fallback_timestamp, is_legacy_schema)
+                        else {
+                            continue;
+                        };
+                        if let Some(turn_id) = turn_id {
+                            upsert
+                                .execute(rusqlite::params![turn_id, message.timestamp, ordinal])
+                                .map_err(|error| {
+                                    format!("writing ZCode scratch earliest turn: {error}")
+                                })?;
+                        }
+                        ordinal += 1;
+                    }
+                    Err(error) if zcode_row_failed_hard(&error) => {
+                        return Err(format!("ZCode source read failed: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
         }
 
-        let agent = row
-            .agent
-            .as_deref()
-            .or(row.mode.as_deref())
-            .map(str::to_string);
-        let mut message = UnifiedMessage::new_with_agent(
-            CLIENT_ID,
-            model_id,
-            PROVIDER_ID,
-            session_id,
-            timestamp,
-            tokens,
-            0.0,
-            agent,
-        );
-        message.dedup_key = Some(format!("zcode-sqlite:{}", row.id));
-        message.duration_ms = row.duration_ms.filter(|duration| *duration > 0);
+        #[cfg(test)]
+        zcode_between_passes_hook();
 
-        let workspace_root = row.session_directory.or(row.session_path);
-        let workspace_key = workspace_root.as_deref().and_then(normalize_workspace_key);
-        let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
-        message.set_workspace(workspace_key, workspace_label);
-
-        turn_ids.push(row.turn_id.filter(|id| !id.is_empty()));
-        messages.push(message);
-    }
-
-    // Assign is_turn_start to the earliest-STARTED request per turn, not the
-    // first one encountered in query order (which is ordered by
-    // completed_at). Timestamps are start-anchored (see above), so a
-    // later-started-but-earlier-completed request could otherwise win the
-    // flag and land the turn in the wrong hour/day bucket downstream.
-    let mut earliest_index_per_turn: HashMap<&str, usize> = HashMap::new();
-    for (index, turn_id) in turn_ids.iter().enumerate() {
-        let Some(turn_id) = turn_id.as_deref() else {
-            continue;
-        };
-        earliest_index_per_turn
-            .entry(turn_id)
-            .and_modify(|current| {
-                if messages[index].timestamp < messages[*current].timestamp {
-                    *current = index;
+        // Second pass: rebuild each published message in the same stable order
+        // and mark the earliest-started row per turn.
+        let mut lookup = scratch
+            .prepare("SELECT ts, ord FROM temp.turn_earliest WHERE turn_id = ?1")
+            .map_err(|error| format!("creating ZCode scratch lookup: {error}"))?;
+        ordinal = 0;
+        {
+            let mut stmt = super::utils::prepare_source_sqlite(&conn, active_query, ZCODE_SCHEMA)
+                .map_err(|_| "ZCode source query failed".to_string())?;
+            let mapped = super::utils::observe_sqlite(stmt.query_map([], zcode_row))
+                .map_err(|_| "ZCode source query failed".to_string())?;
+            for row in super::utils::source_rows(mapped) {
+                match row {
+                    Ok(row) => {
+                        let Some((mut message, turn_id)) =
+                            zcode_message_from_row(row, fallback_timestamp, is_legacy_schema)
+                        else {
+                            continue;
+                        };
+                        if let Some(turn_id) = turn_id.as_deref() {
+                            let (winner_ts, winner_ord): (i64, i64) = lookup
+                                .query_row([turn_id], |query_row| {
+                                    Ok((query_row.get(0)?, query_row.get(1)?))
+                                })
+                                .map_err(|error| {
+                                    format!("reading ZCode scratch earliest turn: {error}")
+                                })?;
+                            if message.timestamp == winner_ts && ordinal == winner_ord {
+                                message.is_turn_start = true;
+                            }
+                        }
+                        ordinal += 1;
+                        sink(message)?;
+                    }
+                    Err(error) if zcode_row_failed_hard(&error) => {
+                        return Err(format!("ZCode source read failed: {error}"));
+                    }
+                    Err(_) => {}
                 }
-            })
-            .or_insert(index);
-    }
-    for index in earliest_index_per_turn.into_values() {
-        messages[index].is_turn_start = true;
+            }
+        }
+        Ok(())
+    })();
+    let _ = conn.execute_batch("ROLLBACK;");
+    visit
+}
+
+const ZCODE_SCHEMA: &[(&str, &[&str])] = &[
+    (
+        "model_usage",
+        &[
+            "id",
+            "session_id",
+            "turn_id",
+            "model_id",
+            "started_at",
+            "completed_at",
+            "duration_ms",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "computed_total_tokens",
+            "agent",
+            "mode",
+        ],
+    ),
+    ("session", &["id", "directory", "path"]),
+];
+
+fn zcode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZcodeUsageRow> {
+    Ok(ZcodeUsageRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        model_id: row.get(3)?,
+        started_at: row.get(4)?,
+        completed_at: row.get(5)?,
+        duration_ms: row.get(6)?,
+        input_tokens: row.get(7)?,
+        output_tokens: row.get(8)?,
+        reasoning_tokens: row.get(9)?,
+        cache_read_input_tokens: row.get(10)?,
+        cache_creation_input_tokens: row.get(11)?,
+        computed_total_tokens: row.get(12)?,
+        agent: row.get(13)?,
+        mode: row.get(14)?,
+        session_directory: row.get(15)?,
+        session_path: row.get(16)?,
+    })
+}
+
+/// Build the published message for one source row, or `None` when the row
+/// carries no tokens (the old `tokens.total() == 0` skip). The returned
+/// turn id is already filtered for empty ids.
+fn zcode_message_from_row(
+    row: ZcodeUsageRow,
+    fallback_timestamp: i64,
+    is_legacy_schema: bool,
+) -> Option<(UnifiedMessage, Option<String>)> {
+    let session_id = row.session_id.unwrap_or_else(|| "unknown".to_string());
+    let model_id = row
+        .model_id
+        .as_deref()
+        .map(canonicalize_model)
+        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+    let timestamp = resolve_zcode_timestamp(
+        row.started_at,
+        row.completed_at,
+        row.duration_ms,
+        fallback_timestamp,
+    );
+
+    let raw_input = row.input_tokens.unwrap_or(0);
+    let raw_output = row.output_tokens.unwrap_or(0);
+    let raw_cache_read = row.cache_read_input_tokens.unwrap_or(0);
+    let raw_cache_write = row.cache_creation_input_tokens.unwrap_or(0);
+    let raw_reasoning = row.reasoning_tokens.unwrap_or(0);
+
+    let (net_input, net_output) = match row.computed_total_tokens {
+        Some(total) => normalize_zcode_input_and_output(
+            raw_input,
+            raw_output,
+            raw_cache_read,
+            raw_cache_write,
+            raw_reasoning,
+            Some(total),
+        ),
+        // When `computed_total_tokens` is NULL, distinguish two cases:
+        // 1. Legacy schema (column doesn't exist): unconditionally subtract,
+        //    since every sampled row in a real ZCode database is confirmed
+        //    cache/reasoning-inclusive.
+        // 2. Modern schema but this row's value is NULL: can't detect shape,
+        //    so pass through unchanged (the normalize function's default when
+        //    total is None). Subtracting unconditionally here would undercount
+        //    rows that are already cache-exclusive.
+        None if is_legacy_schema => (
+            subtract_overlap(
+                raw_input,
+                raw_cache_read.max(0).saturating_add(raw_cache_write.max(0)),
+            ),
+            subtract_overlap(raw_output, raw_reasoning),
+        ),
+        None => normalize_zcode_input_and_output(
+            raw_input,
+            raw_output,
+            raw_cache_read,
+            raw_cache_write,
+            raw_reasoning,
+            None,
+        ),
+    };
+
+    let tokens = TokenBreakdown {
+        input: net_input,
+        output: net_output,
+        cache_read: raw_cache_read.max(0),
+        cache_write: raw_cache_write.max(0),
+        cache_write_1h: 0,
+        reasoning: raw_reasoning.max(0),
+    };
+
+    if tokens.total() == 0 {
+        return None;
     }
 
-    messages
+    let agent = row
+        .agent
+        .as_deref()
+        .or(row.mode.as_deref())
+        .map(str::to_string);
+    let mut message = UnifiedMessage::new_with_agent(
+        CLIENT_ID,
+        model_id,
+        PROVIDER_ID,
+        session_id,
+        timestamp,
+        tokens,
+        0.0,
+        agent,
+    );
+    message.dedup_key = Some(format!("zcode-sqlite:{}", row.id));
+    message.duration_ms = row.duration_ms.filter(|duration| *duration > 0);
+
+    let workspace_root = row.session_directory.or(row.session_path);
+    let workspace_key = workspace_root.as_deref().and_then(normalize_workspace_key);
+    let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+    message.set_workspace(workspace_key, workspace_label);
+
+    let turn_id = row.turn_id.filter(|id| !id.is_empty());
+    Some((message, turn_id))
+}
+
+/// Conversion errors keep the old skip-row semantics; execution errors abort
+/// the generation so the publisher never treats a partial prefix as success.
+fn zcode_row_failed_hard(error: &rusqlite::Error) -> bool {
+    !matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnIndex(..)
+            | rusqlite::Error::InvalidColumnName(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::QueryReturnedNoRows
+    )
+}
+
+// Deterministic test-only barrier between the two source passes. Runs after
+// the first pass statement is dropped and before the second SELECT starts,
+// so a test writer mutates the source exactly where the reported race lives.
+// Production builds compile it out; never sleeps.
+#[cfg(test)]
+thread_local! {
+    static ZCODE_BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn zcode_between_passes_hook() {
+    if let Some(hook) = ZCODE_BETWEEN_PASSES.take() {
+        hook();
+    }
+}
+
+/// File-backed scratch for per-turn earliest markers. Only the TEMP schema
+/// holds tables so pages spill to disk instead of the heap.
+fn open_zcode_scratch() -> Result<Connection, String> {
+    let scratch =
+        Connection::open_in_memory().map_err(|error| format!("opening ZCode scratch: {error}"))?;
+    scratch
+        .execute_batch(
+            "PRAGMA temp_store=FILE;
+             PRAGMA temp.cache_size=-64;
+             PRAGMA temp.cache_spill=ON;
+             PRAGMA mmap_size=0;",
+        )
+        .map_err(|error| format!("configuring ZCode scratch: {error}"))?;
+    let disk_temp: bool = scratch
+        .query_row(
+            "SELECT (SELECT temp_store FROM pragma_temp_store) = 1
+             AND sqlite_compileoption_used('TEMP_STORE=3') = 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("checking ZCode scratch storage: {error}"))?;
+    if !disk_temp {
+        return Err("ZCode scratch requires file-backed SQLite TEMP storage".into());
+    }
+    scratch
+        .execute_batch(
+            "CREATE TEMP TABLE turn_earliest (
+                 turn_id TEXT PRIMARY KEY,
+                 ts INTEGER NOT NULL,
+                 ord INTEGER NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .map_err(|error| format!("creating ZCode scratch: {error}"))?;
+    Ok(scratch)
+}
+
+pub fn parse_zcode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::new();
+    match visit_zcode_sqlite(db_path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    }) {
+        Ok(()) => messages,
+        Err(error) => {
+            tracing::warn!(db_path = %db_path.display(), %error, "ZCode source read failed; discarding partial generation");
+            Vec::new()
+        }
+    }
 }
 
 /// Resolve the anchor timestamp for a `model_usage` row.
@@ -832,5 +994,208 @@ mod tests {
         assert_eq!(msg.tokens.cache_write, 10);
         assert_eq!(msg.tokens.reasoning, 5);
         assert_eq!(msg.tokens.total(), 145);
+    }
+
+    #[test]
+    fn test_visit_zcode_marks_earliest_start_despite_completion_order() {
+        // Regression: rows arrive ordered by completed_at, but is_turn_start
+        // must flag the earliest-STARTED request per turn.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_zcode_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        // Later-started row completes first, so it sorts first in query
+        // order; the earlier-started row must still win the flag.
+        for (id, started, completed) in [
+            ("usage_late_start", 2_000_i64, 2_100_i64),
+            ("usage_early_start", 1_000_i64, 3_000_i64),
+        ] {
+            conn.execute(
+                r#"
+                INSERT INTO model_usage (
+                    id, session_id, turn_id, model_id, started_at, completed_at,
+                    input_tokens, output_tokens
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![id, "sess_1", "turn_1", "glm-5.2", started, completed, 10_i64, 1_i64],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut messages = Vec::new();
+        visit_zcode_sqlite(&db_path, &mut |message| {
+            messages.push(message);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        // Stable query order (by completion): late-start row first.
+        assert_eq!(messages[0].timestamp, 2_000);
+        assert_eq!(messages[1].timestamp, 1_000);
+        assert!(!messages[0].is_turn_start);
+        assert!(messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn test_visit_zcode_earliest_start_tie_keeps_first_in_query_order() {
+        // Tie behavior: equal earliest timestamps keep the first row in
+        // query order (completion, then id), matching the old strict-`<`.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_zcode_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        for id in ["usage_a", "usage_b"] {
+            conn.execute(
+                r#"
+                INSERT INTO model_usage (
+                    id, session_id, turn_id, model_id, started_at, completed_at,
+                    input_tokens, output_tokens
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![id, "sess_1", "turn_1", "glm-5.2", 1_000_i64, 2_000_i64, 10_i64, 1_i64],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut messages = Vec::new();
+        visit_zcode_sqlite(&db_path, &mut |message| {
+            messages.push(message);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].is_turn_start);
+        assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn test_visit_zcode_sink_error_aborts_without_further_publish() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_zcode_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        for id in ["usage_1", "usage_2"] {
+            conn.execute(
+                r#"
+                INSERT INTO model_usage (
+                    id, session_id, model_id, completed_at,
+                    input_tokens, output_tokens
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![id, "sess_1", "glm-5.2", 1_000_i64, 10_i64, 1_i64],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut published = 0;
+        let result = visit_zcode_sqlite(&db_path, &mut |_| {
+            published += 1;
+            Err("boom".to_string())
+        });
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(published, 1);
+    }
+
+    #[test]
+    fn test_visit_zcode_snapshot_stable_under_concurrent_writer() {
+        // Deterministic (no sleeps): the WAL writer fires from the
+        // between-passes hook — after the first pass statement is dropped
+        // but before the second SELECT starts. That is exactly where the
+        // reported race lives (a writer inside the first sink call runs
+        // after the second SELECT already fixed its snapshot and cannot
+        // catch the race). Under the explicit read transaction pass two
+        // must still publish the two snapshot rows with original
+        // timestamps and the precomputed turn flag on usage_2; without
+        // the transaction the divergent pass-two scan sees usage_3 and
+        // the moved started_at.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_zcode_sqlite_db(&dir);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            for (id, started, completed) in [
+                ("usage_1", 2_000_i64, 2_100_i64),
+                ("usage_2", 1_000_i64, 3_000_i64),
+            ] {
+                conn.execute(
+                    r#"
+                    INSERT INTO model_usage (
+                        id, session_id, turn_id, model_id, started_at, completed_at,
+                        input_tokens, output_tokens
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                    params![id, "sess_1", "turn_1", "glm-5.2", started, completed, 10_i64, 1_i64],
+                )
+                .unwrap();
+            }
+        }
+
+        let hook_path = db_path.clone();
+        ZCODE_BETWEEN_PASSES.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let writer = Connection::open(&hook_path).unwrap();
+                writer
+                    .execute(
+                        "UPDATE model_usage SET started_at = 500 WHERE id = 'usage_2'",
+                        [],
+                    )
+                    .unwrap();
+                writer
+                    .execute(
+                        r#"
+                    INSERT INTO model_usage (
+                        id, session_id, turn_id, model_id, started_at, completed_at,
+                        input_tokens, output_tokens
+                    ) VALUES ('usage_3', 'sess_1', 'turn_1', 'glm-5.2', 100, 150, 10, 1)
+                    "#,
+                        [],
+                    )
+                    .unwrap();
+            }) as Box<dyn FnOnce()>);
+        });
+
+        let mut messages = Vec::new();
+        visit_zcode_sqlite(&db_path, &mut |message| {
+            messages.push(message);
+            Ok(())
+        })
+        .unwrap();
+        ZCODE_BETWEEN_PASSES.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("zcode-sqlite:usage_1")
+        );
+        assert_eq!(messages[0].timestamp, 2_000);
+        assert!(!messages[0].is_turn_start);
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some("zcode-sqlite:usage_2")
+        );
+        assert_eq!(messages[1].timestamp, 1_000);
+        assert!(messages[1].is_turn_start);
+        // Prove the hook fired and the writer committed: the snapshot hid
+        // the mutation, but the file now holds it.
+        let check = Connection::open(&db_path).unwrap();
+        let started: i64 = check
+            .query_row(
+                "SELECT started_at FROM model_usage WHERE id = 'usage_2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, 500);
+        let extra: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM model_usage WHERE id = 'usage_3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(extra, 1);
     }
 }

@@ -11,51 +11,36 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-// Archived transcripts are immutable zstd files. Bound expansion before parsing
-// so a corrupt archive cannot allocate its advertised decoded size.
+// Archived transcripts are immutable zstd files. Decoded output is bounded
+// while streaming so a corrupt archive cannot expand without limit.
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let file = super::utils::open_source_file(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(file)?;
-    decoder.window_log_max(26)?;
-    let mut bytes = Vec::new();
-    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(std::io::Error::other(
-            "decoded transcript exceeds archive limit",
-        ));
-    }
-    Ok(bytes)
+/// Stream one OpenClaw transcript to `sink`. Plain files stream line by line;
+/// `.zst` archives stream decoded lines through the same lossy framing, with
+/// the decoded byte count enforced while decoding. A corrupt, truncated, or
+/// oversize archive yields `Err` with nothing committed, so transactional
+/// ingestion publishes nothing partial. A transcript without filename
+/// identity is empty success, as before. `window_log_max(26)` keeps the
+/// decoder window bounded as before.
+pub(crate) fn visit_openclaw_transcript(
+    transcript_path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(session_id) = openclaw_session_id(transcript_path) else {
+        return Ok(());
+    };
+    visit_openclaw_session(transcript_path, &session_id, sink)
 }
 
-/// Transcript lines, decoding `.zst` archives (upstream #1285). A plain file
-/// keeps the previous line reader; an archive that fails to decode or exceeds
-/// `MAX_ARCHIVE_BYTES` yields nothing rather than a partial transcript.
-fn transcript_lines(path: &Path) -> Option<Box<dyn Iterator<Item = String>>> {
-    if path.extension().is_some_and(|extension| extension == "zst") {
-        let bytes = read_archive(path, MAX_ARCHIVE_BYTES).ok()?;
-        let lines: Vec<String> = bytes
-            .split(|&byte| byte == b'\n')
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect();
-        return Some(Box::new(lines.into_iter()));
-    }
-    let file = super::utils::open_source_file(path).ok()?;
-    // A line that is not valid UTF-8 is skipped and the lines after it are
-    // still read, as before; an I/O error ends the file instead of retrying.
-    let mut reader = BufReader::new(file);
-    Some(Box::new(std::iter::from_fn(move || loop {
-        let mut raw = Vec::new();
-        match reader.read_until(b'\n', &mut raw) {
-            Ok(0) | Err(_) => return None,
-            Ok(_) => {
-                if let Ok(line) = String::from_utf8(raw) {
-                    return Some(line);
-                }
-            }
-        }
-    })))
+fn openclaw_session_id(transcript_path: &Path) -> Option<String> {
+    transcript_path
+        .file_name()
+        .and_then(|name| {
+            name.to_string_lossy()
+                .split_once(".jsonl")
+                .map(|(id, _)| id.to_string())
+        })
+        .filter(|id| !id.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,20 +131,25 @@ pub fn parse_openclaw_index(index_path: &Path) -> Vec<UnifiedMessage> {
 }
 
 pub fn parse_openclaw_transcript(transcript_path: &Path) -> Vec<UnifiedMessage> {
-    let session_id = match transcript_path
-        .file_name()
-        .and_then(|n| {
-            n.to_string_lossy()
-                .split_once(".jsonl")
-                .map(|(id, _)| id.to_string())
-        })
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => id,
-        None => return Vec::new(),
+    let Some(session_id) = openclaw_session_id(transcript_path) else {
+        return Vec::new();
     };
-
     parse_openclaw_session(transcript_path, &session_id)
+}
+
+/// Collect one session through the streaming visitor. A corrupt, truncated,
+/// or oversize archive discards its whole prefix so compatible callers never
+/// report partial success; the index caller keeps its skip semantics by
+/// skipping empty results as before.
+fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::new();
+    match visit_openclaw_session(session_path, session_id, &mut |message| {
+        messages.push(message);
+        Ok(())
+    }) {
+        Ok(()) => messages,
+        Err(_) => Vec::new(),
+    }
 }
 
 fn resolve_session_path(index_dir: &Path, entry: &SessionEntry) -> PathBuf {
@@ -181,122 +171,319 @@ fn resolve_session_path(index_dir: &Path, entry: &SessionEntry) -> PathBuf {
     }
 }
 
-fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedMessage> {
-    let Some(lines) = transcript_lines(session_path) else {
-        return Vec::new();
-    };
-
-    // Get file modification time as fallback for missing timestamps
+/// Shared OpenClaw line driver: `Ok(())` on success, `Err` when the sink
+/// rejects a message or a `.zst` archive is corrupt/truncated/oversize.
+pub(crate) fn visit_openclaw_session(
+    session_path: &Path,
+    session_id: &str,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
     let file_mtime_ms = super::utils::source_metadata(session_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-
-    let mut messages = Vec::with_capacity(64);
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
     let mut buffer = Vec::with_capacity(4096);
+    if session_path
+        .extension()
+        .is_some_and(|extension| extension == "zst")
+    {
+        visit_openclaw_archive_lines(
+            session_path,
+            session_id,
+            file_mtime_ms,
+            &mut current_model,
+            &mut current_provider,
+            &mut buffer,
+            sink,
+        )
+    } else {
+        let file =
+            super::utils::open_source_file(session_path).map_err(|error| error.to_string())?;
+        visit_openclaw_reader_lines(
+            BufReader::new(file),
+            session_id,
+            file_mtime_ms,
+            &mut current_model,
+            &mut current_provider,
+            &mut buffer,
+            sink,
+        )
+    }
+}
 
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        buffer.clear();
-        buffer.extend_from_slice(trimmed.as_bytes());
-        let entry: OpenClawEntry = match simd_json::from_slice(&mut buffer) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        match entry.entry_type.as_str() {
-            "model_change" => {
-                if let Some(model) = entry.model_id {
-                    current_model = Some(model);
-                }
-                if let Some(provider) = entry.provider {
-                    current_provider = Some(provider);
-                }
+/// Streaming `.zst` decode: one lossy line plus decoder buffering in memory,
+/// bounded by the stdlib `Take` to `MAX_ARCHIVE_BYTES + 1` decoded bytes.
+/// `Take` caps what the `BufReader` can pull no matter how far ahead it
+/// reads, so its overread cannot reject an archive at or under the bound;
+/// after the loop `limit() == 0` means the decoder still had output, i.e.
+/// the archive is oversize. Oversize, corrupt, or truncated archives return
+/// `Err` so the transactional worker rolls back anything already sunk.
+fn visit_openclaw_archive_lines(
+    session_path: &Path,
+    session_id: &str,
+    file_mtime_ms: i64,
+    current_model: &mut Option<String>,
+    current_provider: &mut Option<String>,
+    buffer: &mut Vec<u8>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let file = super::utils::open_source_file(session_path).map_err(|error| error.to_string())?;
+    let mut decoder = zstd::stream::read::Decoder::new(file).map_err(|error| error.to_string())?;
+    decoder
+        .window_log_max(26)
+        .map_err(|error| error.to_string())?;
+    let mut limited = decoder.take(MAX_ARCHIVE_BYTES + 1);
+    {
+        let mut reader = BufReader::new(&mut limited);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => return Err(error.to_string()),
             }
-            "custom" => {
-                if entry.custom_type.as_deref() != Some("model-snapshot") {
-                    continue;
-                }
-
-                if let Some(data) = entry.data {
-                    if let Some(model) = data.model_id {
-                        current_model = Some(model);
-                    }
-                    if let Some(provider) = data.provider {
-                        current_provider = Some(provider);
-                    }
-                }
-            }
-            "message" => {
-                if let Some(msg) = entry.message {
-                    if msg.role.as_deref() != Some("assistant") {
-                        continue;
-                    }
-
-                    let usage = match msg.usage {
-                        Some(u) => u,
-                        None => continue,
-                    };
-
-                    let model = msg
-                        .model
-                        .clone()
-                        .filter(|m| !m.is_empty())
-                        .or_else(|| current_model.clone().filter(|m| !m.is_empty()));
-                    let provider = msg
-                        .provider
-                        .clone()
-                        .filter(|p| !p.is_empty())
-                        .or_else(|| current_provider.clone().filter(|p| !p.is_empty()))
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    let model = match model {
-                        Some(model) => model,
-                        None => continue,
-                    };
-
-                    current_model = Some(model.clone());
-                    current_provider = Some(provider.clone());
-                    let timestamp = msg.timestamp.unwrap_or(file_mtime_ms);
-                    let provider_cost = usage
-                        .cost
-                        .and_then(|cost| cost.total)
-                        .filter(|cost| cost.is_finite() && *cost >= 0.0);
-                    let mut message = UnifiedMessage::new(
-                        "openclaw",
-                        model,
-                        provider,
-                        session_id.to_string(),
-                        timestamp,
-                        TokenBreakdown {
-                            input: usage.input.unwrap_or(0).max(0),
-                            output: usage.output.unwrap_or(0).max(0),
-                            cache_read: usage.cache_read.unwrap_or(0).max(0),
-                            cache_write: usage.cache_write.unwrap_or(0).max(0),
-                            reasoning: 0,
-                            cache_write_1h: 0,
-                        },
-                        provider_cost.unwrap_or(0.0),
-                    );
-                    if provider_cost.is_some() {
-                        message.mark_provider_reported_cost();
-                    }
-                    messages.push(message);
-                }
-            }
-            _ => {}
+            strip_newline(&mut raw);
+            let line = String::from_utf8_lossy(&raw).into_owned();
+            visit_openclaw_line(
+                &line,
+                session_id,
+                file_mtime_ms,
+                current_model,
+                current_provider,
+                buffer,
+                sink,
+            )?;
         }
     }
+    if limited.limit() == 0 {
+        return Err("decoded transcript exceeds archive limit".to_string());
+    }
+    Ok(())
+}
 
-    messages
+/// Plain-file streaming line driver over any buffered reader.
+fn visit_openclaw_reader_lines<R: BufRead>(
+    reader: R,
+    session_id: &str,
+    file_mtime_ms: i64,
+    current_model: &mut Option<String>,
+    current_provider: &mut Option<String>,
+    buffer: &mut Vec<u8>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut reader = reader;
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        strip_newline(&mut raw);
+        // Plain transcripts keep the legacy strict-UTF-8 skip: an undecodable
+        // line costs only itself.
+        let line = match String::from_utf8(std::mem::take(&mut raw)) {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        visit_openclaw_line(
+            &line,
+            session_id,
+            file_mtime_ms,
+            current_model,
+            current_provider,
+            buffer,
+            sink,
+        )?;
+    }
+}
+
+/// Drop one trailing `\n` plus an optional preceding `\r`, mirroring the
+/// legacy plain-file framing (CRLF included).
+fn strip_newline(raw: &mut Vec<u8>) {
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+        if raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+    }
+}
+
+/// One transcript line: model tracking plus a single assistant message to the
+/// sink. Malformed lines are skipped; only the sink can fail.
+#[allow(clippy::too_many_arguments)]
+fn visit_openclaw_line(
+    line: &str,
+    session_id: &str,
+    file_mtime_ms: i64,
+    current_model: &mut Option<String>,
+    current_provider: &mut Option<String>,
+    buffer: &mut Vec<u8>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    buffer.clear();
+    buffer.extend_from_slice(trimmed.as_bytes());
+    let entry: OpenClawEntry = match simd_json::from_slice(buffer) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(()),
+    };
+    visit_openclaw_entry(
+        entry,
+        session_id,
+        file_mtime_ms,
+        current_model,
+        current_provider,
+        sink,
+    )
+}
+
+/// One parsed entry: model tracking plus a single assistant message.
+fn visit_openclaw_entry(
+    entry: OpenClawEntry,
+    session_id: &str,
+    file_mtime_ms: i64,
+    current_model: &mut Option<String>,
+    current_provider: &mut Option<String>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    match entry.entry_type.as_str() {
+        "model_change" => {
+            if let Some(model) = entry.model_id {
+                *current_model = Some(model);
+            }
+            if let Some(provider) = entry.provider {
+                *current_provider = Some(provider);
+            }
+            Ok(())
+        }
+        "custom" => {
+            if entry.custom_type.as_deref() != Some("model-snapshot") {
+                return Ok(());
+            }
+            if let Some(data) = entry.data {
+                if let Some(model) = data.model_id {
+                    *current_model = Some(model);
+                }
+                if let Some(provider) = data.provider {
+                    *current_provider = Some(provider);
+                }
+            }
+            Ok(())
+        }
+        "message" => visit_openclaw_message(
+            entry.message,
+            session_id,
+            file_mtime_ms,
+            current_model,
+            current_provider,
+            sink,
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// One `message` entry: assistant usage with a known model goes to the sink.
+/// The timestamp is message-level (`message.timestamp`), falling back to the
+/// file mtime, exactly like the legacy collector.
+fn visit_openclaw_message(
+    message: Option<OpenClawMessage>,
+    session_id: &str,
+    file_mtime_ms: i64,
+    current_model: &mut Option<String>,
+    current_provider: &mut Option<String>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let message = match message {
+        Some(message) => message,
+        None => return Ok(()),
+    };
+    if message.role.as_deref() != Some("assistant") {
+        return Ok(());
+    }
+    // Resolve model/provider against the borrowed message before moving its
+    // usage out; a partial move would forbid the borrow below.
+    let (model, provider) = openclaw_model_provider(&message, current_model, current_provider);
+    let model = match model {
+        Some(model) => model,
+        None => return Ok(()),
+    };
+    let timestamp = message.timestamp.unwrap_or(file_mtime_ms);
+    let usage = match message.usage {
+        Some(usage) => usage,
+        None => return Ok(()),
+    };
+    *current_model = Some(model.clone());
+    *current_provider = Some(provider.clone());
+    sink(openclaw_message(
+        session_id, timestamp, model, provider, usage,
+    ))
+}
+
+/// Resolve the message model/provider against the running lane state.
+fn openclaw_model_provider(
+    message: &OpenClawMessage,
+    current_model: &Option<String>,
+    current_provider: &Option<String>,
+) -> (Option<String>, String) {
+    let model = message
+        .model
+        .clone()
+        .filter(|model| !model.is_empty())
+        .or_else(|| current_model.clone().filter(|model| !model.is_empty()));
+    let provider = message
+        .provider
+        .clone()
+        .filter(|provider| !provider.is_empty())
+        .or_else(|| {
+            current_provider
+                .clone()
+                .filter(|provider| !provider.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    (model, provider)
+}
+/// Build one provider-cost-aware assistant message.
+fn openclaw_message(
+    session_id: &str,
+    timestamp: i64,
+    model: String,
+    provider: String,
+    usage: OpenClawUsage,
+) -> UnifiedMessage {
+    let provider_cost = usage
+        .cost
+        .and_then(|cost| cost.total)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
+    let mut message = UnifiedMessage::new(
+        "openclaw",
+        model,
+        provider,
+        session_id.to_string(),
+        timestamp,
+        TokenBreakdown {
+            input: usage.input.unwrap_or(0).max(0),
+            output: usage.output.unwrap_or(0).max(0),
+            cache_read: usage.cache_read.unwrap_or(0).max(0),
+            cache_write: usage.cache_write.unwrap_or(0).max(0),
+            reasoning: 0,
+            cache_write_1h: 0,
+        },
+        provider_cost.unwrap_or(0.0),
+    );
+    if provider_cost.is_some() {
+        message.mark_provider_reported_cost();
+    }
+    message
 }
 
 #[cfg(test)]
@@ -338,26 +525,74 @@ mod tests {
     }
 
     // Ported from upstream #1285.
+    // The 64 MiB decoded bound is exact: MAX decodes, MAX + 1 fails. Both
+    // exercise the real streaming visitor, not a byte helper.
     #[test]
-    fn compressed_archive_enforces_decoded_limit() {
+    fn archive_decoded_bound_accepts_exact_max_and_rejects_max_plus_one() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("session.jsonl.zst");
-        std::fs::write(&path, zstd::encode_all(&b"12345"[..], 0).unwrap()).unwrap();
-        assert_eq!(read_archive(&path, 5).unwrap(), b"12345");
-        assert!(read_archive(&path, 4).is_err());
-    }
+        let line = b"{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":1},\"timestamp\":1700000000000}}\n";
+        let filler = b"x\n";
+        let mut exact = Vec::with_capacity(MAX_ARCHIVE_BYTES as usize + 1);
+        exact.extend_from_slice(line);
+        while exact.len() + filler.len() <= MAX_ARCHIVE_BYTES as usize {
+            exact.extend_from_slice(filler);
+        }
+        while exact.len() < MAX_ARCHIVE_BYTES as usize {
+            exact.push(b'x');
+        }
+        assert_eq!(exact.len(), MAX_ARCHIVE_BYTES as usize);
+        let mut oversize = exact.clone();
+        oversize.push(b'z');
+        assert_eq!(oversize.len(), MAX_ARCHIVE_BYTES as usize + 1);
 
+        let exact_path = dir.path().join("exact.jsonl.zst");
+        std::fs::write(&exact_path, zstd::encode_all(exact.as_slice(), 0).unwrap()).unwrap();
+        let mut count = 0;
+        let result = visit_openclaw_session(&exact_path, "exact", &mut |_| {
+            count += 1;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(count, 1);
+        assert_eq!(parse_openclaw_transcript(&exact_path).len(), 1);
+
+        let oversize_path = dir.path().join("oversize.jsonl.zst");
+        std::fs::write(
+            &oversize_path,
+            zstd::encode_all(oversize.as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        let mut count = 0;
+        let result = visit_openclaw_session(&oversize_path, "oversize", &mut |_| {
+            count += 1;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(count, 1);
+        assert!(parse_openclaw_transcript(&oversize_path).is_empty());
+    }
     // Ported from upstream #1285.
     #[test]
     fn invalid_or_truncated_compressed_archive_does_not_emit_partial_usage() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("session.jsonl.deleted.timestamp.zst");
-        let content = br#"{"type":"message","message":{"role":"assistant","model":"example","usage":{"input":100},"timestamp":1700000000000}}"#;
-        let mut bytes = zstd::encode_all(&content[..], 0).unwrap();
+        let line = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"example\",\"usage\":{\"input\":100},\"timestamp\":1700000000000}}\n";
+        let content = format!("{line}{line}");
+        let mut bytes = zstd::encode_all(content.as_bytes(), 0).unwrap();
         bytes.pop();
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        // A late corruption still fails the visit so the transactional worker
+        // rolls back the valid prefix; the compatible API reports nothing.
+        let mut count = 0;
+        let result = visit_openclaw_session(&path, "session", &mut |_| {
+            count += 1;
+            Ok(())
+        });
+        assert!(result.is_err());
         assert!(parse_openclaw_transcript(&path).is_empty());
         std::fs::write(&path, b"not a zstd stream").unwrap();
+        let result = visit_openclaw_session(&path, "session", &mut |_| Ok(()));
+        assert!(result.is_err());
         assert!(parse_openclaw_transcript(&path).is_empty());
     }
 
@@ -371,6 +606,42 @@ mod tests {
         bytes.extend_from_slice(b"{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":2},\"timestamp\":1700000001000}}\n");
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(parse_openclaw_transcript(&path).len(), 2);
+    }
+    #[test]
+    fn transcript_without_filename_identity_is_empty_success() {
+        let dir = TempDir::new().unwrap();
+        let session_path = create_test_session(&dir, "no-identity.txt", "{\"type\":\"message\"}\n");
+        assert!(parse_openclaw_transcript(Path::new(&session_path)).is_empty());
+        let mut called = false;
+        let result = visit_openclaw_transcript(Path::new(&session_path), &mut |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(!called);
+    }
+
+    #[test]
+    fn sink_failure_aborts_session_visit() {
+        let dir = TempDir::new().unwrap();
+        let content = "{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"m\"}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1},\"timestamp\":1700000000000}}\n{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":2},\"timestamp\":1700000001000}}\n";
+        let session_path = create_test_session(&dir, "session.jsonl", content);
+        let mut calls = 0;
+        let result = visit_openclaw_session(Path::new(&session_path), "test-session", &mut |_| {
+            calls += 1;
+            Err("boom".to_string())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+    #[test]
+    fn message_timestamp_is_preserved_not_file_mtime() {
+        let dir = TempDir::new().unwrap();
+        let content = "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"m\",\"usage\":{\"input\":7},\"timestamp\":1700000001234}}\n";
+        let session_path = create_test_session(&dir, "session.jsonl", content);
+        let messages = parse_openclaw_transcript(Path::new(&session_path));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1700000001234);
     }
 
     #[test]

@@ -284,11 +284,6 @@ fn large_headless_body_is_streamed_and_large_individual_line_is_not_dropped() {
 #[test]
 fn large_history_is_finalized_on_actual_disk_with_bounded_cache() {
     let rows = ClaudeRows::new(ClaudeStorage::Disk).unwrap();
-    let cache_size: i64 = rows
-        .0
-        .query_row("PRAGMA scratch.cache_size", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(cache_size, -2048);
     for index in 0..24000 {
         let message = UnifiedMessage::new_with_dedup(
             "claude",

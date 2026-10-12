@@ -1,7 +1,14 @@
 use super::{aliases, litellm::ModelPricing};
 use crate::{provider_identity, strip_parenthesized_reasoning_tier, TokenBreakdown};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+
+/// Single shared backing for one canonical dataset key. Every index (sorted
+/// keys, model parts, lowercase maps, canonical map) clones the `Arc` instead
+/// of copying the key `String`, so the bytes are charged once. Lowercase and
+/// model-part spellings stay owned `String`s: they are distinct spellings,
+/// not copies of the canonical bytes.
+type SharedKey = Arc<str>;
 
 const PROVIDER_PREFIXES: &[&str] = &[
     "openai/",
@@ -121,7 +128,7 @@ fn cached_result_bytes(value: &Option<CachedResult>) -> usize {
 }
 
 struct KeyModelPart {
-    key: String,
+    key: SharedKey,
     lower_model_part: String,
 }
 
@@ -131,24 +138,24 @@ struct ProviderScopedModelPath<'a> {
 }
 
 pub struct PricingLookup {
-    litellm: HashMap<String, ModelPricing>,
-    openrouter: HashMap<String, ModelPricing>,
-    cursor: HashMap<String, ModelPricing>,
-    sakana: HashMap<String, ModelPricing>,
-    litellm_keys: Vec<String>,
-    openrouter_keys: Vec<String>,
+    litellm: HashMap<SharedKey, ModelPricing>,
+    openrouter: HashMap<SharedKey, ModelPricing>,
+    cursor: HashMap<SharedKey, ModelPricing>,
+    sakana: HashMap<SharedKey, ModelPricing>,
+    litellm_keys: Vec<SharedKey>,
+    openrouter_keys: Vec<SharedKey>,
     litellm_key_parts: Vec<KeyModelPart>,
     openrouter_key_parts: Vec<KeyModelPart>,
-    litellm_lower: HashMap<String, String>,
+    litellm_lower: HashMap<String, SharedKey>,
     /// LiteLLM keys whose whole id, after version-separator normalization, is
     /// one of the request-wide 272K identities: the only rows
     /// `canonical_tier_donor` may lend tiers from. Such a key has no provider
     /// prefix by construction.
-    litellm_canonical: HashMap<String, String>,
-    openrouter_lower: HashMap<String, String>,
-    openrouter_model_part: HashMap<String, String>,
-    cursor_lower: HashMap<String, String>,
-    sakana_lower: HashMap<String, String>,
+    litellm_canonical: HashMap<String, SharedKey>,
+    openrouter_lower: HashMap<String, SharedKey>,
+    openrouter_model_part: HashMap<String, SharedKey>,
+    cursor_lower: HashMap<String, SharedKey>,
+    sakana_lower: HashMap<String, SharedKey>,
     retained_base_bytes: usize,
     // Dynamic string bytes are updated under the same lock as their entries.
     lookup_cache: RwLock<(HashMap<String, Option<CachedResult>>, usize)>,
@@ -188,57 +195,76 @@ impl PricingLookup {
         cursor: HashMap<String, ModelPricing>,
         sakana: HashMap<String, ModelPricing>,
     ) -> Self {
-        let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
+        // Re-key every dataset on one shared `Arc<str>` per canonical key so
+        // sorted keys, model parts, and lowercase maps clone the `Arc` instead
+        // of copying the key bytes.
+        let share = |map: HashMap<String, ModelPricing>| -> HashMap<SharedKey, ModelPricing> {
+            map.into_iter()
+                .map(|(key, pricing)| (SharedKey::from(key.as_str()), pricing))
+                .collect()
+        };
+        let litellm = share(litellm);
+        let openrouter = share(openrouter);
+        let cursor = share(cursor);
+        let sakana = share(sakana);
+
+        let mut litellm_keys: Vec<SharedKey> = litellm.keys().cloned().collect();
         // Fallbacks select the first eligible key. Break equal-length ties so
         // rebuilding an unchanged catalog cannot randomly change its rates.
         litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
-        let mut openrouter_keys: Vec<String> = openrouter.keys().cloned().collect();
+        let mut openrouter_keys: Vec<SharedKey> = openrouter.keys().cloned().collect();
         openrouter_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         let mut litellm_lower = HashMap::with_capacity(litellm.len());
-        let mut litellm_canonical: HashMap<String, String> = HashMap::new();
+        let mut litellm_canonical: HashMap<String, SharedKey> = HashMap::new();
         for key in &litellm_keys {
             let lower = key.to_lowercase();
             let id = normalize_version_separator(&lower).unwrap_or_else(|| lower.clone());
             if is_request_wide_identity(&id) {
-                let slot = litellm_canonical.entry(id).or_insert_with(|| key.clone());
-                if key < slot {
-                    *slot = key.clone();
+                match litellm_canonical.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if **key < **slot.get() {
+                            slot.insert(SharedKey::clone(key));
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(SharedKey::clone(key));
+                    }
                 }
             }
-            litellm_lower.insert(lower, key.clone());
+            litellm_lower.insert(lower, SharedKey::clone(key));
         }
 
         let mut openrouter_lower = HashMap::with_capacity(openrouter.len());
         let mut openrouter_model_part = HashMap::with_capacity(openrouter.len());
         for key in &openrouter_keys {
             let lower = key.to_lowercase();
-            openrouter_lower.insert(lower.clone(), key.clone());
+            openrouter_lower.insert(lower.clone(), SharedKey::clone(key));
             if let Some(model_part) = lower.split('/').next_back() {
                 if model_part != lower {
-                    openrouter_model_part.insert(model_part.to_string(), key.clone());
+                    openrouter_model_part.insert(model_part.to_string(), SharedKey::clone(key));
                 }
             }
         }
 
         let mut cursor_lower = HashMap::with_capacity(cursor.len());
         for key in cursor.keys() {
-            cursor_lower.insert(key.to_lowercase(), key.clone());
+            cursor_lower.insert(key.to_lowercase(), SharedKey::clone(key));
         }
 
         let mut sakana_lower = HashMap::with_capacity(sakana.len());
         for key in sakana.keys() {
-            sakana_lower.insert(key.to_lowercase(), key.clone());
+            sakana_lower.insert(key.to_lowercase(), SharedKey::clone(key));
         }
 
-        let build_key_parts = |keys: &[String]| -> Vec<KeyModelPart> {
+        let build_key_parts = |keys: &[SharedKey]| -> Vec<KeyModelPart> {
             keys.iter()
                 .map(|key| {
                     let lower = key.to_lowercase();
                     let model_part = lower.split('/').next_back().unwrap_or(&lower).to_string();
                     KeyModelPart {
-                        key: key.clone(),
+                        key: SharedKey::clone(key),
                         lower_model_part: model_part,
                     }
                 })
@@ -272,8 +298,13 @@ impl PricingLookup {
 
     fn catalog_retained_bytes(&self) -> usize {
         let mut bytes = 0usize;
+        // Each canonical key backing is charged once via its owning dataset
+        // map; every other index only clones the `Arc`.
         for map in [&self.litellm, &self.openrouter, &self.cursor, &self.sakana] {
-            bytes = bytes.saturating_add(super::pricing_map_bytes(map));
+            bytes = bytes.saturating_add(super::map_allocation_bytes(map));
+            for key in map.keys() {
+                bytes = bytes.saturating_add(super::shared_key_bytes(key));
+            }
         }
         for map in [
             &self.litellm_lower,
@@ -284,20 +315,15 @@ impl PricingLookup {
             &self.sakana_lower,
         ] {
             bytes = bytes.saturating_add(super::map_allocation_bytes(map));
-            for (key, value) in map {
-                bytes = bytes
-                    .saturating_add(super::allocation_bytes(key.capacity(), 1))
-                    .saturating_add(super::allocation_bytes(value.capacity(), 1));
+            for key in map.keys() {
+                bytes = bytes.saturating_add(super::allocation_bytes(key.capacity(), 1));
             }
         }
         for keys in [&self.litellm_keys, &self.openrouter_keys] {
             bytes = bytes.saturating_add(super::allocation_bytes(
                 keys.capacity(),
-                std::mem::size_of::<String>(),
+                std::mem::size_of::<SharedKey>(),
             ));
-            for key in keys {
-                bytes = bytes.saturating_add(super::allocation_bytes(key.capacity(), 1));
-            }
         }
         for parts in [&self.litellm_key_parts, &self.openrouter_key_parts] {
             bytes = bytes.saturating_add(super::allocation_bytes(
@@ -306,7 +332,6 @@ impl PricingLookup {
             ));
             for part in parts {
                 bytes = bytes
-                    .saturating_add(super::allocation_bytes(part.key.capacity(), 1))
                     .saturating_add(super::allocation_bytes(part.lower_model_part.capacity(), 1));
             }
         }
@@ -1300,8 +1325,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         let family = extract_model_family(model_id);
-        let mut family_matches_list: Vec<&String> = Vec::new();
-
+        let mut family_matches_list: Vec<&SharedKey> = Vec::new();
         for key in &self.litellm_keys {
             let lower_key = key.to_lowercase();
             if family_matches(&lower_key, &family) && contains_model_id(&lower_key, model_id) {
@@ -1315,7 +1339,7 @@ impl PricingLookup {
             return Some(result);
         }
 
-        let mut all_matches: Vec<&String> = Vec::new();
+        let mut all_matches: Vec<&SharedKey> = Vec::new();
         for key in &self.litellm_keys {
             let lower_key = key.to_lowercase();
             if contains_model_id(&lower_key, model_id) {
@@ -1372,8 +1396,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         let family = extract_model_family(model_id);
-        let mut family_matches_list: Vec<&String> = Vec::new();
-
+        let mut family_matches_list: Vec<&SharedKey> = Vec::new();
         for key in &self.openrouter_keys {
             let lower_key = key.to_lowercase();
             let model_part = lower_key.split('/').next_back().unwrap_or(&lower_key);
@@ -1391,7 +1414,7 @@ impl PricingLookup {
             return Some(result);
         }
 
-        let mut all_matches: Vec<&String> = Vec::new();
+        let mut all_matches: Vec<&SharedKey> = Vec::new();
         for key in &self.openrouter_keys {
             let lower_key = key.to_lowercase();
             let model_part = lower_key.split('/').next_back().unwrap_or(&lower_key);
@@ -2614,8 +2637,8 @@ fn is_reseller_provider(key: &str) -> bool {
 }
 
 fn select_best_match(
-    matches: &[&String],
-    dataset: &HashMap<String, ModelPricing>,
+    matches: &[&SharedKey],
+    dataset: &HashMap<SharedKey, ModelPricing>,
     source: &str,
     provider_id: Option<&str>,
 ) -> Option<LookupResult> {
@@ -2627,7 +2650,7 @@ fn select_best_match(
         .map(provider_identity::provider_tags)
         .unwrap_or_default();
 
-    let provider_matches: Vec<&String> = matches
+    let provider_matches: Vec<&SharedKey> = matches
         .iter()
         .copied()
         .filter(|key| provider_identity::matches_provider_hint_with_tags(key, &hint_tags))
@@ -2644,17 +2667,17 @@ fn select_best_match(
     // with no per-token cost data). If provider-specific candidates are all
     // unusable, fall back to any priced candidate in the broader match set so
     // fuzzy/provider-aware lookups can still resolve a valid non-provider key.
-    let preferred_with_pricing: Vec<&String> = preferred_matches
+    let preferred_with_pricing: Vec<&SharedKey> = preferred_matches
         .iter()
         .copied()
-        .filter(|k| dataset.get(k.as_str()).is_some_and(has_any_usable_pricing))
+        .filter(|k| dataset.get(&***k).is_some_and(has_any_usable_pricing))
         .collect();
-    let effective_matches: Vec<&String> =
+    let effective_matches: Vec<&SharedKey> =
         if preferred_with_pricing.is_empty() && !provider_matches.is_empty() {
             matches
                 .iter()
                 .copied()
-                .filter(|k| dataset.get(k.as_str()).is_some_and(has_any_usable_pricing))
+                .filter(|k| dataset.get(&***k).is_some_and(has_any_usable_pricing))
                 .collect()
         } else {
             preferred_with_pricing
@@ -2665,7 +2688,7 @@ fn select_best_match(
     let effective_matches = effective_matches.as_slice();
 
     let hint_is_reseller = provider_id.is_some_and(is_reseller_provider);
-    let pick = |candidates: &[&String], prefer_reseller: bool| -> Option<LookupResult> {
+    let pick = |candidates: &[&SharedKey], prefer_reseller: bool| -> Option<LookupResult> {
         let key = if prefer_reseller {
             candidates
                 .iter()
@@ -2679,10 +2702,10 @@ fn select_best_match(
                 .or_else(|| candidates.first())
         };
         key.and_then(|k| {
-            dataset.get(k.as_str()).map(|pricing| LookupResult {
+            dataset.get(&***k).map(|pricing| LookupResult {
                 pricing: pricing.clone(),
                 source: source.into(),
-                matched_key: (*k).clone(),
+                matched_key: k.to_string(),
             })
         })
     };
@@ -2951,13 +2974,13 @@ fn exact_match_with_provider_prefixes(
     model_id: &str,
     provider_id: Option<&str>,
     key_parts: &[KeyModelPart],
-    dataset: &HashMap<String, ModelPricing>,
+    dataset: &HashMap<SharedKey, ModelPricing>,
     source: &str,
 ) -> Option<LookupResult> {
     let provider_id = provider_id?;
     let hint_tags = provider_identity::provider_tags(provider_id);
 
-    let matches: Vec<&String> = key_parts
+    let matches: Vec<&SharedKey> = key_parts
         .iter()
         .filter(|kp| {
             model_part_matches_exact(&kp.lower_model_part, model_id)
@@ -7389,5 +7412,69 @@ mod tests {
                 |_| mismatched(),
             )
             .is_none());
+    }
+    // Shared-`Arc<str>` key indexes must preserve the exact precedence chain:
+    // exact beats provider-scoped beats version spelling beats prefix beats
+    // fuzzy, longest-first with lexicographic ties inside fuzzy, and the
+    // provider/original-vs-reseller arbitration on top. This owns one catalog
+    // per stage so a regression in any stage cannot hide behind another.
+    #[test]
+    fn shared_key_indexes_preserve_exact_prefix_fuzzy_tie_precedence() {
+        let priced = || ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            output_cost_per_token: Some(0.000002),
+            ..Default::default()
+        };
+
+        // Exact outranks a longer fuzzy-only key containing the id.
+        let mut litellm = HashMap::new();
+        litellm.insert("tiny-model".to_string(), priced());
+        litellm.insert("prefix-tiny-model-suffix".to_string(), priced());
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        assert_eq!(
+            lookup.lookup("tiny-model").unwrap().matched_key,
+            "tiny-model"
+        );
+
+        // Longest-first fuzzy: both keys contain the id as a delimited
+        // fragment (neither is exact), so the longer key wins.
+        let mut litellm = HashMap::new();
+        litellm.insert("xx-shared-fragment".to_string(), priced());
+        litellm.insert("longer-shared-fragment-key".to_string(), priced());
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        assert_eq!(
+            lookup.lookup("shared-fragment").unwrap().matched_key,
+            "longer-shared-fragment-key"
+        );
+
+        // Equal-length fuzzy tie: lexicographically smallest key wins.
+        let mut litellm = HashMap::new();
+        litellm.insert("zz-model-abc".to_string(), priced());
+        litellm.insert("aa-model-abc".to_string(), priced());
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        // Neither key is exact for "model-abc"; both contain it as a delimited
+        // fragment, so fuzzy arbitration picks the lexicographic tie-break.
+        assert_eq!(
+            lookup.lookup("model-abc").unwrap().matched_key,
+            "aa-model-abc"
+        );
+
+        // Provider hint prefers the hint-matching row; without a hint the
+        // original provider beats the reseller.
+        let mut litellm = HashMap::new();
+        litellm.insert("openai/tiny-provider".to_string(), priced());
+        litellm.insert("azure/tiny-provider".to_string(), priced());
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        assert_eq!(
+            lookup
+                .lookup_with_provider("tiny-provider", Some("azure"))
+                .unwrap()
+                .matched_key,
+            "azure/tiny-provider"
+        );
+        assert_eq!(
+            lookup.lookup("tiny-provider").unwrap().matched_key,
+            "openai/tiny-provider"
+        );
     }
 }

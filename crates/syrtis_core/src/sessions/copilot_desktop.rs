@@ -7,7 +7,6 @@ use super::utils::lossy_lines;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use chrono::{DateTime, NaiveDateTime};
-use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -31,20 +30,12 @@ struct SessionStateMetadata {
     cwd: Option<String>,
 }
 
-pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match super::utils::observe_sqlite(Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )) {
-        Ok(conn) => conn,
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to open Copilot Desktop database"
-            );
-            return Vec::new();
-        }
+pub(crate) fn visit_copilot_desktop_db(
+    db_path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(conn) = super::utils::open_readonly_sqlite(db_path) else {
+        return Ok(());
     };
 
     let mut stmt = match super::utils::prepare_source_sqlite(
@@ -86,11 +77,11 @@ pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
                 error = %err,
                 "Failed to prepare Copilot Desktop sessions query"
             );
-            return Vec::new();
+            return Ok(());
         }
     };
 
-    let rows = match super::utils::observe_sqlite(stmt.query_map([], |row| {
+    let mapped = match super::utils::observe_sqlite(stmt.query_map([], |row| {
         Ok(CopilotDesktopSessionRow {
             id: row.get(0)?,
             model: row.get(1)?,
@@ -101,32 +92,71 @@ pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
             created_at: row.get(6)?,
             agent: row.get(7)?,
         })
-    }))
-    .map(super::utils::source_rows)
-    {
-        Ok(rows) => rows,
+    })) {
+        Ok(mapped) => mapped,
         Err(err) => {
             warn!(
                 db_path = %db_path.display(),
                 error = %err,
                 "Failed to execute Copilot Desktop sessions query"
             );
-            return Vec::new();
+            return Ok(());
         }
     };
 
-    rows.filter_map(|row| match row {
-        Ok(row) => Some(session_row_to_message(db_path, row)),
+    for row in super::utils::source_rows(mapped) {
+        match row {
+            Ok(row) => sink(session_row_to_message(db_path, row))?,
+            Err(err) => {
+                if sqlite_row_failed_hard(&err) {
+                    return Err(format!("Copilot Desktop source read failed: {err}"));
+                }
+                warn!(
+                    db_path = %db_path.display(),
+                    error = %err,
+                    "Failed to decode Copilot Desktop session row"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mirror of `utils::sqlite_read_failed` (which is crate-private there):
+/// conversion errors keep the old skip-row semantics, while execution errors
+/// abort the generation so the publisher never treats a partial prefix as
+/// a successful generation.
+fn sqlite_row_failed_hard(error: &rusqlite::Error) -> bool {
+    !matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnIndex(..)
+            | rusqlite::Error::InvalidColumnName(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::QueryReturnedNoRows
+    )
+}
+
+pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::new();
+    match visit_copilot_desktop_db(db_path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    }) {
+        Ok(()) => messages,
+        // A failed generation publishes nothing; the read-scope flag (set via
+        // observe_sqlite/source_rows) still reports the failure to ingestion.
         Err(err) => {
             warn!(
                 db_path = %db_path.display(),
                 error = %err,
-                "Failed to decode Copilot Desktop session row"
+                "Copilot Desktop source read failed; discarding partial generation"
             );
-            None
+            Vec::new()
         }
-    })
-    .collect()
+    }
 }
 
 pub(crate) fn session_state_event_paths(db_path: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -496,6 +526,24 @@ mod tests {
         fs::set_permissions(&events, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn visit_copilot_desktop_db_propagates_sink_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "auto", 100, 50, 0, 0, 0, None);
+        drop(conn);
+
+        let mut published = 0;
+        let result = visit_copilot_desktop_db(&db_path, &mut |_| {
+            published += 1;
+            Err("boom".to_string())
+        });
+
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(published, 1);
     }
 
     #[test]

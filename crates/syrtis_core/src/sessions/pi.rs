@@ -132,27 +132,21 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
     parse_pi_format_file(path, "pi", PiDedup::CrossSession)
 }
 
-/// Parse a JSONL session file written in the Pi record format.
+/// Stream one Pi-format session file to `sink` without retaining its messages.
 ///
-/// `client` is stamped on every message, namespaces its dedup key, and is the
-/// provider of last resort when the message names none and the model is not
-/// recognizable. Pi uses it as `pi`; Kimchi as `kimchi` (`sessions::kimchi`).
-pub(crate) fn parse_pi_format_file(
+/// Observable output matches [`parse_pi_format_file`]: a missing header or a
+/// malformed pre-header record yields zero messages with success, malformed
+/// later records are skipped, and a sink failure aborts with `Err`.
+pub(crate) fn visit_pi_format_file(
     path: &Path,
     client: &str,
     dedup: PiDedup,
-) -> Vec<UnifiedMessage> {
-    let file = match super::utils::open_source_file(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let file = super::utils::open_source_file(path).map_err(|error| error.to_string())?;
     let fallback_timestamp = file_modified_timestamp_ms(path);
-
     let reader = BufReader::new(file);
-    let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
     let mut buffer = Vec::with_capacity(4096);
-
     let mut session_id: Option<String> = None;
     let mut workspace_key: Option<String> = None;
     let mut workspace_label: Option<String> = None;
@@ -185,21 +179,21 @@ pub(crate) fn parse_pi_format_file(
             buffer.extend_from_slice(trimmed.as_bytes());
             let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut buffer) {
                 Ok(probe) => probe.entry_type,
-                Err(_) => return Vec::new(),
+                Err(_) => return Ok(()),
             };
 
             if entry_type != "session" {
                 if PRE_SESSION_METADATA_TYPES.contains(&entry_type.as_str()) {
                     continue;
                 }
-                return Vec::new();
+                return Ok(());
             }
 
             buffer.clear();
             buffer.extend_from_slice(trimmed.as_bytes());
             let header = match simd_json::from_slice::<PiSessionHeader>(&mut buffer) {
                 Ok(h) => h,
-                Err(_) => return Vec::new(),
+                Err(_) => return Ok(()),
             };
 
             session_id = Some(header.id);
@@ -324,10 +318,57 @@ pub(crate) fn parse_pi_format_file(
             }),
         };
         unified.set_workspace(workspace_key.clone(), workspace_label.clone());
-        messages.push(unified);
+        sink(unified)?;
     }
-
+    Ok(())
+}
+/// Parse a JSONL session file written in the Pi record format.
+///
+/// `client` is stamped on every message, namespaces its dedup key, and is the
+/// provider of last resort when the message names none and the model is not
+/// recognizable. Pi uses it as `pi`; Kimchi as `kimchi` (`sessions::kimchi`).
+pub(crate) fn parse_pi_format_file(
+    path: &Path,
+    client: &str,
+    dedup: PiDedup,
+) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::with_capacity(64);
+    let _ = visit_pi_format_file(path, client, dedup, &mut |message| {
+        messages.push(message);
+        Ok(())
+    });
     messages
+}
+
+/// Thin per-client streaming entry points over the shared Pi-format visitor.
+/// App ingestion routes through these; the `Vec` wrappers stay for tests and
+/// the non-ingestion callers listed in `lib.rs`.
+pub(crate) fn visit_pi_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_pi_format_file(path, "pi", PiDedup::CrossSession, sink)
+}
+
+pub(crate) fn visit_kimchi_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_pi_format_file(path, "kimchi", PiDedup::SessionScoped, sink)
+}
+
+pub(crate) fn visit_senpi_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_pi_format_file(path, "senpi", PiDedup::CrossSession, sink)
+}
+
+pub(crate) fn visit_omp_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_pi_format_file(path, "omp", PiDedup::CrossSession, sink)
 }
 
 #[cfg(test)]

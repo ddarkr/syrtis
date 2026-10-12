@@ -220,6 +220,12 @@ fn pricing_map_bytes(map: &HashMap<String, ModelPricing>) -> usize {
     })
 }
 
+/// Bytes for one shared canonical key backing (`Arc<str>` payload), charged
+/// once no matter how many indexes clone the `Arc`.
+pub(crate) fn shared_key_bytes(key: &str) -> usize {
+    allocation_bytes(key.len(), 1)
+}
+
 impl PricingService {
     pub fn new(
         litellm_data: HashMap<String, ModelPricing>,

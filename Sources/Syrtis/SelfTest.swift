@@ -9317,6 +9317,27 @@ enum SelfTest {
                 "the animation raster is still a square 18pt box at 2x, unaffected by the logical size")
         }
 #endif
+        // Demand-only frame residency: each icon state names exactly one
+        // frame set, so switching discards the obsolete one; static state
+        // needs only the first frame. Unknown styles fall back to cat.
+        let demandCat = TrayAnimator.demandedFrames(style: "cat", dark: true, animated: true)
+        let demandCatOff = TrayAnimator.demandedFrames(style: "cat", dark: true, animated: false)
+        expect(
+            demandCat.key == "anim-cat2" && demandCatOff.staticOnly
+                && !demandCat.staticOnly,
+            "cat demand is one dark set; static demand needs only its first frame")
+        expect(
+            TrayAnimator.demandedFrames(style: "parrot", dark: false).key == "anim-parrot-light"
+                && TrayAnimator.demandedFrames(style: "sand", dark: true, level: 2).key == "anim-sand2",
+            "parrot follows theme and sand follows its demanded level")
+        expect(
+            TrayAnimator.demandedFrames(style: "nope", dark: true).key == "anim-cat2"
+                && TrayAnimator.frameDirectory(style: "sand", dark: true, level: 99) == "anim-sand3",
+            "unknown styles fall back to cat and sand levels clamp to the top cohort")
+        expect(
+            TrayAnimator.loadFirstFrame(directory: "anim-cat2").count == 1
+                && TrayAnimator.loadFirstFrame(directory: "anim-nope-missing").isEmpty,
+            "static state loads one first frame; missing art stays empty for the cat fallback")
 
         // MARK: - Discord Rich Presence payload (DISCORD-PRESENCE M1)
         //
