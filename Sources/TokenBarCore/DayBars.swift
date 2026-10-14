@@ -35,21 +35,18 @@ public struct DayBar: Sendable {
 public enum DayBars {
     public static let window = 30
 
-    /// Build the trailing `window`-day series ending at the last selected
-    /// token/cost day. `rangeEnd` (or `endFallback`) is used when the selected
-    /// slice has no token/cost activity. Days outside the data render as empty bars.
-    ///
-    /// The token/cost series derives its own end while it has data, preventing
-    /// hidden or message-only activity from shifting metric bars out of view.
-    /// When it has no data, `rangeEnd` must still be the SELECTED clients' end
-    /// (`stats.dateRange.end`), not the unfiltered payload range.
+    /// Build the trailing `window` calendar days ending today for all-time
+    /// and current-year views, including empty days without token/cost activity.
+    /// Other years retain the last selected metric day as their anchor;
+    /// empty historical slices use the selected range end or year end.
     public static func build(
         payload: UsagePayload,
         clientIds: [String],
         stackBy: StackBy,
         colors: ModelColorMap,
         rangeEnd: String,
-        endFallback: String
+        year: String?,
+        today: String
     ) -> [DayBar] {
         let allowed = Set(clientIds)
         var byDate: [String: DayBar] = [:]
@@ -58,7 +55,12 @@ public enum DayBars {
             if day.totalTokens > 0 || day.totalCost > 0 { byDate[day.date] = day }
         }
 
-        let end = byDate.keys.max() ?? (rangeEnd.isEmpty ? endFallback : rangeEnd)
+        let end: String
+        if let year, year != String(today.prefix(4)) {
+            end = byDate.keys.max() ?? (rangeEnd.isEmpty ? "\(year)-12-31" : rangeEnd)
+        } else {
+            end = today
+        }
         guard let endDay = ISODay(end) else { return [] }
         return (0..<window).map { i in
             let date = ISODay(number: endDay.number - (window - 1) + i).iso
