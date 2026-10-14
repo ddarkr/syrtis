@@ -4006,7 +4006,7 @@ enum SelfTest {
             "a raw grok-4.6-build finds the model report's grok-4.6 shade, not the fallback")
         let groupingBars = DayBars.build(
             payload: groupingPayload, clientIds: ["grok"], stackBy: .model,
-            colors: groupingColors, rangeEnd: "2024-12-31", endFallback: "2024-12-31")
+            colors: groupingColors, rangeEnd: "2024-12-31", year: "2024", today: "2026-07-09")
         let groupingSegments = groupingBars.last?.segments ?? []
         expect(
             groupingSegments.map(\.key) == ["grok-4.6", "grok-code-fast-1"]
@@ -8470,8 +8470,8 @@ enum SelfTest {
             "overview is never subject to the hidden-lens fallback")
 
         // Filtered activity, DayBars windows, tooltip placement, and chart geometry.
-        // Hidden later activity cannot extend selected streaks or shift token/cost
-        // bars; a message-only day stays activity but does not move the metric window.
+        // Hidden later activity cannot extend selected streaks. Metric bars
+        // follow the calendar for live views and selected activity for older years.
         func activityDay(_ client: String, _ date: String, tokens: Int64 = 10, cost: Double = 1) -> String {
             "{\"date\":\"\(date)\",\"totals\":{\"tokens\":\(tokens),\"cost\":\(cost),\"messages\":1},\"intensity\":\(tokens > 0 ? 1 : 0),\"tokenBreakdown\":{\"input\":\(tokens),\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"reasoning\":0},\"clients\":[{\"client\":\"\(client)\",\"modelId\":\"m\",\"providerId\":\"p\",\"cost\":\(cost),\"messages\":1,\"tokens\":{\"input\":\(tokens),\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"reasoning\":0}}]}"
         }
@@ -8495,17 +8495,62 @@ enum SelfTest {
         let visAlone = UsageStats(payload: noHidden, selectedClients: ["vis"])
         expect(visFiltered.streaks.current == visAlone.streaks.current && visFiltered.streaks.longest == visAlone.streaks.longest && visFiltered.dateRange.end == visAlone.dateRange.end, "filtered stats equal a payload without the hidden client")
 
-        let chartPayload = activityPayload(end: "2026-07-05", days: [activityDay("vis", "2026-07-03"), activityDay("hid", "2026-07-05")])
+        let chartPayload = activityPayload(end: "2026-07-05", days: [
+            activityDay("vis", "2026-07-03"), activityDay("hid", "2026-07-05")])
         let chartColors = ModelColorMap(report: nil)
-        struct DayBarCase { let name: String; let payload: UsagePayload; let rangeEnd: String; let fallback: String; let last: String; let hasTokens: Bool }
-        for c in [
-            DayBarCase(name: "hidden later activity does not push selected usage out of the window", payload: chartPayload, rangeEnd: "2026-07-05", fallback: "2026-07-09", last: "2026-07-03", hasTokens: true),
-            DayBarCase(name: "a later message-only day does not shift the token/cost window", payload: messageTail, rangeEnd: "2026-07-31", fallback: "2026-07-31", last: "2026-07-01", hasTokens: true),
-            DayBarCase(name: "empty series uses endFallback when rangeEnd is empty", payload: activityPayload(end: "2026-07-09", days: []), rangeEnd: "", fallback: "2026-07-09", last: "2026-07-09", hasTokens: false),
-        ] {
-            let bars = DayBars.build(payload: c.payload, clientIds: ["vis"], stackBy: .agent, colors: chartColors, rangeEnd: c.rangeEnd, endFallback: c.fallback)
-            expect(bars.count == DayBars.window && bars.last?.date == c.last && ((bars.last?.totalTokens ?? 0) > 0) == c.hasTokens, c.name)
+        for stack in StackBy.allCases {
+            for year in [nil, "2026"] as [String?] {
+                let before = DayBars.build(
+                    payload: chartPayload, clientIds: ["vis"], stackBy: stack,
+                    colors: chartColors, rangeEnd: "2026-07-03", year: year, today: "2026-07-03")
+                let after = DayBars.build(
+                    payload: chartPayload, clientIds: ["vis"], stackBy: stack,
+                    colors: chartColors, rangeEnd: "2026-07-03", year: year, today: "2026-07-04")
+                expect(
+                    before.first?.date == "2026-06-04" && before.last?.totalTokens == 10
+                        && after.count == 30 && after.first?.date == "2026-06-05"
+                        && after.last?.date == "2026-07-04" && after.last?.isEmpty == true
+                        && after[28].totalTokens == 10 && after[28].totalCost == 1,
+                    "unchanged usage rolls forward at midnight for \(stack), year \(year ?? "all")")
+            }
+            let boundaryPayload = activityPayload(end: "2026-07-03", days: [
+                activityDay("vis", "2026-06-04"), activityDay("vis", "2026-07-03")])
+            let boundaryBars = DayBars.build(
+                payload: boundaryPayload, clientIds: ["vis"], stackBy: stack,
+                colors: chartColors, rangeEnd: "2026-07-03", year: nil, today: "2026-07-04")
+            expect(
+                boundaryBars.reduce(Int64(0)) { $0 + $1.totalTokens } == 10
+                    && boundaryBars.reduce(0.0) { $0 + $1.totalCost } == 1,
+                "rollover removes the oldest day from both token and price bars for \(stack)")
         }
+        let messageBars = DayBars.build(
+            payload: messageTail, clientIds: ["vis"], stackBy: .model,
+            colors: chartColors, rangeEnd: "2026-07-31", year: "2026", today: "2026-07-31")
+        expect(
+            messageBars.first?.date == "2026-07-02" && messageBars.last?.date == "2026-07-31"
+                && messageBars.allSatisfy(\.isEmpty),
+            "a message-only today stays empty without freezing the metric window")
+        let oldYearBars = DayBars.build(
+            payload: chartPayload, clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeEnd: "2026-07-03", year: "2026", today: "2027-01-01")
+        expect(
+            oldYearBars.last?.date == "2026-07-03" && oldYearBars.last?.totalTokens == 10,
+            "an older year retains selected metric activity rather than jumping to today or hidden activity")
+        let emptyBars = DayBars.build(
+            payload: activityPayload(end: "", days: []), clientIds: ["vis"], stackBy: .agent,
+            colors: chartColors, rangeEnd: "", year: nil, today: "2026-07-09")
+        expect(
+            emptyBars.first?.date == "2026-06-10" && emptyBars.last?.date == "2026-07-09"
+                && emptyBars.allSatisfy(\.isEmpty),
+            "empty live usage still shows the current calendar window")
+        let newYearBars = DayBars.build(
+            payload: activityPayload(end: "2026-12-31", days: [activityDay("vis", "2026-12-31")]),
+            clientIds: ["vis"], stackBy: .model, colors: chartColors,
+            rangeEnd: "2026-12-31", year: nil, today: "2027-01-01")
+        expect(
+            newYearBars.first?.date == "2026-12-03" && newYearBars.last?.date == "2027-01-01"
+                && newYearBars[28].totalTokens == 10 && newYearBars.last?.isEmpty == true,
+            "all-time bars roll across New Year without losing yesterday's usage")
 
         let viewport = CGRect(x: 100, y: 200, width: 400, height: 300)
         let chartFrame = CGRect(x: 120, y: 250, width: 360, height: 150)

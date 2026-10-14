@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-12
+last_verified: 2026-10-15
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -36,6 +36,8 @@ sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makef
 | FFI smoke | Rust -> C ABI -> Swift decoder 是否能端到端運作 | 所有特殊資料條件的正確數字 |
 | Live app check | 真實 session、視窗 lifecycle、外觀與更新流程是否不崩 | 沒有觸發資料時的 correctness fix |
 | CI | 可重複的 build/selftest/smoke gate | 本機 private data 與人工 UX 判斷 |
+
+Calendar Bars rollover 的獨立 native smoke 使用正式 `UsageChartCard` 與停在昨天的 synthetic graph，All years／目前年度均在 own-process compositor 顯示今天為右端、今天空 bar。UI-free before／after smoke 同時證明首日移出後 token／cost 不再計入。這是日期視窗與實際 chart 的短程證據，不代表安裝版在真實午夜的長時間 lifecycle 已驗收；暫時的 native probe 不保留於 app。
 
 ## Hermetic fixtures
 
@@ -70,6 +72,7 @@ PT0 的 hermetic authorities are Rust last-good and binding decisions, refresh s
 | Tray demand and cancellation | UI-free acceptance 鎖定 rate 的唯一 owner、static sand／動畫／tokens-per-min predicates、graph 的 title／visible client items／Discord predicates、重新有 demand 立即 fetch、last-good 保留，以及取消／replacement 後完成的 payload 不發布。獨立 30 秒 quota-staleness render 在無 graph／rate demand 時仍運作；真實 native UI lifecycle 另驗，不由 predicate tests 代替。 |
 | Compact quota wire | Rust folds 與 Swift attribution fixtures 對 exact half-open windows／cycle、declared account/model scope、assigned／excluded／unassigned、undated／turn counts、coverage、last-good 與 coherent pricing generation 驗證；實際 Swift → C ABI → Rust smoke 解碼 compact response 並釋放每個 native pointer，不以 mock echo 取代 contract。 |
 | Demand scheduler | 隔離 bundled selftest 驗證共享 ingestion、exact producer scopes、30 秒 active／5 分鐘 idle verification、dirty debounce、manual postrequest barrier、clock-only expiry 可越過被阻塞的 source verification、scope replacement／final close 的 late publication rejection、ordinary-query／quota pins、pricing expiry、midnight／timezone 與 lazy expanded-model demand。首張 graph 在 blocked union capture 前發布；side capture 借用 installed token 時不提早釋放，root replacement 與 query completion 後僅釋放一次。 |
+| Calendar bar rollover | 同一份 payload 在午夜前後，All years／目前年度的 Model 與 Agent bars 都前移一個日曆日；今天無 metric activity 時為空 bar，移出的首日不再計入 token／price。另驗 message-only、empty payload、跨年與其他年度的 selected-client metric anchor，不把 scheduler query 次數當成可見日期範圍正確的證據。 |
 | Native lease admission | 實際 sync／query／window ABI 驗證省略 primary quota 的 `clientId`、extra-account validation、same-producer aliases、64-scope／32-producer admission、共享 metadata 容量與超過 32 個 quota aliases 的 token 可用性。重送 normalized root registry 保持 lease 可讀，effective change 才使舊 lease 過期。 |
 | Trusted report folds | Graph／models／hourly／Agents 與 buffered oracle 比較 exact integer、cost 與 traversal output；malformed later row 不發布 partial aggregate，public visitor 保留 failure-before-first-callback、chronological order 與 reentrant source replacement。 |
 | LocalClients lane reuse | Unchanged OpenCode＋changed other-lane 的 totals／ordered public output、source-order reversal、SQLite／JSON／path／provider changes、empty transitions 與 superseded handle rejection。GC 後 copied references 仍可解碼，retired decision/index rows 不累積。 |

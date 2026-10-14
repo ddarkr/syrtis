@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-12
+last_verified: 2026-10-15
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -343,6 +343,8 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 SwiftUI owns the seven dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. A process-lifetime `@MainActor` publication coordinator applies the Rust `publicationGeneration` guard across the popover and Settings models, snapshot restore, and TrayAnimator's independent poller before any payload or scalar is stored. Dashboard polling reconciles the accepted payload into the shared scalar, while TrayAnimator's payload getter prefers the coordinator's latest generated payload over an older result from its own poller. The persistent scalar participates in the tray icon signature, so that write triggers immediate gauge rendering and the app-level defaults observer refreshes the title; missing generations remain direct demo/legacy values and are not persisted. Settings reconciliation is keyed by generation plus selection/exclusions, or by generated timestamp plus resolved-scalar fingerprint for legacy payloads, so distinct payloads cannot collide on `generatedAt` alone. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
 
 Swift FFI decoder 用 `Data(bytesNoCopy:)` 接管 native C buffer，由 custom deallocator 恰好呼叫一次 `tb_free`；NULL、error envelope、optional null 與 legacy decode 共用此 ownership seam。這省去 bridge 的完整 buffer copy，不代表 `JSONDecoder` 沒有內部 allocation。Graph generation 更新或釋放 local demand 時，無效的 filtered-stats memo 立即清除。
+
+`DayBars` 的 All years／目前年度視圖以本機今天為最近 30 個日曆日的終點；沒有新 token／cost 的日子仍顯示空 bar，不以最後使用日期凍結視窗。`UsageChartCard` 傳入目前年度選擇與 `Format.todayKey()`，沿用 scheduler 的 midnight／timezone 更新，不增加 source polling。其他年度保留最後一個 selected token／cost day；沒有 metric activity 時使用 selected range end，空 range 則使用該年年底。日期視窗只影響 Bars 與其 legend，不改變 summary 的 activity range 或全年 Heatmap／3D grid。
 
 TrayAnimator 只持有當下 style／sand level／appearance 的 frame set；animation 關閉時只載入第一張。切換、quota style 與 stop 釋放不再需要的 frame set。Settings preview 不再使用 process-global frame cache，而由可見 view 的 demand／disappearance 管理 images；appearance／level 切換或重新開啟需重新解碼，接受 latency 以降低 resident RAM。
 
