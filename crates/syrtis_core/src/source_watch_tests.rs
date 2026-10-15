@@ -4,12 +4,18 @@ use std::fs;
 use tempfile::TempDir;
 
 fn context(home: &Path, settings: scanner::ScannerSettings) -> ResolvedLocalSourceContext {
+    context_with_cache(home, settings, &home.join("owned-cache"))
+}
+
+fn context_with_cache(
+    home: &Path,
+    settings: scanner::ScannerSettings,
+    cache: &Path,
+) -> ResolvedLocalSourceContext {
     let config = home.join("platform-config");
     let data = home.join("platform-data");
-    let cache = home.join("owned-cache");
     let fingerprint =
-        RemoteSourceContextV1::preview_fingerprint(home, &config, &data, &cache, &settings)
-            .unwrap();
+        RemoteSourceContextV1::preview_fingerprint(home, &config, &data, cache, &settings).unwrap();
     RemoteSourceContextV1::new(
         home,
         config,
@@ -971,4 +977,493 @@ fn targeted_claude_corrections_and_truncation_preserve_collected_usage() {
             .sum::<i64>(),
         56
     );
+}
+
+fn pi_family_header() -> &'static str {
+    "{\"type\":\"session\",\"id\":\"ses\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/fixture\"}\n"
+}
+
+fn pi_family_row(id: &str, second: u32, input: i64) -> String {
+    serde_json::json!({
+        "type":"message","id":id,"timestamp":format!("2026-01-01T00:00:{second:02}Z"),
+        "message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic",
+            "responseId":id,
+            "usage":{"input":input,"output":4,"cacheRead":1,"cacheWrite":0,"totalTokens":input+5}}
+    })
+    .to_string()
+        + "\n"
+}
+
+fn pi_family_phases(
+    context: &ResolvedLocalSourceContext,
+    snapshot: &crate::LocalUsageSnapshot,
+) -> Vec<(String, usize, i32)> {
+    let db = Connection::open(context.usage_dir().join("source-message-cache.sqlite3")).unwrap();
+    let mut statement = db
+        .prepare("SELECT lane,source_order,phase FROM sq_scope_sources WHERE scope_generation=?1 AND kind='cache' ORDER BY lane,source_order")
+        .unwrap();
+    let rows = statement
+        .query_map([snapshot.generation()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn assert_pi_family_parity(snapshots: &[crate::LocalUsageSnapshot; 2]) {
+    for query in [
+        crate::LocalUsageQuery::default(),
+        crate::LocalUsageQuery {
+            from_ms: Some(1_767_225_602_000),
+            until_ms: Some(1_767_225_605_000),
+            chronological: true,
+            ..Default::default()
+        },
+    ] {
+        let rows = snapshots.each_ref().map(|snapshot| {
+            let mut rows = Vec::new();
+            crate::visit_local_usage_snapshot(snapshot, query, &|_| true, &mut |message| {
+                rows.push(message.clone())
+            })
+            .unwrap();
+            rows
+        });
+        // Byte equality also preserves f64 bits, provenance and traversal order.
+        assert_eq!(
+            bincode::serialize(&rows[0]).unwrap(),
+            bincode::serialize(&rows[1]).unwrap()
+        );
+    }
+    assert!(
+        incremental_rows(&snapshots[0])
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum::<i64>()
+            > 0,
+        "empty facts cannot establish parity"
+    );
+}
+
+fn pi_family_targeted_step(
+    contexts: &[ResolvedLocalSourceContext; 2],
+    client: &str,
+    mode: crate::LocalUsageSelection,
+    snapshots: &mut [crate::LocalUsageSnapshot; 2],
+    path: &Path,
+    contents: &str,
+    warm_changed: bool,
+) -> Vec<crate::UnifiedMessage> {
+    let manifest = capture_local_source_watch_manifest(&contexts[0], &options(client)).unwrap();
+    fs::write(path, contents).unwrap();
+    let (paths, _replacement) = changed_paths(
+        manifest
+            .verify_hinted_changes(
+                contexts[0].home_dir(),
+                &[reqwest::Url::from_file_path(path).unwrap().to_string()],
+            )
+            .unwrap(),
+    );
+    assert_eq!(paths, vec![path.to_path_buf()]);
+    if warm_changed {
+        // Another producer may already have collected this hint. Its scope is
+        // distinct, so the original scope remains current but the source is warm.
+        let other_mode = if mode == crate::LocalUsageSelection::Report {
+            crate::LocalUsageSelection::LocalClients
+        } else {
+            crate::LocalUsageSelection::Report
+        };
+        for context in contexts {
+            crate::synchronize_local_usage(context, options(client), other_mode).unwrap();
+        }
+    }
+    let targeted = crate::try_synchronize_local_usage_sources(
+        &contexts[0],
+        options(client),
+        mode,
+        &snapshots[0],
+        &paths,
+    )
+    .unwrap()
+    .expect("verified Pi-family primary changes must reach targeted ingestion");
+    // Independent store, same sources and identical prior cache operations:
+    // targeted ingestion must never warm the authoritative oracle.
+    let full = crate::synchronize_local_usage(&contexts[1], options(client), mode).unwrap();
+    *snapshots = [targeted, full];
+    assert_pi_family_parity(snapshots);
+    assert_eq!(
+        pi_family_phases(&contexts[0], &snapshots[0]),
+        pi_family_phases(&contexts[1], &snapshots[1])
+    );
+    incremental_rows(&snapshots[0])
+}
+
+fn pi_family_common_input(rows: &[crate::UnifiedMessage]) -> i64 {
+    rows.iter()
+        .find(|message| {
+            message
+                .dedup_key
+                .as_deref()
+                .is_some_and(|key| key.ends_with(":common"))
+        })
+        .expect("the conflicting same-key contribution must survive")
+        .tokens
+        .input
+}
+
+#[test]
+fn targeted_pi_family_matches_full_ingestion() {
+    for client in ["pi", "kimchi", "senpi", "omp"] {
+        for mode in [
+            crate::LocalUsageSelection::Report,
+            crate::LocalUsageSelection::LocalClients,
+        ] {
+            for warm_base in [false, true] {
+                let home = TempDir::new().unwrap();
+                let contexts = ["targeted/cache", "authoritative/cache"].map(|cache| {
+                    context_with_cache(home.path(), Default::default(), &home.path().join(cache))
+                });
+                assert_ne!(contexts[0].usage_dir(), contexts[1].usage_dir());
+                let root = contexts[0]
+                    .resolve_client_path(ClientId::from_str(client).unwrap())
+                    .unwrap()
+                    .join("project");
+                let source = root.join("a.jsonl");
+                let empty = root.join("m.jsonl");
+                let duplicate = root.join("z.jsonl");
+                let initial = pi_family_header().to_owned() + &pi_family_row("common", 1, 10);
+                let duplicate_initial =
+                    pi_family_header().to_owned() + &pi_family_row("common", 1, 30);
+                write(&source, initial.as_bytes());
+                write(&empty, pi_family_header().as_bytes());
+                write(&duplicate, duplicate_initial.as_bytes());
+                let scan = scanner::scan_all_clients_with_source_context(
+                    &contexts[0],
+                    &[client.to_owned()],
+                )
+                .unwrap();
+                assert_eq!(
+                    scan.get(ClientId::from_str(client).unwrap()),
+                    &[source.clone(), empty.clone(), duplicate.clone()]
+                );
+                let mut snapshots = contexts.each_ref().map(|context| {
+                    crate::synchronize_local_usage(context, options(client), mode).unwrap()
+                });
+                if warm_base {
+                    snapshots = contexts.each_ref().map(|context| {
+                        crate::synchronize_local_usage(context, options(client), mode).unwrap()
+                    });
+                }
+                assert_pi_family_parity(&snapshots);
+                assert_eq!(pi_family_common_input(&incremental_rows(&snapshots[0])), 10);
+                let appended = initial.clone() + &pi_family_row("append", 2, 20);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &appended,
+                    false,
+                );
+                assert_eq!(
+                    pi_family_common_input(&rows),
+                    if mode == crate::LocalUsageSelection::Report {
+                        30
+                    } else {
+                        10
+                    }
+                );
+                assert_eq!(rows.len(), 2);
+                let partial = appended.clone() + "{\"type\":\"message\",\"id\":";
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &partial,
+                    false,
+                );
+                assert_eq!(rows.len(), 2, "partial trailing records add no facts");
+                let completed = appended + &pi_family_row("completed", 3, 40);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &completed,
+                    false,
+                );
+                assert_eq!(rows.len(), 3);
+                let corrected = pi_family_header().to_owned()
+                    + &pi_family_row("common", 1, 90)
+                    + &pi_family_row("append", 2, 20)
+                    + &pi_family_row("completed", 3, 40);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &corrected,
+                    false,
+                );
+                assert_eq!(
+                    pi_family_common_input(&rows),
+                    if mode == crate::LocalUsageSelection::Report {
+                        30
+                    } else {
+                        90
+                    }
+                );
+                // Previously cold a must now become warm and beat changed z.
+                let changed_duplicate = duplicate_initial + &pi_family_row("later", 4, 50);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &duplicate,
+                    &changed_duplicate,
+                    false,
+                );
+                assert_eq!(pi_family_common_input(&rows), 90);
+                assert_eq!(rows.len(), 4);
+                let truncated = pi_family_header().to_owned() + &pi_family_row("common", 1, 90);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &truncated,
+                    false,
+                );
+                assert_eq!(rows.len(), 4, "truncation retains collected missing keys");
+                let restored = corrected + &pi_family_row("warm-hit", 4, 60);
+                let rows = pi_family_targeted_step(
+                    &contexts,
+                    client,
+                    mode,
+                    &mut snapshots,
+                    &source,
+                    &restored,
+                    true,
+                );
+                assert_eq!(pi_family_common_input(&rows), 90);
+                assert_eq!(rows.len(), 5, "another producer's cache hit stays warm");
+                let baseline =
+                    capture_local_source_watch_manifest(&contexts[0], &options(client)).unwrap();
+                fs::remove_file(&source).unwrap();
+                assert!(matches!(
+                    baseline
+                        .verify_hinted_changes(
+                            contexts[0].home_dir(),
+                            &[reqwest::Url::from_file_path(&source).unwrap().to_string()],
+                        )
+                        .unwrap(),
+                    LocalSourceVerification::Rediscover
+                ));
+                snapshots = contexts.each_ref().map(|context| {
+                    crate::synchronize_local_usage(context, options(client), mode).unwrap()
+                });
+                assert_pi_family_parity(&snapshots);
+                let retained_rows = incremental_rows(&snapshots[0]);
+                // Baseline LocalClients carries family archives without the
+                // live dedup tag, so a conflicting deleted copy can still be
+                // counted alongside its live sibling. Preserve authoritative
+                // ordered-output parity above; numeric correction is not part
+                // of this performance cutover. Check unique source-free facts
+                // by stable identity and token lanes instead of assuming a
+                // total row count for that preexisting behavior.
+                for (id, input) in [("append", 20), ("completed", 40), ("warm-hit", 60)] {
+                    let key_suffix = format!(":{id}");
+                    let mut facts = retained_rows.iter().filter(|message| {
+                        message
+                            .dedup_key
+                            .as_deref()
+                            .is_some_and(|key| key.ends_with(&key_suffix))
+                    });
+                    let fact = facts.next().expect("deleted-source usage remains readable");
+                    assert!(
+                        facts.next().is_none(),
+                        "unique retained identity counts once"
+                    );
+                    assert_eq!(fact.tokens.input, input);
+                    assert_eq!(fact.tokens.output, 4);
+                    assert_eq!(fact.tokens.cache_read, 1);
+                    assert_eq!(fact.tokens.cache_write, 0);
+                    assert_eq!(fact.tokens.total(), input + 5);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn targeted_pi_family_falls_back_for_unsupported_dependencies_and_replacement() {
+    for client in ["pi", "kimchi", "senpi", "omp"] {
+        for mode in [
+            crate::LocalUsageSelection::Report,
+            crate::LocalUsageSelection::LocalClients,
+        ] {
+            let home = TempDir::new().unwrap();
+            let context = context(home.path(), Default::default());
+            let source = context
+                .resolve_client_path(ClientId::from_str(client).unwrap())
+                .unwrap()
+                .join("project/a.jsonl");
+            let claude = context
+                .resolve_client_path(ClientId::Claude)
+                .unwrap()
+                .join("project/session.jsonl");
+            let meta = claude.with_extension("meta.json");
+            let unsupported = context
+                .resolve_client_path(ClientId::Jcode)
+                .unwrap()
+                .join("session_a.json");
+            let contents = pi_family_header().to_owned() + &pi_family_row("common", 1, 10);
+            write(&source, contents.as_bytes());
+            write(&claude, incremental_claude_row("claude", 20).as_bytes());
+            write(&meta, b"{\"agentName\":\"before\"}");
+            write(&unsupported, b"{\"messages\":[]}");
+            let options = LocalParseOptions {
+                clients: Some(vec![client.to_owned(), "claude".into(), "jcode".into()]),
+                ..Default::default()
+            };
+            let snapshot = crate::synchronize_local_usage(&context, options.clone(), mode).unwrap();
+            let before = bincode::serialize(&incremental_rows(&snapshot)).unwrap();
+            for (path, contents) in [
+                (&unsupported, "{\"messages\":[],\"changed\":true}"),
+                (&meta, "{\"agentName\":\"after\"}"),
+            ] {
+                let baseline = capture_local_source_watch_manifest(&context, &options).unwrap();
+                fs::write(path, contents).unwrap();
+                let (paths, _) = changed_paths(
+                    baseline
+                        .verify_hinted_changes(
+                            context.home_dir(),
+                            &[reqwest::Url::from_file_path(path).unwrap().to_string()],
+                        )
+                        .unwrap(),
+                );
+                assert!(
+                    crate::try_synchronize_local_usage_sources(
+                        &context,
+                        options.clone(),
+                        mode,
+                        &snapshot,
+                        &paths,
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "unsupported primary and dependency-only hints must use full ingestion"
+                );
+                assert_eq!(
+                    before,
+                    bincode::serialize(&incremental_rows(&snapshot)).unwrap()
+                );
+            }
+            let baseline = capture_local_source_watch_manifest(&context, &options).unwrap();
+            fs::write(&meta, b"{\"agentName\":\"late\"}").unwrap();
+            fs::write(&claude, incremental_claude_row("claude", 40)).unwrap();
+            assert!(
+                matches!(
+                    baseline
+                        .verify_hinted_changes(
+                            context.home_dir(),
+                            &[reqwest::Url::from_file_path(&claude).unwrap().to_string()],
+                        )
+                        .unwrap(),
+                    LocalSourceVerification::Rediscover
+                ),
+                "a named primary cannot hide changed parser dependencies"
+            );
+            let baseline = capture_local_source_watch_manifest(&context, &options).unwrap();
+            fs::rename(&source, source.with_extension("preserved")).unwrap();
+            write(&source, contents.as_bytes());
+            assert!(
+                matches!(
+                    baseline
+                        .verify_hinted_changes(
+                            context.home_dir(),
+                            &[reqwest::Url::from_file_path(&source).unwrap().to_string()],
+                        )
+                        .unwrap(),
+                    LocalSourceVerification::Rediscover
+                ),
+                "a replacement inode is not an eligible append"
+            );
+            assert_eq!(
+                before,
+                bincode::serialize(&incremental_rows(&snapshot)).unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn targeted_pi_family_read_failure_keeps_last_good_scope() {
+    use std::os::unix::fs::PermissionsExt;
+    for client in ["pi", "kimchi", "senpi", "omp"] {
+        for mode in [
+            crate::LocalUsageSelection::Report,
+            crate::LocalUsageSelection::LocalClients,
+        ] {
+            let home = TempDir::new().unwrap();
+            let context = context(home.path(), Default::default());
+            let source = context
+                .resolve_client_path(ClientId::from_str(client).unwrap())
+                .unwrap()
+                .join("project/a.jsonl");
+            let contents = pi_family_header().to_owned() + &pi_family_row("common", 1, 10);
+            write(&source, contents.as_bytes());
+            let snapshot = crate::synchronize_local_usage(&context, options(client), mode).unwrap();
+            let before = bincode::serialize(&incremental_rows(&snapshot)).unwrap();
+            assert_eq!(pi_family_common_input(&incremental_rows(&snapshot)), 10);
+            let baseline = capture_local_source_watch_manifest(&context, &options(client)).unwrap();
+            fs::write(&source, contents + &pi_family_row("append", 2, 20)).unwrap();
+            let (paths, _) = changed_paths(
+                baseline
+                    .verify_hinted_changes(
+                        context.home_dir(),
+                        &[reqwest::Url::from_file_path(&source).unwrap().to_string()],
+                    )
+                    .unwrap(),
+            );
+            let permissions = fs::metadata(&source).unwrap().permissions();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).unwrap();
+            let failed = crate::try_synchronize_local_usage_sources(
+                &context,
+                options(client),
+                mode,
+                &snapshot,
+                &paths,
+            );
+            fs::set_permissions(&source, permissions).unwrap();
+            assert!(
+                failed.is_err(),
+                "read failure must not publish partial facts"
+            );
+            assert_eq!(
+                before,
+                bincode::serialize(&incremental_rows(&snapshot)).unwrap(),
+                "the previous immutable publication remains readable"
+            );
+            assert!(
+                crate::try_synchronize_local_usage_sources(
+                    &context,
+                    options(client),
+                    mode,
+                    &snapshot,
+                    &paths,
+                )
+                .unwrap()
+                .is_some(),
+                "a failed staging attempt must not retire the last-good base"
+            );
+        }
+    }
 }

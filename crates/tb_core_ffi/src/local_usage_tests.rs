@@ -706,4 +706,172 @@ mod tests {
         release(&drifted_token);
         release(&unhinted_token);
     }
+
+    fn stable_historical_payload(mut value: Value) -> Value {
+        if let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut) {
+            meta.remove("generatedAt");
+            meta.remove("processingTimeMs");
+        }
+        value.as_object_mut().unwrap().remove("processingTimeMs");
+        value
+    }
+
+    #[test]
+    fn ordinary_report_checkpoints_survive_restart_and_changed_capture() {
+        let Some(phase) = std::env::var_os("SYRTIS_CHECKPOINT_RESTART_PHASE") else {
+            let root = tempfile::TempDir::new().unwrap();
+            for phase in ["seed", "append", "reopen"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "local_usage::tests::ordinary_report_checkpoints_survive_restart_and_changed_capture", "--nocapture"])
+                    .env_clear()
+                    .env("SYRTIS_CHECKPOINT_RESTART_PHASE", phase)
+                    .env("HOME", root.path())
+                    .env("SYRTIS_CONFIG_DIR", root.path().join("config"))
+                    .env("SYRTIS_USAGE_DIR", root.path().join("usage"))
+                    .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                    .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                    .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+                    .env("TZ", "UTC");
+                for key in ["SystemRoot", "SystemDrive"] {
+                    if let Some(value) = std::env::var_os(key) {
+                        command.env(key, value);
+                    }
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{phase}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let phase = phase.to_str().unwrap();
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let directory = root.join(".claude/projects/checkpoint");
+        std::fs::create_dir_all(&directory).unwrap();
+        let row = |index: usize| {
+            let timestamp = chrono::DateTime::from_timestamp_millis(
+                1_735_689_600_000 + index as i64 * 3_600_000,
+            )
+            .unwrap()
+            .to_rfc3339();
+            json!({"type":"assistant","timestamp":timestamp,"requestId":format!("request-{index}"),
+                "message":{"id":format!("message-{index}"),"model":"claude-sonnet-4",
+                    "usage":{"input_tokens":index as i64 % 13+1,"output_tokens":3,
+                        "cache_read_input_tokens":2,"cache_creation_input_tokens":1}}})
+            .to_string()
+                + "\n"
+        };
+        if phase == "seed" {
+            use std::io::Write;
+            let mut history = std::io::BufWriter::new(
+                std::fs::File::create(directory.join("a-history.jsonl")).unwrap(),
+            );
+            for index in 0..2000 {
+                history.write_all(row(index).as_bytes()).unwrap();
+            }
+            history.flush().unwrap();
+            std::fs::write(directory.join("z-current.jsonl"), row(2000)).unwrap();
+            let cache = root.join("config/cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(
+                cache.join("pricing-litellm.json"),
+                json!({
+                    "timestamp":now_ms()/1000,
+                    "data":{"claude-sonnet-4":{"input_cost_per_token":0.013,
+                        "output_cost_per_token":0.031,"cache_read_input_token_cost":0.001,
+                        "cache_creation_input_token_cost":0.003}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                cache.join("pricing-openrouter.json"),
+                json!({
+                    "timestamp":now_ms()/1000,"data":{}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        } else if phase == "append" {
+            std::fs::write(directory.join("z-current.jsonl"), row(2000) + &row(2001)).unwrap();
+        }
+        let sync = data(ffi(
+            &json!({"scopes":[{"id":"report","kind":"report","clients":["claude"]}]}),
+            crate::tb_local_usage_sync,
+        ));
+        let token = sync["leaseToken"].as_str().unwrap();
+        let mut reports = serde_json::Map::new();
+        for kind in ["graph", "models", "hourly", "agents"] {
+            reports.insert(
+                kind.into(),
+                stable_historical_payload(query_at(token, "report", kind, now_ms())),
+            );
+        }
+        let database =
+            rusqlite::Connection::open(root.join("usage/source-message-cache.sqlite3")).unwrap();
+        let checkpoints: i64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM report_checkpoints WHERE row_count=?1",
+                [if phase == "seed" { 2001 } else { 2002 }],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoints, 4,
+            "all four ordinary kinds must persist exact producing folds"
+        );
+        if phase == "seed" {
+            std::fs::write(
+                root.join("seed-generation.json"),
+                sync["scopes"][0]["sourceGeneration"].to_string(),
+            )
+            .unwrap();
+        } else if phase == "append" {
+            let previous: Value =
+                serde_json::from_slice(&std::fs::read(root.join("seed-generation.json")).unwrap())
+                    .unwrap();
+            assert_ne!(previous, sync["scopes"][0]["sourceGeneration"]);
+            let prior: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM report_checkpoints WHERE row_count=2001",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                prior, 4,
+                "cross-generation prefix states must remain reachable after restart"
+            );
+            // Evict only disposable compact checkpoints to force the complete
+            // historical oracle on the identical captured lease and pricing.
+            database
+                .execute("DELETE FROM report_checkpoints", [])
+                .unwrap();
+            for kind in ["graph", "models", "hourly", "agents"] {
+                assert_eq!(
+                    reports[kind],
+                    stable_historical_payload(query_at(token, "report", kind, now_ms())),
+                    "{kind}: full versus incremental payload differs"
+                );
+            }
+            std::fs::write(
+                root.join("append-reports.json"),
+                serde_json::to_vec(&reports).unwrap(),
+            )
+            .unwrap();
+        } else {
+            let expected: Value =
+                serde_json::from_slice(&std::fs::read(root.join("append-reports.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                Value::Object(reports),
+                expected,
+                "restarted exact pricing/query identity must preserve every payload field"
+            );
+        }
+        release(token);
+    }
 }

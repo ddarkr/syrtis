@@ -728,7 +728,7 @@ pub fn local_report_scan_options(options: &ReportOptions) -> LocalParseOptions {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelUsage {
     pub client: String,
     pub merged_clients: Option<String>,
@@ -991,16 +991,31 @@ fn aggregate_model_usage_entries(
     .expect("in-memory fixture fold succeeds")
 }
 
+#[cfg(test)]
 fn aggregate_model_usage_entries_with(
     group_by: &GroupBy,
     visit: impl FnOnce(&mut dyn FnMut(&UnifiedMessage)) -> Result<(), String>,
 ) -> Result<Vec<ModelUsage>, String> {
+    aggregate_model_usage_entries_fold(group_by, &|_| true, |_, fold| visit(fold), None)
+}
+
+fn aggregate_model_usage_entries_fold(
+    group_by: &GroupBy,
+    filter: &dyn Fn(&UnifiedMessage) -> bool,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+    cached: Option<&HistoricalReportFold<'_>>,
+) -> Result<Vec<ModelUsage>, String> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
     // One alias snapshot for the whole fold so a mid-fold set_model_aliases
     // cannot split messages across two grouping configs.
-    let aliases = model_alias::snapshot_grouping_aliases();
+    let aliases = cached
+        .map(|cached| std::borrow::Cow::Borrowed(&cached.aliases))
+        .unwrap_or_else(|| std::borrow::Cow::Owned(model_alias::snapshot_grouping_aliases()));
 
-    let mut fold = |msg: &UnifiedMessage| {
+    let fold = |model_map: &mut HashMap<String, ModelUsage>, msg: &UnifiedMessage| {
         let normalized = aliases.fold(normalize_syntactic(&msg.model_id));
         let (workspace_group_key, workspace_key, workspace_label) =
             if *group_by == GroupBy::WorkspaceModel {
@@ -1087,7 +1102,7 @@ fn aggregate_model_usage_entries_with(
             .performance
             .record_message(positive_token_total(&msg.tokens), msg.duration_ms);
     };
-    visit(&mut fold)?;
+    visit_report_state(&mut model_map, cached, filter, visit, fold)?;
 
     let mut entries: Vec<ModelUsage> = model_map
         .into_values()
@@ -1107,14 +1122,32 @@ fn aggregate_model_usage_entries_with(
             entry
         })
         .collect();
-    entries.sort_by(|a, b| match (a.cost.is_nan(), b.cost.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => b
-            .cost
-            .partial_cmp(&a.cost)
-            .unwrap_or(std::cmp::Ordering::Equal),
+    entries.sort_by(|a, b| {
+        let cost = match (a.cost.is_nan(), b.cost.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b
+                .cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        };
+        cost.then_with(|| {
+            (
+                &a.client,
+                &a.model,
+                &a.provider,
+                &a.workspace_key,
+                &a.session_id,
+            )
+                .cmp(&(
+                    &b.client,
+                    &b.model,
+                    &b.provider,
+                    &b.workspace_key,
+                    &b.session_id,
+                ))
+        })
     });
 
     Ok(entries)
@@ -1600,6 +1633,326 @@ fn validate_report_snapshot(
     Ok(())
 }
 
+/// The key and every cached calendar transform share these immutable TZif
+/// rules. chrono::Local has a one-second thread-local refresh cache and cannot
+/// safely be combined with a freshly captured timezone fingerprint.
+struct CapturedReportTimezone {
+    zone: jiff::tz::TimeZone,
+    digest: [u8; 32],
+}
+
+impl CapturedReportTimezone {
+    fn capture() -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        use std::borrow::Cow;
+        use std::io::Read;
+        let requested = std::env::var("TZ").ok();
+        if requested.as_deref() == Some("") {
+            return Some(Self {
+                zone: jiff::tz::TimeZone::UTC,
+                digest: Sha256::digest(b"syrtis-report-empty-tz-utc-v1").into(),
+            });
+        }
+        let name = requested.as_deref().unwrap_or("localtime");
+        let localtime = name == "localtime";
+        let name = name.strip_prefix(':').unwrap_or(name);
+        let primary = if localtime {
+            Some(Cow::Borrowed(std::path::Path::new("/etc/localtime")))
+        } else if std::path::Path::new(name).is_absolute() {
+            Some(Cow::Borrowed(std::path::Path::new(name)))
+        } else {
+            None
+        };
+        // The same file search order used by chrono's Unix resolver. Resolve
+        // lazily instead of allocating all candidate paths on every query.
+        let directories: &[&str] = if primary.is_some() {
+            &[]
+        } else {
+            &[
+                "/usr/share/zoneinfo",
+                "/share/zoneinfo",
+                "/etc/zoneinfo",
+                "/usr/share/lib/zoneinfo",
+            ]
+        };
+        for path in primary.into_iter().chain(
+            directories
+                .iter()
+                .map(|directory| Cow::Owned(std::path::Path::new(directory).join(name))),
+        ) {
+            let Ok(file) = std::fs::File::open(&*path) else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata() else {
+                return None;
+            };
+            if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+                return None;
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            if file.take(1024 * 1024 + 1).read_to_end(&mut bytes).is_err() {
+                return None;
+            }
+            if bytes.len() > 1024 * 1024 {
+                return None;
+            }
+            let zone = jiff::tz::TimeZone::tzif("captured-report", &bytes).ok()?;
+            return Some(Self {
+                zone,
+                digest: Sha256::digest(&bytes).into(),
+            });
+        }
+        // Custom POSIX rules/unresolved zones keep the authoritative complete
+        // prepared fold. Never persist a state under an uncertain identity.
+        None
+    }
+
+    fn date(&self, milliseconds: i64) -> String {
+        let Ok(timestamp) = jiff::Timestamp::from_millisecond(milliseconds) else {
+            return String::new();
+        };
+        let Some(datetime) = chrono::DateTime::from_timestamp_millis(milliseconds) else {
+            return String::new();
+        };
+        let Some(offset) = chrono::FixedOffset::east_opt(self.zone.to_offset(timestamp).seconds())
+        else {
+            return String::new();
+        };
+        datetime
+            .with_timezone(&offset)
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn hour(&self, message: &UnifiedMessage) -> String {
+        if message.timestamp > 0 {
+            // Match the existing hourly contract's second truncation exactly.
+            let seconds = message.timestamp / 1000;
+            if let (Ok(timestamp), Some(datetime)) = (
+                jiff::Timestamp::from_second(seconds),
+                chrono::DateTime::from_timestamp(seconds, 0),
+            ) {
+                if let Some(offset) =
+                    chrono::FixedOffset::east_opt(self.zone.to_offset(timestamp).seconds())
+                {
+                    return datetime
+                        .with_timezone(&offset)
+                        .format("%Y-%m-%d %H:00")
+                        .to_string();
+                }
+            }
+        }
+        format!("{} 00:00", message.date)
+    }
+}
+
+/// The saved value is the actual sequential accumulator, not a partial sum.
+/// A changed source generation does not enter its key: selected membership
+/// establishes the longest reusable prefix before any payload is decoded.
+struct HistoricalReportFold<'a> {
+    query: store_query::QueryState,
+    checkpoint: usage_store::ReportCheckpoint,
+    snapshot: &'a LocalUsageSnapshot,
+    pricing: Option<&'a pricing::PricingService>,
+    aliases: model_alias::GroupingAliasSnapshot,
+    timezone: Option<CapturedReportTimezone>,
+}
+
+impl<'a> HistoricalReportFold<'a> {
+    fn new(
+        snapshot: &'a LocalUsageSnapshot,
+        options: &ReportOptions,
+        pricing: Option<&'a pricing::PricingService>,
+        kind: &str,
+    ) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        let aliases = model_alias::snapshot_grouping_aliases();
+        let mut hash = Sha256::new();
+        // Bump the checkpoint revision when report arithmetic/grouping or
+        // pricing-policy semantics change within the same package version.
+        hash.update(b"syrtis-sequential-report-checkpoint-v2");
+        hash.update(env!("CARGO_PKG_VERSION").as_bytes());
+        hash.update(
+            bincode::serialize(&(
+                &snapshot.scope,
+                kind,
+                &options.clients,
+                &options.year,
+                &options.since,
+                &options.until,
+                &options.group_by,
+            ))
+            .map_err(|error| error.to_string())?,
+        );
+        hash.update(aliases.content_digest());
+        if let Some(pricing) = pricing {
+            hash.update([1]);
+            hash.update(pricing.content_digest());
+        } else {
+            hash.update([0]);
+        }
+        let mut timezone = CapturedReportTimezone::capture();
+        if let Some(timezone) = &timezone {
+            hash.update(timezone.digest);
+        }
+        let query = store_query::QueryState::open(&snapshot.root)?;
+        query.pin(snapshot)?;
+        let prepared = query.prepare_query(snapshot, LocalUsageQuery::compact());
+        let released = query.unpin();
+        prepared.and(released)?;
+        query.prepare_report_fold(snapshot)?;
+        let outside_timezone_range: bool = query
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sq_rows WHERE timestamp<?1 OR timestamp>?2)
+                 OR EXISTS(SELECT 1 FROM ocq_rows WHERE timestamp<?1 OR timestamp>?2)",
+                rusqlite::params![
+                    jiff::Timestamp::MIN.as_millisecond(),
+                    jiff::Timestamp::MAX.as_millisecond()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if outside_timezone_range {
+            timezone = None;
+        }
+        let key = hash.finalize().into();
+        let checkpoint = if timezone.is_some() {
+            usage_store::ReportCheckpoint::open(query.connection(), key)?
+        } else {
+            usage_store::ReportCheckpoint::disabled(key)
+        };
+        Ok(Self {
+            query,
+            checkpoint,
+            snapshot,
+            pricing,
+            aliases,
+            timezone,
+        })
+    }
+
+    fn fold<T>(
+        &self,
+        state: &mut T,
+        filter: &dyn Fn(&UnifiedMessage) -> bool,
+        push: &mut impl FnMut(&mut T, &UnifiedMessage),
+    ) -> Result<(), String>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let Some(timezone) = &self.timezone else {
+            return fold_prepared_usage_snapshot(
+                self.snapshot,
+                &self.query,
+                self.pricing,
+                LocalUsageQuery::compact(),
+                &|message| filter(message),
+                &mut |message| push(state, message),
+                false,
+            )
+            .map(|_| ());
+        };
+        let requested: HashSet<&str> = self.snapshot.clients.iter().map(String::as_str).collect();
+        let passes = |message: &UnifiedMessage| {
+            requested.is_empty()
+                || retain_for_requested_clients(
+                    &message.client,
+                    &message.model_id,
+                    &message.provider_id,
+                    &requested,
+                )
+        };
+        // Restoring consumes the encoded blob. If this private fold object is
+        // used again, replay from zero rather than skipping a consumed prefix.
+        let resume_rows = if self.checkpoint.has_restored() {
+            self.checkpoint.resume_rows
+        } else {
+            0
+        };
+        if let Some(restored) = self.checkpoint.restore()? {
+            *state = restored;
+        } else {
+            usage_store::visit_opencode_query_on(
+                self.query.connection(),
+                false,
+                usage_store::OpenCodeSelectionMode::Report,
+                false,
+                &|raw| {
+                    let mut message = raw.clone();
+                    message.date = timezone.date(message.timestamp);
+                    apply_pricing_if_available(&mut message, self.pricing);
+                    passes(&message) && filter(&message)
+                },
+                &mut |raw| {
+                    let mut message = raw.clone();
+                    message.date = timezone.date(message.timestamp);
+                    apply_pricing_if_available(&mut message, self.pricing);
+                    if passes(&message) && filter(&message) {
+                        push(state, &message);
+                    }
+                },
+            )?;
+            self.checkpoint.save(self.query.connection(), 0, state)?;
+        }
+        let mut last = resume_rows;
+        self.query.visit_report_suffix(
+            last,
+            &mut |position, lane, simple, guarded, mut message| {
+                if lane != "grok" || self.query.grok_select(&mut message)? {
+                    message.date = timezone.date(message.timestamp);
+                    if simple {
+                        reprice_lane_message(&mut message, self.pricing, guarded);
+                    } else if !guarded || message.cost <= 0.0 {
+                        apply_pricing_if_available(&mut message, self.pricing);
+                    }
+                    if passes(&message) {
+                        if lane == "synthetic" {
+                            sessions::synthetic::normalize_synthetic_gateway_fields(
+                                &mut message.model_id,
+                                &mut message.provider_id,
+                            );
+                        }
+                        if filter(&message) {
+                            push(state, &message);
+                        }
+                    }
+                }
+                last = position;
+                if position % 1024 == 0 {
+                    self.checkpoint
+                        .save(self.query.connection(), position, state)?;
+                }
+                Ok(())
+            },
+        )?;
+        if last > resume_rows && last % 1024 != 0 {
+            self.checkpoint.save(self.query.connection(), last, state)?;
+        }
+        self.checkpoint.finish(self.query.connection())
+    }
+}
+
+fn visit_report_state<T>(
+    state: &mut T,
+    cached: Option<&HistoricalReportFold<'_>>,
+    filter: &dyn Fn(&UnifiedMessage) -> bool,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+    mut push: impl FnMut(&mut T, &UnifiedMessage),
+) -> Result<(), String>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    if let Some(cached) = cached {
+        cached.fold(state, filter, &mut push)
+    } else {
+        visit(filter, &mut |message| push(state, message))
+    }
+}
+
 /// Fold a complete, exact-scope Report snapshot using captured pricing only.
 pub fn get_model_report_from_snapshot(
     snapshot: &LocalUsageSnapshot,
@@ -1607,7 +1960,9 @@ pub fn get_model_report_from_snapshot(
     pricing: Option<&pricing::PricingService>,
 ) -> Result<ModelReport, String> {
     validate_report_snapshot(snapshot, &resolve_report_clients(&options))?;
-    model_report_with_visitor(&options, Instant::now(), |filter, sink| {
+    let start = Instant::now();
+    let cached = HistoricalReportFold::new(snapshot, &options, pricing, "models")?;
+    model_report_with_fold(&options, start, Some(&cached), |filter, sink| {
         drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
     })
 }
@@ -1619,7 +1974,9 @@ pub fn get_agents_report_from_snapshot(
     pricing: Option<&pricing::PricingService>,
 ) -> Result<AgentReport, String> {
     validate_report_snapshot(snapshot, &report_scan_clients(&options))?;
-    agents_report_with_visitor(&options, Instant::now(), |filter, sink| {
+    let start = Instant::now();
+    let cached = HistoricalReportFold::new(snapshot, &options, pricing, "agents")?;
+    agents_report_with_fold(&options, start, Some(&cached), |filter, sink| {
         drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
     })
 }
@@ -1631,7 +1988,9 @@ pub fn get_hourly_report_from_snapshot(
     pricing: Option<&pricing::PricingService>,
 ) -> Result<HourlyReport, String> {
     validate_report_snapshot(snapshot, &report_scan_clients(&options))?;
-    hourly_report_with_visitor(&options, Instant::now(), |filter, sink| {
+    let start = Instant::now();
+    let cached = HistoricalReportFold::new(snapshot, &options, pricing, "hourly")?;
+    hourly_report_with_fold(&options, start, Some(&cached), |filter, sink| {
         drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
     })
 }
@@ -1663,14 +2022,25 @@ pub fn lean_local_graph_from_snapshot(
     pricing_mode: GraphPricingMode,
 ) -> Result<GraphResultWithContract, String> {
     validate_report_snapshot(snapshot, &resolve_report_clients(&options))?;
+    let start = Instant::now();
     let pricing = if pricing_mode == GraphPricingMode::LocalOnly {
         None
     } else {
         pricing
     };
-    lean_graph_report_with_visitor(&options, Instant::now(), pricing_mode, |filter, sink| {
-        drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
-    })
+    let kind = match pricing_mode {
+        GraphPricingMode::LocalOnly => "graph-local-only",
+        GraphPricingMode::BestEffort => "graph-best-effort",
+    };
+    let cached = HistoricalReportFold::new(snapshot, &options, pricing, kind)?;
+    graph_report_with_visitor_inner(
+        &options,
+        start,
+        pricing_mode,
+        true,
+        Some(&cached),
+        |filter, sink| drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink),
+    )
 }
 
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
@@ -1717,6 +2087,18 @@ fn model_report_with_visitor(
         &mut dyn FnMut(&UnifiedMessage),
     ) -> Result<(), String>,
 ) -> Result<ModelReport, String> {
+    model_report_with_fold(options, start, None, visit)
+}
+
+fn model_report_with_fold(
+    options: &ReportOptions,
+    start: Instant,
+    cached: Option<&HistoricalReportFold<'_>>,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+) -> Result<ModelReport, String> {
     let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
     let since_s = options.since.clone();
     let until_s = options.until.clone();
@@ -1739,7 +2121,7 @@ fn model_report_with_visitor(
         true
     };
     let entries =
-        aggregate_model_usage_entries_with(&options.group_by, |fold| visit(&msg_filter, fold))?;
+        aggregate_model_usage_entries_fold(&options.group_by, &msg_filter, visit, cached)?;
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
@@ -1867,7 +2249,7 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     })
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct AgentAccumulator {
     clients: std::collections::BTreeSet<String>,
     input: i64,
@@ -1993,6 +2375,18 @@ fn agents_report_with_visitor(
         &mut dyn FnMut(&UnifiedMessage),
     ) -> Result<(), String>,
 ) -> Result<AgentReport, String> {
+    agents_report_with_fold(options, start, None, visit)
+}
+
+fn agents_report_with_fold(
+    options: &ReportOptions,
+    start: Instant,
+    cached: Option<&HistoricalReportFold<'_>>,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+) -> Result<AgentReport, String> {
     let (_, exact) = split_report_client_filter(options);
     let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
     let since_s = options.since.clone();
@@ -2021,10 +2415,10 @@ fn agents_report_with_visitor(
 
     let mut by_agent: HashMap<String, AgentAccumulator> = HashMap::new();
 
-    let mut fold = |msg: &UnifiedMessage| {
+    let fold = |by_agent: &mut HashMap<String, AgentAccumulator>, msg: &UnifiedMessage| {
         by_agent.entry(agent_bucket_key(msg)).or_default().add(msg);
     };
-    visit(&msg_filter, &mut fold)?;
+    visit_report_state(&mut by_agent, cached, &msg_filter, visit, fold)?;
 
     let mut entries: Vec<AgentReportEntry> = by_agent
         .into_iter()
@@ -2064,6 +2458,7 @@ fn agents_report_with_visitor(
             .partial_cmp(&a.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b_total.cmp(&a_total))
+            .then_with(|| a.agent.cmp(&b.agent))
     });
 
     // f64's Sum identity is -0.0, so an empty report would serialize as
@@ -2083,7 +2478,7 @@ fn agents_report_with_visitor(
     })
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct HourAggregator {
     clients: HashSet<String>,
     models: HashSet<String>,
@@ -2147,6 +2542,18 @@ fn hourly_report_with_visitor(
         &mut dyn FnMut(&UnifiedMessage),
     ) -> Result<(), String>,
 ) -> Result<HourlyReport, String> {
+    hourly_report_with_fold(options, start, None, visit)
+}
+
+fn hourly_report_with_fold(
+    options: &ReportOptions,
+    start: Instant,
+    cached: Option<&HistoricalReportFold<'_>>,
+    visit: impl FnOnce(
+        &dyn Fn(&UnifiedMessage) -> bool,
+        &mut dyn FnMut(&UnifiedMessage),
+    ) -> Result<(), String>,
+) -> Result<HourlyReport, String> {
     use chrono::{Local, TimeZone};
     let (_, exact) = split_report_client_filter(options);
     let year_prefix = options.year.as_ref().map(|y| format!("{}-", y));
@@ -2177,10 +2584,14 @@ fn hourly_report_with_visitor(
     let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
     // One alias snapshot for the whole fold so a mid-fold set_model_aliases
     // cannot split messages across two grouping configs.
-    let aliases = model_alias::snapshot_grouping_aliases();
+    let aliases = cached
+        .map(|cached| std::borrow::Cow::Borrowed(&cached.aliases))
+        .unwrap_or_else(|| std::borrow::Cow::Owned(model_alias::snapshot_grouping_aliases()));
 
-    let mut fold = |msg: &UnifiedMessage| {
-        let hour_key = if msg.timestamp > 0 {
+    let fold = |hour_map: &mut HashMap<String, HourAggregator>, msg: &UnifiedMessage| {
+        let hour_key = if let Some(timezone) = cached.and_then(|cached| cached.timezone.as_ref()) {
+            timezone.hour(msg)
+        } else if msg.timestamp > 0 {
             let ts_secs = msg.timestamp / 1000;
             match Local.timestamp_opt(ts_secs, 0) {
                 chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:00").to_string(),
@@ -2209,7 +2620,7 @@ fn hourly_report_with_visitor(
         }
         entry.cost += msg.cost;
     };
-    visit(&msg_filter, &mut fold)?;
+    visit_report_state(&mut hour_map, cached, &msg_filter, visit, fold)?;
 
     let mut entries: Vec<HourlyUsage> = hour_map
         .into_iter()
@@ -2480,9 +2891,10 @@ fn local_usage_clients(
     })
 }
 
-/// Recollect verified changes to existing Claude/Codex primary files while
-/// carrying the previous scope's immutable source descriptors. The caller
-/// must authoritatively verify all known inputs and retain periodic discovery.
+/// Recollect verified changes to existing Claude, Codex and Pi-family
+/// (Pi/Kimchi/Senpi/OMP) primary files while carrying the previous scope's
+/// immutable source descriptors. The caller must verify captured identities
+/// and parser dependencies and retain periodic authoritative discovery.
 /// Unsupported plans return `None`; actual read/publication failures return
 /// errors and leave the previous completed scope available.
 pub fn try_synchronize_local_usage_sources(
@@ -2548,7 +2960,48 @@ pub fn try_synchronize_local_usage_sources(
             ClientId::Codex => {
                 store_query::stage_codex(&query, &mut cache, path, source.index, source.headless)?
             }
-            _ => unreachable!("incremental plan only admits Claude and Codex"),
+            ClientId::Pi | ClientId::Kimchi | ClientId::Senpi | ClientId::Omp => {
+                let visit = match source.client {
+                    ClientId::Pi => sessions::pi::visit_pi_file,
+                    ClientId::Kimchi => sessions::pi::visit_kimchi_file,
+                    ClientId::Senpi => sessions::pi::visit_senpi_file,
+                    ClientId::Omp => sessions::pi::visit_omp_file,
+                    _ => unreachable!(),
+                };
+                let identity = message_cache::CacheIdentity::for_client(source.client);
+                let before = message_cache::SourceFingerprint::from_path_samples_only(path);
+                if let Some(metadata) =
+                    store_query::cache_hit(&cache, identity, path, before.as_ref(), false)?
+                {
+                    store_query::stage_cached(
+                        &query,
+                        &cache,
+                        identity,
+                        path,
+                        &metadata,
+                        source.client.as_str(),
+                        source.index,
+                        0,
+                        source.tag,
+                        false,
+                    )?;
+                    continue;
+                }
+                store_query::stage_streamed_source(
+                    &query,
+                    &mut cache,
+                    identity,
+                    path,
+                    before,
+                    message_cache::SourceFingerprint::from_path_samples_only,
+                    |sink| visit(path, sink),
+                    source.client.as_str(),
+                    source.index,
+                    i32::from(selection == LocalUsageSelection::Report),
+                    source.tag,
+                )?
+            }
+            _ => unreachable!("incremental plan only admits Claude, Codex, Pi-family"),
         }
     }
     cache.check()?;
@@ -3496,7 +3949,7 @@ pub(crate) fn for_each_usage_lane(
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct CostCoverageFold {
     known: bool,
     unknown: bool,
@@ -3583,7 +4036,7 @@ async fn generate_graph_with_loaded_pricing_inner(
         .map(Ok)
         .unwrap_or_else(|| get_home_dir_string(&options.home_dir))?;
     let clients = resolve_report_clients(&options);
-    graph_report_with_visitor_inner(&options, start, pricing_mode, lean, |filter, sink| {
+    graph_report_with_visitor_inner(&options, start, pricing_mode, lean, None, |filter, sink| {
         scan_report_messages(
             context, &home_dir, &clients, &options, pricing, filter, sink,
         )
@@ -3599,9 +4052,10 @@ fn graph_report_with_visitor(
         &mut dyn FnMut(&UnifiedMessage),
     ) -> Result<(), String>,
 ) -> Result<GraphResultWithContract, String> {
-    graph_report_with_visitor_inner(options, start, pricing_mode, false, visit)
+    graph_report_with_visitor_inner(options, start, pricing_mode, false, None, visit)
 }
 
+#[cfg(test)]
 /// Lean app graph path: identical wire payload shape with `time_metrics: None`
 /// and unset `active_time_ms`; skips the sessionize fold entirely. Only for
 /// callers whose mapping drops those fields anyway.
@@ -3614,7 +4068,7 @@ pub(crate) fn lean_graph_report_with_visitor(
         &mut dyn FnMut(&UnifiedMessage),
     ) -> Result<(), String>,
 ) -> Result<GraphResultWithContract, String> {
-    graph_report_with_visitor_inner(options, start, pricing_mode, true, visit)
+    graph_report_with_visitor_inner(options, start, pricing_mode, true, None, visit)
 }
 
 fn graph_report_with_visitor_inner(
@@ -3622,6 +4076,7 @@ fn graph_report_with_visitor_inner(
     start: Instant,
     pricing_mode: GraphPricingMode,
     lean: bool,
+    cached: Option<&HistoricalReportFold<'_>>,
     visit: impl FnOnce(
         &dyn Fn(&UnifiedMessage) -> bool,
         &mut dyn FnMut(&UnifiedMessage),
@@ -3654,18 +4109,21 @@ fn graph_report_with_visitor_inner(
     // scan_messages_streaming handles all dedup (trae keep-latest + dedup_key gate).
     // StreamingAggregator.feed_pre_deduped() bypasses its internal dedup gate
     // since the driver already guarantees uniqueness.
-    let mut day_agg = aggregator::StreamingAggregator::new();
+    let mut state = (
+        aggregator::StreamingAggregator::new(),
+        CostCoverageFold::default(),
+    );
     let mut sess_agg = (!lean).then(store_query::DiskTimeFold::new).transpose()?;
-    let mut coverage = CostCoverageFold::default();
-
-    let mut fold = |message: &UnifiedMessage| {
-        coverage.observe(message);
-        day_agg.feed_pre_deduped(message);
+    let fold = |state: &mut (aggregator::StreamingAggregator, CostCoverageFold),
+                message: &UnifiedMessage| {
+        state.1.observe(message);
+        state.0.feed_pre_deduped(message);
         if let Some(sess_agg) = sess_agg.as_mut() {
             sess_agg.feed(message);
         }
     };
-    visit(&msg_filter, &mut fold)?;
+    visit_report_state(&mut state, cached, &msg_filter, visit, fold)?;
+    let (day_agg, coverage) = state;
 
     let contract = GraphMetaContract {
         pricing_mode,

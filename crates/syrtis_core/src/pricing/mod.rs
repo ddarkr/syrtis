@@ -194,6 +194,7 @@ pub struct PricingService {
     custom: CustomPricing,
     lookup: PricingLookup,
     retained_base_bytes: usize,
+    content_digest: [u8; 32],
 }
 
 // Conservative retained-allocation accounting, not allocator/RSS telemetry.
@@ -239,17 +240,76 @@ impl PricingService {
         litellm_data: HashMap<String, ModelPricing>,
         openrouter_data: HashMap<String, ModelPricing>,
     ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"syrtis-pricing-content-v1");
+        let cursor = Self::build_cursor_overrides();
+        let sakana = Self::build_sakana_overrides();
+        let capacity = custom
+            .len()
+            .max(litellm_data.len())
+            .max(openrouter_data.len())
+            .max(cursor.len())
+            .max(sakana.len());
+        let mut entries = Vec::with_capacity(capacity);
+        for dataset in [
+            None,
+            Some(&litellm_data),
+            Some(&openrouter_data),
+            Some(&cursor),
+            Some(&sakana),
+        ] {
+            entries.clear();
+            if let Some(dataset) = dataset {
+                entries.extend(dataset.iter().map(|(key, value)| (key.as_str(), value)));
+            } else {
+                entries.extend(custom.entries());
+            }
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            digest.update((entries.len() as u64).to_le_bytes());
+            for &(key, value) in &entries {
+                digest.update((key.len() as u64).to_le_bytes());
+                digest.update(key.as_bytes());
+                for price in [
+                    value.input_cost_per_token,
+                    value.input_cost_per_token_above_128k_tokens,
+                    value.input_cost_per_token_above_200k_tokens,
+                    value.input_cost_per_token_above_256k_tokens,
+                    value.input_cost_per_token_above_272k_tokens,
+                    value.output_cost_per_token,
+                    value.output_cost_per_token_above_128k_tokens,
+                    value.output_cost_per_token_above_200k_tokens,
+                    value.output_cost_per_token_above_256k_tokens,
+                    value.output_cost_per_token_above_272k_tokens,
+                    value.cache_creation_input_token_cost,
+                    value.cache_creation_input_token_cost_above_200k_tokens,
+                    value.cache_read_input_token_cost,
+                    value.cache_read_input_token_cost_above_200k_tokens,
+                    value.cache_read_input_token_cost_above_272k_tokens,
+                ] {
+                    match price {
+                        Some(price) => {
+                            digest.update([1]);
+                            digest.update(price.to_bits().to_le_bytes());
+                        }
+                        None => digest.update([0]),
+                    }
+                }
+            }
+        }
+        drop(entries);
         Self {
             retained_base_bytes: std::mem::size_of::<Self>()
                 .saturating_add(custom.retained_bytes()),
+            content_digest: digest.finalize().into(),
             custom,
-            lookup: PricingLookup::new_with_sakana(
-                litellm_data,
-                openrouter_data,
-                Self::build_cursor_overrides(),
-                Self::build_sakana_overrides(),
-            ),
+            lookup: PricingLookup::new_with_sakana(litellm_data, openrouter_data, cursor, sakana),
         }
+    }
+
+    /// Immutable exact catalog/override identity, independent of process-local
+    /// Arc addresses and lookup-cache growth. Computed once at construction.
+    pub(crate) fn content_digest(&self) -> [u8; 32] {
+        self.content_digest
     }
 
     /// Conservative bytes retained by this service, including lookup cache

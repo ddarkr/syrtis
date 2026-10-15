@@ -1406,9 +1406,10 @@ mod disk;
 pub(crate) use disk::set_parser_version_for_test;
 pub(crate) use disk::{
     collect_unreferenced_versions_on, decode_path_for_carry, decode_stored_message_for_query,
-    encode_path_for_carry, import_legacy_shards_on, reconcile_missing_sources_on,
-    recover_source_message_cache, retained_state_change_token, validate_durable_store_on,
-    validate_scope_metadata_on, CachedSourceMetadata, SourceMessageCache,
+    encode_path_for_carry, import_legacy_shards_on, install_logical_views_on,
+    reconcile_missing_sources_on, recover_source_message_cache, retained_state_change_token,
+    validate_durable_store_on, validate_scope_metadata_on, CachedSourceMetadata,
+    SourceMessageCache,
 };
 
 #[cfg(test)]
