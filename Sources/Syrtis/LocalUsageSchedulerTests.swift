@@ -180,6 +180,153 @@ extension LocalUsageScheduler {
             var wall = Date(timeIntervalSince1970: 1_800_000_000)
             func advance(_ seconds: TimeInterval) { monotonic += seconds; wall.addTimeInterval(seconds) }
         }
+        // Cadence belongs to the exact recent question, not to global activity.
+        for mode in 0..<4 {
+            let cadenceClock = Clock()
+            // An inactive wall bucket crosses at +3s, before its actual +10s cadence.
+            cadenceClock.wall.addTimeInterval(7)
+            let cadenceSource = SchedulerFixtureSource()
+            let cadenceScheduler = LocalUsageScheduler(
+                source: cadenceSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { cadenceClock.monotonic }, wallNow: { cadenceClock.wall })
+            let recentSession = cadenceScheduler.openSession()
+            let cadenceRate = Query(kind: "rate")
+            var cadenceRates: [Double] = []
+            var clockTicks = 0
+            await cadenceSource.appendRecentEvent(
+                at: Int64(cadenceClock.wall.timeIntervalSince1970 * 1000) - 56_000)
+            cadenceScheduler.update(recentSession, queries: [cadenceRate], active: mode == 0) { _, result in
+                if case .success(.rate(let value)) = result { cadenceRates.append(value) }
+            }
+            cadenceScheduler.setClock(recentSession) { clockTicks += 1 }
+            if mode >= 2 {
+                let otherSession = cadenceScheduler.openSession()
+                // Even another visible recent scope must not accelerate this one.
+                let other = mode == 2 ? Query(kind: "graph", year: "2026")
+                    : Query(kind: "rate", clients: ["codex"])
+                cadenceScheduler.update(otherSession, queries: [other], active: true) { _, _ in }
+            }
+            await cadenceScheduler.runDueWork()
+            let initialSyncs = cadenceScheduler.syncCount
+            let initialTicks = clockTicks
+            let initialQueries = (await cadenceSource.history()).1.filter { $0.scopeId == cadenceRate.scope.id }.count
+            cadenceClock.advance(5)
+            await cadenceScheduler.runDueWork()
+            let atFive = (await cadenceSource.history()).1.filter { $0.scopeId == cadenceRate.scope.id }.count
+            expect(cadenceRates == (mode == 0 ? [120, 0] : [120])
+                   && atFive == initialQueries + (mode == 0 ? 1 : 0),
+                   "active recent expires at five seconds; inactive recent ignores unrelated active demand mode \(mode)")
+            if mode < 3 {
+                expect(clockTicks == initialTicks + (mode == 0 ? 1 : 0),
+                       "clock callbacks follow demanded recent cadence mode \(mode)")
+            }
+            cadenceClock.advance(5)
+            await cadenceScheduler.runDueWork()
+            let atTen = (await cadenceSource.history()).1.filter { $0.scopeId == cadenceRate.scope.id }.count
+            expect(cadenceRates.last == 0 && atTen == initialQueries + (mode == 0 ? 2 : 1)
+                   && cadenceScheduler.syncCount == initialSyncs,
+                   "inactive recent queries at ten seconds without idle ingestion mode \(mode)")
+            cadenceClock.advance(1)
+            await cadenceSource.appendRecentEvent(
+                at: Int64(cadenceClock.wall.timeIntervalSince1970 * 1000))
+            cadenceScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///cadence"])
+            cadenceClock.advance(0.11)
+            await cadenceScheduler.runDueWork()
+            expect(cadenceRates.last == 120 && cadenceScheduler.syncCount == initialSyncs + 1,
+                   "new source generation publishes immediately between clock deadlines mode \(mode)")
+            cadenceScheduler.stop()
+        }
+        // Changing activity during await invalidates both old values and errors.
+        for initiallyActive in [false, true] {
+            for fails in [false, true] {
+                let transitionClock = Clock()
+                transitionClock.wall.addTimeInterval(7)
+                let transitionSource = SchedulerFixtureSource()
+                let transitionScheduler = LocalUsageScheduler(
+                    source: transitionSource, observesSources: false, automaticallySchedules: false,
+                    monotonicNow: { transitionClock.monotonic }, wallNow: { transitionClock.wall })
+                let transitionSession = transitionScheduler.openSession()
+                let transitionRate = Query(kind: "rate")
+                var publications: [Double] = []
+                var failures = 0
+                var ticks = 0
+                let receive: @MainActor (Query, Result<LocalUsageValue, Error>) -> Void = { _, result in
+                    if case .success(.rate(let value)) = result { publications.append(value) }
+                    if case .failure = result { failures += 1 }
+                }
+                await transitionSource.appendRecentEvent(
+                    at: Int64(transitionClock.wall.timeIntervalSince1970 * 1000) - 56_000)
+                transitionScheduler.update(transitionSession, queries: [transitionRate],
+                                           active: initiallyActive, onValue: receive)
+                transitionScheduler.setClock(transitionSession) { ticks += 1 }
+                await transitionScheduler.runDueWork()
+                let initialTicks = ticks
+                transitionClock.advance(initiallyActive ? 5 : 10)
+                if fails { await transitionSource.failNextQuery(kind: "rate") }
+                await transitionSource.pauseNextQuery(kind: "rate")
+                let pausedTurn = Task { await transitionScheduler.runClockWork() }
+                await transitionSource.waitForPausedQuery()
+                transitionScheduler.update(transitionSession, queries: [transitionRate],
+                                           active: !initiallyActive, onValue: receive)
+                await transitionSource.resumeQuery()
+                await pausedTurn.value
+                expect(publications == [120] && failures == 0 && transitionScheduler.lastError == nil,
+                       "activity transition rejects stale recent value/error active \(initiallyActive) failure \(fails)")
+                expect(ticks == initialTicks + (initiallyActive ? 0 : 1),
+                       "paused-query completion ticks using current demand cadence active \(initiallyActive)")
+                await transitionScheduler.runDueWork()
+                expect(publications == [120, 0] && failures == 0 && transitionScheduler.syncCount == 1,
+                       "activity transition refolds current recent clock without rereading sources")
+                transitionClock.advance(5)
+                await transitionScheduler.runDueWork()
+                expect(publications.count == (initiallyActive ? 2 : 3),
+                       "transition starts a full new exact cadence rather than inheriting a wall bucket")
+                if initiallyActive {
+                    transitionClock.advance(5)
+                    await transitionScheduler.runDueWork()
+                    expect(publications == [120, 0, 0],
+                           "deactivated recent query waits ten seconds from transition")
+                }
+                transitionScheduler.update(transitionSession, queries: [], active: false, onValue: receive)
+                let emptySyncs = transitionScheduler.syncCount
+                let emptyQueries = transitionScheduler.queryCount
+                transitionClock.advance(1000)
+                transitionScheduler.sourcesChanged(requiresTopology: true)
+                await transitionScheduler.runDueWork()
+                expect(transitionScheduler.syncCount == emptySyncs && transitionScheduler.queryCount == emptyQueries,
+                       "minimized zero-demand session does not run source or query work")
+                transitionScheduler.stop()
+            }
+        }
+        // The immediately-due sentinel is valid even without any local queries.
+        let callbackClock = Clock()
+        let callbackSource = SchedulerFixtureSource()
+        let callbackScheduler = LocalUsageScheduler(
+            source: callbackSource, observesSources: false, automaticallySchedules: true,
+            monotonicNow: { callbackClock.monotonic }, wallNow: { callbackClock.wall })
+        let callbackSession = callbackScheduler.openSession()
+        var callbackTicks = 0
+        callbackScheduler.setClock(callbackSession) { callbackTicks += 1 }
+        expect(callbackTicks == 1 && callbackScheduler.syncCount == 0 && callbackScheduler.queryCount == 0,
+               "first clock-only owner receives its immediate callback without local source work")
+        await callbackScheduler.runClockWork()
+        await callbackSource.appendRecentEvent(
+            at: Int64(callbackClock.wall.timeIntervalSince1970 * 1000))
+        callbackScheduler.update(callbackSession, queries: [Query(kind: "rate")], active: true) { _, _ in }
+        await callbackScheduler.runDueWork()
+        await callbackSource.pauseNextQuery(kind: "rate")
+        callbackClock.advance(5)
+        callbackScheduler.clockChanged()
+        await callbackSource.waitForPausedQuery()
+        let ticksBeforeNotification = callbackTicks
+        let syncsBeforeNotification = callbackScheduler.syncCount
+        callbackScheduler.clockChanged()
+        expect(callbackTicks == ticksBeforeNotification + 1
+               && callbackScheduler.syncCount == syncsBeforeNotification,
+               "clock notification immediately reaches consumers while the recent query is paused")
+        await callbackSource.resumeQuery()
+        await callbackScheduler.runDueWork()
+        callbackScheduler.stop()
         let clock = Clock()
         let source = SchedulerFixtureSource()
         let scheduler = LocalUsageScheduler(
@@ -203,22 +350,22 @@ extension LocalUsageScheduler {
                "scheduler exact demand union shares ingestion and one compact query")
         expect(history.0[0].scopes.count == 1 && history.0[0].scopes[0].clients == nil
                && !history.0[0].refreshPricing, "recent-only demand has all-client authority and no pricing transport")
-        clock.advance(10)
+        clock.advance(5)
         await scheduler.runDueWork()
         history = await source.history()
         expect(history.0.count == 1 && history.1.count == 2,
-               "ten-second visible expiry publication is a pure query, not ingestion")
-        clock.advance(20)
+               "five-second visible expiry publication is a pure query, not ingestion")
+        clock.advance(25)
         await scheduler.runDueWork()
         history = await source.history()
         expect(history.0.count == 2 && !history.0[1].verifyTopology && !history.0[1].force,
                "active thirty-second fallback verifies known inputs without rediscovery")
         scheduler.sourcesChanged(requiresTopology: false)
         let beforeDebounce = scheduler.syncCount
-        clock.advance(0.1)
+        clock.advance(0.05)
         await scheduler.runDueWork()
         expect(scheduler.syncCount == beforeDebounce, "dirty hint does not bypass debounce")
-        clock.advance(0.2)
+        clock.advance(0.06)
         await scheduler.runDueWork()
         expect(scheduler.syncCount == beforeDebounce + 1, "dirty deadline drains a hint once")
         clock.advance(30)
@@ -1104,6 +1251,58 @@ extension LocalUsageScheduler {
                "failed replacement recovers the reopened header on the next synchronization")
         reopenedModel.releaseLocalDemand()
         replacementScheduler.stop()
+        // A burst keeps its first deadline; named syncs cannot reset periodic verification.
+        let burstClock = Clock()
+        let burstSource = SchedulerFixtureSource()
+        let burstScheduler = LocalUsageScheduler(
+            source: burstSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { burstClock.monotonic }, wallNow: { burstClock.wall })
+        let burstSession = burstScheduler.openSession()
+        burstScheduler.update(burstSession, queries: [Query(kind: "rate")], active: true) { _, _ in }
+        await burstScheduler.runDueWork()
+        burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///first"])
+        for path in ["file:///second", "file:///third"] {
+            burstClock.advance(0.04)
+            burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: [path])
+            await burstScheduler.runDueWork()
+        }
+        expect(burstScheduler.syncCount == 1, "dirty burst does not bypass the first hint deadline")
+        burstClock.advance(0.03)
+        await burstScheduler.runDueWork()
+        let drainedBurst = (await burstSource.history()).0.last
+        expect(burstScheduler.syncCount == 2
+               && drainedBurst?.changedFileURLs == ["file:///first", "file:///second", "file:///third"],
+               "continuous hints drain at the first dirty deadline instead of resetting it")
+        for second in [5.0, 10, 15, 20, 25] {
+            burstClock.advance(second - burstClock.monotonic)
+            burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///periodic"])
+            burstClock.advance(0.11)
+            await burstScheduler.runDueWork()
+            expect((await burstSource.history()).0.last?.changedFileURLs == ["file:///periodic"],
+                   "named sync remains targeted before the original thirty-second deadline")
+        }
+        burstClock.advance(30 - burstClock.monotonic)
+        burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///deadline"])
+        await burstScheduler.runDueWork()
+        let periodicRequest = (await burstSource.history()).0.last
+        expect(burstScheduler.syncCount == 8 && periodicRequest?.changedFileURLs == nil
+               && periodicRequest?.force == false && periodicRequest?.verifyTopology == false,
+               "authoritative thirty-second verification outranks a fresh hint and survives every named sync")
+        // Retry combines consumed evidence with callbacks received during failure.
+        await burstSource.pauseNextSync()
+        await burstSource.failNextSync()
+        burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///consumed"])
+        burstClock.advance(0.11)
+        let failedBurst = Task { await burstScheduler.runDueWork() }
+        await burstSource.waitForPausedSync()
+        burstScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///inflight"])
+        await burstSource.resumeSync()
+        await failedBurst.value
+        burstClock.advance(10)
+        await burstScheduler.runDueWork()
+        expect((await burstSource.history()).0.last?.changedFileURLs == ["file:///consumed", "file:///inflight"],
+               "failed capture retries consumed names together with in-flight callbacks")
+        burstScheduler.stop()
         // Hint plumbing: bounded coalesced file evidence rides the plain
         // dirty sync, overflow/topology/periodic syncs verify authoritatively.
         let hintClock = Clock()

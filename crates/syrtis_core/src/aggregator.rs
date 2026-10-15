@@ -230,6 +230,7 @@ pub fn generate_graph_result(
 // Internal helpers
 // =============================================================================
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DayAccumulator {
     totals: DailyTotals,
     token_breakdown: TokenBreakdown,
@@ -464,7 +465,7 @@ impl DayAccumulator {
             cache_write_1h: self.token_breakdown.cache_write_1h.max(0),
         };
 
-        let clients: Vec<ClientContribution> = self
+        let mut clients: Vec<ClientContribution> = self
             .clients
             .into_values()
             .map(|mut s| {
@@ -478,6 +479,13 @@ impl DayAccumulator {
                 s
             })
             .collect();
+        clients.sort_by(|left, right| {
+            (&left.client, &left.model_id, &left.provider_id).cmp(&(
+                &right.client,
+                &right.model_id,
+                &right.provider_id,
+            ))
+        });
 
         DailyContribution {
             date,
@@ -813,9 +821,12 @@ fn calculate_intensities(contributions: &mut [DailyContribution]) {
 /// Streaming aggregator that folds messages one-by-one without materialising a
 /// full clone of the message list.  Trae messages are buffered until
 /// [`StreamingAggregator::finalize`] so only the latest-per-session survives.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StreamingAggregator {
     days: HashMap<String, DayAccumulator>,
+    #[serde(skip)]
     seen: HashSet<String>,
+    #[serde(skip)]
     trae_latest: HashMap<String, UnifiedMessage>,
 }
 

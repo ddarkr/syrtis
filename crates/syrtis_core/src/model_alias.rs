@@ -295,6 +295,21 @@ impl GroupingAliasSnapshot {
     pub fn fold(&self, syntactic_name: String) -> String {
         self.resolver.apply(syntactic_name)
     }
+
+    pub(crate) fn content_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut entries: Vec<_> = self.resolver.map.iter().collect();
+        entries.sort_unstable_by_key(|(left, _)| *left);
+        let mut hash = Sha256::new();
+        hash.update(b"syrtis-grouping-aliases-v1");
+        for (key, value) in entries {
+            hash.update((key.len() as u64).to_le_bytes());
+            hash.update(key.as_bytes());
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        hash.finalize().into()
+    }
 }
 
 /// Clone the currently installed grouping-alias resolver for one report fold.

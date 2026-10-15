@@ -4,7 +4,7 @@ use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use std::fmt;
 use std::marker::PhantomData;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 type StoredSourceIdentity = (String, [u8; 32], Vec<u8>);
 
 #[derive(Debug, Clone)]
@@ -55,6 +55,77 @@ impl Default for SourceMessageCache {
 
 fn sql_error(_: rusqlite::Error) -> String {
     "source message cache database operation failed".to_string()
+}
+
+/// Logical generations freeze an immutable prefix of a physical append stream.
+/// No predecessor traversal is needed, and fallback time belongs to the snapshot.
+pub(crate) fn install_logical_views_on(connection: &Connection) -> Result<(), String> {
+    let mapped: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='mc_generation_storage' AND type='table')",
+        [], |row| row.get(0),
+    ).map_err(sql_error)?;
+    let schema: i64 = connection
+        .query_row(
+            "SELECT value FROM mc_meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !matches!(schema, 1 | 2) || (schema == 2 && !mapped) || (schema == 1 && mapped) {
+        return Err("source message cache schema is incomplete or unsupported".into());
+    }
+    let installed: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_temp_master WHERE name='mc_logical_rows'
+             AND EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='mc_logical_storage')",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if installed
+        .as_ref()
+        .is_none_or(|sql| sql.contains("mc_generation_storage") != mapped)
+    {
+        connection.execute_batch("DROP VIEW IF EXISTS temp.mc_logical_rows; DROP VIEW IF EXISTS temp.mc_logical_turn_ids; DROP VIEW IF EXISTS temp.mc_logical_storage;").map_err(sql_error)?;
+        if mapped {
+            connection.execute_batch(
+                "CREATE TEMP VIEW mc_logical_storage AS
+                 SELECT source_id,generation,row_generation,row_count,format_version FROM main.mc_generation_storage;
+                 CREATE TEMP VIEW mc_logical_rows AS
+                 SELECT r.source_id,s.generation,r.ordinal,r.dedup_key,r.retained,r.fallback,
+                        CASE WHEN r.fallback THEN COALESCE(s.fallback_timestamp,r.timestamp) ELSE r.timestamp END AS timestamp,
+                        r.message,r.digest,r.session_id,r.model_id,r.client,r.provider_id,r.workspace,r.workspace_label,
+                        s.row_generation,s.format_version
+                 FROM main.mc_generation_storage s JOIN main.mc_rows r
+                   ON r.source_id=s.source_id AND r.generation=s.row_generation AND r.ordinal<s.row_count;
+                 CREATE TEMP VIEW mc_logical_turn_ids AS
+                 SELECT t.source_id,s.generation,t.turn_id FROM main.mc_generation_storage s
+                 JOIN main.mc_codex_turn_ids t ON t.source_id=s.source_id AND t.generation=s.turn_generation
+                   AND t.born_generation<=s.generation;"
+            ).map_err(sql_error)?;
+        } else {
+            connection.execute_batch(
+                "CREATE TEMP VIEW mc_logical_storage AS
+                 SELECT source_id,generation,generation AS row_generation,9223372036854775807 AS row_count,format_version FROM main.mc_versions;
+                 CREATE TEMP VIEW mc_logical_rows AS SELECT r.*,r.generation AS row_generation,v.format_version
+                 FROM main.mc_rows r JOIN main.mc_versions v ON v.source_id=r.source_id AND v.generation=r.generation;
+                 CREATE TEMP VIEW mc_logical_turn_ids AS SELECT source_id,generation,turn_id FROM main.mc_codex_turn_ids;"
+            ).map_err(sql_error)?;
+        }
+    }
+    if mapped {
+        connection
+            .prepare_cached("SELECT reference_digest FROM mc_generation_storage LIMIT 0")
+            .map_err(sql_error)?;
+    }
+    connection
+        .prepare_cached("SELECT * FROM mc_logical_rows LIMIT 0")
+        .map_err(sql_error)?;
+    connection
+        .prepare_cached("SELECT * FROM mc_logical_turn_ids LIMIT 0")
+        .map_err(sql_error)?;
+    Ok(())
 }
 
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, String> {
@@ -184,9 +255,18 @@ fn initialize(connection: &Connection) -> Result<(), String> {
     if existing != 0 && existing != 8 {
         return Err("source message cache schema is incomplete".to_string());
     }
+    let upgrade = existing == 0
+        || connection
+            .query_row(
+                "SELECT value FROM mc_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error)?
+            == 1;
     let transaction = rusqlite::Transaction::new_unchecked(
         connection,
-        if existing == 0 {
+        if upgrade {
             rusqlite::TransactionBehavior::Immediate
         } else {
             rusqlite::TransactionBehavior::Deferred
@@ -218,7 +298,7 @@ fn initialize(connection: &Connection) -> Result<(), String> {
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    if version != SCHEMA_VERSION {
+    if version != 1 && version != SCHEMA_VERSION {
         return Err("source message cache schema is unsupported".to_string());
     }
     // Warm admission is read-only: two overlapping readers must never upgrade
@@ -263,6 +343,32 @@ fn initialize(connection: &Connection) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS mc_namespaces(namespace TEXT PRIMARY KEY,signature BLOB NOT NULL);",
     ).map_err(sql_error)?;
     }
+    if version == 1 {
+        transaction.execute_batch(
+            "CREATE TABLE mc_generation_storage(
+                source_id INTEGER NOT NULL REFERENCES mc_sources(id) ON DELETE CASCADE,
+                generation INTEGER NOT NULL,row_generation INTEGER NOT NULL,row_count INTEGER NOT NULL CHECK(row_count>=0),
+                fallback_timestamp INTEGER,format_version INTEGER NOT NULL,turn_generation INTEGER NOT NULL,
+                reference_digest BLOB NOT NULL,
+                PRIMARY KEY(source_id,generation)) WITHOUT ROWID;
+             CREATE INDEX mc_storage_rows ON mc_generation_storage(source_id,row_generation,row_count);
+             CREATE INDEX mc_storage_turns ON mc_generation_storage(source_id,turn_generation);
+             ALTER TABLE mc_codex_turn_ids ADD COLUMN born_generation INTEGER NOT NULL DEFAULT 0;
+             INSERT INTO mc_generation_storage
+                SELECT source_id,generation,generation,message_count,NULL,format_version,generation,x'' FROM mc_versions;
+             UPDATE mc_meta SET value=2 WHERE key='schema_version';"
+        ).map_err(sql_error)?;
+        let mut statement = transaction.prepare("SELECT source_id,generation FROM mc_generation_storage ORDER BY source_id,generation").map_err(sql_error)?;
+        let mut rows = statement.query([]).map_err(sql_error)?;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            seal_storage_reference(
+                &transaction,
+                row.get(0).map_err(sql_error)?,
+                row.get(1).map_err(sql_error)?,
+            )?;
+        }
+    }
+    transaction.prepare("SELECT row_generation,row_count,fallback_timestamp,format_version,turn_generation,reference_digest FROM mc_generation_storage LIMIT 0").map_err(sql_error)?;
     // Preparing every required column rejects malformed existing tables before
     // any source can be published. Never repair an incompatible table in place.
     transaction.prepare(
@@ -270,10 +376,11 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                 v.parser_version,v.format_version,v.fingerprint,v.resume,v.message_count,
                 v.retained_count,v.fallback_count,v.retained_digest,r.ordinal,r.dedup_key,r.retained,r.fallback,r.timestamp,
                 v.cacheable,v.codex_turn_count,v.codex_turn_digest,r.message,r.digest,r.session_id,r.model_id,r.client,r.provider_id,r.workspace,r.workspace_label,
-                t.turn_id FROM mc_sources s LEFT JOIN mc_versions v ON v.source_id=s.id
+                t.turn_id,t.born_generation FROM mc_sources s LEFT JOIN mc_versions v ON v.source_id=s.id
                 LEFT JOIN mc_rows r ON r.source_id=s.id LEFT JOIN mc_codex_turn_ids t ON t.source_id=s.id LIMIT 0",
     ).map_err(sql_error)?;
-    transaction.commit().map_err(sql_error)
+    transaction.commit().map_err(sql_error)?;
+    install_logical_views_on(connection)
 }
 
 fn read_metadata(
@@ -328,6 +435,42 @@ fn read_version(
         || codex_turn_digest.len() != 32
     {
         return Err("source message cache metadata is invalid".to_string());
+    }
+    let schema: i64 = connection
+        .query_row(
+            "SELECT value FROM mc_meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if schema == SCHEMA_VERSION {
+        let (row_generation,row_count,fallback_timestamp,recorded_format,turn_generation,digest): (i64,u64,Option<i64>,u32,i64,Vec<u8>) =
+            connection.query_row(
+                "SELECT row_generation,row_count,fallback_timestamp,format_version,turn_generation,reference_digest
+                 FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+                params![id,generation], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            ).map_err(sql_error)?;
+        let expected = encode_fact(&(
+            id,
+            generation,
+            row_generation,
+            row_count,
+            fallback_timestamp,
+            recorded_format,
+            turn_generation,
+        ))?;
+        if row_generation <= 0
+            || row_generation > generation
+            || turn_generation <= 0
+            || turn_generation > generation
+            || row_count != message_count
+            || recorded_format != format_version
+            || digest != Sha256::digest(&expected).as_slice()
+        {
+            return Err("source message cache storage reference is invalid".into());
+        }
+    } else if schema != 1 {
+        return Err("source message cache schema is unsupported".into());
     }
     let current = CacheIdentity::current_for_namespace(&namespace)
         .ok_or_else(|| "source message cache parser owner is unknown".to_string())?;
@@ -637,6 +780,7 @@ impl SourceMessageCache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn visit_codex_turn_ids<S>(
         &self,
         source_id: i64,
@@ -652,6 +796,20 @@ impl SourceMessageCache {
             visit_codex_ids(&transaction, &stored, sink)?;
             transaction.commit().map_err(sql_error)
         })
+    }
+
+    pub(crate) fn open_codex_turn_reader(
+        &self,
+        source_id: i64,
+        generation: i64,
+    ) -> Result<Connection, String> {
+        self.ensure_open()?;
+        let connection = crate::usage_store::open_database(self.root()?)?;
+        install_logical_views_on(&connection)?;
+        connection.execute_batch("BEGIN").map_err(sql_error)?;
+        let stored = read_version(&connection, source_id, generation)?;
+        visit_codex_ids(&connection, &stored, &mut |_| Ok(()))?;
+        Ok(connection)
     }
 
     #[cfg(test)]
@@ -673,18 +831,17 @@ impl SourceMessageCache {
             if until_ms == Some(i64::MIN) {return transaction.commit().map_err(sql_error);}
             let upper = until_ms.map_or(i64::MAX,|until| until-1);
             let mut statement = transaction.prepare(
-                "SELECT retained,fallback,timestamp,message,digest FROM mc_rows
+                "SELECT retained,fallback,timestamp,message,digest,format_version FROM mc_logical_rows
                  WHERE source_id=?1 AND generation=?2 AND timestamp>=?3 AND timestamp<=?4 ORDER BY timestamp,ordinal",
             ).map_err(sql_error)?;
             let mut rows = statement.query(params![source_id,generation,from_ms.unwrap_or(i64::MIN),upper]).map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
                 let retained: bool = row.get(0).map_err(sql_error)?;
                 let fallback: bool = row.get(1).map_err(sql_error)?;
-                let timestamp: i64 = row.get(2).map_err(sql_error)?;
                 let bytes: Vec<u8> = row.get(3).map_err(sql_error)?;
                 verify_digest(&bytes,&row.get::<_,Vec<u8>>(4).map_err(sql_error)?)?;
-                let mut message = decode_stored_message(stored.format_version, &bytes)?;
-                if fallback {message.set_timestamp(timestamp);}
+                let mut message = decode_stored_message(row.get(5).map_err(sql_error)?, &bytes)?;
+                if fallback {message.set_timestamp(row.get(2).map_err(sql_error)?);}
                 sink(&message,retained,fallback)?;
             }
             drop(rows);drop(statement);
@@ -739,19 +896,16 @@ impl SourceMessageCache {
                 fallback_timestamp: (fingerprint.modified_ns / 1_000_000) as i64,
             };
             if let Some(expected) = append_from {
-                let old = old.as_ref().filter(|old| old.parser_version == identity.parser_version && old.metadata.cacheable
+                let old = old.as_ref().filter(|old| identity.namespace == ClientId::Codex.as_str()
+                    && old.format_version == CACHE_FORMAT_VERSION && old.parser_version == identity.parser_version && old.metadata.cacheable
                     && old.id == expected.source_id && old.metadata.generation == expected.generation && old.metadata.fingerprint == expected.fingerprint)
                     .ok_or_else(|| "source message cache append generation changed".to_string())?;
                 transaction.execute(
-                    "INSERT INTO mc_rows SELECT source_id,?1,ordinal,dedup_key,retained,fallback,
-                         CASE WHEN fallback=1 THEN ?4 ELSE timestamp END,message,digest,session_id,model_id,client,provider_id,workspace,workspace_label
-                     FROM mc_rows WHERE source_id=?2 AND generation=?3",
-                    params![generation,id,old.metadata.generation,writer.fallback_timestamp],
-                ).map_err(sql_error)?;
-                migrate_copied_rows(&transaction,id,generation,old.format_version)?;
-                transaction.execute(
-                    "INSERT INTO mc_codex_turn_ids SELECT source_id,?1,turn_id FROM mc_codex_turn_ids WHERE source_id=?2 AND generation=?3",
-                    params![generation,id,old.metadata.generation],
+                    "UPDATE mc_generation_storage SET
+                       row_generation=(SELECT row_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?3),
+                       turn_generation=(SELECT turn_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?3)
+                     WHERE source_id=?1 AND generation=?2",
+                    params![id,generation,old.metadata.generation],
                 ).map_err(sql_error)?;
                 writer.next_ordinal = old.metadata.message_count;
             }
@@ -778,6 +932,9 @@ impl SourceMessageCache {
             let produced_rows = writer.next_ordinal;
             for (index, history) in histories.iter().enumerate() {
                 let Some(history) = *history else {continue;};
+                if append_from.is_some_and(|base| base.source_id == history.id && base.generation == history.metadata.generation) {
+                    continue;
+                }
                 if histories[..index].iter().flatten().any(|prior|
                     prior.id == history.id && prior.metadata.generation == history.metadata.generation) {
                     continue;
@@ -1052,7 +1209,7 @@ fn allocate_generation(
     identity: CacheIdentity,
     path: &Path,
     _parser_version: u32,
-    _fingerprint: &SourceFingerprint,
+    fingerprint: &SourceFingerprint,
     old: Option<&StoredMetadata>,
 ) -> Result<(i64, i64), String> {
     let generation: i64 = connection.query_row(
@@ -1060,6 +1217,7 @@ fn allocate_generation(
         [],|row| row.get(0),
     ).map_err(sql_error)?;
     if let Some(old) = old {
+        create_generation_storage(connection, old.id, generation, fingerprint)?;
         return Ok((old.id, generation));
     }
     let inactive: Option<i64> = connection
@@ -1075,6 +1233,7 @@ fn allocate_generation(
         .optional()
         .map_err(sql_error)?;
     if let Some(id) = inactive {
+        create_generation_storage(connection, id, generation, fingerprint)?;
         return Ok((id, generation));
     }
     connection
@@ -1087,7 +1246,51 @@ fn allocate_generation(
             ],
         )
         .map_err(sql_error)?;
-    Ok((connection.last_insert_rowid(), generation))
+    let id = connection.last_insert_rowid();
+    create_generation_storage(connection, id, generation, fingerprint)?;
+    Ok((id, generation))
+}
+
+fn create_generation_storage(
+    connection: &Connection,
+    id: i64,
+    generation: i64,
+    fingerprint: &SourceFingerprint,
+) -> Result<(), String> {
+    // Only this write transaction can see the unpublished mapping. Expose its
+    // stream for reconciliation, then freeze the exact count at publication;
+    // do not rewrite the indexed mapping for every produced message.
+    connection
+        .execute(
+            "INSERT INTO mc_generation_storage VALUES(?1,?2,?2,9223372036854775807,?3,?4,?2,x'')",
+            params![
+                id,
+                generation,
+                (fingerprint.modified_ns / 1_000_000) as i64,
+                CACHE_FORMAT_VERSION
+            ],
+        )
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+fn seal_storage_reference(connection: &Connection, id: i64, generation: i64) -> Result<(), String> {
+    let (row_generation,row_count,fallback_timestamp,format_version,turn_generation): (i64,u64,Option<i64>,u32,i64) = connection.query_row(
+        "SELECT row_generation,row_count,fallback_timestamp,format_version,turn_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+        params![id,generation], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).map_err(sql_error)?;
+    let bytes = encode_fact(&(
+        id,
+        generation,
+        row_generation,
+        row_count,
+        fallback_timestamp,
+        format_version,
+        turn_generation,
+    ))?;
+    connection.execute("UPDATE mc_generation_storage SET reference_digest=?3 WHERE source_id=?1 AND generation=?2",
+        params![id,generation,Sha256::digest(&bytes).as_slice()]).map_err(sql_error)?;
+    Ok(())
 }
 
 pub(crate) struct SourceRowWriter<'a> {
@@ -1107,6 +1310,10 @@ impl SourceRowWriter<'_> {
     }
 
     pub(crate) fn clear_codex_turn_ids(&mut self) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE mc_generation_storage SET turn_generation=?2 WHERE source_id=?1 AND generation=?2",
+            params![self.source_id,self.generation],
+        ).map_err(sql_error)?;
         self.connection
             .execute(
                 "DELETE FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2",
@@ -1118,7 +1325,8 @@ impl SourceRowWriter<'_> {
 
     pub(crate) fn insert_codex_turn_id(&mut self, turn_id: &str) -> Result<(), String> {
         self.connection
-            .prepare_cached("INSERT OR IGNORE INTO mc_codex_turn_ids VALUES(?1,?2,?3)")
+            .prepare_cached("INSERT OR IGNORE INTO mc_codex_turn_ids(source_id,generation,turn_id,born_generation)
+                SELECT source_id,turn_generation,?3,?2 FROM mc_generation_storage WHERE source_id=?1 AND generation=?2")
             .map_err(sql_error)?
             .execute(params![self.source_id, self.generation, turn_id])
             .map_err(sql_error)?;
@@ -1132,12 +1340,16 @@ impl SourceRowWriter<'_> {
     ) -> Result<(), String> {
         let ordinal = i64::try_from(self.next_ordinal)
             .map_err(|_| "source message cache row count overflow".to_string())?;
+        if ordinal == i64::MAX {
+            return Err("source message cache row count overflow".into());
+        }
         let bytes = encode_fact(message)?;
         let digest = Sha256::digest(&bytes);
         self.connection.prepare_cached(
             "INSERT INTO mc_rows(source_id,generation,ordinal,dedup_key,retained,fallback,timestamp,message,digest,
                  session_id,model_id,client,provider_id,workspace,workspace_label)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             SELECT ?1,row_generation,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15
+             FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
         ).map_err(sql_error)?.execute(params![self.source_id,self.generation,ordinal,message.dedup_key,retained,fallback,
             if fallback {self.fallback_timestamp} else {message.timestamp},bytes,digest.as_slice(),
             message.session_id,message.model_id,message.client,message.provider_id,encode_fact(&message.workspace_key)?,encode_fact(&message.workspace_label)?],
@@ -1201,7 +1413,7 @@ fn merge_history(
         && writer
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM mc_rows
+                "SELECT COUNT(*) FROM mc_logical_rows
              WHERE source_id=?1 AND generation=?2 AND retained=0",
                 params![old.id, old.metadata.generation],
                 |row| row.get::<_, u64>(0),
@@ -1211,14 +1423,14 @@ fn merge_history(
     let connection = writer.connection;
     let mut current_lookup = connection
         .prepare_cached(
-            "SELECT ordinal,retained,message,digest FROM mc_rows
+            "SELECT ordinal,retained,message,digest FROM mc_logical_rows
          WHERE source_id=?1 AND generation=?2 AND dedup_key=?3 ORDER BY ordinal DESC LIMIT 1",
         )
         .map_err(sql_error)?;
     let mut statement = writer
         .connection
         .prepare(
-            "SELECT dedup_key,retained,message,digest FROM mc_rows
+            "SELECT dedup_key,retained,message,digest FROM mc_logical_rows
          WHERE source_id=?1 AND generation=?2 AND dedup_key IS NOT NULL ORDER BY ordinal",
         )
         .map_err(sql_error)?;
@@ -1291,7 +1503,7 @@ fn merge_history(
     // the same retained facts. Fresh keyless rows win by position; surplus
     // old rows carry verbatim; equal-valued repeats never collapse.
     let mut keyless = writer.connection.prepare(
-        "SELECT message,digest,retained FROM mc_rows WHERE source_id=?1 AND generation=?2 AND dedup_key IS NULL ORDER BY ordinal",
+        "SELECT message,digest,retained FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 AND dedup_key IS NULL ORDER BY ordinal",
     ).map_err(sql_error)?;
     let mut keyless_rows = keyless
         .query(params![old.id, old.metadata.generation])
@@ -1314,7 +1526,7 @@ fn merge_history(
                 .connection
                 .execute(
                     "INSERT INTO mc_keyless_matches
-                 SELECT message,COUNT(*) FROM mc_rows
+                 SELECT message,COUNT(*) FROM mc_logical_rows
                  WHERE source_id=?1 AND generation=?2 AND dedup_key IS NULL GROUP BY message",
                     params![writer.source_id, writer.generation],
                 )
@@ -1354,7 +1566,7 @@ fn retained_digest(connection: &Connection, id: i64, generation: i64) -> Result<
     let mut hasher = Sha256::new();
     hasher.update(b"tokscale-retained-source-v2");
     let mut statement = connection.prepare(
-        "SELECT dedup_key,digest FROM mc_rows WHERE source_id=?1 AND generation=?2 AND retained=1
+        "SELECT dedup_key,digest FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 AND retained=1
          ORDER BY dedup_key,digest,ordinal",
     ).map_err(sql_error)?;
     let mut rows = statement
@@ -1387,11 +1599,18 @@ fn publish_generation(
     old: Option<&StoredMetadata>,
 ) -> Result<CachedSourceMetadata, String> {
     let (message_count,retained_count,fallback_count): (u64,u64,u64) = connection.query_row(
-        "SELECT count(*),coalesce(sum(retained),0),coalesce(sum(fallback),0) FROM mc_rows WHERE source_id=?1 AND generation=?2",
+        "SELECT count(*),coalesce(sum(retained),0),coalesce(sum(fallback),0) FROM mc_logical_rows WHERE source_id=?1 AND generation=?2",
         params![id,generation],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     ).map_err(sql_error)?;
+    connection
+        .execute(
+            "UPDATE mc_generation_storage SET row_count=?3 WHERE source_id=?1 AND generation=?2",
+            params![id, generation, message_count],
+        )
+        .map_err(sql_error)?;
     let digest = retained_digest(connection, id, generation)?;
     let (codex_turn_count, codex_turn_digest) = codex_ids_digest(connection, id, generation)?;
+    seal_storage_reference(connection, id, generation)?;
     if advance_current && old.map_or(retained_count > 0, |old| old.retained_digest != digest) {
         connection
             .execute(
@@ -1461,13 +1680,14 @@ fn visit_stored_rows<S>(
 where
     S: FnMut(&UnifiedMessage, bool, bool) -> Result<(), String> + ?Sized,
 {
-    let mut statement = connection.prepare("SELECT ordinal,retained,fallback,message,digest,timestamp FROM mc_rows WHERE source_id=?1 AND generation=?2 ORDER BY ordinal").map_err(sql_error)?;
-    let mut rows = statement
-        .query(params![stored.id, stored.metadata.generation])
-        .map_err(sql_error)?;
+    install_logical_views_on(connection)?;
     let mut count = 0;
     let mut retained_count = 0;
     let mut fallback_count = 0;
+    let mut statement = connection.prepare("SELECT ordinal,retained,fallback,message,digest,timestamp,format_version FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 ORDER BY ordinal").map_err(sql_error)?;
+    let mut rows = statement
+        .query(params![stored.id, stored.metadata.generation])
+        .map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
         let ordinal: u64 = row.get(0).map_err(sql_error)?;
         let retained: bool = row.get(1).map_err(sql_error)?;
@@ -1478,7 +1698,7 @@ where
             return Err("source message cache source rows are incomplete".to_string());
         }
         verify_digest(&bytes, &digest)?;
-        let mut message = decode_stored_message(stored.format_version, &bytes)?;
+        let mut message = decode_stored_message(row.get(6).map_err(sql_error)?, &bytes)?;
         if fallback {
             message.set_timestamp(row.get(5).map_err(sql_error)?);
         }
@@ -1487,6 +1707,8 @@ where
         retained_count += u64::from(retained);
         fallback_count += u64::from(fallback);
     }
+    drop(rows);
+    drop(statement);
     if count != stored.metadata.message_count
         || retained_count != stored.metadata.retained_count
         || fallback_count != stored.metadata.fallback_count
@@ -2331,13 +2553,13 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
             self.connection.execute(
                     "INSERT INTO mc_rows SELECT source_id,?1,ordinal,dedup_key,retained,fallback,timestamp,message,digest,
                          session_id,model_id,client,provider_id,workspace,workspace_label
-                     FROM mc_rows WHERE source_id=?2 AND generation=?3",
+                     FROM mc_logical_rows WHERE source_id=?2 AND generation=?3",
                     params![current_generation,id,old.metadata.generation],
                 ).map_err(serde::de::Error::custom)?;
             self.connection
                 .execute(
-                    "INSERT OR IGNORE INTO mc_codex_turn_ids SELECT source_id,?1,turn_id
-                     FROM mc_codex_turn_ids WHERE source_id=?2 AND generation IN (?3,?4)",
+                    "INSERT OR IGNORE INTO mc_codex_turn_ids(source_id,generation,turn_id)
+                     SELECT source_id,?1,turn_id FROM mc_logical_turn_ids WHERE source_id=?2 AND generation IN (?3,?4)",
                     params![current_generation, id, old.metadata.generation, generation],
                 )
                 .map_err(serde::de::Error::custom)?;
@@ -2392,6 +2614,12 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
             self.connection
                 .execute(
                     "DELETE FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2",
+                    params![id, generation],
+                )
+                .map_err(serde::de::Error::custom)?;
+            self.connection
+                .execute(
+                    "DELETE FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
                     params![id, generation],
                 )
                 .map_err(serde::de::Error::custom)?;
@@ -2459,7 +2687,7 @@ pub(crate) fn recover_source_message_cache(cache_root: &Path) -> Result<(), Stri
 fn validate_stored_counts(connection: &Connection, stored: &StoredMetadata) -> Result<(), String> {
     let (count,retained,fallback,first,last): (u64,u64,u64,Option<u64>,Option<u64>) = connection.query_row(
         "SELECT count(*),coalesce(sum(retained),0),coalesce(sum(fallback),0),min(ordinal),max(ordinal)
-         FROM mc_rows WHERE source_id=?1 AND generation=?2",
+         FROM mc_logical_rows WHERE source_id=?1 AND generation=?2",
         params![stored.id,stored.metadata.generation],
         |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
     ).map_err(sql_error)?;
@@ -2481,19 +2709,25 @@ fn visit_codex_ids<S>(
 where
     S: FnMut(&str) -> Result<(), String> + ?Sized,
 {
-    let mut hasher = Sha256::new();
-    hasher.update(b"tokscale-codex-turn-membership-v1");
-    let mut count = 0;
-    let mut statement = connection.prepare("SELECT turn_id FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2 ORDER BY turn_id").map_err(sql_error)?;
+    let mut statement = connection.prepare(
+        "SELECT turn_id FROM mc_logical_turn_ids WHERE source_id=?1 AND generation=?2 ORDER BY turn_id",
+    ).map_err(sql_error)?;
     let mut rows = statement
         .query(params![stored.id, stored.metadata.generation])
         .map_err(sql_error)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"tokscale-codex-turn-membership-v1");
+    let mut count = 0;
     while let Some(row) = rows.next().map_err(sql_error)? {
-        let id: String = row.get(0).map_err(sql_error)?;
+        let id = row
+            .get_ref(0)
+            .map_err(sql_error)?
+            .as_str()
+            .map_err(|_| "source message cache Codex turn ID is invalid".to_string())?;
         hasher.update((id.len() as u64).to_le_bytes());
         hasher.update(id.as_bytes());
         count += 1;
-        sink(&id)?;
+        sink(id)?;
     }
     if count != stored.codex_turn_count || hasher.finalize().as_slice() != stored.codex_turn_digest
     {
@@ -2598,7 +2832,7 @@ impl<'de> Visitor<'de> for LegacyCodexState<'_> {
             .next_element_seed(StreamSequence::<String, _>::new(|turn_id| {
                 self.0
                     .connection
-                    .prepare_cached("INSERT OR IGNORE INTO mc_codex_turn_ids VALUES(?1,?2,?3)")
+                    .prepare_cached("INSERT OR IGNORE INTO mc_codex_turn_ids(source_id,generation,turn_id) VALUES(?1,?2,?3)")
                     .map_err(sql_error)?
                     .execute(params![self.0.source_id, self.0.generation, turn_id])
                     .map_err(sql_error)?;
@@ -2671,9 +2905,11 @@ pub(crate) fn collect_unreferenced_versions_on(connection: &Connection) -> Resul
     connection.execute(candidates, []).map_err(sql_error)?;
     // Empty source shells with no surviving version are removed below.
     connection.execute_batch(
-        "DELETE FROM mc_rows WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_rows.source_id AND g.generation=mc_rows.generation);
-         DELETE FROM mc_codex_turn_ids WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_codex_turn_ids.source_id AND g.generation=mc_codex_turn_ids.generation);
+        "DELETE FROM mc_generation_storage WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_generation_storage.source_id AND g.generation=mc_generation_storage.generation);
          DELETE FROM mc_versions WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_versions.source_id AND g.generation=mc_versions.generation);
+         DELETE FROM mc_generation_storage WHERE NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_generation_storage.source_id AND v.generation=mc_generation_storage.generation);
+         DELETE FROM mc_rows WHERE NOT EXISTS(SELECT 1 FROM mc_generation_storage s WHERE s.source_id=mc_rows.source_id AND s.row_generation=mc_rows.generation AND s.row_count>mc_rows.ordinal);
+         DELETE FROM mc_codex_turn_ids WHERE NOT EXISTS(SELECT 1 FROM mc_generation_storage s WHERE s.source_id=mc_codex_turn_ids.source_id AND s.turn_generation=mc_codex_turn_ids.generation AND s.generation>=mc_codex_turn_ids.born_generation);
          DELETE FROM mc_sources WHERE active=0 AND NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_sources.id);
          DELETE FROM mc_gc;",
     ).map_err(sql_error)
@@ -2691,7 +2927,7 @@ fn codex_ids_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"tokscale-codex-turn-membership-v1");
     let mut count = 0;
-    let mut statement = connection.prepare("SELECT turn_id FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2 ORDER BY turn_id").map_err(sql_error)?;
+    let mut statement = connection.prepare("SELECT turn_id FROM mc_logical_turn_ids WHERE source_id=?1 AND generation=?2 ORDER BY turn_id").map_err(sql_error)?;
     let mut rows = statement
         .query(params![source_id, generation])
         .map_err(sql_error)?;
@@ -2761,21 +2997,17 @@ pub(crate) fn reconcile_missing_sources_on(
 /// turn membership. No warm-parser admission gate may hide old readable
 /// facts: every recorded version validates by its own recorded format.
 pub(crate) fn validate_durable_store_on(connection: &Connection) -> Result<(), String> {
+    install_logical_views_on(connection)?;
     let mut statement = connection
         .prepare("SELECT source_id,generation FROM mc_versions ORDER BY source_id,generation")
         .map_err(sql_error)?;
     let mut rows = statement.query([]).map_err(sql_error)?;
-    let mut versions = Vec::new();
     while let Some(row) = rows.next().map_err(sql_error)? {
-        versions.push((
-            row.get::<_, i64>(0).map_err(sql_error)?,
-            row.get::<_, i64>(1).map_err(sql_error)?,
-        ));
-    }
-    drop(rows);
-    drop(statement);
-    for (source_id, generation) in versions {
-        let stored = read_version(connection, source_id, generation)?;
+        let stored = read_version(
+            connection,
+            row.get(0).map_err(sql_error)?,
+            row.get(1).map_err(sql_error)?,
+        )?;
         validate_stored_generation(connection, &stored)?;
     }
     Ok(())
@@ -2787,6 +3019,7 @@ fn validate_stored_generation(
 ) -> Result<(), String> {
     // Metadata alone is not completeness proof: missing rows must never be
     // normalized into a smaller, newly valid generation or recovery snapshot.
+    install_logical_views_on(connection)?;
     visit_stored_rows(connection, stored, &mut |_: &UnifiedMessage, _, _| Ok(()))?;
     if retained_digest(connection, stored.id, stored.metadata.generation)? != stored.retained_digest
     {

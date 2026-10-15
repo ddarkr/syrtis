@@ -1,4 +1,4 @@
-//! Scheduler source lane and pure, exact-scope aggregate queries.
+//! Scheduler source lane and exact-scope report queries.
 //! Leases retain metadata, pinned disk handles and shared pricing, never rows.
 
 use parking_lot::Mutex;
@@ -696,6 +696,11 @@ pub(crate) fn query(json: &str) -> Result<crate::EncodedLocalPayload, String> {
         ..Default::default()
     };
     let pricing = lease.pricing.as_deref();
+    // Ordinary reports use the engine's bounded, disk-backed sequential
+    // checkpoints. Their identity is the exact producer + query semantics +
+    // immutable pricing content, not this lease token or source generation.
+    // Selected-prefix admission precedes decoding/pricing/folding; no raw
+    // history or report checkpoints are retained in the native lease registry.
     let payload = match (scope.spec.kind, request.kind.as_str()) {
         (ScopeKind::Report, "graph") => {
             crate::usage_graph::run_from_snapshot(&scope.source.snapshot, options, pricing)

@@ -1050,19 +1050,40 @@ fn open_codex_scratch(schema: &str) -> Result<rusqlite::Connection, String> {
     Ok(database)
 }
 
-/// Exact task-start membership for same-millisecond/non-v7 fork admission.
-/// The bounded lane seeds and publishes this set through cache row visitors;
-/// it must never put the historical set back into scalar resume metadata.
+/// Exact task-start membership with a pinned historical lookup and disk-backed
+/// delta. Clearing detaches history; publication writes only the delta.
 #[derive(Default)]
 pub(crate) struct CodexForkTurnIds {
     database: Option<rusqlite::Connection>,
     native: Option<std::collections::HashSet<String>>,
+    history: Option<(rusqlite::Connection, i64, i64)>,
+    reset: bool,
 }
 
 impl CodexForkTurnIds {
+    pub(crate) fn set_history(
+        &mut self,
+        database: rusqlite::Connection,
+        source_id: i64,
+        generation: i64,
+    ) {
+        self.history = Some((database, source_id, generation));
+    }
+
+    pub(crate) fn was_reset(&self) -> bool {
+        self.reset
+    }
+
+    pub(crate) fn release_history(&mut self) {
+        self.history = None;
+    }
+
     pub(crate) fn insert(&mut self, id: &str) -> Result<(), String> {
         if let Some(native) = &mut self.native {
             native.insert(id.to_owned());
+            return Ok(());
+        }
+        if self.contains(id)? {
             return Ok(());
         }
         if self.database.is_none() {
@@ -1085,19 +1106,30 @@ impl CodexForkTurnIds {
         if let Some(native) = &self.native {
             return Ok(native.contains(id));
         }
-        let Some(database) = &self.database else {
-            return Ok(false);
-        };
-        database
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM temp.fork_turn_ids WHERE id=?1)",
-                [id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("reading Codex fork membership: {error}"))
+        if let Some(database) = &self.database {
+            let found: bool = database
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM temp.fork_turn_ids WHERE id=?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("reading Codex fork membership: {error}"))?;
+            if found {
+                return Ok(true);
+            }
+        }
+        if let Some((database, source_id, generation)) = &self.history {
+            return database.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_logical_turn_ids WHERE source_id=?1 AND generation=?2 AND turn_id=?3)",
+                rusqlite::params![source_id,generation,id], |row| row.get(0),
+            ).map_err(|error| format!("reading historical Codex fork membership: {error}"));
+        }
+        Ok(false)
     }
 
     pub(crate) fn clear(&mut self) -> Result<(), String> {
+        self.reset = true;
+        self.history = None;
         if let Some(native) = &mut self.native {
             native.clear();
         } else if let Some(database) = &self.database {
@@ -1276,6 +1308,7 @@ fn parse_codex_reader<R: BufRead>(
             &mut state.forked_child_task_started_turn_ids,
         )),
         database: None,
+        ..Default::default()
     };
     let mut outcome = visit_codex_reader(
         reader,
@@ -1321,6 +1354,7 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut fork_turn_ids = CodexForkTurnIds {
         native: Some(std::collections::HashSet::new()),
         database: None,
+        ..Default::default()
     };
     // Materialized callers deliberately retain rows preceding a read failure.
     let _ = visit_codex_reader(

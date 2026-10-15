@@ -116,6 +116,19 @@ fn seed_legacy_store(dir: &Path, input_a: i64, input_b: i64) -> (Vec<u8>, Vec<u8
         )
         .unwrap();
     fs::remove_file(source).unwrap();
+    drop(cache);
+    // This fixture is the pre-append-reuse schema, not a current store with
+    // manually inconsistent generation-storage metadata.
+    let connection = Connection::open(dir.join(DATABASE)).unwrap();
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+         DROP TABLE mc_generation_storage;
+         ALTER TABLE mc_codex_turn_ids DROP COLUMN born_generation;
+         UPDATE mc_meta SET value=1 WHERE key='schema_version';
+         COMMIT;",
+        )
+        .unwrap();
     (fact_bytes(&live), fact_bytes(&retained))
 }
 

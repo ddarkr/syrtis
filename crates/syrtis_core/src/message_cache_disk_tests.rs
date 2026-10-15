@@ -1368,6 +1368,11 @@ fn seed_format4_rows(
             "UPDATE mc_versions SET format_version=4,parser_version=4 WHERE source_id=?1 AND generation=?2",
             params![metadata.source_id,metadata.generation],
         ).map_err(sql_error)?;
+        db.execute(
+            "UPDATE mc_generation_storage SET format_version=4 WHERE source_id=?1 AND generation=?2",
+            params![metadata.source_id,metadata.generation],
+        ).map_err(sql_error)?;
+        seal_storage_reference(db,metadata.source_id,metadata.generation)?;
         Ok(())
     }).unwrap();
 }
@@ -2138,4 +2143,766 @@ fn source_free_shard_migration_serves_reports_after_legacy_cache_removal() {
         assert_eq!(second.total_input, expected);
         assert_eq!(second.total_messages, first.total_messages);
     }
+}
+
+#[test]
+fn codex_append_stream_reuses_payload_and_turn_rows_across_repeated_appends() {
+    let sources = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let path = source(sources.path(), "codex.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let fingerprint = SourceFingerprint::from_path(&path).unwrap();
+    let resume =
+        build_codex_incremental_cache(&path, fingerprint.size, CodexParseState::default()).unwrap();
+    let initial = cache
+        .write_source(
+            identity,
+            &path,
+            fingerprint,
+            None,
+            None,
+            Some(resume),
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                for ordinal in 0..256 {
+                    let mut event = message(&format!("event-{ordinal}"), ordinal);
+                    event.client = "codex".into();
+                    if ordinal % 2 == 0 {
+                        event.dedup_key = None;
+                    }
+                    writer.push(&event, false, ordinal == 0)?;
+                    writer.insert_codex_turn_id(&format!("turn-{ordinal}"))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    let initial_rows = encode_fact(&rows(&cache, &initial)).unwrap();
+    cache.with_database(None,|db| {
+        db.execute_batch(&format!(
+            "CREATE TEMP TRIGGER forbid_prefix_update BEFORE UPDATE ON mc_rows
+             WHEN OLD.source_id={} AND OLD.generation={} BEGIN SELECT RAISE(ABORT,'immutable prefix rewritten'); END;
+             CREATE TEMP TRIGGER forbid_append_payload_copy BEFORE INSERT ON mc_rows
+             WHEN NEW.source_id={} AND NEW.generation!={} BEGIN SELECT RAISE(ABORT,'payload stream copied'); END;
+             CREATE TEMP TRIGGER forbid_append_membership_copy BEFORE INSERT ON mc_codex_turn_ids
+             WHEN NEW.source_id={} AND NEW.generation!={} BEGIN SELECT RAISE(ABORT,'turn stream copied'); END;",
+            initial.source_id,initial.generation,initial.source_id,initial.generation,initial.source_id,initial.generation,
+        )).map_err(sql_error)
+    }).unwrap();
+    let mut latest = initial.clone();
+    for step in 1..=9 {
+        fs::write(&path, format!("source\n{}", "append\n".repeat(step))).unwrap();
+        let fingerprint = SourceFingerprint::from_path(&path).unwrap();
+        let resume =
+            build_codex_incremental_cache(&path, fingerprint.size, CodexParseState::default())
+                .unwrap();
+        latest = cache
+            .write_source(
+                identity,
+                &path,
+                fingerprint,
+                None,
+                Some(&latest),
+                Some(resume),
+                &mut |_| {},
+                &mut |_, _| Ok(()),
+                |writer| {
+                    writer.push(&message(&format!("new-{step}"), step as i64), false, true)?;
+                    writer.insert_codex_turn_id(&format!("new-turn-{step}"))?;
+                    writer.insert_codex_turn_id("turn-0")
+                },
+            )
+            .unwrap();
+        assert_eq!(latest.message_count, 256 + step as u64);
+        assert_eq!(encode_fact(&rows(&cache, &initial)).unwrap(), initial_rows);
+        let (physical_rows,physical_ids,streams): (u64,u64,u64) = cache.with_database(None,|db| {
+            db.query_row("SELECT (SELECT COUNT(*) FROM mc_rows),(SELECT COUNT(*) FROM mc_codex_turn_ids),
+                (SELECT COUNT(DISTINCT row_generation) FROM mc_generation_storage)",
+                [],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(sql_error)
+        }).unwrap();
+        assert_eq!(
+            (physical_rows, physical_ids, streams),
+            (256 + step as u64, 256 + step as u64, 1)
+        );
+    }
+    let timestamp = (latest.fingerprint.modified_ns / 1_000_000) as i64;
+    let mut fallback_rows = 0;
+    cache
+        .visit_version_range(
+            latest.source_id,
+            latest.generation,
+            Some(timestamp),
+            timestamp.checked_add(1),
+            &mut |event, _, fallback| {
+                assert!(fallback);
+                assert_eq!(event.timestamp, timestamp);
+                fallback_rows += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(fallback_rows, 10);
+    let mut old_ids = 0;
+    cache
+        .visit_codex_turn_ids(initial.source_id, initial.generation, &mut |_| {
+            old_ids += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(old_ids, 256, "birth bounds preserve old membership");
+    let mut membership = crate::sessions::codex::CodexForkTurnIds::default();
+    membership.set_history(
+        cache
+            .open_codex_turn_reader(latest.source_id, latest.generation)
+            .unwrap(),
+        latest.source_id,
+        latest.generation,
+    );
+    assert!(membership.contains("turn-0").unwrap());
+    membership.insert("turn-0").unwrap();
+    membership.insert("delta-only").unwrap();
+    let mut delta = Vec::new();
+    membership
+        .visit(&mut |id| {
+            delta.push(id.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(delta, vec!["delta-only"]);
+    membership.clear().unwrap();
+    assert!(membership.was_reset());
+    assert!(!membership.contains("turn-0").unwrap());
+    assert!(!membership.contains("delta-only").unwrap());
+}
+
+#[test]
+fn codex_append_corrections_and_truncation_keep_inherited_keyless_multiplicity_and_gc() {
+    let sources = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let path = source(sources.path(), "codex.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let codex_message = |key: &str, input| {
+        let mut event = message(key, input);
+        event.client = "codex".into();
+        event.model_id = "gpt-5".into();
+        event.provider_id = "openai".into();
+        event
+    };
+    // Match stage_codex's no-op retained-context refresh. The generic helper
+    // deliberately applies Claude annotation refresh and is not a Codex oracle:
+    // changing provider/workspace bytes makes keyless facts distinct values.
+    let full_parse = |messages: &[UnifiedMessage]| {
+        cache
+            .write_source(
+                identity,
+                &path,
+                SourceFingerprint::from_path(&path).unwrap(),
+                None,
+                None,
+                None,
+                &mut |_| {},
+                &mut |_, _| Ok(()),
+                |writer| {
+                    for event in messages {
+                        writer.push(event, false, false)?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap()
+    };
+    let mut keyless = codex_message("unused", 7);
+    keyless.dedup_key = None;
+    let keyless_fact = encode_fact(&keyless).unwrap();
+    let initial = full_parse(&[codex_message("first", 1), keyless.clone(), keyless.clone()]);
+    cache.with_database(None,|db| {
+        db.execute_batch("CREATE TABLE sq_scope_sources(scope_generation INTEGER,cache_source_id INTEGER,cache_generation INTEGER);").map_err(sql_error)?;
+        db.execute("INSERT INTO sq_scope_sources VALUES(1,?1,?2)",params![initial.source_id,initial.generation]).map_err(sql_error)?;
+        Ok(())
+    }).unwrap();
+    let mut latest = initial.clone();
+    for step in 1..=5 {
+        fs::write(&path, format!("source\n{}", "append\n".repeat(step))).unwrap();
+        latest = cache
+            .write_source(
+                identity,
+                &path,
+                SourceFingerprint::from_path(&path).unwrap(),
+                None,
+                Some(&latest),
+                None,
+                &mut |_| {},
+                &mut |_, _| Ok(()),
+                |writer| {
+                    if step == 1 {
+                        writer.push(&codex_message("last", 2), false, false)?;
+                        writer.push(&keyless, false, false)?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+    let corrected = full_parse(&[codex_message("first", 99), keyless.clone()]);
+    let corrected_rows = rows(&cache, &corrected);
+    assert_eq!(
+        corrected_rows
+            .iter()
+            .map(|row| row.0.tokens.input)
+            .collect::<Vec<_>>(),
+        vec![99, 7, 2, 7, 7]
+    );
+    assert_eq!(corrected.retained_count, 3);
+    fs::write(&path, b"truncated\n").unwrap();
+    let truncated = full_parse(&[]);
+    assert_eq!(
+        rows(&cache, &truncated)
+            .iter()
+            .map(|row| row.0.tokens.input)
+            .collect::<Vec<_>>(),
+        vec![99, 2, 7, 7, 7]
+    );
+    assert_eq!(truncated.retained_count, 5);
+    cache.collect_unreferenced_versions().unwrap();
+    assert_eq!(rows(&cache, &initial).len(), 3);
+    assert_eq!(rows(&cache, &truncated).len(), 5);
+    cache
+        .with_database(None, |db| {
+            db.execute("DELETE FROM sq_scope_sources", [])
+                .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    cache.collect_unreferenced_versions().unwrap();
+    assert!(cache
+        .visit_version(initial.source_id, initial.generation, &mut |_, _, _| Ok(()))
+        .is_err());
+    let physical: u64 = cache
+        .with_database(None, |db| {
+            db.query_row("SELECT COUNT(*) FROM mc_rows", [], |row| row.get(0))
+                .map_err(sql_error)
+        })
+        .unwrap();
+    assert_eq!(
+        physical, 5,
+        "no unreferenced append stream survives collection"
+    );
+    let full_observation = vec![
+        codex_message("first", 99),
+        keyless.clone(),
+        keyless.clone(),
+        keyless,
+        codex_message("last", 2),
+    ];
+    let restored = full_parse(&full_observation);
+    assert_eq!(restored.message_count, 5);
+    assert_eq!(restored.retained_count, 0);
+    let restored_rows = rows(&cache, &restored);
+    let restored_events: Vec<_> = restored_rows.iter().map(|row| row.0.clone()).collect();
+    assert_eq!(
+        encode_fact(&restored_events).unwrap(),
+        encode_fact(&full_observation).unwrap(),
+        "restoration preserves every complete source fact byte-for-byte and in source order"
+    );
+    assert_eq!(
+        restored_events
+            .iter()
+            .map(|event| event.tokens.input)
+            .sum::<i64>(),
+        122
+    );
+    let restored_keyless: Vec<_> = restored_events
+        .iter()
+        .filter(|event| event.dedup_key.is_none())
+        .collect();
+    assert_eq!(restored_keyless.len(), 3);
+    assert!(restored_keyless.iter().all(|event| encode_fact(*event).unwrap()==keyless_fact),
+        "source-local identical keyless occurrences neither collapse nor acquire duplicate retained copies");
+    cache
+        .with_database(None, validate_durable_store_on)
+        .unwrap();
+}
+
+#[test]
+fn codex_append_suffix_and_reference_failures_roll_back_without_mutating_installed_prefix() {
+    let sources = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let path = source(sources.path(), "codex.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let initial = publish(&cache, identity, &path, &[message("first", 1)]);
+    fs::write(&path, b"source\nappend\n").unwrap();
+    for fail_publish in [false, true] {
+        let result = cache.write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            None,
+            Some(&initial),
+            None,
+            &mut |_| {},
+            &mut |_, _| {
+                if fail_publish {
+                    Err("injected scope publication failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |writer| {
+                writer.push(&message("suffix", 2), false, false)?;
+                writer.insert_codex_turn_id("suffix-turn")?;
+                if fail_publish {
+                    Ok(())
+                } else {
+                    Err("injected source producer failure".into())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(rows(&cache, &initial).len(), 1);
+        let counts: (u64,u64,u64,i64) = cache.with_database(None,|db| {
+            db.query_row("SELECT (SELECT COUNT(*) FROM mc_rows),(SELECT COUNT(*) FROM mc_codex_turn_ids),
+                (SELECT COUNT(*) FROM mc_generation_storage),(SELECT generation FROM mc_sources)",
+                [],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(sql_error)
+        }).unwrap();
+        assert_eq!(counts, (1, 0, 1, initial.generation));
+    }
+    for column in [
+        "row_generation",
+        "turn_generation",
+        "fallback_timestamp",
+        "row_count",
+        "format_version",
+    ] {
+        cache.with_database(None,|db| {
+            let transaction = db.unchecked_transaction().map_err(sql_error)?;
+            transaction.execute(&format!("UPDATE mc_generation_storage SET {column}=999 WHERE source_id=?1 AND generation=?2"),
+                params![initial.source_id,initial.generation]).map_err(sql_error)?;
+            assert!(validate_durable_store_on(&transaction).is_err(),"corrupt {column} must fail closed");
+            transaction.rollback().map_err(sql_error)
+        }).unwrap();
+    }
+    cache
+        .with_database(None, |db| {
+            let transaction = db.unchecked_transaction().map_err(sql_error)?;
+            transaction
+                .execute("DELETE FROM mc_generation_storage", [])
+                .map_err(sql_error)?;
+            assert!(validate_durable_store_on(&transaction).is_err());
+            transaction.rollback().map_err(sql_error)
+        })
+        .unwrap();
+    cache
+        .with_database(None, validate_durable_store_on)
+        .unwrap();
+}
+
+#[test]
+fn pre_reuse_source_free_store_validates_readonly_and_upgrades_only_the_migration_target() {
+    let root = TempDir::new().unwrap();
+    let legacy = root.path().join("legacy");
+    let path = source(root.path(), "gone.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let cache = SourceMessageCache::open_from_root(Some(&legacy));
+    let mut keyless = message("unused", 7);
+    keyless.dedup_key = None;
+    let metadata = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                writer.push(&message("stable:req", 13), false, true)?;
+                writer.push(&keyless, true, false)
+            },
+        )
+        .unwrap();
+    let expected = encode_fact(&rows(&cache, &metadata)).unwrap();
+    drop(cache);
+    fs::remove_file(&path).unwrap();
+    let database_path = legacy.join("source-message-cache.sqlite3");
+    let connection = Connection::open(&database_path).unwrap();
+    connection.execute_batch(
+        "BEGIN IMMEDIATE; DROP TABLE mc_generation_storage;
+         ALTER TABLE mc_codex_turn_ids DROP COLUMN born_generation;
+         UPDATE mc_meta SET value=1 WHERE key='schema_version'; COMMIT; PRAGMA wal_checkpoint(TRUNCATE);",
+    ).unwrap();
+    drop(connection);
+    let original = fs::read(&database_path).unwrap();
+    let readonly =
+        Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    validate_durable_store_on(&readonly).unwrap();
+    assert_eq!(fs::read(&database_path).unwrap(), original);
+    assert_eq!(
+        readonly
+            .query_row(
+                "SELECT value FROM mc_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(readonly);
+    let target = root.path().join("durable");
+    crate::usage_migration::prepare(&target, std::slice::from_ref(&legacy)).unwrap();
+    assert_eq!(fs::read(&database_path).unwrap(), original);
+    let migrated = SourceMessageCache::open_from_root(Some(&target));
+    let found = migrated
+        .retention_metadata(identity, &path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(encode_fact(&rows(&migrated, &found)).unwrap(), expected);
+    migrated
+        .with_database(None, |db| {
+            assert_eq!(
+                db.query_row(
+                    "SELECT value FROM mc_meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .map_err(sql_error)?,
+                2
+            );
+            validate_durable_store_on(db)
+        })
+        .unwrap();
+    fs::remove_dir_all(&legacy).unwrap();
+    crate::usage_migration::prepare(&target, std::slice::from_ref(&legacy)).unwrap();
+    assert_eq!(encode_fact(&rows(&migrated, &found)).unwrap(), expected);
+}
+
+#[test]
+#[serial_test::serial]
+fn codex_logical_prefixes_serve_reports_recent_ranges_old_snapshots_and_corruption_atomically() {
+    use crate::store_query::{QueryState, SelectionMode, UsageQuery};
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "codex.jsonl");
+    let durable = root.path().join("durable");
+    let cache = SourceMessageCache::open_from_root(Some(&durable));
+    cache.ensure_open().unwrap();
+    crate::usage_store::synchronize_opencode_sources(&[], &[], &durable, &mut |_, _, _, _, _| {
+        Ok(())
+    })
+    .unwrap();
+    let context = crate::ResolvedLocalSourceContext::capture(
+        Some(root.path().to_path_buf()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let clients = vec!["codex".to_owned()];
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    let timestamp = 1_785_542_400_000;
+    let event = |input, key: Option<&str>, offset| {
+        let mut event = UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "session",
+            timestamp + offset,
+            TokenBreakdown {
+                input,
+                ..Default::default()
+            },
+            0.0,
+        );
+        event.dedup_key = key.map(str::to_owned);
+        event
+    };
+    let original = QueryState::open(&durable).unwrap();
+    let mut old_report = original
+        .begin_scope(&durable, &context, &clients, None, SelectionMode::Report)
+        .unwrap();
+    let initial = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |db, metadata| {
+                original.register_cache_on(db, &path, metadata, "codex", 0, 0, false, false)
+            },
+            |writer| {
+                writer.push(&event(10, Some("old"), 0), false, false)?;
+                writer.push(&event(20, None, 1), false, false)
+            },
+        )
+        .unwrap();
+    original.publish(&mut old_report).unwrap();
+    let collect = |snapshot: &crate::LocalUsageSnapshot, range: UsageQuery| {
+        let mut events = Vec::new();
+        crate::visit_local_usage_snapshot(snapshot, range, &|_| true, &mut |message| {
+            events.push(message.clone())
+        })
+        .unwrap();
+        events
+    };
+    let old_events = encode_fact(&collect(&old_report, UsageQuery::compact())).unwrap();
+    let mut latest = initial;
+    let mut expected_input = 30;
+    let mut latest_recent = None;
+    for step in 1..=6 {
+        fs::write(&path, format!("source\n{}", "append\n".repeat(step))).unwrap();
+        let staged = QueryState::open(&durable).unwrap();
+        let mut recent = staged
+            .begin_scope(
+                &durable,
+                &context,
+                &clients,
+                None,
+                SelectionMode::LocalClients,
+            )
+            .unwrap();
+        latest = cache
+            .write_source(
+                identity,
+                &path,
+                SourceFingerprint::from_path(&path).unwrap(),
+                None,
+                Some(&latest),
+                None,
+                &mut |_| {},
+                &mut |db, metadata| {
+                    staged.register_cache_on(db, &path, metadata, "codex", 0, 0, false, false)
+                },
+                |writer| {
+                    writer.push(
+                        &event(
+                            30 + step as i64,
+                            Some(&format!("new-{step}")),
+                            step as i64 * 1000,
+                        ),
+                        false,
+                        false,
+                    )
+                },
+            )
+            .unwrap();
+        staged.publish(&mut recent).unwrap();
+        expected_input += 30 + step as i64;
+        assert_eq!(
+            encode_fact(&collect(&old_report, UsageQuery::compact())).unwrap(),
+            old_events
+        );
+        let all = collect(&recent, UsageQuery::compact());
+        assert_eq!(all.len(), 2 + step);
+        assert_eq!(
+            all.iter().map(|event| event.tokens.input).sum::<i64>(),
+            expected_input
+        );
+        let suffix = collect(
+            &recent,
+            UsageQuery {
+                from_ms: Some(timestamp + step as i64 * 1000),
+                until_ms: Some(timestamp + step as i64 * 1000 + 1),
+                ..UsageQuery::compact()
+            },
+        );
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].tokens.input, 30 + step as i64);
+        let prefix = collect(
+            &recent,
+            UsageQuery {
+                from_ms: Some(timestamp),
+                until_ms: Some(timestamp + 2),
+                ..UsageQuery::compact()
+            },
+        );
+        assert_eq!(encode_fact(&prefix).unwrap(), old_events);
+        latest_recent = Some(recent);
+    }
+    let staged = QueryState::open(&durable).unwrap();
+    let mut report = staged
+        .begin_scope(&durable, &context, &clients, None, SelectionMode::Report)
+        .unwrap();
+    staged
+        .register_cache(&path, &latest, "codex", 0, 0, false, false)
+        .unwrap();
+    staged.publish(&mut report).unwrap();
+    fs::remove_file(&path).unwrap();
+    let options = crate::ReportOptions {
+        clients: Some(clients),
+        ..Default::default()
+    };
+    let model = crate::get_model_report_from_snapshot(&report, options.clone(), None).unwrap();
+    let agents = crate::get_agents_report_from_snapshot(&report, options.clone(), None).unwrap();
+    let hourly = crate::get_hourly_report_from_snapshot(&report, options.clone(), None).unwrap();
+    let graph = crate::generate_local_graph_from_snapshot(
+        &report,
+        options.clone(),
+        None,
+        crate::GraphPricingMode::LocalOnly,
+    )
+    .unwrap();
+    assert_eq!(model.total_input, expected_input);
+    assert_eq!(model.total_messages, 8);
+    assert_eq!(agents.total_messages, 8);
+    assert_eq!(hourly.total_cost, model.total_cost);
+    assert_eq!(graph.graph().summary.total_tokens, expected_input);
+    let recent = latest_recent.unwrap();
+    assert_eq!(collect(&recent, UsageQuery::compact()).len(), 8);
+    cache
+        .with_database(None, |db| {
+            db.execute(
+                "UPDATE mc_rows SET message=x'ff' WHERE source_id=?1 AND ordinal=0",
+                [latest.source_id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    for snapshot in [&report, &recent] {
+        let mut callbacks = 0;
+        assert!(crate::visit_local_usage_snapshot(
+            snapshot,
+            UsageQuery::compact(),
+            &|_| true,
+            &mut |_| callbacks += 1
+        )
+        .is_err());
+        assert_eq!(
+            callbacks, 0,
+            "corrupt reused payload cannot publish partial output"
+        );
+    }
+    assert!(crate::get_model_report_from_snapshot(&report, options.clone(), None).is_err());
+    assert!(crate::get_agents_report_from_snapshot(&report, options.clone(), None).is_err());
+    assert!(crate::get_hourly_report_from_snapshot(&report, options.clone(), None).is_err());
+    assert!(crate::generate_local_graph_from_snapshot(
+        &report,
+        options,
+        None,
+        crate::GraphPricingMode::LocalOnly
+    )
+    .is_err());
+    cache
+        .with_database(None, |db| {
+            db.execute(
+                "DELETE FROM mc_rows WHERE source_id=?1 AND ordinal=0",
+                [latest.source_id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    let mut bounded_callbacks = 0;
+    assert!(crate::visit_local_usage_snapshot(
+        &recent,
+        UsageQuery {from_ms:Some(timestamp+6000),until_ms:Some(timestamp+6001),..UsageQuery::compact()},
+        &|_| true,
+        &mut |_| bounded_callbacks += 1,
+    ).is_err(),"a missing frozen-prefix fact must fail even when it is outside the requested recent window");
+    assert_eq!(bounded_callbacks, 0);
+}
+
+#[test]
+#[serial_test::serial]
+fn codex_staging_looks_up_historical_turns_and_publishes_only_membership_deltas() {
+    use crate::store_query::{QueryState, SelectionMode};
+    let root = TempDir::new().unwrap();
+    let durable = root.path().join("durable");
+    let path = root.path().join("codex.jsonl");
+    let mut transcript = concat!(
+        "{\"timestamp\":\"2026-05-05T21:52:10.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e5c03-1e99-7000-8000-0000000000ff\",\"forked_from_id\":\"019e5b00-0000-7000-8000-000000000001\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"019e5b00-0000-7000-8000-000000000001\",\"depth\":1}}},\"model_provider\":\"openai\",\"cwd\":\"/repo\"}}\n",
+        "{\"timestamp\":\"2026-05-05T21:52:10.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e5b00-0000-7000-8000-000000000001\",\"source\":\"vscode\",\"model_provider\":\"openai\",\"cwd\":\"/repo\"}}\n",
+    ).to_owned();
+    let mut cache = SourceMessageCache::open_from_root(Some(&durable));
+    cache.ensure_open().unwrap();
+    crate::usage_store::synchronize_opencode_sources(&[], &[], &durable, &mut |_, _, _, _, _| {
+        Ok(())
+    })
+    .unwrap();
+    let context = crate::ResolvedLocalSourceContext::capture(
+        Some(root.path().to_path_buf()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    for step in 1..=7 {
+        transcript.push_str(&format!(
+            "{{\"timestamp\":\"2026-05-05T21:52:20.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"019e5c03-1e99-7000-8000-{step:012}\"}}}}\n"
+        ));
+        fs::write(&path, &transcript).unwrap();
+        let staged = QueryState::open(&durable).unwrap();
+        let mut scope = staged
+            .begin_scope(
+                &durable,
+                &context,
+                &["codex".into()],
+                None,
+                SelectionMode::Report,
+            )
+            .unwrap();
+        crate::store_query::stage_codex(&staged, &mut cache, &path, 0, false).unwrap();
+        staged.publish(&mut scope).unwrap();
+        let metadata = cache.metadata(identity, &path).unwrap().unwrap();
+        let mut ids = 0;
+        cache
+            .visit_codex_turn_ids(metadata.source_id, metadata.generation, &mut |_| {
+                ids += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ids, step);
+        assert_eq!(metadata.message_count, 0);
+        let (physical_ids, streams): (u64, u64) = cache
+            .with_database(None, |db| {
+                db.query_row(
+                    "SELECT COUNT(*),COUNT(DISTINCT generation) FROM mc_codex_turn_ids",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(sql_error)
+            })
+            .unwrap();
+        assert_eq!(
+            (physical_ids, streams),
+            (step as u64, 1),
+            "parser staging must not rewrite historical membership"
+        );
+    }
+    // The chosen turn was admitted in an older append, not the current delta.
+    // Lookup-backed membership must open the child's gate and propagate reset.
+    transcript.push_str(concat!(
+        "{\"timestamp\":\"2026-05-05T21:52:20.100Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"019e5c03-1e99-7000-8000-000000000001\",\"model\":\"gpt-5.5\",\"cwd\":\"/repo\"}}\n",
+        "{\"timestamp\":\"2026-05-05T21:52:20.200Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":2,\"total_tokens\":22},\"last_token_usage\":{\"input_tokens\":20,\"output_tokens\":2,\"total_tokens\":22}}}}\n",
+    ));
+    fs::write(&path, &transcript).unwrap();
+    let staged = QueryState::open(&durable).unwrap();
+    let mut scope = staged
+        .begin_scope(
+            &durable,
+            &context,
+            &["codex".into()],
+            None,
+            SelectionMode::Report,
+        )
+        .unwrap();
+    crate::store_query::stage_codex(&staged, &mut cache, &path, 0, false).unwrap();
+    staged.publish(&mut scope).unwrap();
+    let metadata = cache.metadata(identity, &path).unwrap().unwrap();
+    assert_eq!(metadata.message_count, 1);
+    assert_eq!(rows(&cache, &metadata)[0].0.tokens.input, 20);
+    let mut ids = 0;
+    cache
+        .visit_codex_turn_ids(metadata.source_id, metadata.generation, &mut |_| {
+            ids += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(ids, 0, "parser reset chooses a new empty membership stream");
 }

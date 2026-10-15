@@ -1961,6 +1961,190 @@ where
     Ok(())
 }
 
+const REPORT_STATE_BYTE_LIMIT: usize = 1024 * 1024;
+
+/// One serialization pass with a hard byte ceiling. Small aggregates do not
+/// reserve the full ceiling, and oversized states never allocate beyond it.
+#[derive(Default)]
+struct ReportStateBuffer {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl std::io::Write for ReportStateBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > REPORT_STATE_BYTE_LIMIT - self.bytes.len() {
+            self.oversized = true;
+            return Err(std::io::Error::other("report checkpoint byte limit"));
+        }
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(128)
+                .clamp(needed, REPORT_STATE_BYTE_LIMIT);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_report_state<T: Serialize>(state: &T) -> Result<Option<Vec<u8>>, String> {
+    let mut output = ReportStateBuffer::default();
+    match bincode::serialize_into(&mut output, state) {
+        Ok(()) => Ok(Some(output.bytes)),
+        Err(_) if output.oversized => Ok(None),
+        Err(_) => Err("usage report checkpoint encoding failed".into()),
+    }
+}
+
+/// Compact sequential fold states, never partial floating-point sums or facts.
+/// Membership is checked before decoding a historical prefix. Checkpoints are
+/// disposable, but their admission and storage errors still fail the query.
+pub(crate) struct ReportCheckpoint {
+    key: [u8; 32],
+    restored: std::cell::RefCell<Option<Vec<u8>>>,
+    pub(crate) resume_rows: i64,
+}
+
+impl ReportCheckpoint {
+    pub(crate) fn disabled(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            restored: std::cell::RefCell::new(None),
+            resume_rows: 0,
+        }
+    }
+
+    pub(crate) fn open(connection: &Connection, key: [u8; 32]) -> Result<Self, String> {
+        sql(connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS report_checkpoints(
+                id INTEGER PRIMARY KEY,
+                query_key BLOB NOT NULL,
+                row_count INTEGER NOT NULL,
+                membership BLOB NOT NULL,
+                state BLOB NOT NULL,
+                state_digest BLOB NOT NULL,
+                UNIQUE(query_key,row_count,membership));
+             CREATE TEMP TABLE report_checkpoint_staged(
+                row_count INTEGER PRIMARY KEY,membership BLOB NOT NULL,
+                state BLOB NOT NULL,state_digest BLOB NOT NULL);",
+        ))?;
+        let state: Option<(i64, Vec<u8>, Vec<u8>)> = sql(connection
+            .query_row(
+                "SELECT c.row_count,c.state,c.state_digest FROM report_checkpoints c
+             JOIN sq_fold_membership m ON m.position=c.row_count AND m.membership=c.membership
+             WHERE c.query_key=?1 AND length(c.state)<=1048576
+             ORDER BY c.row_count DESC LIMIT 1",
+                [key.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional())?;
+        if let Some((position, state, digest)) = state {
+            use sha2::{Digest, Sha256};
+            if Sha256::digest(&state)[..] != digest[..] {
+                return Err("usage report checkpoint checksum mismatch".into());
+            }
+            Ok(Self {
+                key,
+                restored: std::cell::RefCell::new(Some(state)),
+                resume_rows: position,
+            })
+        } else {
+            Ok(Self::disabled(key))
+        }
+    }
+
+    pub(crate) fn has_restored(&self) -> bool {
+        self.restored.borrow().is_some()
+    }
+
+    pub(crate) fn restore<T: DeserializeOwned>(&self) -> Result<Option<T>, String> {
+        let bytes = self.restored.borrow_mut().take();
+        bytes
+            .map(|bytes| {
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .with_limit(1024 * 1024)
+                    .reject_trailing_bytes()
+                    .deserialize(&bytes)
+                    .map_err(|_| "usage report checkpoint decoding failed".to_string())
+            })
+            .transpose()
+    }
+
+    pub(crate) fn save<T: Serialize>(
+        &self,
+        connection: &Connection,
+        position: i64,
+        state: &T,
+    ) -> Result<(), String> {
+        // Do not walk the aggregate once to size it, then twice more through
+        // bincode::serialize. The capped writer declines optional retention
+        // without truncating the report or eagerly allocating 1 MiB.
+        let Some(state) = encode_report_state(state)? else {
+            return Ok(());
+        };
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&state);
+        sql(connection.execute(
+            "INSERT OR REPLACE INTO report_checkpoint_staged(row_count,membership,state,state_digest)
+             SELECT position,membership,?2,?3 FROM sq_fold_membership WHERE position=?1",
+            params![position, state, digest.as_slice()],
+        ))?;
+        sql(connection.execute_batch(
+            "DELETE FROM report_checkpoint_staged WHERE row_count NOT IN
+                 (SELECT row_count FROM report_checkpoint_staged ORDER BY row_count DESC LIMIT 128);
+             DELETE FROM report_checkpoint_staged WHERE row_count IN (
+                 SELECT row_count FROM (
+                     SELECT row_count,SUM(length(state)+length(membership)+length(state_digest)+48)
+                         OVER (ORDER BY row_count DESC) AS retained_bytes
+                     FROM report_checkpoint_staged
+                 ) WHERE retained_bytes>16777216);",
+        ))?;
+        Ok(())
+    }
+
+    /// Publish optional states only after the entire trusted fold succeeds.
+    /// Temporary snapshots spill to disk, have the same caps as final entries,
+    /// and disappear on an error without touching canonical source facts.
+    pub(crate) fn finish(&self, connection: &Connection) -> Result<(), String> {
+        let pending: bool = sql(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM report_checkpoint_staged)",
+            [],
+            |row| row.get(0),
+        ))?;
+        if !pending {
+            return Ok(());
+        }
+        let transaction = sql(connection.unchecked_transaction())?;
+        sql(transaction.execute(
+            "INSERT OR REPLACE INTO report_checkpoints(query_key,row_count,membership,state,state_digest)
+             SELECT ?1,row_count,membership,state,state_digest FROM report_checkpoint_staged
+             ORDER BY row_count",
+            [self.key.as_slice()],
+        ))?;
+        sql(transaction.execute_batch(
+            "DELETE FROM report_checkpoints WHERE id NOT IN
+                 (SELECT id FROM report_checkpoints ORDER BY id DESC LIMIT 128);
+             DELETE FROM report_checkpoints WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id,SUM(length(state)+length(query_key)+length(membership)+length(state_digest)+32)
+                         OVER (ORDER BY id DESC) AS retained_bytes
+                     FROM report_checkpoints
+                 ) WHERE retained_bytes>16777216);",
+        ))?;
+        sql(transaction.commit())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3849,5 +4033,198 @@ mod tests {
             )
             .unwrap();
         assert_eq!(empty_again, prior_total);
+    }
+
+    #[test]
+    fn report_checkpoint_publication_caps_bytes_count_and_rolls_back_errors() {
+        let root = TempDir::new().unwrap();
+        let connection = Connection::open(root.path().join("checkpoint.sqlite3")).unwrap();
+        configure_connection(&connection).unwrap();
+        connection.execute_batch(
+            "CREATE TEMP TABLE sq_fold_membership(position INTEGER PRIMARY KEY,membership BLOB);
+             CREATE TABLE canonical_fact(value INTEGER);
+             INSERT INTO canonical_fact VALUES(42);",
+        ).unwrap();
+        for position in 0..160_i64 {
+            connection
+                .execute(
+                    "INSERT INTO sq_fold_membership VALUES(?1,?2)",
+                    params![position, vec![position as u8; 32]],
+                )
+                .unwrap();
+        }
+        let checkpoint = ReportCheckpoint::open(&connection, [7; 32]).unwrap();
+        let large_state = vec![3_u8; 900 * 1024];
+        for position in 0..24 {
+            checkpoint
+                .save(&connection, position, &large_state)
+                .unwrap();
+        }
+        let staged_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(length(state)+length(membership)+length(state_digest)+48),0)
+             FROM report_checkpoint_staged",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(staged_bytes <= 16 * 1024 * 1024);
+        assert!(
+            staged_bytes >= 15 * 1024 * 1024,
+            "fixture must actually reach the byte cap"
+        );
+        checkpoint.finish(&connection).unwrap();
+        let retained = || {
+            connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(state)+length(query_key)+length(membership)+length(state_digest)+32),0)
+             FROM report_checkpoints",
+            [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap()
+        };
+        assert!(retained().1 <= 16 * 1024 * 1024);
+        connection
+            .execute("DELETE FROM report_checkpoint_staged", [])
+            .unwrap();
+        for position in 0..145_i64 {
+            checkpoint.save(&connection, position, &position).unwrap();
+        }
+        let staged_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM report_checkpoint_staged", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(staged_count, 128, "fixture must reach the entry cap");
+        checkpoint.finish(&connection).unwrap();
+        assert_eq!(retained().0, 128);
+        connection
+            .execute("DELETE FROM report_checkpoint_staged", [])
+            .unwrap();
+        checkpoint
+            .save(&connection, 145, &vec![0_u8; 1024 * 1024])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM report_checkpoint_staged", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .unwrap(),
+            0,
+            "oversized state must be declined before serialized allocation"
+        );
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_checkpoint BEFORE INSERT ON report_checkpoints
+             WHEN NEW.row_count=150 BEGIN SELECT RAISE(ABORT,'fixture failure'); END;",
+            )
+            .unwrap();
+        for position in 145..152_i64 {
+            checkpoint.save(&connection, position, &position).unwrap();
+        }
+        let before = retained();
+        assert!(checkpoint.finish(&connection).is_err());
+        assert_eq!(
+            retained(),
+            before,
+            "failed publication must roll back the complete cache transaction"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM canonical_fact", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn report_checkpoint_serializes_once_with_exact_bounded_bytes() {
+        use std::io::Write;
+        struct Counted<'a> {
+            calls: &'a std::cell::Cell<usize>,
+            value: &'a (u64, f64, Vec<String>),
+        }
+        impl Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.calls.set(self.calls.get() + 1);
+                self.value.serialize(serializer)
+            }
+        }
+        let calls = std::cell::Cell::new(0);
+        let value = (
+            u64::MAX,
+            -0.0,
+            vec!["model".to_string(), "other-model".to_string()],
+        );
+        let state = Counted {
+            calls: &calls,
+            value: &value,
+        };
+        let bytes = encode_report_state(&state).unwrap().unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "checkpoint encoding must not prewalk the aggregate"
+        );
+        assert_eq!(
+            bytes,
+            bincode::serialize(&value).unwrap(),
+            "existing fixed-int/f64 codec is unchanged"
+        );
+        let mut buffer = ReportStateBuffer::default();
+        buffer.write_all(&[7; 8]).unwrap();
+        assert!(buffer.bytes.capacity() < REPORT_STATE_BYTE_LIMIT);
+        assert!(buffer.write_all(&vec![0; REPORT_STATE_BYTE_LIMIT]).is_err());
+        assert!(buffer.oversized);
+        assert_eq!(buffer.bytes, [7; 8]);
+        assert!(buffer.bytes.capacity() <= REPORT_STATE_BYTE_LIMIT);
+        assert!(encode_report_state(&vec![0_u8; REPORT_STATE_BYTE_LIMIT])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn report_checkpoint_reads_only_longest_admissible_state() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("checkpoint.sqlite3");
+        let reader = || {
+            let connection = Connection::open(&path).unwrap();
+            configure_connection(&connection).unwrap();
+            connection.execute_batch(
+                "CREATE TEMP TABLE sq_fold_membership(position INTEGER PRIMARY KEY,membership BLOB);
+                 INSERT INTO sq_fold_membership VALUES(0,x'00'),(1,x'01');",
+            ).unwrap();
+            connection
+        };
+        let writer = reader();
+        let saved = ReportCheckpoint::open(&writer, [42; 32]).unwrap();
+        saved.save(&writer, 0, &11_u64).unwrap();
+        saved.save(&writer, 1, &22_u64).unwrap();
+        saved.finish(&writer).unwrap();
+        writer
+            .execute(
+                "UPDATE report_checkpoints SET state=x'ff' WHERE row_count=0",
+                [],
+            )
+            .unwrap();
+        let current = reader();
+        let restored = ReportCheckpoint::open(&current, [42; 32]).unwrap();
+        assert_eq!(restored.resume_rows, 1);
+        assert!(restored.has_restored());
+        assert_eq!(restored.restore::<u64>().unwrap(), Some(22));
+        assert!(
+            !restored.has_restored(),
+            "the encoded blob must not remain beside the decoded state"
+        );
+        assert_eq!(restored.restore::<u64>().unwrap(), None);
+        writer
+            .execute(
+                "UPDATE report_checkpoints SET state=x'ff' WHERE row_count=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            ReportCheckpoint::open(&reader(), [42; 32]).is_err(),
+            "the longest state actually used for reuse still requires its checksum"
+        );
     }
 }

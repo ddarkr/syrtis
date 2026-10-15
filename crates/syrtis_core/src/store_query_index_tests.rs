@@ -1377,3 +1377,899 @@ fn metadata_report_index_matches_full_replay_and_rejects_loser_loss() {
     assert!(result.is_err());
     assert_eq!(seen, 0);
 }
+
+fn historical_payload(
+    snapshot: &UsageSnapshot,
+    options: &crate::ReportOptions,
+    pricing: Option<&crate::pricing::PricingService>,
+    kind: &str,
+    incremental: bool,
+) -> serde_json::Value {
+    if incremental {
+        historical_payload_inner(snapshot, options, pricing, kind, true)
+    } else {
+        // The complete oracle starts with a fresh chrono::Local thread cache.
+        // A just-changed TZ must not make the independent oracle stale too.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| historical_payload_inner(snapshot, options, pricing, kind, false))
+                .join()
+                .unwrap()
+        })
+    }
+}
+
+fn historical_payload_inner(
+    snapshot: &UsageSnapshot,
+    options: &crate::ReportOptions,
+    pricing: Option<&crate::pricing::PricingService>,
+    kind: &str,
+    incremental: bool,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let mut value = match kind {
+        "models" => {
+            let report = if incremental {
+                crate::get_model_report_from_snapshot(snapshot, options.clone(), pricing).unwrap()
+            } else {
+                crate::model_report_with_visitor(options, start, |filter, sink| {
+                    crate::drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
+                })
+                .unwrap()
+            };
+            serde_json::to_value(report).unwrap()
+        }
+        "agents" => {
+            let report = if incremental {
+                crate::get_agents_report_from_snapshot(snapshot, options.clone(), pricing).unwrap()
+            } else {
+                crate::agents_report_with_visitor(options, start, |filter, sink| {
+                    crate::drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
+                })
+                .unwrap()
+            };
+            serde_json::to_value(report).unwrap()
+        }
+        "hourly" => {
+            let report = if incremental {
+                crate::get_hourly_report_from_snapshot(snapshot, options.clone(), pricing).unwrap()
+            } else {
+                crate::hourly_report_with_visitor(options, start, |filter, sink| {
+                    crate::drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
+                })
+                .unwrap()
+            };
+            serde_json::to_value(report).unwrap()
+        }
+        "graph-best-effort" => {
+            let report = if incremental {
+                crate::lean_local_graph_from_snapshot(
+                    snapshot,
+                    options.clone(),
+                    pricing,
+                    crate::GraphPricingMode::BestEffort,
+                )
+                .unwrap()
+            } else {
+                crate::lean_graph_report_with_visitor(
+                    options,
+                    start,
+                    crate::GraphPricingMode::BestEffort,
+                    |filter, sink| {
+                        crate::drive_trusted_report_fold(snapshot, pricing, &|m| filter(m), sink)
+                    },
+                )
+                .unwrap()
+            };
+            serde_json::to_value(report.into_graph()).unwrap()
+        }
+        _ => panic!("unknown report fixture"),
+    };
+    value.as_object_mut().unwrap().remove("processing_time_ms");
+    if let Some(meta) = value
+        .get_mut("meta")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.remove("processing_time_ms");
+        meta.remove("generated_at");
+    }
+    value
+}
+
+fn publish_historical_fixture(
+    root: &std::path::Path,
+    context: &ResolvedLocalSourceContext,
+    count: usize,
+    correction: Option<usize>,
+) -> UsageSnapshot {
+    let publisher = query(root);
+    let mut snapshot = publisher
+        .begin_scope(root, context, &["amp".into()], None, SelectionMode::Report)
+        .unwrap();
+    let source = context.home_dir().join("historical.jsonl");
+    std::fs::write(&source, format!("{count}-{correction:?}")).unwrap();
+    let cache = SourceMessageCache::open_from_root(Some(root));
+    cache
+        .write_source(
+            CacheIdentity::for_client(ClientId::Amp),
+            &source,
+            SourceFingerprint::from_path_samples_only(&source).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |db, metadata| {
+                publisher.register_cache_on(db, &source, metadata, "amp", 0, 0, false, false)
+            },
+            |writer| {
+                for index in 0..count {
+                    let timestamp = if index == 7 {
+                        0
+                    } else {
+                        1_735_689_600_000 + index as i64 * 3_600_000
+                            - if correction == Some(index) {
+                                86_400_000
+                            } else {
+                                0
+                            }
+                    };
+                    let mut row = message(
+                        "amp",
+                        "history",
+                        timestamp,
+                        Some(&format!("row-{index}")),
+                        if correction == Some(index) {
+                            1_000
+                        } else {
+                            (index % 5 + 1) as i64
+                        },
+                    );
+                    row.model_id = if index % 2 == 0 {
+                        "model"
+                    } else {
+                        "other-model"
+                    }
+                    .into();
+                    row.agent = Some(if index % 3 == 0 { "Builder" } else { "Main" }.into());
+                    row.is_turn_start = index % 7 == 0;
+                    row.duration_ms = Some((index % 17 + 1) as i64);
+                    // Reassociation would lose the small terms after the large
+                    // cost. Every checkpoint must preserve the sequential bits.
+                    if index % 11 != 0 {
+                        row.cost = if index == 1 { 1e16 } else { 1.0 };
+                        row.cost_source = crate::sessions::CostSource::ProviderReported;
+                    }
+                    writer.push(&row, false, false)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    publisher.publish(&mut snapshot).unwrap();
+    snapshot
+}
+
+#[test]
+fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads() {
+    if std::env::var_os("SYRTIS_REPORT_CHECKPOINT_CHILD").is_none() {
+        let home = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store_query::tests::historical_report_checkpoints_reuse_changed_generations_with_exact_payloads", "--nocapture"])
+            .env_clear()
+            .env("SYRTIS_REPORT_CHECKPOINT_CHILD", "1")
+            .env("HOME", home.path())
+            .env("SYRTIS_CONFIG_DIR", home.path().join("config"))
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .env("TZ", "UTC")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let options = crate::ReportOptions {
+        clients: Some(vec!["amp".into()]),
+        ..Default::default()
+    };
+    let price = |rate| {
+        crate::pricing::PricingService::new(
+            std::collections::HashMap::from([(
+                "model".into(),
+                crate::pricing::ModelPricing {
+                    input_cost_per_token: Some(rate),
+                    ..Default::default()
+                },
+            )]),
+            std::collections::HashMap::new(),
+        )
+    };
+    let pricing = price(0.013);
+    let kinds = ["graph-best-effort", "models", "hourly", "agents"];
+    let first = publish_historical_fixture(root.path(), &context, 2305, None);
+    for kind in kinds {
+        assert_eq!(
+            historical_payload(&first, &options, Some(&pricing), kind, true),
+            historical_payload(&first, &options, Some(&pricing), kind, false),
+        );
+    }
+    let second = publish_historical_fixture(root.path(), &context, 2330, None);
+    assert_ne!(first.generation, second.generation);
+    assert!(query(root.path()).pin(&first).is_err());
+    for kind in kinds {
+        // All connections from the producing fold were dropped. Reopening the
+        // disk state is sufficient; no process registry holds these folds.
+        let cached =
+            crate::HistoricalReportFold::new(&second, &options, Some(&pricing), kind).unwrap();
+        assert_eq!(cached.checkpoint.resume_rows, 2305, "{kind}");
+        drop(cached);
+        REPORT_DECODED_ROWS.with(|count| count.set(0));
+        let incremental = historical_payload(&second, &options, Some(&pricing), kind, true);
+        assert_eq!(
+            REPORT_DECODED_ROWS.with(|count| count.get()),
+            25,
+            "{kind} decoded history"
+        );
+        if kind == "models" || kind == "agents" {
+            let key = if kind == "models" {
+                ("model", "other-model")
+            } else {
+                ("agent", "Main")
+            };
+            let cost = incremental["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry[key.0] == key.1)
+                .unwrap()["cost"]
+                .as_f64()
+                .unwrap();
+            assert_eq!(
+                cost.to_bits(),
+                1e16_f64.to_bits(),
+                "sequential f64 bits: {kind}"
+            );
+            assert_ne!(
+                cost.to_bits(),
+                (1e16_f64 + 12.0).to_bits(),
+                "a merged suffix sum would change the exact result"
+            );
+        }
+        assert_eq!(
+            incremental,
+            historical_payload(&second, &options, Some(&pricing), kind, false)
+        );
+        REPORT_DECODED_ROWS.with(|count| count.set(0));
+        assert_eq!(
+            incremental,
+            historical_payload(&second, &options, Some(&pricing), kind, true)
+        );
+        assert_eq!(
+            REPORT_DECODED_ROWS.with(|count| count.get()),
+            0,
+            "{kind} warm decode"
+        );
+    }
+    let corrected = publish_historical_fixture(root.path(), &context, 2330, Some(1200));
+    for kind in kinds {
+        let cached =
+            crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind).unwrap();
+        assert_eq!(
+            cached.checkpoint.resume_rows, 1024,
+            "old-date correction: {kind}"
+        );
+        drop(cached);
+        assert_eq!(
+            historical_payload(&corrected, &options, Some(&pricing), kind, true),
+            historical_payload(&corrected, &options, Some(&pricing), kind, false),
+        );
+        for year in ["2025", "1900"] {
+            let options = crate::ReportOptions {
+                year: Some(year.into()),
+                ..options.clone()
+            };
+            let cached =
+                crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind)
+                    .unwrap();
+            assert!(!cached.checkpoint.has_restored(), "year identity: {kind}");
+            drop(cached);
+            assert_eq!(
+                historical_payload(&corrected, &options, Some(&pricing), kind, true),
+                historical_payload(&corrected, &options, Some(&pricing), kind, false),
+            );
+        }
+        let changed_price = price(0.031);
+        let cached =
+            crate::HistoricalReportFold::new(&corrected, &options, Some(&changed_price), kind)
+                .unwrap();
+        assert!(!cached.checkpoint.has_restored(), "price identity: {kind}");
+        drop(cached);
+        assert_eq!(
+            historical_payload(&corrected, &options, Some(&changed_price), kind, true),
+            historical_payload(&corrected, &options, Some(&changed_price), kind, false),
+        );
+    }
+    crate::model_alias::set_model_aliases(&crate::model_alias::ModelAliasMap {
+        entries: std::collections::BTreeMap::from([("other-model".into(), "model".into())]),
+    });
+    for kind in ["models", "hourly"] {
+        assert!(
+            !crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind)
+                .unwrap()
+                .checkpoint
+                .has_restored()
+        );
+        assert_eq!(
+            historical_payload(&corrected, &options, Some(&pricing), kind, true),
+            historical_payload(&corrected, &options, Some(&pricing), kind, false),
+        );
+    }
+    crate::model_alias::clear_model_aliases();
+    unsafe {
+        std::env::set_var("TZ", "Asia/Seoul");
+    }
+    for kind in kinds {
+        assert!(
+            !crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind)
+                .unwrap()
+                .checkpoint
+                .has_restored(),
+            "timezone identity: {kind}"
+        );
+        assert_eq!(
+            historical_payload(&corrected, &options, Some(&pricing), kind, true),
+            historical_payload(&corrected, &options, Some(&pricing), kind, false),
+        );
+    }
+    unsafe {
+        std::env::set_var("TZ", "UTC");
+    }
+    let retained = publish_historical_fixture(root.path(), &context, 0, None);
+    for kind in kinds {
+        assert_eq!(
+            historical_payload(&retained, &options, Some(&pricing), kind, true),
+            historical_payload(&retained, &options, Some(&pricing), kind, false),
+        );
+    }
+    let other_home = root.path().join("other-home");
+    std::fs::create_dir_all(&other_home).unwrap();
+    let other_context = ResolvedLocalSourceContext::capture(
+        Some(other_home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let other_root_scope = publish_historical_fixture(root.path(), &other_context, 20, None);
+    assert_ne!(other_root_scope.scope, retained.scope);
+    for kind in kinds {
+        assert!(
+            !crate::HistoricalReportFold::new(&other_root_scope, &options, Some(&pricing), kind)
+                .unwrap()
+                .checkpoint
+                .has_restored(),
+            "root scope identity: {kind}"
+        );
+        assert_eq!(
+            historical_payload(&other_root_scope, &options, Some(&pricing), kind, true),
+            historical_payload(&other_root_scope, &options, Some(&pricing), kind, false),
+        );
+    }
+    let publisher = query(root.path());
+    let mut other_client_scope = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["claude".into()],
+            None,
+            SelectionMode::Report,
+        )
+        .unwrap();
+    publisher.publish(&mut other_client_scope).unwrap();
+    let other_options = crate::ReportOptions {
+        clients: Some(vec!["claude".into()]),
+        ..options.clone()
+    };
+    for kind in kinds {
+        assert!(
+            !crate::HistoricalReportFold::new(
+                &other_client_scope,
+                &other_options,
+                Some(&pricing),
+                kind,
+            )
+            .unwrap()
+            .checkpoint
+            .has_restored(),
+            "client scope identity: {kind}"
+        );
+        assert_eq!(
+            historical_payload(
+                &other_client_scope,
+                &other_options,
+                Some(&pricing),
+                kind,
+                true
+            ),
+            historical_payload(
+                &other_client_scope,
+                &other_options,
+                Some(&pricing),
+                kind,
+                false
+            ),
+        );
+    }
+    assert!(crate::get_model_report_from_snapshot(
+        &other_client_scope,
+        options.clone(),
+        Some(&pricing)
+    )
+    .is_err());
+    let database = query(root.path());
+    let (entries, bytes): (i64, i64) = database.db.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(length(state)+length(query_key)+length(membership)+length(state_digest)+32),0)
+         FROM report_checkpoints",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert!(entries <= 128);
+    assert!(bytes <= 16 * 1024 * 1024);
+    database
+        .db
+        .execute(
+            "UPDATE report_checkpoints SET state=x'ff' WHERE row_count=20",
+            [],
+        )
+        .unwrap();
+    for kind in kinds {
+        assert!(
+            crate::HistoricalReportFold::new(&other_root_scope, &options, Some(&pricing), kind,)
+                .is_err(),
+            "corrupt checkpoint state: {kind}"
+        );
+    }
+    database
+        .db
+        .execute("DELETE FROM report_checkpoints WHERE row_count=20", [])
+        .unwrap();
+    for kind in kinds {
+        historical_payload(&other_root_scope, &options, Some(&pricing), kind, true);
+    }
+    let (source, generation, ordinal): (i64, i64, i64) = database
+        .db
+        .query_row(
+            "SELECT v.source_id,v.row_generation,r.ordinal
+         FROM sq_scope_sources s JOIN mc_generation_storage v
+           ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation
+         JOIN mc_rows r ON r.source_id=v.source_id AND r.generation=v.row_generation AND r.ordinal<v.row_count
+         WHERE s.scope_generation=?1 AND s.lane='amp' ORDER BY r.ordinal LIMIT 1",
+            [other_root_scope.generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    // Alter the actual bytes underneath a previously saved checkpoint while
+    // leaving the producer's digest untouched. Metadata-only admission would
+    // return a successful stale aggregate; every ordinary report must fail.
+    database
+        .db
+        .execute(
+            "UPDATE mc_rows SET message=x'ff' WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
+            params![source, generation, ordinal],
+        )
+        .unwrap();
+    let revision: i64 = database
+        .db
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .unwrap();
+    assert!(crate::get_model_report_from_snapshot(
+        &other_root_scope,
+        options.clone(),
+        Some(&pricing)
+    )
+    .is_err());
+    assert!(crate::get_agents_report_from_snapshot(
+        &other_root_scope,
+        options.clone(),
+        Some(&pricing)
+    )
+    .is_err());
+    assert!(crate::get_hourly_report_from_snapshot(
+        &other_root_scope,
+        options.clone(),
+        Some(&pricing)
+    )
+    .is_err());
+    assert!(crate::lean_local_graph_from_snapshot(
+        &other_root_scope,
+        options,
+        Some(&pricing),
+        crate::GraphPricingMode::BestEffort,
+    )
+    .is_err());
+    assert_eq!(
+        revision,
+        database
+            .db
+            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        "failed checkpoint admission must not publish cache replacements"
+    );
+}
+
+#[test]
+fn checkpoint_membership_owns_opencode_aliases_after_scope_gc() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["opencode".to_string()];
+    let mut snapshot = publisher
+        .begin_scope(root.path(), &context, &clients, None, SelectionMode::Report)
+        .unwrap();
+    let source = home.join("opencode.db");
+    // Equal payloads within one canonical source are collapsed at ingestion.
+    // Separate sources preserve the two disconnected alias cohorts until
+    // report arbitration, which is the boundary this regression exercises.
+    local_fixture(&source, &[("row-a", 1)]);
+    let other_directory = home.join("other");
+    std::fs::create_dir_all(&other_directory).unwrap();
+    let other_source = other_directory.join("opencode.db");
+    local_fixture(&other_source, &[("row-b", 1)]);
+    crate::usage_store::synchronize_opencode_sources(
+        &[source, other_source],
+        &[],
+        root.path(),
+        &mut |db, path, sqlite, index, key| {
+            publisher.register_opencode(db, path, sqlite, index, key)
+        },
+    )
+    .unwrap();
+    publisher.publish(&mut snapshot).unwrap();
+    let prepare = || {
+        let reader = query(root.path());
+        reader.pin(&snapshot).unwrap();
+        reader
+            .prepare_query(&snapshot, UsageQuery::compact())
+            .unwrap();
+        reader.unpin().unwrap();
+        reader
+    };
+    let first = prepare();
+    let second = prepare();
+    let (first_id, second_id, payloads): (i64, i64, i64) = second
+        .db
+        .query_row(
+            "SELECT MIN(id),MAX(id),COUNT(DISTINCT payload) FROM ocq_rows",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        payloads, 1,
+        "alias collision must affect exact-payload arbitration"
+    );
+    let messages_before: Vec<Vec<u8>> = second
+        .db
+        .prepare("SELECT message FROM ocq_rows ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    second
+        .db
+        .execute("DELETE FROM ocq_aliases WHERE id=?1", [second_id])
+        .unwrap();
+    second
+        .db
+        .execute(
+            "INSERT INTO ocq_aliases SELECT ?1,key,timestamp,position FROM ocq_aliases WHERE id=?2",
+            params![second_id, first_id],
+        )
+        .unwrap();
+    let messages_after: Vec<Vec<u8>> = second
+        .db
+        .prepare("SELECT message FROM ocq_rows ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        messages_before, messages_after,
+        "only owned arbitration aliases changed"
+    );
+    // Both readers have unpinned. Publish the same producer without sources,
+    // retiring all old canonical descriptors before membership is examined.
+    let mut replacement = publisher
+        .begin_scope(root.path(), &context, &clients, None, SelectionMode::Report)
+        .unwrap();
+    publisher.publish(&mut replacement).unwrap();
+    assert_eq!(
+        publisher
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_scope_sources WHERE scope_generation=?1",
+                [snapshot.generation],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    first.prepare_report_fold(&snapshot).unwrap();
+    second.prepare_report_fold(&snapshot).unwrap();
+    let fold_count = |reader: &QueryState| {
+        let mut count = 0_u64;
+        crate::fold_prepared_usage_snapshot(
+            &snapshot,
+            reader,
+            None,
+            UsageQuery::compact(),
+            &|_| true,
+            &mut |_| count += 1,
+            false,
+        )
+        .unwrap();
+        count
+    };
+    let first_count = fold_count(&first);
+    let second_count = fold_count(&second);
+    assert_eq!(first_count, 2);
+    assert_eq!(second_count, 1);
+    let saved = crate::usage_store::ReportCheckpoint::open(first.connection(), [66; 32]).unwrap();
+    saved.save(first.connection(), 0, &first_count).unwrap();
+    saved.finish(first.connection()).unwrap();
+    let changed =
+        crate::usage_store::ReportCheckpoint::open(second.connection(), [66; 32]).unwrap();
+    assert!(
+        !changed.has_restored(),
+        "post-unpin GC cannot make differing alias cohorts share a checkpoint"
+    );
+}
+
+#[test]
+fn checkpoint_timezone_rules_drive_immediate_same_thread_calendar_changes() {
+    if std::env::var_os("SYRTIS_CHECKPOINT_TIMEZONE_CHILD").is_none() {
+        let root = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store_query::tests::checkpoint_timezone_rules_drive_immediate_same_thread_calendar_changes", "--nocapture"])
+            .env_clear()
+            .env("SYRTIS_CHECKPOINT_TIMEZONE_CHILD", "1")
+            .env("HOME", root.path())
+            .env("SYRTIS_CONFIG_DIR", root.path().join("config"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .env("TZ", "UTC")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use chrono::TimeZone;
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let mut snapshot = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::Report,
+        )
+        .unwrap();
+    let source = home.join("timezone.jsonl");
+    std::fs::write(&source, "timezone fixture").unwrap();
+    let timestamp = 1_735_689_600_000 - 30 * 60 * 1000; // 2024-12-31 23:30 UTC.
+    SourceMessageCache::open_from_root(Some(root.path()))
+        .write_source(
+            CacheIdentity::for_client(ClientId::Amp),
+            &source,
+            SourceFingerprint::from_path_samples_only(&source).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |db, metadata| {
+                publisher.register_cache_on(db, &source, metadata, "amp", 0, 0, false, false)
+            },
+            |writer| {
+                writer.push(
+                    &message("amp", "timezone", timestamp, Some("one"), 10),
+                    false,
+                    false,
+                )
+            },
+        )
+        .unwrap();
+    publisher.publish(&mut snapshot).unwrap();
+    let options = crate::ReportOptions {
+        clients: Some(vec!["amp".into()]),
+        year: Some("2025".into()),
+        since: Some("2025-01-01".into()),
+        until: Some("2025-01-01".into()),
+        ..Default::default()
+    };
+    let kinds = ["graph-best-effort", "models", "hourly", "agents"];
+    for kind in kinds {
+        historical_payload(&snapshot, &options, None, kind, true);
+    }
+    assert_eq!(
+        chrono::Local
+            .timestamp_millis_opt(timestamp)
+            .single()
+            .unwrap()
+            .offset()
+            .local_minus_utc(),
+        0
+    );
+    unsafe {
+        std::env::set_var("TZ", "Asia/Seoul");
+    }
+    // Prime and switch on the same thread, then query immediately: chrono's
+    // old rules are demonstrably still cached, with no sleep-based workaround.
+    assert_eq!(
+        chrono::Local
+            .timestamp_millis_opt(timestamp)
+            .single()
+            .unwrap()
+            .offset()
+            .local_minus_utc(),
+        0,
+        "fixture must expose the stale chrono thread cache"
+    );
+    for kind in kinds {
+        let incremental = historical_payload(&snapshot, &options, None, kind, true);
+        match kind {
+            "graph-best-effort" => {
+                assert_eq!(incremental["summary"]["total_tokens"], 10);
+                assert_eq!(incremental["contributions"][0]["date"], "2025-01-01");
+            }
+            "models" => assert_eq!(incremental["total_input"], 10),
+            "hourly" => assert_eq!(incremental["entries"][0]["hour"], "2025-01-01 08:00"),
+            "agents" => assert_eq!(incremental["total_messages"], 1),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            incremental,
+            historical_payload(&snapshot, &options, None, kind, false)
+        );
+        assert_eq!(
+            incremental,
+            historical_payload(&snapshot, &options, None, kind, true)
+        );
+    }
+    let captured =
+        crate::HistoricalReportFold::new(&snapshot, &options, None, "frozen-timezone-regression")
+            .unwrap();
+    assert!(captured.timezone.is_some());
+    unsafe {
+        std::env::set_var("TZ", "UTC");
+    }
+    let mut dated = std::collections::BTreeMap::<String, i64>::new();
+    captured
+        .fold(
+            &mut dated,
+            &|row| row.date == "2025-01-01",
+            &mut |dated, row| {
+                *dated.entry(row.date.clone()).or_default() += row.tokens.input;
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        dated,
+        std::collections::BTreeMap::from([("2025-01-01".into(), 10)]),
+        "key and conversions must keep the captured rules even after another TZ change"
+    );
+    unsafe {
+        std::env::set_var("TZ", "Asia/Seoul");
+    }
+    let reused =
+        crate::HistoricalReportFold::new(&snapshot, &options, None, "frozen-timezone-regression")
+            .unwrap();
+    assert!(reused.checkpoint.has_restored());
+    for _ in 0..2 {
+        let mut repeated = std::collections::BTreeMap::<String, i64>::new();
+        reused
+            .fold(
+                &mut repeated,
+                &|row| row.date == "2025-01-01",
+                &mut |dated, row| {
+                    *dated.entry(row.date.clone()).or_default() += row.tokens.input;
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repeated, dated,
+            "a consumed restore blob cannot leave an offset that skips facts"
+        );
+        assert!(
+            !reused.checkpoint.has_restored(),
+            "encoded restore bytes must be released after decoding"
+        );
+    }
+
+    unsafe {
+        std::env::set_var("TZ", "America/New_York");
+    }
+    let zone = crate::CapturedReportTimezone::capture().unwrap();
+    for (utc, expected) in [
+        ("2025-03-09T06:59:59Z", "2025-03-09 01:00"),
+        ("2025-03-09T07:00:00Z", "2025-03-09 03:00"),
+        ("2025-11-02T05:30:00Z", "2025-11-02 01:00"),
+        ("2025-11-02T06:30:00Z", "2025-11-02 01:00"),
+    ] {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(utc)
+            .unwrap()
+            .timestamp_millis();
+        let mut row = message("amp", "dst", timestamp, None, 1);
+        row.date = zone.date(timestamp);
+        assert_eq!(zone.hour(&row), expected);
+    }
+    let mut undated = message("amp", "undated", 0, None, 1);
+    undated.date = zone.date(0);
+    assert_eq!(zone.hour(&undated), "1969-12-31 00:00");
+
+    unsafe {
+        std::env::set_var("TZ", "QST0");
+    } // Valid custom POSIX rule without a named TZif file.
+    let unfiltered = crate::ReportOptions {
+        clients: Some(vec!["amp".into()]),
+        ..Default::default()
+    };
+    let custom = crate::HistoricalReportFold::new(&snapshot, &unfiltered, None, "models").unwrap();
+    assert!(custom.timezone.is_none());
+    assert!(!custom.checkpoint.has_restored());
+    let entries_before: i64 = publisher
+        .db
+        .query_row("SELECT COUNT(*) FROM report_checkpoints", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        crate::get_model_report_from_snapshot(&snapshot, unfiltered, None)
+            .unwrap()
+            .total_input,
+        10
+    );
+    assert_eq!(
+        publisher
+            .db
+            .query_row("SELECT COUNT(*) FROM report_checkpoints", [], |row| row
+                .get::<_, i64>(0),)
+            .unwrap(),
+        entries_before,
+        "unresolved/custom rules must not retain uncertain checkpoints"
+    );
+}

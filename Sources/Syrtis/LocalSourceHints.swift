@@ -95,7 +95,7 @@ final class LocalSourceHints {
                 if let hint { relay.enqueue(hint) }
             },
             &context, filter.anchors.map(\.string) as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.5, flags
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.1, flags
         ) else {
             relay.cancel()
             self.relay = nil
@@ -181,6 +181,25 @@ final class LocalSourceHints {
         }
         expect(filter.unsupportedRoots == 1 && filter.anchors.count == 2,
                "invalid UTF8 root retains explicit fallback; valid anchors deduplicate")
+        let nestedJSON = #"""
+        {"roots":[
+          {"sourceRootURL":"file:///fixture/home/.agent/sessions","watchRootURL":"file:///fixture/home/.agent","isDirectory":true},
+          {"sourceRootURL":"file:///fixture/home/.missing/sessions","watchRootURL":"file:///fixture/home","isDirectory":true},
+          {"sourceRootURL":"file:///fixture/home-other/logs","watchRootURL":"file:///fixture/home-other","isDirectory":true}
+        ],"ignoredFileURLs":[],"ignoredBasenameRules":[]}
+        """#
+        if let nestedManifest = try? JSONDecoder().decode(
+            LocalSourceWatchManifest.self, from: Data(nestedJSON.utf8)
+        ) {
+            let nested = Filter(nestedManifest)
+            expect(nested.anchors.map(\.string) == ["/fixture/home", "/fixture/home-other"],
+                   "recursive watches collapse covered anchors without collapsing prefix siblings")
+            expect(nested.hint(for: NativePath("/fixture/home/.agent/sessions/new/log")!, flags: created)?.topology == true
+                   && nested.hint(for: NativePath("/fixture/home/.missing")!, flags: created)?.topology == true
+                   && nested.hint(for: NativePath("/fixture/home/unrelated")!, flags: created) == nil,
+                   "collapsed watches preserve exact source events, recovery and unrelated-sibling filtering")
+        } else { expect(false, "nested watch manifest decodes") }
+        resourceSelfTest(expect)
         expect(hint("/fixture/home/unrelated/file") == nil,
                "broad recovery anchor rejects unrelated home events")
         expect(hint("/fixture/home/.agent/sessions-other/file") == nil,
@@ -265,6 +284,44 @@ final class LocalSourceHints {
                "overflowing named evidence falls back to authoritative verification")
         Relay.selfTest(filter: filter, expect: expect)
     }
+
+    private static func resourceSelfTest(_ expect: (Bool, String) -> Void) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("syrtis-hints-\(UUID().uuidString)", isDirectory: true)
+        let watcher = LocalSourceHints()
+        defer {
+            watcher.stop()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var roots = [LocalSourceWatchRoot(
+                sourceRootURL: directory.absoluteString,
+                watchRootURL: directory.absoluteString, isDirectory: true)]
+            for index in 0..<40 {
+                let child = directory.appendingPathComponent("client-\(index)/sessions", isDirectory: true)
+                try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+                roots.append(.init(sourceRootURL: child.absoluteString,
+                                   watchRootURL: child.absoluteString, isDirectory: true))
+            }
+            let manifest = LocalSourceWatchManifest(roots: roots, ignoredFileURLs: [])
+            func descriptors() -> Int {
+                (0..<4096).reduce(0) { $0 + (fcntl(Int32($1), F_GETFD) >= 0 ? 1 : 0) }
+            }
+            let baseline = descriptors()
+            for _ in 0..<3 {
+                watcher.install(manifest) { _, _ in }
+                Thread.sleep(forTimeInterval: 0.1)
+                expect(watcher.diagnostics.isWatching && descriptors() - baseline < 32,
+                       "overlapping native watches leave descriptor headroom for source reads")
+                watcher.stop()
+                Thread.sleep(forTimeInterval: 0.1)
+                expect(descriptors() - baseline < 8,
+                       "replaced native watches release their directory handles")
+            }
+        } catch { expect(false, "native watch resource fixture: \(error)") }
+    }
+
     /// Byte equality avoids Swift String's canonical-Unicode-equivalence path collisions.
     private struct NativePath: Hashable, Sendable {
         let bytes: [UInt8]
@@ -377,9 +434,15 @@ final class LocalSourceHints {
                 roots.append(Root(source: source, anchor: anchor, isDirectory: root.isDirectory))
             }
             self.roots = roots
-            self.anchors = Array(Set(roots.map(\.anchor))).sorted {
+            // WatchRoot opens each anchor's ancestor chain. FSEvents watches recursively,
+            // so covered descendants only duplicate handles, not event coverage.
+            var anchors: [NativePath] = []
+            for anchor in Set(roots.map(\.anchor)).sorted(by: {
                 $0.bytes.lexicographicallyPrecedes($1.bytes)
+            }) where !anchors.contains(where: { $0.contains(anchor) }) {
+                anchors.append(anchor)
             }
+            self.anchors = anchors
             self.unsupportedRoots = unsupportedRoots
             var ignored: Set<NativePath> = []
             var unsupportedIgnored = 0

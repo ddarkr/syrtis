@@ -44,6 +44,17 @@ final class LocalUsageScheduler {
         let value: LocalUsageValue
         let identity: String
     }
+    private struct RecentClock {
+        let origin: TimeInterval
+        let interval: TimeInterval
+        let revision: UInt64
+        func bucket(at now: TimeInterval) -> Int64 {
+            Int64(max(0, (now - origin) / interval))
+        }
+        func deadline(at now: TimeInterval) -> TimeInterval {
+            origin + Double(bucket(at: now) + 1) * interval
+        }
+    }
     private let source: any UsageDataSource
     private let observesSources: Bool
     private let automaticallySchedules: Bool
@@ -54,6 +65,9 @@ final class LocalUsageScheduler {
     private var waiting: [UUID: Waiting] = [:] { didSet { demandDirty = true } }
     private var demandDirty = true
     private var demandedQueries: Set<Query> = []
+    private var activeRecentQueries: Set<Query> = []
+    private var recentClocks: [Query: RecentClock] = [:]
+    private var recentClockRevision: UInt64 = 0
     private var demandedScopes: Set<LocalUsageScope> = []
     private var activeDemand = false
     private var results: [Query: Cached] = [:]
@@ -357,6 +371,10 @@ final class LocalUsageScheduler {
         // Selective expiry: recents always expire by clock; historical display
         // aggregates expire only when their day/timezone bucket actually moved,
         // so irrelevant ticks reuse the valid held aggregate without DB refold.
+        refreshDemand()
+        for query in demandedQueries where query.isRecent {
+            resetRecentClock(query, interval: recentExpiryInterval(for: query))
+        }
         let expired = results.filter { query, cached in
             query.isRecent || cached.identity != identity(query)
         }.map(\.key)
@@ -394,10 +412,14 @@ final class LocalUsageScheduler {
         guard demandDirty else { return }
         demandDirty = false
         demandedQueries.removeAll(keepingCapacity: true)
+        activeRecentQueries.removeAll(keepingCapacity: true)
         demandedScopes.removeAll(keepingCapacity: true)
         activeDemand = false
         for owner in owners.values {
             demandedQueries.formUnion(owner.queries)
+            if owner.active {
+                for query in owner.queries where query.isRecent { activeRecentQueries.insert(query) }
+            }
             demandedScopes.formUnion(owner.quotas)
             activeDemand = activeDemand || (owner.active && (!owner.queries.isEmpty || !owner.quotas.isEmpty))
         }
@@ -406,9 +428,29 @@ final class LocalUsageScheduler {
             if let quota = entry.quota { demandedScopes.insert(quota) }
         }
         for query in demandedQueries { demandedScopes.insert(query.scope) }
+        for query in recentClocks.keys.filter({ !demandedQueries.contains($0) }) {
+            recentClocks.removeValue(forKey: query)
+        }
+        for query in demandedQueries where query.isRecent {
+            let interval: TimeInterval = activeRecentQueries.contains(query) ? 5 : 10
+            if recentClocks[query]?.interval != interval { resetRecentClock(query, interval: interval) }
+        }
+    }
+    private func resetRecentClock(_ query: Query, interval: TimeInterval) {
+        recentClockRevision &+= 1
+        recentClocks[query] = RecentClock(origin: monotonicNow(), interval: interval,
+                                        revision: recentClockRevision)
     }
     private var scopes: Set<LocalUsageScope> { refreshDemand(); return demandedScopes }
     private var active: Bool { refreshDemand(); return activeDemand }
+    private func recentExpiryInterval(for query: Query) -> TimeInterval {
+        refreshDemand()
+        return activeRecentQueries.contains(query) ? 5 : 10
+    }
+    private var clockExpiryInterval: TimeInterval {
+        refreshDemand()
+        return activeRecentQueries.isEmpty ? 10 : 5
+    }
     private var checkInterval: TimeInterval { active ? 30 : 300 }
     private var needsPricing: Bool {
         scopes.contains { $0.kind == "report" || $0.kind == "quota" }
@@ -423,7 +465,7 @@ final class LocalUsageScheduler {
             || forceVerified < forceRequested || now - lastCheck >= checkInterval
             || now - lastFull >= fullVerificationInterval || now - lastTopology >= 300
             || needsPricing
-            || (dirtySequence > checkedSequence && (dirtyAt == nil || now >= dirtyAt! + 0.25)))
+            || (dirtySequence > checkedSequence && (dirtyAt == nil || now >= dirtyAt! + 0.1)))
     }
     private func requestForce(_ force: Bool) -> UInt64 {
         if force { forceRequested &+= 1; retryAt = 0 }
@@ -501,16 +543,26 @@ final class LocalUsageScheduler {
         let now = wallNow()
         let calendar = Calendar.current
         let day = calendar.startOfDay(for: now).timeIntervalSince1970
-        let clock = query.isRecent ? Int64(now.timeIntervalSince1970 / 10) : Int64(day)
+        refreshDemand()
+        let clock: String
+        if query.isRecent, let cadence = recentClocks[query] {
+            clock = "\(cadence.revision):\(cadence.bucket(at: monotonicNow()))"
+        } else {
+            clock = String(Int64(day))
+        }
         let price = query.isRecent ? "unpriced" : capture.priceGeneration
         let zone = query.isRecent ? "absolute" : TimeZone.current.identifier
         return "\(rootEpoch)|\(capture.rootGeneration)|\(scope.sourceGeneration)|\(price)|\(zone)|\(clock)"
     }
     private var nextClockDeadline: TimeInterval {
         refreshDemand()
-        if demandedQueries.contains(where: \.isRecent) || owners.values.contains(where: { $0.clock != nil }) {
-            return lastClock + 10
+        let nowMonotonic = monotonicNow()
+        var due = TimeInterval.infinity
+        for cadence in recentClocks.values { due = min(due, cadence.deadline(at: nowMonotonic)) }
+        if owners.values.contains(where: { $0.clock != nil }) {
+            due = min(due, lastClock + clockExpiryInterval)
         }
+        if due != .infinity { return due }
         let now = wallNow()
         let midnight = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: now))!
         return monotonicNow() + max(0, midnight.timeIntervalSince(now))
@@ -545,7 +597,7 @@ final class LocalUsageScheduler {
             due = min(due, lastCheck + checkInterval, lastFull + fullVerificationInterval,
                       lastTopology + 300)
             if scopes.contains(where: { $0.kind != "recent" }) { due = min(due, lastPricing + 3600) }
-            if dirtySequence > checkedSequence { due = min(due, (dirtyAt ?? now) + 0.25) }
+            if dirtySequence > checkedSequence { due = min(due, (dirtyAt ?? now) + 0.1) }
         }
         due = max(due, retryAt)
         deadline = Task { [weak self] in
@@ -852,7 +904,7 @@ final class LocalUsageScheduler {
             guard !issueDemanderIDs.isEmpty else { continue }
             // Request-time bucket: a stale completion is dropped and re-issued
             // under the current bucket instead of publishing old data. Recent
-            // buckets by the 10s clock, history by day/timezone: the lane
+            // buckets use this query's demand cadence, history uses day/timezone: the lane
             // split only unblocks recent, it never weakens admission.
             let key = identity(query)
             if results[query]?.identity == key { continue }
@@ -881,6 +933,7 @@ final class LocalUsageScheduler {
                 guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
                 guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
                       !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
+                guard key == identity(query) else { continue }
                 // Native ingestion can evict this generation before its new
                 // lease returns. Stop querying the old scope; the capture
                 // owns its eventual success or failure, not this old query.
@@ -888,7 +941,6 @@ final class LocalUsageScheduler {
                     syncedScopes.remove(query.scope)
                     continue
                 }
-                guard key == identity(query) else { continue }
                 lastError = String(describing: error); retryAt = monotonicNow() + 10
                 previousLeaseUsable = false; syncedScopes.removeAll()
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
@@ -908,7 +960,7 @@ final class LocalUsageScheduler {
         }
     }
     private func tickClock() {
-        guard monotonicNow() - lastClock >= 10 else { return }
+        guard monotonicNow() - lastClock >= clockExpiryInterval else { return }
         lastClock = monotonicNow()
         for owner in owners.values { owner.clock?() }
     }
