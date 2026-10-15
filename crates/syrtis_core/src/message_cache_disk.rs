@@ -57,6 +57,42 @@ fn sql_error(_: rusqlite::Error) -> String {
     "source message cache database operation failed".to_string()
 }
 
+fn row_blob<'a>(row: &'a rusqlite::Row<'_>, column: usize) -> Result<&'a [u8], String> {
+    match row.get_ref(column).map_err(sql_error)? {
+        rusqlite::types::ValueRef::Blob(bytes) => Ok(bytes),
+        value => Err(sql_error(rusqlite::Error::InvalidColumnType(
+            column,
+            row.as_ref()
+                .column_name(column)
+                .map_err(sql_error)?
+                .to_string(),
+            value.data_type(),
+        ))),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn borrowed_cache_blob_rejects_null_and_non_blob_values() {
+    let connection = Connection::open_in_memory().unwrap();
+    let mut statement = connection
+        .prepare("SELECT x'0102', NULL, 'text', 1")
+        .unwrap();
+    let mut rows = statement.query([]).unwrap();
+    let row = rows.next().unwrap().unwrap();
+    assert_eq!(row_blob(row, 0).unwrap(), &[1, 2]);
+    for column in 1..4 {
+        assert_eq!(
+            row_blob(row, column).unwrap_err(),
+            "source message cache database operation failed",
+        );
+    }
+    assert_eq!(
+        verify_digest(row_blob(row, 0).unwrap(), &[0; 32]).unwrap_err(),
+        "source message cache row digest is invalid",
+    );
+}
+
 /// Logical generations freeze an immutable prefix of a physical append stream.
 /// No predecessor traversal is needed, and fallback time belongs to the snapshot.
 pub(crate) fn install_logical_views_on(connection: &Connection) -> Result<(), String> {
@@ -204,9 +240,9 @@ fn migrate_copied_rows(
         .map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
         let ordinal: i64 = row.get(0).map_err(sql_error)?;
-        let bytes: Vec<u8> = row.get(1).map_err(sql_error)?;
-        verify_digest(&bytes, &row.get::<_, Vec<u8>>(2).map_err(sql_error)?)?;
-        let bytes = encode_fact(&decode_stored_message(format_version, &bytes)?)?;
+        let bytes = row_blob(row, 1)?;
+        verify_digest(bytes, row_blob(row, 2)?)?;
+        let bytes = encode_fact(&decode_stored_message(format_version, bytes)?)?;
         connection.prepare_cached(
             "UPDATE mc_rows SET message=?1,digest=?2 WHERE source_id=?3 AND generation=?4 AND ordinal=?5",
         ).map_err(sql_error)?.execute(params![bytes,Sha256::digest(&bytes).as_slice(),source_id,generation,ordinal])
@@ -672,8 +708,7 @@ impl SourceMessageCache {
             let mut out = Vec::new();
             while let Some(row) = rows.next().map_err(sql_error)? {
                 let namespace: String = row.get(0).map_err(sql_error)?;
-                let scope: Vec<u8> = row.get(1).map_err(sql_error)?;
-                let scope: [u8; 32] = scope
+                let scope: [u8; 32] = row_blob(row, 1)?
                     .try_into()
                     .map_err(|_| "source message cache context is invalid".to_string())?;
                 let path: Vec<u8> = row.get(2).map_err(sql_error)?;
@@ -838,9 +873,9 @@ impl SourceMessageCache {
             while let Some(row) = rows.next().map_err(sql_error)? {
                 let retained: bool = row.get(0).map_err(sql_error)?;
                 let fallback: bool = row.get(1).map_err(sql_error)?;
-                let bytes: Vec<u8> = row.get(3).map_err(sql_error)?;
-                verify_digest(&bytes,&row.get::<_,Vec<u8>>(4).map_err(sql_error)?)?;
-                let mut message = decode_stored_message(row.get(5).map_err(sql_error)?, &bytes)?;
+                let bytes = row_blob(row, 3)?;
+                verify_digest(bytes,row_blob(row, 4)?)?;
+                let mut message = decode_stored_message(row.get(5).map_err(sql_error)?, bytes)?;
                 if fallback {message.set_timestamp(row.get(2).map_err(sql_error)?);}
                 sink(&message,retained,fallback)?;
             }
@@ -1101,10 +1136,8 @@ impl SourceMessageCache {
             let mut rows = statement.query([]).map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
                 let namespace: String = row.get(0).map_err(sql_error)?;
-                let path: Vec<u8> = row.get(1).map_err(sql_error)?;
-                let path = decode::<CachedPath>(&path)?.into_path_buf();
-                let scope: Vec<u8> = row.get(2).map_err(sql_error)?;
-                let scope: [u8; 32] = scope
+                let path = decode::<CachedPath>(row_blob(row, 1)?)?.into_path_buf();
+                let scope: [u8; 32] = row_blob(row, 2)?
                     .try_into()
                     .map_err(|_| "source message cache context is invalid".to_string())?;
                 match fs::metadata(&path) {
@@ -1160,7 +1193,7 @@ impl SourceMessageCache {
             let mut statement = transaction.prepare("SELECT path FROM mc_sources WHERE namespace=?1 AND scope=?3 AND active=1 AND EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_sources.id AND v.generation=mc_sources.generation AND v.parser_version=?2) ORDER BY path").map_err(sql_error)?;
             let mut rows = statement.query(params![identity.namespace,identity.parser_version,identity.scope.as_slice()]).map_err(sql_error)?;
             while let Some(row) = rows.next().map_err(sql_error)? {
-                let path = decode::<CachedPath>(&row.get::<_,Vec<u8>>(0).map_err(sql_error)?)?.into_path_buf();
+                let path = decode::<CachedPath>(row_blob(row, 0)?)?.into_path_buf();
                 let metadata = read_metadata(&transaction,identity,&path)?.ok_or_else(|| "source message cache metadata disappeared".to_string())?;
                 sink(&path,&metadata.metadata)?;
             }
@@ -1178,9 +1211,8 @@ impl SourceMessageCache {
                 let mut statement = connection.prepare("SELECT path,scope FROM mc_sources WHERE namespace=?1 AND active=1 ORDER BY path,scope").map_err(sql_error)?;
                 let mut rows = statement.query([identity.namespace]).map_err(sql_error)?;
                 while let Some(row) = rows.next().map_err(sql_error)? {
-                    let path = decode::<CachedPath>(&row.get::<_,Vec<u8>>(0).map_err(sql_error)?)?.into_path_buf();
-                    let scope: Vec<u8> = row.get(1).map_err(sql_error)?;
-                    let scope: [u8;32] = scope.try_into().map_err(|_| "source message cache context is invalid".to_string())?;
+                    let path = decode::<CachedPath>(row_blob(row, 0)?)?.into_path_buf();
+                    let scope: [u8;32] = row_blob(row, 1)?.try_into().map_err(|_| "source message cache context is invalid".to_string())?;
                     let identity = CacheIdentity { scope,..identity };
                     if let Some(entry) = materialize(connection,identity,&path,false)? { entries.push(entry); }
                 }
@@ -1450,10 +1482,10 @@ fn merge_history(
             continue;
         }
         let stored_retained: bool = row.get(1).map_err(sql_error)?;
-        let bytes: Vec<u8> = row.get(2).map_err(sql_error)?;
-        let digest: Vec<u8> = row.get(3).map_err(sql_error)?;
-        verify_digest(&bytes, &digest)?;
-        let stored = decode_stored_message(old.format_version, &bytes)?;
+        let bytes = row_blob(row, 2)?;
+        let digest = row_blob(row, 3)?;
+        verify_digest(bytes, digest)?;
+        let stored = decode_stored_message(old.format_version, bytes)?;
         let current = current_lookup
             .query_row(params![writer.source_id, writer.generation, key], |row| {
                 Ok((
@@ -1692,13 +1724,13 @@ where
         let ordinal: u64 = row.get(0).map_err(sql_error)?;
         let retained: bool = row.get(1).map_err(sql_error)?;
         let fallback: bool = row.get(2).map_err(sql_error)?;
-        let bytes: Vec<u8> = row.get(3).map_err(sql_error)?;
-        let digest: Vec<u8> = row.get(4).map_err(sql_error)?;
+        let bytes = row_blob(row, 3)?;
+        let digest = row_blob(row, 4)?;
         if ordinal != count {
             return Err("source message cache source rows are incomplete".to_string());
         }
-        verify_digest(&bytes, &digest)?;
-        let mut message = decode_stored_message(row.get(6).map_err(sql_error)?, &bytes)?;
+        verify_digest(bytes, digest)?;
+        let mut message = decode_stored_message(row.get(6).map_err(sql_error)?, bytes)?;
         if fallback {
             message.set_timestamp(row.get(5).map_err(sql_error)?);
         }
@@ -2285,8 +2317,7 @@ fn verify_shard_transfer(transaction: &Connection, identity: CacheIdentity) -> R
     ).map_err(sql_error)?;
     let mut rows = imported.query([]).map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
-        let source =
-            decode::<CachedPath>(&row.get::<_, Vec<u8>>(0).map_err(sql_error)?)?.into_path_buf();
+        let source = decode::<CachedPath>(row_blob(row, 0)?)?.into_path_buf();
         let stored = read_metadata(transaction, identity, &source)?
             .ok_or_else(|| "source message cache migration is incomplete".to_string())?;
         validate_stored_generation(transaction, &stored)?;
@@ -2978,8 +3009,7 @@ pub(crate) fn reconcile_missing_sources_on(
     while let Some(row) = rows.next().map_err(sql_error)? {
         let _source_id: i64 = row.get(0).map_err(sql_error)?;
         let _generation: i64 = row.get(1).map_err(sql_error)?;
-        let path =
-            decode::<CachedPath>(&row.get::<_, Vec<u8>>(2).map_err(sql_error)?)?.into_path_buf();
+        let path = decode::<CachedPath>(row_blob(row, 2)?)?.into_path_buf();
         match fs::metadata(path) {
             Ok(_) => {}
             // Absent sources keep their last-good generation: durable queries

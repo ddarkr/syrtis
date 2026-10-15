@@ -33,32 +33,38 @@ pub fn parse_copilot_file(path: &Path) -> Vec<UnifiedMessage> {
         }
 
         if let Ok(record) = serde_json::from_str::<Value>(trimmed) {
-            records.push(record);
+            records.push(CopilotRecord::from_value(
+                &record,
+                records.len(),
+                fallback_timestamp,
+            ));
         }
     }
 
     let trace_contexts = collect_trace_contexts(&records);
-    let candidates: Vec<CopilotUsageCandidate> = records
+    let candidates = records
         .iter()
-        .enumerate()
-        .filter_map(|(index, record)| {
-            usage_candidate_from_record(record, index, fallback_timestamp, &trace_contexts)
-        })
-        .collect();
+        .filter_map(|record| record.candidate.as_ref());
 
-    let chat_traces = candidate_trace_contexts(&candidates, CopilotUsageSource::ChatSpan);
-    let inference_traces = candidate_trace_contexts(&candidates, CopilotUsageSource::InferenceLog);
-    let agent_turn_traces = candidate_trace_contexts(&candidates, CopilotUsageSource::AgentTurnLog);
-    let chat_response_ids = candidate_response_ids(&candidates, CopilotUsageSource::ChatSpan);
+    let chat_traces = candidate_trace_contexts(candidates.clone(), CopilotUsageSource::ChatSpan);
+    let inference_traces =
+        candidate_trace_contexts(candidates.clone(), CopilotUsageSource::InferenceLog);
+    let agent_turn_traces =
+        candidate_trace_contexts(candidates.clone(), CopilotUsageSource::AgentTurnLog);
+    let chat_response_ids =
+        candidate_response_ids(candidates.clone(), CopilotUsageSource::ChatSpan);
     let inference_response_ids =
-        candidate_response_ids(&candidates, CopilotUsageSource::InferenceLog);
+        candidate_response_ids(candidates.clone(), CopilotUsageSource::InferenceLog);
     let agent_turn_response_ids =
-        candidate_response_ids(&candidates, CopilotUsageSource::AgentTurnLog);
+        candidate_response_ids(candidates, CopilotUsageSource::AgentTurnLog);
 
-    let mut messages = Vec::with_capacity(candidates.len());
+    let mut messages = Vec::new();
     let mut index_by_dedup_key = HashMap::new();
 
-    for candidate in candidates.into_iter().filter(|candidate| {
+    for record in records.into_iter().filter(|record| {
+        let Some(candidate) = record.candidate.as_ref() else {
+            return false;
+        };
         should_emit_candidate(
             candidate,
             &chat_traces,
@@ -69,7 +75,7 @@ pub fn parse_copilot_file(path: &Path) -> Vec<UnifiedMessage> {
             &agent_turn_response_ids,
         )
     }) {
-        let message = candidate.into_message();
+        let message = record.into_candidate(&trace_contexts).into_message();
         let Some(dedup_key) = message.dedup_key.clone() else {
             messages.push(message);
             continue;
@@ -92,6 +98,83 @@ enum CopilotUsageSource {
     InferenceLog,
     AgentTurnLog,
     AgentSummarySpan,
+}
+
+// Only fields needed after the current JSON record has been discarded.
+struct CopilotRecord {
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
+    has_attributes: bool,
+    is_agent_summary: bool,
+    model: Option<String>,
+    session: Option<(String, SessionIdPriority)>,
+    agent: Option<String>,
+    index: usize,
+    turn_index: Option<i64>,
+    candidate: Option<CopilotUsageCandidate>,
+}
+
+impl CopilotRecord {
+    fn from_value(record: &Value, index: usize, fallback_timestamp: i64) -> Self {
+        let attributes = record.get("attributes").and_then(Value::as_object);
+        Self {
+            trace_id: trace_id_from_record(record).map(str::to_string),
+            span_id: span_id_from_record(record).map(str::to_string),
+            parent_span_id: parent_span_id_from_record(record).map(str::to_string),
+            has_attributes: attributes.is_some(),
+            is_agent_summary: attributes
+                .is_some_and(|attrs| is_agent_summary_span_record(record, attrs)),
+            model: attributes
+                .and_then(|attrs| first_non_empty_attr(attrs, MODEL_ATTRS))
+                .map(str::to_string),
+            session: attributes
+                .and_then(best_session_attr)
+                .map(|(id, priority)| (id.to_string(), priority)),
+            agent: attributes
+                .and_then(|attrs| first_non_empty_attr(attrs, &["gen_ai.agent.id"]))
+                .map(str::to_string),
+            index,
+            turn_index: attributes.and_then(|attrs| {
+                ["turn.index", "copilot_chat.turn.index"]
+                    .iter()
+                    .find_map(|key| attrs.get(*key).and_then(value_as_i64))
+            }),
+            candidate: usage_candidate_from_record(record, fallback_timestamp),
+        }
+    }
+
+    fn into_candidate(self, contexts: &HashMap<String, TraceContext>) -> CopilotUsageCandidate {
+        let mut candidate = self.candidate.expect("filtered usage candidate");
+        let context = self.trace_id.as_deref().and_then(|id| contexts.get(id));
+        candidate.model = self
+            .model
+            .or_else(|| context.and_then(|context| context.model.clone()))
+            .unwrap_or_else(|| "unknown".to_string());
+        candidate.provider_id = inferred_provider_from_model(&candidate.model)
+            .unwrap_or("github-copilot")
+            .to_string();
+        candidate.session_id = self
+            .session
+            .map(|(id, _)| id)
+            .or_else(|| context.and_then(|context| context.session_id.clone()))
+            .or_else(|| self.trace_id.clone())
+            .unwrap_or_else(|| "unknown-session".to_string());
+        // Record-local attribution always overrides the late trace fallback.
+        candidate.agent = self
+            .agent
+            .or_else(|| context.and_then(|context| context.agent_id.clone()));
+        candidate.dedup_key = dedup_key(
+            candidate.source,
+            self.trace_id.as_deref(),
+            self.span_id.as_deref(),
+            self.turn_index,
+            &candidate.session_id,
+            candidate.timestamp_ms,
+            self.index,
+        );
+        candidate
+    }
 }
 
 struct TraceContext {
@@ -178,15 +261,15 @@ fn merge_copilot_duplicate(existing: &mut UnifiedMessage, duplicate: UnifiedMess
     existing.duration_ms = merged_end.map(|end| end.saturating_sub(merged_start));
 }
 
-fn collect_trace_contexts(records: &[Value]) -> HashMap<String, TraceContext> {
+fn collect_trace_contexts(records: &[CopilotRecord]) -> HashMap<String, TraceContext> {
     let mut contexts = HashMap::new();
 
     for record in records {
-        let Some(trace_id) = trace_id_from_record(record) else {
+        let Some(trace_id) = record.trace_id.as_deref() else {
             continue;
         };
 
-        let Some(attributes) = record.get("attributes").and_then(Value::as_object) else {
+        if !record.has_attributes {
             continue;
         };
 
@@ -200,13 +283,13 @@ fn collect_trace_contexts(records: &[Value]) -> HashMap<String, TraceContext> {
             });
 
         if context.model.is_none() {
-            context.model = first_non_empty_attr(attributes, MODEL_ATTRS).map(str::to_string);
+            context.model.clone_from(&record.model);
         }
 
-        if let Some((session_id, priority)) = best_session_attr(attributes) {
-            if priority > context.session_id_priority {
+        if let Some((session_id, priority)) = record.session.as_ref() {
+            if *priority > context.session_id_priority {
                 context.session_id = Some(session_id.to_string());
-                context.session_id_priority = priority;
+                context.session_id_priority = *priority;
             }
         }
     }
@@ -237,7 +320,7 @@ fn collect_trace_contexts(records: &[Value]) -> HashMap<String, TraceContext> {
 /// invoke_agent is nested and must not become the trace default. When a trace
 /// has no invoke_agent span, fall back to the first non-empty gen_ai.agent.id
 /// seen in the trace (input order).
-fn resolve_trace_fallback_agents(records: &[Value]) -> HashMap<String, String> {
+fn resolve_trace_fallback_agents(records: &[CopilotRecord]) -> HashMap<String, String> {
     // (traceId, spanId) -> parentSpanId across every span that declares both.
     // OTel span ids are only unique within their trace, so hierarchy state must
     // stay trace-scoped rather than using a flat span-id map.
@@ -252,26 +335,26 @@ fn resolve_trace_fallback_agents(records: &[Value]) -> HashMap<String, String> {
     let mut trace_first_agent: HashMap<&str, &str> = HashMap::new();
 
     for record in records {
-        let Some(trace_id) = trace_id_from_record(record) else {
+        let Some(trace_id) = record.trace_id.as_deref() else {
             continue;
         };
         // Parent links are structural span data, not attributes. Collect them
         // before the attributes gate so attribute-less intermediate task/tool
         // spans still connect nested invoke_agent spans to the root.
-        let span_id = span_id_from_record(record);
+        let span_id = record.span_id.as_deref();
         if let Some(span_id) = span_id {
-            if let Some(parent_span_id) = parent_span_id_from_record(record) {
+            if let Some(parent_span_id) = record.parent_span_id.as_deref() {
                 parent_of.insert((trace_id, span_id), parent_span_id);
             }
         }
 
-        let Some(attributes) = record.get("attributes").and_then(Value::as_object) else {
+        if !record.has_attributes {
             continue;
         };
 
-        let agent_id = first_non_empty_attr(attributes, &["gen_ai.agent.id"]);
+        let agent_id = record.agent.as_deref();
 
-        if is_agent_summary_span_record(record, attributes) {
+        if record.is_agent_summary {
             if let Some(span_id) = span_id {
                 invoke_agent_span_ids.insert((trace_id, span_id));
                 trace_invoke_agents
@@ -341,65 +424,27 @@ fn is_root_invoke_agent(
 
 fn usage_candidate_from_record(
     record: &Value,
-    index: usize,
     fallback_timestamp: i64,
-    trace_contexts: &HashMap<String, TraceContext>,
 ) -> Option<CopilotUsageCandidate> {
     let attributes = record.get("attributes").and_then(Value::as_object)?;
-    let trace_id = trace_id_from_record(record).map(str::to_string);
-    let trace_context = trace_id
-        .as_deref()
-        .and_then(|trace_id| trace_contexts.get(trace_id));
-
-    if is_chat_span_record(record, attributes) {
-        return candidate_from_attributes(
-            CopilotUsageSource::ChatSpan,
-            record,
-            attributes,
-            trace_id,
-            trace_context,
-            index,
-            fallback_timestamp,
-        );
-    }
-
-    if is_inference_log_record(record, attributes) {
-        return candidate_from_attributes(
-            CopilotUsageSource::InferenceLog,
-            record,
-            attributes,
-            trace_id,
-            trace_context,
-            index,
-            fallback_timestamp,
-        );
-    }
-
-    if is_agent_turn_log_record(record, attributes) {
-        return candidate_from_attributes(
-            CopilotUsageSource::AgentTurnLog,
-            record,
-            attributes,
-            trace_id,
-            trace_context,
-            index,
-            fallback_timestamp,
-        );
-    }
-
-    if is_agent_summary_span_record(record, attributes) {
-        return candidate_from_attributes(
-            CopilotUsageSource::AgentSummarySpan,
-            record,
-            attributes,
-            trace_id,
-            trace_context,
-            index,
-            fallback_timestamp,
-        );
-    }
-
-    None
+    let source = if is_chat_span_record(record, attributes) {
+        CopilotUsageSource::ChatSpan
+    } else if is_inference_log_record(record, attributes) {
+        CopilotUsageSource::InferenceLog
+    } else if is_agent_turn_log_record(record, attributes) {
+        CopilotUsageSource::AgentTurnLog
+    } else if is_agent_summary_span_record(record, attributes) {
+        CopilotUsageSource::AgentSummarySpan
+    } else {
+        return None;
+    };
+    candidate_from_attributes(
+        source,
+        record,
+        attributes,
+        trace_id_from_record(record).map(str::to_string),
+        fallback_timestamp,
+    )
 }
 
 fn candidate_from_attributes(
@@ -407,8 +452,6 @@ fn candidate_from_attributes(
     record: &Value,
     attributes: &Map<String, Value>,
     trace_id: Option<String>,
-    trace_context: Option<&TraceContext>,
-    index: usize,
     fallback_timestamp: i64,
 ) -> Option<CopilotUsageCandidate> {
     let input = attr_i64_first(attributes, &["gen_ai.usage.input_tokens"]);
@@ -449,70 +492,41 @@ fn candidate_from_attributes(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let model = first_non_empty_attr(attributes, MODEL_ATTRS)
-        .or_else(|| trace_context.and_then(|context| context.model.as_deref()))
-        .unwrap_or("unknown")
-        .to_string();
-    let provider_id = inferred_provider_from_model(&model)
-        .unwrap_or("github-copilot")
-        .to_string();
-    let session_id = best_session_attr(attributes)
-        .map(|(session_id, _)| session_id)
-        .or_else(|| trace_context.and_then(|context| context.session_id.as_deref()))
-        .or(trace_id.as_deref())
-        .unwrap_or("unknown-session")
-        .to_string();
     let timestamp_ms = timestamp_ms_from_record(record).unwrap_or(fallback_timestamp);
     let duration_ms = duration_ms_from_record(record);
-    let dedup_key = dedup_key_for_record(
-        source,
-        record,
-        attributes,
-        trace_id.as_deref(),
-        &session_id,
-        timestamp_ms,
-        index,
-    );
+    // The final session fallback is only known after every record is projected.
+    let dedup_key = String::new();
 
     Some(CopilotUsageCandidate {
         source,
         trace_id,
         response_id,
-        model,
-        provider_id,
-        session_id,
+        model: String::new(),
+        provider_id: String::new(),
+        session_id: String::new(),
         timestamp_ms,
         duration_ms,
         tokens,
         dedup_key,
-        // Per-record attribution first: when a chat/inference record carries its
-        // own gen_ai.agent.id (e.g. a sub-agent turn inside a shared trace), use
-        // it so sub-agents are not mis-attributed to the trace's first agent.
-        // Fall back to the trace-level agent (typically from the invoke_agent
-        // span) only when the record itself has none.
-        agent: first_non_empty_attr(attributes, &["gen_ai.agent.id"])
-            .map(str::to_string)
-            .or_else(|| trace_context.and_then(|tc| tc.agent_id.clone())),
+        agent: None,
     })
 }
 
-fn candidate_trace_contexts(
-    candidates: &[CopilotUsageCandidate],
+fn candidate_trace_contexts<'a>(
+    candidates: impl Iterator<Item = &'a CopilotUsageCandidate>,
     source: CopilotUsageSource,
 ) -> HashSet<String> {
     candidates
-        .iter()
         .filter(|candidate| candidate.source == source)
         .filter_map(|candidate| candidate.trace_id.clone())
         .collect()
 }
 
-fn candidate_response_ids(
-    candidates: &[CopilotUsageCandidate],
+fn candidate_response_ids<'a>(
+    candidates: impl Iterator<Item = &'a CopilotUsageCandidate>,
     source: CopilotUsageSource,
 ) -> HashSet<String> {
     candidates
-        .iter()
         .filter(|candidate| candidate.source == source)
         .filter_map(|candidate| candidate.response_id.clone())
         .collect()
@@ -682,17 +696,15 @@ fn parent_span_id_from_record(value: &Value) -> Option<&str> {
         .filter(|parent_span_id| !parent_span_id.is_empty())
 }
 
-fn dedup_key_for_record(
+fn dedup_key(
     source: CopilotUsageSource,
-    record: &Value,
-    attributes: &Map<String, Value>,
     trace_id: Option<&str>,
+    span_id: Option<&str>,
+    turn_index: Option<i64>,
     session_id: &str,
     timestamp_ms: i64,
     index: usize,
 ) -> String {
-    let span_id = span_id_from_record(record);
-
     match source {
         CopilotUsageSource::ChatSpan | CopilotUsageSource::AgentSummarySpan => {
             match (trace_id, span_id) {
@@ -709,9 +721,7 @@ fn dedup_key_for_record(
             // is stable across re-runs. Otherwise fall back to the line index
             // so two turn-less agent-turn records in the same trace do not
             // collide on a `0` sentinel.
-            let turn_part = ["turn.index", "copilot_chat.turn.index"]
-                .iter()
-                .find_map(|key| attributes.get(*key).and_then(value_as_i64))
+            let turn_part = turn_index
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| format!("idx-{index}"));
             if let Some(trace_id) = trace_id {
@@ -907,6 +917,56 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    #[test]
+    fn test_late_context_preserves_record_overrides_and_successful_record_ordinals() {
+        let file = create_test_file(
+            r#"not json
+
+null
+{"type":"span","traceId":"late","name":"chat","startTime":[1775934260,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.usage.input_tokens":7}}
+{"traceId":"late","attributes":{"gen_ai.response.model":"gpt-5","gen_ai.response.id":"response"}}
+{"type":"span","traceId":"late","spanId":"own","name":"chat","attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"own-model","github.copilot.interaction_id":"own-interaction","gen_ai.agent.id":"own-agent","gen_ai.usage.output_tokens":3}}
+{"traceId":"late","attributes":{"gen_ai.request.model":"ignored-model","github.copilot.interaction_id":"interaction"}}
+{"traceId":"late","attributes":{"gen_ai.conversation.id":"session-first"}}
+{"traceId":"late","attributes":{"gen_ai.conversation.id":"session-later"}}
+{"type":"span","traceId":"late","spanId":"root","name":"invoke_agent","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.agent.id":"root-agent"}}
+"#,
+        );
+        let messages = parse_copilot_file(file.path());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].model_id, "gpt-5");
+        assert_eq!(messages[0].provider_id, "openai");
+        assert_eq!(messages[0].session_id, "session-first");
+        assert_eq!(messages[0].agent.as_deref(), Some("root-agent"));
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("span:session-first:1775934260000:1")
+        );
+        assert_eq!(messages[0].tokens.input, 7);
+        assert_eq!(messages[1].model_id, "own-model");
+        assert_eq!(messages[1].session_id, "own-interaction");
+        assert_eq!(messages[1].agent.as_deref(), Some("own-agent"));
+    }
+
+    #[test]
+    fn test_zero_chat_does_not_suppress_late_response_precedence() {
+        let file = create_test_file(
+            r#"{"type":"span","traceId":"zero","spanId":"chat","name":"chat","attributes":{"gen_ai.operation.name":"chat","gen_ai.response.id":"shared","gen_ai.usage.input_tokens":-1}}
+{"type":"span","traceId":"summary","spanId":"summary","name":"invoke_agent","attributes":{"gen_ai.operation.name":"invoke_agent","gen_ai.response.id":"shared","gen_ai.usage.input_tokens":100}}
+{"type":"log","traceId":"turn","attributes":{"event.name":"copilot_chat.agent.turn","gen_ai.response.id":"shared","gen_ai.usage.input_tokens":50}}
+{"type":"log","startTime":[1775934260,0],"attributes":{"event.name":"gen_ai.client.inference.operation.details","gen_ai.response.id":"shared","gen_ai.usage.input_tokens":9}}
+"#,
+        );
+        let messages = parse_copilot_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 9);
+        assert_eq!(messages[0].session_id, "shared");
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("log:shared:1775934260000:3")
+        );
     }
 
     #[test]
