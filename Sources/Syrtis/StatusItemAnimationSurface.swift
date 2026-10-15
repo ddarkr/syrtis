@@ -422,6 +422,7 @@ private final class StatusItemRunnerLayer: CALayer {
     }
 
     func setColor(_ color: CGColor) {
+        guard tintColor != color else { return }
         tintColor = color
         applyTint()
     }

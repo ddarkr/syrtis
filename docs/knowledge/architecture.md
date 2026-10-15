@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-15
+last_verified: 2026-10-16
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -367,6 +367,8 @@ Swift FFI decoder 用 `Data(bytesNoCopy:)` 接管 native C buffer，由 custom d
 TrayAnimator 只持有當下 style／sand level／appearance 的 frame set；animation 關閉時只載入第一張。切換、quota style 與 stop 釋放不再需要的 frame set。Settings preview 不再使用 process-global frame cache，而由可見 view 的 demand／disappearance 管理 images；appearance／level 切換或重新開啟需重新解碼，接受 latency 以降低 resident RAM。
 
 選單列 rate 的唯一 owner 是 `TrayAnimator`；AppDelegate 只讀它的 last-good `tokensPerMinRate`，不另發 rate FFI。Demand 為 tokens/min title、sand icon（即使 animation 關閉仍需要 rate）或非 quota icon 的啟用動畫；沒有 demand 時停止 reader，重新啟用立即讀取。Rate replacement／取消先推進 generation，完成時同時檢查 generation、demand 與 cancellation，舊結果不得發布。失敗與移除 demand 保留 last-good 值，不製造零值。
+
+`StatusItemRunnerLayer` ignores an unchanged resolved tint instead of rebuilding its tinted `CGImage` frames. Changed colors still rebuild the current frame set; frame count, animation speed, geometry and appearance selection are unchanged. This removes repeated rendering work and its temporary allocations, not the active animation's image storage.
 
 Tray and Discord read the app-owned background graph. Each active presentation holds one `TrayDisplayProjection`, keyed by exact hidden-client membership, optional allowlist, local day and timezone; accepting a graph replaces the projection even when `generatedAt` repeats. Disabling a presentation drops its projection but keeps the last-good graph for immediate re-enabling. The independent 30-second render clock redraws cached menu-bar state and quota staleness without reading sources or replacing quota network polling.
 
