@@ -17,10 +17,10 @@ public struct ModelReportEntry: Decodable, Sendable {
     public let messageCount: Int
     public let cost: Double
     public let msPer1kTokens: Double?
-    /// What the local pricing table would charge for this row's tokens; `nil`
-    /// when it cannot price them (no cached dataset, or a model it does not
-    /// carry). See `local_cost_estimate` in
-    /// crates/tb_core_ffi/src/model_report.rs.
+    /// Conservative local-price upper bound for this aggregate's tokens;
+    /// `nil` when no usable rates exist. Request tiers and cache TTLs are
+    /// bounded rather than guessed; this is not a billing estimate.
+    /// See `local_cost_estimate` in crates/tb_core_ffi/src/model_report.rs.
     ///
     /// Optional so a report serialized before this field existed still
     /// decodes.
@@ -28,9 +28,8 @@ public struct ModelReportEntry: Decodable, Sendable {
 }
 
 public extension ModelReportEntry {
-    /// How many times `cost` exceeds what the local pricing table would
-    /// charge, when that multiple is large enough to call the cost broken;
-    /// `nil` otherwise.
+    /// How many times `cost` exceeds the local-price upper bound, when that
+    /// multiple is large enough to call the cost broken; `nil` otherwise.
     ///
     /// A client that reports its own per-message cost (OpenCode, MiMo Code)
     /// has that figure taken verbatim by syrtis-core — it never meets a

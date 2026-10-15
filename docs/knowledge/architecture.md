@@ -291,6 +291,8 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 
 ## Usage attribution
 
+The model report's local cost estimate is a conservative aggregate upper bound for the anomaly guard, not a bill. It takes each token lane's maximum configured tariff, includes derived hourly cache-write rates and the canonical OpenAI priority bound, and returns no estimate when no usable rates exist. Lost per-request tiers or cache TTL splits are not reconstructed; ordinary billing calculations and wire fields are unchanged.
+
 本機用量與 quota 卡片並置時隱含「這些 token 消耗了那個訂閱」的宣稱，而本機資料沒有任何欄位記錄計費關係。歸屬因此是**使用者宣告**，不是推論：推論只能產生建議，未經確認一律 `unassigned`，且三態（`assigned`／`excluded`／`unassigned`）各自可見、相加等於該 client 的本機總量。文案不得宣稱扣抵。
 
 分類必須在會遺失對應鍵維度的聚合之前生效，所以歸屬頁消費的是 provider-split 的原始列；`modelLevelEntries` 會把 provider 摺回去，只供不分類的顯示端使用。

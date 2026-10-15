@@ -105,8 +105,8 @@ pub(crate) fn run_from_snapshot(
     crate::encode_local_payload(&map_report(report, pricing))
 }
 
-/// What the local pricing table would charge for this row's tokens, or `None`
-/// when it cannot price them.
+/// Conservative configured-rate upper bound for this aggregate, or `None`
+/// when it cannot price any tokens. Lost request tiers and TTLs are not guessed.
 ///
 /// This exists because clients that record their own per-message cost
 /// (OpenCode, MiMo Code) have it taken verbatim: syrtis-core's
@@ -133,53 +133,14 @@ fn local_cost_estimate(
         cache_read: entry.cache_read,
         cache_write: entry.cache_write,
         reasoning: entry.reasoning,
-        // `ModelUsage` carries no 1h/5m split, so this has to assume one.
-        // Assume ALL of it is 1h, which is the more expensive of the two:
-        // this estimate is the denominator of a ratio compared against a
-        // threshold, so only an UPPER bound on it is safe. Under-estimating
-        // inflates the ratio and invents warnings; over-estimating only
-        // deflates it and stays quiet, which is the right way to fail for a
-        // guard against costs wrong by three orders of magnitude.
-        //
-        // The asymmetry is not theoretical. This line used to pass 0 (price
-        // everything at the 5m rate) and that produced a real false-positive
-        // path, found in review of #309:
-        //
-        //   `compute_cost` charges a 1h write at 2x base input, deriving it
-        //   as `2.0 * tiered_cost(..., input_cost_per_token, ...)` because no
-        //   pricing table publishes a 1h key. The 5m rate is the table's
-        //   `cache_creation_input_token_cost` — which some entries omit. The
-        //   provider hint steers `claude-haiku-4-5` to
-        //   `perplexity/anthropic/claude-haiku-4-5`, a resale entry with no
-        //   such key (the canonical one has 1.25e-06; upstream tokscale #57).
-        //   So a 5m-priced estimate dropped that row's cache write entirely
-        //   while tokscale still billed it. A row that builds a large cache,
-        //   has a small input/output remainder and takes no later cache reads
-        //   — ordinary for a session that ends after priming — then reaches
-        //   `cost / estimate` above 50 on a LOCALLY priced row, showing "cost
-        //   reported by the client" over a number no client reported.
-        //
-        // Pricing the whole write at 1h closes that path at the source rather
-        // than bounding it: the estimate now includes those tokens even when
-        // the matched entry has no 5m rate, because the 1h rate is derived
-        // from input rather than looked up. Where the real split was 5m the
-        // estimate runs high by at most 2.0/1.25 = 1.6x, which only makes the
-        // guard quieter.
-        //
-        // The rows the guard exists for are unaffected either way: OpenCode's
-        // self-reported costs come through deepseek/openrouter with no cache
-        // write at all.
-        //
-        // Two earlier comments here argued this was safe with `0`, first
-        // because the gap was "a few percent" (unmeasured; it reaches 60% of
-        // the cache-write component) and then because the affected and judged
-        // rows were disjoint (they are not — every row is estimated). Both
-        // were reasoning about how big the error was. The error's DIRECTION
-        // was the part that mattered.
-        cache_write_1h: entry.cache_write,
+        // The aggregate no longer carries cache TTLs or per-request tiers.
+        cache_write_1h: 0,
     };
-    let estimate =
-        pricing.calculate_cost_with_provider(&entry.model, Some(&entry.provider), &usage);
+    let estimate = pricing.calculate_aggregate_cost_upper_bound_with_provider(
+        &entry.model,
+        Some(&entry.provider),
+        &usage,
+    )?;
     (estimate.is_finite() && estimate > 0.0).then_some(estimate)
 }
 
@@ -710,6 +671,64 @@ mod tests {
         e.provider = "deepseek".to_string();
         e.cost = cost;
         e
+    }
+
+    #[test]
+    fn aggregate_estimate_bounds_unknown_cache_ttl_and_openai_priority() {
+        let service = syrtis_core::pricing::PricingService::new(
+            std::collections::HashMap::from([(
+                "audit".to_owned(),
+                syrtis_core::pricing::ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    cache_creation_input_token_cost: Some(9e-6),
+                    ..Default::default()
+                },
+            )]),
+            std::collections::HashMap::new(),
+        );
+        let mut usage = entry(100_000, 0, 0, 100_000, 0);
+        usage.model = "audit".to_owned();
+        usage.provider = "anthropic".to_owned();
+        let ordinary = local_cost_estimate(Some(&service), &usage).unwrap();
+        assert!((ordinary - 1.0).abs() < 1e-12);
+        for provider in ["openai", "openai-codex", "openai_codex", " OpenAI "] {
+            usage.provider = provider.to_owned();
+            let priority_bound = local_cost_estimate(Some(&service), &usage).unwrap();
+            assert!((priority_bound - 2.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn aggregate_bound_covers_interior_ttl_split_with_decreasing_custom_tiers() {
+        let service = syrtis_core::pricing::PricingService::new(
+            std::collections::HashMap::from([(
+                "audit".to_owned(),
+                syrtis_core::pricing::ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    cache_creation_input_token_cost: Some(9e-6),
+                    cache_creation_input_token_cost_above_200k_tokens: Some(1e-6),
+                    ..Default::default()
+                },
+            )]),
+            std::collections::HashMap::new(),
+        );
+        let mut usage = entry(100_000, 0, 0, 400_000, 0);
+        usage.model = "audit".to_owned();
+        usage.provider = "anthropic".to_owned();
+        let bound = local_cost_estimate(Some(&service), &usage).unwrap();
+        assert!((bound - 3.7).abs() < 1e-12);
+        let mixed = service.calculate_cost_with_provider(
+            "audit",
+            Some("anthropic"),
+            &syrtis_core::TokenBreakdown {
+                input: 100_000,
+                cache_write: 400_000,
+                cache_write_1h: 200_000,
+                ..Default::default()
+            },
+        );
+        assert!((mixed - 2.3).abs() < 1e-12);
+        assert!(bound >= mixed);
     }
 
     #[test]
