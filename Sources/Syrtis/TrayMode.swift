@@ -41,7 +41,8 @@ enum TrayMode: String, CaseIterable {
 
     /// The tray title for this mode ("" = icon only). `tokensPerMin` feeds
     /// the live-rate mode; `quotaRemaining` the quota mode.
-    func title(graph: UsagePayload?, tokensPerMin: Double?, quotaRemaining: Double? = nil) -> String {
+    func title(graph: UsagePayload?, tokensPerMin: Double?, quotaRemaining: Double? = nil,
+               projection: TrayDisplayProjection? = nil) -> String {
         if self == .quotaLeft {
             guard let quotaRemaining else { return "—%" }
             return "\(Int(min(100, max(0, quotaRemaining)).rounded()))%"
@@ -50,14 +51,17 @@ enum TrayMode: String, CaseIterable {
             guard let tokensPerMin else { return "—/m" }
             return "\(Format.compactTokens(Int64(max(0, tokensPerMin).rounded())))/m"
         }
-        guard self != .hidden, let graph else { return "" }
+        guard self != .hidden, let graph = projection?.graph ?? graph else { return "" }
         /// Hidden clients must not appear in any tray figure. An empty hidden
         /// set is byte-identical to the pre-hide summary/today totals. Computed
         /// lazily only in the branches that read it — title() runs on every
         /// UserDefaults write (AppDelegate's observer), and the rate/early modes
         /// never touch the aggregate.
         func totals() -> TrayTotals {
-            graph.trayTotals(hidden: ClientRegistry.hiddenTabClients(), today: Format.todayKey())
+            if let projection {
+                return projection.totals(hidden: ClientRegistry.hiddenTabClients(), today: Format.todayKey())
+            }
+            return graph.trayTotals(hidden: ClientRegistry.hiddenTabClients(), today: Format.todayKey())
         }
         switch self {
         case .todayTokens:

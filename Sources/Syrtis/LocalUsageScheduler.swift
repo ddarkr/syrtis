@@ -40,9 +40,12 @@ final class LocalUsageScheduler {
         let force: UInt64
         let continuation: CheckedContinuation<LocalUsageValue?, Error>
     }
-    private struct Cached {
+    struct DisplaySnapshot {
         let value: LocalUsageValue
         let identity: String
+        let capturedAt: Date
+        let scanRoots: String
+        fileprivate var requiresRefresh = false
     }
     private struct RecentClock {
         let origin: TimeInterval
@@ -70,7 +73,7 @@ final class LocalUsageScheduler {
     private var recentClockRevision: UInt64 = 0
     private var demandedScopes: Set<LocalUsageScope> = []
     private var activeDemand = false
-    private var results: [Query: Cached] = [:]
+    private var results: [Query: DisplaySnapshot] = [:]
     private var sync: LocalUsageSyncResult?
     private var syncedScopes: Set<LocalUsageScope> = []
     private var capturingScopes: Set<LocalUsageScope> = []
@@ -177,6 +180,19 @@ final class LocalUsageScheduler {
     }
     func contains(_ session: Session) -> Bool { owners[session] != nil && !stopped }
 
+    /// Display-only last good history. It never satisfies a freshness barrier.
+    /// Root changes and demand removal evict it through the ordinary cache.
+    func displaySnapshot(for query: Query) -> DisplaySnapshot? {
+        guard !stopped, !query.isRecent, let held = results[query],
+              held.scanRoots == ClaudeExtraRoots.appliedPayloadJSON else { return nil }
+        return held
+    }
+
+    private func cachedIdentity(_ query: Query) -> String? {
+        guard let held = results[query], !held.requiresRefresh else { return nil }
+        return held.identity
+    }
+
     func update(_ session: Session, queries: Set<Query>, active: Bool,
                 onValue: @escaping @MainActor (Query, Result<LocalUsageValue, Error>) -> Void) {
         guard var owner = owners[session], !stopped else { return }
@@ -185,7 +201,7 @@ final class LocalUsageScheduler {
         owners[session] = owner
         if changed { pruneResults() }
         for query in queries {
-            if !needsSync, let held = results[query], held.identity == identity(query),
+            if !needsSync, let held = results[query], cachedIdentity(query) == identity(query),
                syncedScopes.contains(query.scope) {
                 onValue(query, .success(held.value))
             }
@@ -250,7 +266,7 @@ final class LocalUsageScheduler {
         let barrier = requestForce(force)
         // Exact held results stay usable while unrelated scopes keep global
         // needsSync true; starvation by unrelated demand is a scheduler bug.
-        if !force, let held = results[query], held.identity == identity(query),
+        if !force, let held = results[query], cachedIdentity(query) == identity(query),
            syncedScopes.contains(query.scope) {
             return held.value
         }
@@ -378,7 +394,10 @@ final class LocalUsageScheduler {
         let expired = results.filter { query, cached in
             query.isRecent || cached.identity != identity(query)
         }.map(\.key)
-        for query in expired { results.removeValue(forKey: query) }
+        for query in expired {
+            if query.isRecent { results.removeValue(forKey: query) }
+            else { results[query]?.requiresRefresh = true }
+        }
         lastClock = -TimeInterval.infinity
         if reverify { sourcesChanged(requiresTopology: true); dirtyAt = nil }
         kick()
@@ -512,7 +531,7 @@ final class LocalUsageScheduler {
     private func resumeReadyWaiters() {
         for entry in Array(waiting.values) where contains(entry.session) && entry.force <= forceVerified {
             if let query = entry.query, let value = results[query],
-               value.identity == identity(query), syncedScopes.contains(query.scope) {
+               cachedIdentity(query) == identity(query), syncedScopes.contains(query.scope) {
                 waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: value.value)
             } else if let quota = entry.quota, syncedScopes.contains(quota) {
                 waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: nil)
@@ -523,7 +542,7 @@ final class LocalUsageScheduler {
     private func resumeQueryWaiters(_ query: Query) {
         for entry in Array(waiting.values) where entry.query == query
             && contains(entry.session) && entry.force <= forceVerified {
-            if let value = results[query], value.identity == identity(query),
+            if let value = results[query], cachedIdentity(query) == identity(query),
                syncedScopes.contains(query.scope) {
                 waiting.removeValue(forKey: entry.id)?.continuation.resume(returning: value.value)
             }
@@ -576,10 +595,10 @@ final class LocalUsageScheduler {
         let now = monotonicNow()
         if worker == nil, now >= retryAt, needsSync { worker = Task { await self.runWorker() } }
         let recentMissing = demandedQueries.contains {
-            $0.isRecent && syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
+            $0.isRecent && syncedScopes.contains($0.scope) && cachedIdentity($0) != identity($0)
         }
         let historyMissing = demandedQueries.contains {
-            !$0.isRecent && syncedScopes.contains($0.scope) && results[$0]?.identity != identity($0)
+            !$0.isRecent && syncedScopes.contains($0.scope) && cachedIdentity($0) != identity($0)
         }
         if recentQueryWorker == nil, now >= retryAt, recentMissing || now >= nextClockDeadline {
             _ = startRecentQueryWorker()
@@ -753,9 +772,9 @@ final class LocalUsageScheduler {
             failWaiters(error, throughForce: forceBarrier)
             for (session, owner) in owners where contains(session) {
                 for query in owner.queries {
-                    // Last-good display stays in the consumer, but a failed
-                    // capture must revalidate every query on recovery.
-                    results.removeValue(forKey: query)
+                    // Retain compact last-good display for newly opened views,
+                    // but force every query to revalidate on recovery.
+                    results[query]?.requiresRefresh = true
                     owner.callback?(query, .failure(error))
                 }
             }
@@ -765,7 +784,7 @@ final class LocalUsageScheduler {
     private func unpublishedGraphs() -> [(query: Query, owners: Set<Session>)] {
         refreshDemand()
         var stages: [(query: Query, owners: Set<Session>)] = []
-        for query in demandedQueries where query.kind == "graph" && results[query]?.identity != identity(query) {
+        for query in demandedQueries where query.kind == "graph" && cachedIdentity(query) != identity(query) {
             stages.append((query, demanders(of: query)))
         }
         stages.sort { $0.query.scope.id < $1.query.scope.id }
@@ -818,8 +837,9 @@ final class LocalUsageScheduler {
               side.scopes.contains(where: { $0.id == query.scope.id }),
               !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
         let key = identity(query, in: side)
-        if results[query]?.identity == key { return }
+        if cachedIdentity(query) == key { return }
         queryCount += 1
+        let scanRoots = ClaudeExtraRoots.appliedPayloadJSON
         do {
             let value = try await source.localUsageQuery(LocalUsageQueryRequest(
                 leaseToken: side.leaseToken, scopeId: query.scope.id, kind: query.kind,
@@ -827,8 +847,10 @@ final class LocalUsageScheduler {
                 nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
             guard !stopped, epoch == rootEpoch, demandedQueries.contains(query),
                   key == identity(query, in: side),
+                  scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
                   !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { return }
-            results[query] = Cached(value: value, identity: key)
+            results[query] = DisplaySnapshot(
+                value: value, identity: key, capturedAt: wallNow(), scanRoots: scanRoots)
             for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
                 owner.callback?(query, .success(value))
             }
@@ -907,9 +929,10 @@ final class LocalUsageScheduler {
             // buckets use this query's demand cadence, history uses day/timezone: the lane
             // split only unblocks recent, it never weakens admission.
             let key = identity(query)
-            if results[query]?.identity == key { continue }
+            if cachedIdentity(query) == key { continue }
             let token = snapshot.leaseToken
             pinLease(token)
+            let scanRoots = ClaudeExtraRoots.appliedPayloadJSON
             do {
                 defer { unpinLease(token) }
                 queryCount += 1
@@ -919,12 +942,14 @@ final class LocalUsageScheduler {
                     nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
                 guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
                 guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
+                      scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
                       !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
                 if key != identity(query) {
-                    results.removeValue(forKey: query)
+                    results[query]?.requiresRefresh = true
                     continue
                 }
-                results[query] = Cached(value: value, identity: key)
+                results[query] = DisplaySnapshot(
+                    value: value, identity: key, capturedAt: wallNow(), scanRoots: scanRoots)
                 for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
                     owner.callback?(query, .success(value))
                 }

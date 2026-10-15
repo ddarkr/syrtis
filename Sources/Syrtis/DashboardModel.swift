@@ -162,9 +162,8 @@ struct RestoredSnapshot: Equatable {
 /// load so a fresh DashboardModel can start in `.ready` state instead of
 /// flashing "Loading usage…" every time the popover reopens.
 ///
-/// Runtime close keeps only graph/provider state here. Model, hourly, agent
-/// and trace payloads are owned by their visible scheduler sessions; legacy
-/// one-shot diagnostics retain their isolated reopen fixtures.
+/// Keeps the last visible compact reports for first paint on reopen, not source
+/// leases or background demand. Fresh scheduler results replace them in place.
 private struct DashboardSnapshot {
     let payload: UsagePayload
     let stats: UsageStats
@@ -184,6 +183,12 @@ private struct DashboardSnapshot {
     /// When this process fetched `modelReport`, so a reopen does not reset
     /// the hourly pricing refresh in `ensureModelReport` (#191).
     let modelFetchedAt: Date?
+    let hourly: HourlyReport?
+    let hourlyClients: Set<String>?
+    let hourlyYear: String?
+    let agents: AgentsReport?
+    let agentsClients: Set<String>?
+    let agentsYear: String?
     let colors: ModelColorMap
     let knownYears: [String]
     let year: String?
@@ -383,7 +388,11 @@ private struct DashboardSnapshot {
         localError = localQueryErrors.values.sorted().first
         if view == .agents, agentsClients != Set(clients) || agentsYear != Self.identityYear(year) { agents = nil }
         if modelSliceIsCommitted { cacheSnapshot() }
-        scheduler.setStatus(localSession) { [weak self] pending, _ in self?.localPending = pending }
+        scheduler.setStatus(localSession) { [weak self] pending, error in
+            self?.localPending = pending
+            self?.localError = error ?? self?.localQueryErrors.values.sorted().first
+            if error != nil { self?.restoredSnapshot?.failed = true }
+        }
         scheduler.update(localSession, queries: questions, active: true) { [weak self] query, result in
             guard let self, scheduler.contains(localSession), self.year == requestedYear else { return }
             switch result {
@@ -413,8 +422,12 @@ private struct DashboardSnapshot {
                 case .agents(let report):
                     self.agents = report; self.agentsClients = Set(query.clients ?? [])
                     self.agentsYear = Self.identityYear(requestedYear)
+                    if self.modelSliceIsCommitted { self.cacheSnapshot() }
                 case .trace(let buckets):
-                    if query.windowSecs == 600 { self.trace = buckets }
+                    if query.windowSecs == 600 {
+                        self.trace = buckets
+                        self.refreshSnapshotLiveData()
+                    }
                 case .rate(let rate): self.liveRate = rate
                 }
             }
@@ -442,25 +455,13 @@ private struct DashboardSnapshot {
     }
 
     func releaseLocalDemand() {
+        if modelSliceIsCommitted { cacheSnapshot() }
         windowRefreshTask?.cancel(); windowRefreshTask = nil
         expandedModelRows.removeAll()
         releaseWindowUsageDemand()
         if let scheduler, let localSession { scheduler.release(localSession) }
         graphFetchToken &+= 1; _ = beginHourlyRequest(); _ = beginModelRequest()
         fulfillRestoreGate()
-        modelReport = nil; hourly = nil; agents = nil; trace = []
-        statsMemoGeneratedAt = nil; statsMemoSelected = nil; statsMemoValue = nil
-        if scheduler != nil, ownsLastSnapshot, let snapshot = Self.lastSnapshot {
-            replaceLastSnapshot(DashboardSnapshot(
-                payload: snapshot.payload, stats: snapshot.stats, payloadCapturedAt: snapshot.payloadCapturedAt,
-                modelReport: nil, modelGeneratedAt: nil, modelFetchedAt: nil,
-                colors: ModelColorMap(report: nil), knownYears: snapshot.knownYears, year: snapshot.year,
-                agentUsage: snapshot.agentUsage, trace: [],
-                quotaCards: DashboardSnapshot.QuotaCards(
-                    summaries: [], heatmaps: [:], heatmapWindows: [], windowCards: [:],
-                    windowCardAccounts: [:], windowCurves: [:], history: [], equivalences: [:],
-                    cycles: [], historyCardId: nil, cyclesAccount: nil)))
-        }
     }
 
     private func fetchGraph(year: String?, force: Bool, priority: TaskPriority) async throws -> UsagePayload {
@@ -505,7 +506,7 @@ private struct DashboardSnapshot {
     /// the model's `year` can never drift (the guard MUST compare the same value
     /// the model fetches, or it would mis-classify a consistent snapshot as stale).
     /// Callers that own process-wide settings may explicitly pass nil for all time.
-    private static func resolveYear() -> String? {
+    static func resolveYear() -> String? {
         CommandLine.arguments
             .first(where: { $0.hasPrefix("--year=") })
             .map { String($0.dropFirst("--year=".count)) }
@@ -553,7 +554,14 @@ private struct DashboardSnapshot {
         if let snap = Self.lastSnapshot, snap.year == initialYear {
             payload = snap.payload
             stats = snap.stats
+            payloadCapturedAt = snap.payloadCapturedAt
             modelReport = snap.modelReport
+            hourly = snap.hourly
+            hourlyClients = snap.hourlyClients
+            hourlyYear = snap.hourlyYear
+            agents = snap.agents
+            agentsClients = snap.agentsClients
+            agentsYear = snap.agentsYear
             colors = snap.colors
             knownYears = snap.knownYears
             // Draw the history cards from the last publication rather than
@@ -629,6 +637,7 @@ private struct DashboardSnapshot {
             // comment), so a disk restore ALWAYS leaves modelReport/modelYear/
             // modelPayloadGeneratedAt nil and the gate is always installed.
             payload = envelope.payload
+            payloadCapturedAt = envelope.savedAt
             stats = UsageStats(
                 payload: envelope.payload, selectedClients: Set(envelope.payload.summary.clients))
             knownYears = envelope.knownYears
@@ -641,6 +650,35 @@ private struct DashboardSnapshot {
         }
         if cachesSnapshot {
             Self.lastSnapshotOwner = ObjectIdentifier(self)
+        }
+        if let scheduler, let localSession, scheduler.contains(localSession),
+           let graph = scheduler.displaySnapshot(for: .init(kind: "graph", year: initialYear)),
+           case .graph(let prepared) = graph.value {
+            payload = prepared
+            stats = UsageStats(payload: prepared, selectedClients: Set(prepared.summary.clients))
+            knownYears = Set(knownYears + prepared.years.map(\.year)).sorted(by: >)
+            acceptedPayloadYear = Self.identityYear(initialYear)
+            payloadCapturedAt = graph.capturedAt
+            payloadScanRoots = graph.scanRoots
+            phase = .ready
+            restoredSnapshot = RestoredSnapshot(savedAt: graph.capturedAt, failed: false)
+            restoreGatePending = true
+            invalidateModel()
+            if let models = scheduler.displaySnapshot(for: .init(kind: "models", year: initialYear)),
+               models.identity == graph.identity, case .models(let report) = models.value {
+                modelReport = report
+                colors = ModelColorMap(report: report)
+                modelYear = Self.identityYear(initialYear)
+                modelPayloadGeneratedAt = prepared.meta.generatedAt
+                modelFetchedAt = models.capturedAt
+            }
+        }
+        if let scheduler, let localSession {
+            scheduler.setStatus(localSession) { [weak self] pending, error in
+                self?.localPending = pending
+                self?.localError = error
+                if error != nil { self?.restoredSnapshot?.failed = true }
+            }
         }
     }
 
@@ -1151,6 +1189,7 @@ private struct DashboardSnapshot {
             }
             Self.hourlyCache[cacheKey] = report
         }
+        if modelSliceIsCommitted { cacheSnapshot() }
     }
 
     private func reload(force: Bool, kind: RefreshKind) async {
@@ -1312,6 +1351,8 @@ private struct DashboardSnapshot {
             modelReport: modelReport,
             modelGeneratedAt: modelPayloadGeneratedAt,
             modelFetchedAt: modelFetchedAt,
+            hourly: hourly, hourlyClients: hourlyClients, hourlyYear: hourlyYear,
+            agents: agents, agentsClients: agentsClients, agentsYear: agentsYear,
             colors: colors, knownYears: knownYears, year: year,
             agentUsage: agentUsage, trace: trace,
             quotaCards: DashboardSnapshot.QuotaCards(
@@ -1378,6 +1419,8 @@ private struct DashboardSnapshot {
             modelReport: snap.modelReport,
             modelGeneratedAt: snap.modelGeneratedAt,
             modelFetchedAt: snap.modelFetchedAt,
+            hourly: snap.hourly, hourlyClients: snap.hourlyClients, hourlyYear: snap.hourlyYear,
+            agents: snap.agents, agentsClients: snap.agentsClients, agentsYear: snap.agentsYear,
             colors: snap.colors, knownYears: snap.knownYears, year: snap.year,
             agentUsage: agentUsage, trace: trace,
             // From the model, not from `snap`: this path republishes the cache
