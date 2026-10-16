@@ -4,7 +4,7 @@ id: kb-vendor-tokscale
 kind: canonical
 scope: repository
 read_when: changing Syrtis engine code, persistent usage, parser output, or assessing an upstream-derived fix
-last_verified: 2026-10-08
+last_verified: 2026-10-16
 sources: ["Cargo.toml", "crates/syrtis_core/Cargo.toml", "crates/syrtis_core/UPSTREAM.md", "vendor/README.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public issue #45", "public issue #118", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -22,6 +22,7 @@ Syrtis owns `syrtis-core` as ordinary source in [`crates/syrtis_core`](../../cra
 - [Schema and parser output](#schema-and-parser-output)
 - [Sibling-source rule](#sibling-source-rule)
 - [Upstream alignment](#upstream-alignment)
+- [2026-10-16 collection audit](#2026-10-16-collection-audit)
 - [Handoff checklist](#handoff-checklist)
 
 ---
@@ -181,6 +182,44 @@ This rule applies to JSONL journals, Roo-family history, SQLite WAL files, Claud
 The public rolling inventory is tracked in [issue #45](https://github.com/Nanako0129/syrtis/issues/45). It is an inventory and decision surface, not a promise to clear every deferred capability. Correctness work is prioritized over new client breadth during maintenance. Every selected item must be re-evaluated against the current tokscale upstream head and current shared-engine tree before implementation.
 
 The Copilot nested-agent bookkeeping in the engine's `UPSTREAM.md` records upstream issue [#879](https://github.com/junhoyeo/tokscale/issues/879) as closed and pull request [#880](https://github.com/junhoyeo/tokscale/pull/880) as merged (upstream commit [`20d9096a68a40d4a4e83581b0e0dd308aadc5ab7`](https://github.com/junhoyeo/tokscale/commit/20d9096a68a40d4a4e83581b0e0dd308aadc5ab7), the PR head; GitHub PR merge commit `b7277d49a14ae905c17195be214d632e365b3ca6`). The exact merged diff has been compared with the M10-E hardening: its trace-scoped hierarchy and stale-cache rebuild semantics are equivalent, so no additional production or cache-schema port is needed. The assessment therefore closes as bookkeeping-only. This is no longer an external-upstream wait state; do not resurrect the superseded intermediate report when describing that status.
+
+## 2026-10-16 collection audit
+
+本次以 [tokscale `68a4324ab15d4337e295a36e3dff5d4431a182b3`](https://github.com/junhoyeo/tokscale/commit/68a4324ab15d4337e295a36e3dff5d4431a182b3) 的實際 source build，與 Syrtis 的合成檔案 parser 輸出比較。不是以不同 revision 的已發布 CLI 代替該 SHA，也沒有讀取使用者 sessions 或呼叫 provider。兩邊序列化 schema 不同，因此逐項比較事件、timestamp、session、provider／model、token lanes、cost 與 dedup identity，不要求整份 JSON byte-equal。
+
+下表 token 順序是 input／output／cache-read／cache-write；所有案例 reasoning／1h-write 都為 0，provider／model 為 `anthropic`／`claude-sonnet-4`。
+
+| 合成案例 | Syrtis | tokscale | 結論 |
+|---|---|---|---|
+| Pi | 1 event，40／15／7／3，timestamp `1790856000000` | 相同 | 這份 fixture 的 token、時間與 session 一致 |
+| OMP | 1 event，40／15／7／3，timestamp `1790856000000` | 相同 | 這份 fixture 的 token、時間與 session 一致 |
+| Cline legacy | 1 event，40／15／7／3，cost 0.05 | 相同 | 既有 Roo-style 格式未見該 fixture 的漏收 |
+| Cline CLI | 0 events | 1 event，30／15／7／3，cost 0.05 | `.messages.json` object 格式確實未收集 |
+| Amp explicit usage time | 1 event，40／15／7／3，cost 0.05；timestamp `1790856001000` | 相同 tokens／cost；timestamp `1791036000000` | 不是 token 總量漏收，但明確使用時刻遭忽略，可能歸錯日期 |
+
+Pi／OMP 的 Syrtis response key 帶 provider（例如 `pi:response:anthropic:response-1`），上游不帶；Amp 的本機 cost provenance 是 `providerReported`，上游為 `unknown`。這些差異不能直接當作漏收。Cline CLI 的 upstream input 30 是從 fixture 的 inclusive input 40 扣除 cache-read 7 與 cache-write 3，而非兩邊相同 token units 的落差。具體來源為 pinned [Amp timestamp reader](https://github.com/junhoyeo/tokscale/blob/68a4324ab15d4337e295a36e3dff5d4431a182b3/crates/tokscale-core/src/sessions/amp.rs#L190-L218)、[Cline CLI parser](https://github.com/junhoyeo/tokscale/blob/68a4324ab15d4337e295a36e3dff5d4431a182b3/crates/tokscale-core/src/sessions/cline.rs#L15-L268) 與 [CLI discovery](https://github.com/junhoyeo/tokscale/blob/68a4324ab15d4337e295a36e3dff5d4431a182b3/crates/tokscale-core/src/scanner.rs#L1513-L1537)。
+
+### Source inventory 與未執行範圍
+
+Registry source inventory 是 Syrtis 42 個、上游 57 個 clients；Syrtis-only 為空。上游另外註冊 `antigravity-extension`、`cherrystudio`、`codebuddy`、`commandcode`、`devin-cli`、`devin-desktop`、`dsh`、`freebuff`、`fx`、`lmstudio`、`mcode`、`micode-desktop`、`prime-agent`、`unsloth`、`workbuddy`。這是 capability 差距，不是 57-client runtime 完整性驗收。
+
+同一批 source review 另辨識出下列 discovery 差異；除上表明列案例外，尚未做該來源的 runtime 對拍：
+
+| 已有 client | 待驗證的來源差異 |
+|---|---|
+| Cline | CLI 的 `.cline/data/sessions/*.messages.json`、`CLINE_SESSION_DATA_DIR`／`CLINE_DATA_DIR`／`CLINE_DIR` overrides，以及 manifest 的 workspace metadata 不在現有 Roo-only 路徑 |
+| Amp | 上游另外掃描 config 的 `amp-cache/threads` export cache；現有本機 `amp/threads` 不等於此來源 |
+| Claude | 上游有 `CLAUDE_CONFIG_DIR/projects` resolver；本機既有 app registry／extra roots 是不同設定介面，不保證自動追隨該環境變數 |
+| Codex | 上游 registry pattern 是 `*.jsonl*`；Syrtis 是 `*.jsonl`。僅憑 pattern 差異不能證明某種壓縮格式已可解析 |
+| Copilot | 上游另有 `.copilot/session-store.db` 來源；既有 OTEL／Desktop ingestion 不等於此 store |
+| ZCode | 本機明確只收 v2 SQLite；上游另收 `.zcode/projects` JSONL |
+
+上游還有 `service_tier`、`session_title`、`parent_session_id`、`model_attribution_conflicted` 欄位，本機另有 `dedup_aliases` 與 cache-split provenance。這些是 schema／metadata 能力差異；未對真實 corpora、report pricing、SQLite clients 或 GUI 做完整驗收，不能由五個 parser fixtures 宣稱「沒有其他漏收」。
+
+### 本批處置
+
+本批交付調查，不擴增新 client／Cline CLI parser，也不直接改 Amp timestamp。Amp 目前發出 keyless events；既有 durable reconciliation 使用完整 canonical event bytes，因此單獨修 timestamp 並 bump parser 可能保留舊事件、再加入改時刻後的新事件而重複計數。這項 migration 風險來自 source tracing，尚未做 migration runtime 驗證。安全 cutover 需要 exact legacy→corrected occurrence 對應，涵蓋 unchanged／changed source upgrade、相同值多次事件、missing historical rows 與來源已刪除；不能用忽略 timestamp 的模糊比對或全量覆蓋歷史替代。這些未解項目保留於此，不表示已修復。
+
 
 ## Handoff checklist
 

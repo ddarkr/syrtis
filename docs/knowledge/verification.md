@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-15
+last_verified: 2026-10-16
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -127,6 +127,10 @@ swift run --build-system native Syrtis --smoke
 
 `cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates. CI's Rust-build subset runs `cargo test -p tb_core_ffi --locked` and `cargo clippy -p tb_core_ffi --all-targets --locked --no-deps`; neither replaces workspace engine verification. The owned engine retains `#![deny(clippy::all)]` and the repository pins its Rust toolchain. A cached-library PR skips rebuilding unchanged Rust inputs.
 
+CI 的 `Usage performance smoke` 在相同 Rust cache-miss／main-push 條件下，額外執行 `cargo test -p syrtis-core --release --locked --test performance -- --ignored --nocapture`。它用清空環境的 child process 與 temporary home／usage root，固定 UTC、四個 Rayon workers、cache-only pricing，不掃使用者資料或呼叫 provider。64 個 Claude files 共 4,096 events，分別檢查 cold sync＋read、warm sync＋三次 graph、32 次 64-event recent queries、單檔新增 event 的 targeted sync＋read；每個階段同時斷言 exact row／token totals，避免更少的輸出被誤認為更快。
+
+取樣前設定的粗略 budgets 分別為 30／15／15／15 秒；step timeout 五分鐘涵蓋 compilation。測試預設 ignored，只有明示 release gate 執行；耗時與 JSON summary 留在 CI log。初次本機 synthetic smoke 的四階段為 250／149／141／119 ms，所有數值一致。這道 gate 針對大幅退化，不比較不同 runners 的微小差異，不涵蓋 RSS、GUI latency、SQLite clients 或真實 corpus，亦不取代完整 workspace correctness suite。`crates/**` 與 workflow 已在現有 Rust library cache key 中，改 smoke 內容不會誤用先前通過的 library entry。
+
 Live account-scope smoke必須在hermetic security suite通過後才執行，且每次重新執行都需要當次明確授權。若出現任何Keychain或credential授權視窗，立即停止process並把smoke判為失敗；不得要求輸入登入密碼、讀取secret或用真實credential診斷。
 
 | Gate | Expected evidence |
@@ -157,6 +161,10 @@ The final release Swift bridge also exercised source-specific boundaries: Droid 
 A fresh release Swift → C ABI → Rust smoke of the integrated code preserved 116 tokens and two messages after truncation, then 244 tokens and three messages after a new turn, complete source-directory deletion, two fresh source-free processes, and restored duplicate transcripts. Each capture also accepted a primary quota scope without `clientId`. This smoke used isolated synthetic roots, not live account data or GUI acceptance.
 
 ### Live-rate freshness isolation
+
+Recent rate／trace 的來源視窗保留 inclusive `nowMs`，但不納入 timestamp 大於 query clock 的事件；共用 `usage_tail::visit_snapshot` 將 upper bound 轉為 exclusive `now.checked_add(1)`，因此 scheduler 與 legacy rate／trace callers 同時受保護。`i64::MAX` 不加 upper bound，因為不存在更大的有效 timestamp。Hermetic C ABI fixture 在 event 前 1 ms 必須得到 rate 0／empty trace，在 event 當下仍得到 38 tokens；修正前的前一個查詢錯誤回傳 38。
+
+獨立 release C ABI smoke 另外在隔離 home／usage root 建立 20-token Claude event，透過正式 `tb_local_usage_sync`／`tb_local_usage_query` 得到 event 前 rate 0／empty trace、event 當下 rate 20／trace 20、過期 rate 0，最後釋放 lease；不呼叫 provider 或讀取 Keychain。這是實際 native query path 的短程證據，不是 GUI 或真實使用資料驗收。
 
 Automatic scheduler regression 以同一個 paused graph query 驗證 recent rate 的 `120 → 0 → 120`：先按 wall clock 過期，再同步新增事件，兩次發布都必須發生在 historical query 釋放之前。初次隔離比較中，baseline scheduler 有三個失敗斷言，修正後的 scheduler runner 通過 88 個 checks。Bounded wall-time guards 只限制失敗等待，不以 query ordering 或 mock callback 次數作為正確性證據。
 

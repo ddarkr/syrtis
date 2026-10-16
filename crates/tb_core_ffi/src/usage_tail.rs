@@ -123,9 +123,11 @@ fn visit_snapshot(
         snapshot,
         syrtis_core::LocalUsageQuery {
             from_ms: Some(cutoff),
+            // The live clock is inclusive; later-dated rows are not live yet.
+            // At i64::MAX no representable timestamp needs an upper bound.
+            until_ms: now.checked_add(1),
             chronological: true,
             hydrate_opencode_aliases: false,
-            ..Default::default()
         },
         &|_| true,
         sink,
