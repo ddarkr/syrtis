@@ -291,9 +291,9 @@ Provider-wide history uses `quota-pace-history-v3.json` keyed by provider、opaq
 
 Pricing metadata is refreshable rather than frozen for the process lifetime; the current refresh cadence is approximately one hour. When provider-hinted lookup selects an entry without cache rates, local cache-rate backfill preserves the correct cache pricing.
 
-## Usage attribution
-
 The model report's local cost estimate is a conservative aggregate upper bound for the anomaly guard, not a bill. It takes each token lane's maximum configured tariff, includes derived hourly cache-write rates and the canonical OpenAI priority bound, and returns no estimate when no usable rates exist. Lost per-request tiers or cache TTL splits are not reconstructed; ordinary billing calculations and wire fields are unchanged.
+
+## Usage attribution
 
 本機用量與 quota 卡片並置時隱含「這些 token 消耗了那個訂閱」的宣稱，而本機資料沒有任何欄位記錄計費關係。歸屬因此是**使用者宣告**，不是推論：推論只能產生建議，未經確認一律 `unassigned`，且三態（`assigned`／`excluded`／`unassigned`）各自可見、相加等於該 client 的本機總量。文案不得宣稱扣抵。
 
@@ -366,9 +366,9 @@ Swift FFI decoder 用 `Data(bytesNoCopy:)` 接管 native C buffer，由 custom d
 
 TrayAnimator 只持有當下 style／sand level／appearance 的 frame set；animation 關閉時只載入第一張。切換、quota style 與 stop 釋放不再需要的 frame set。Settings preview 不再使用 process-global frame cache，而由可見 view 的 demand／disappearance 管理 images；appearance／level 切換或重新開啟需重新解碼，接受 latency 以降低 resident RAM。
 
-選單列 rate 的唯一 owner 是 `TrayAnimator`；AppDelegate 只讀它的 last-good `tokensPerMinRate`，不另發 rate FFI。Demand 為 tokens/min title、sand icon（即使 animation 關閉仍需要 rate）或非 quota icon 的啟用動畫；沒有 demand 時停止 reader，重新啟用立即讀取。Rate replacement／取消先推進 generation，完成時同時檢查 generation、demand 與 cancellation，舊結果不得發布。失敗與移除 demand 保留 last-good 值，不製造零值。
-
 `StatusItemRunnerLayer` ignores an unchanged resolved tint instead of rebuilding its tinted `CGImage` frames. Changed colors still rebuild the current frame set; frame count, animation speed, geometry and appearance selection are unchanged. This removes repeated rendering work and its temporary allocations, not the active animation's image storage.
+
+選單列 rate 的唯一 owner 是 `TrayAnimator`；AppDelegate 只讀它的 last-good `tokensPerMinRate`，不另發 rate FFI。Demand 為 tokens/min title、sand icon（即使 animation 關閉仍需要 rate）或非 quota icon 的啟用動畫；沒有 demand 時停止 reader，重新啟用立即讀取。Rate replacement／取消先推進 generation，完成時同時檢查 generation、demand 與 cancellation，舊結果不得發布。失敗與移除 demand 保留 last-good 值，不製造零值。
 
 Tray and Discord read the app-owned background graph. Each active presentation holds one `TrayDisplayProjection`, keyed by exact hidden-client membership, optional allowlist, local day and timezone; accepting a graph replaces the projection even when `generatedAt` repeats. Disabling a presentation drops its projection but keeps the last-good graph for immediate re-enabling. The independent 30-second render clock redraws cached menu-bar state and quota staleness without reading sources or replacing quota network polling.
 

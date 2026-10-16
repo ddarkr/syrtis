@@ -566,11 +566,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, query.year == nil,
                   case .success(.graph(let graph)) = result else { return }
             self.lastGraph = graph
+            self.trayProjection = trayNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
+            self.discordProjection = discordNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
             self.applyMenuBarState()
             self.applyDiscordPresence()
         }
-            self.trayProjection = trayNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
-            self.discordProjection = discordNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
     }
 
     /// Stale quota rendering has its own cheap cadence, even when no local
