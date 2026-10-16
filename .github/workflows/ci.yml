@@ -217,6 +217,14 @@ jobs:
         if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         run: cargo test -p tb_core_ffi --locked
 
+      # Synthetic, isolated release-mode budgets catch large ingestion/query
+      # regressions. Hardware-independent correctness checks run in every arm;
+      # timings remain in the job log, not a cross-runner speedup claim.
+      - name: Usage performance smoke
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
+        timeout-minutes: 5
+        run: cargo test -p syrtis-core --release --locked --test performance -- --ignored --nocapture
+
       - name: Clippy
         if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         run: cargo clippy -p tb_core_ffi --all-targets --locked --no-deps

@@ -127,6 +127,10 @@ swift run Syrtis --smoke
 
 `cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates. CI's Rust-build subset runs `cargo test -p tb_core_ffi --locked` and `cargo clippy -p tb_core_ffi --all-targets --locked --no-deps`; neither replaces workspace engine verification. The owned engine retains `#![deny(clippy::all)]` and the repository pins its Rust toolchain. A cached-library PR skips rebuilding unchanged Rust inputs.
 
+CI 的 `Usage performance smoke` 在相同 Rust cache-miss／main-push 條件下，額外執行 `cargo test -p syrtis-core --release --locked --test performance -- --ignored --nocapture`。它用清空環境的 child process 與 temporary home／usage root，固定 UTC、四個 Rayon workers、cache-only pricing，不掃使用者資料或呼叫 provider。64 個 Claude files 共 4,096 events，分別檢查 cold sync＋read、warm sync＋三次 graph、32 次 64-event recent queries、單檔新增 event 的 targeted sync＋read；每個階段同時斷言 exact row／token totals，避免更少的輸出被誤認為更快。
+
+取樣前設定的粗略 budgets 分別為 30／15／15／15 秒；step timeout 五分鐘涵蓋 compilation。測試預設 ignored，只有明示 release gate 執行；耗時與 JSON summary 留在 CI log。初次本機 synthetic smoke 的四階段為 250／149／141／119 ms，所有數值一致。這道 gate 針對大幅退化，不比較不同 runners 的微小差異，不涵蓋 RSS、GUI latency、SQLite clients 或真實 corpus，亦不取代完整 workspace correctness suite。`crates/**` 與 workflow 已在現有 Rust library cache key 中，改 smoke 內容不會誤用先前通過的 library entry。
+
 Live account-scope smoke必須在hermetic security suite通過後才執行，且每次重新執行都需要當次明確授權。若出現任何Keychain或credential授權視窗，立即停止process並把smoke判為失敗；不得要求輸入登入密碼、讀取secret或用真實credential診斷。
 
 | Gate | Expected evidence |
