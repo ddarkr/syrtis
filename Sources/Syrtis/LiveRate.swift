@@ -6,10 +6,11 @@ import TokenBarCore
 enum LiveRate {
     /// Unscoped queries preserve unknown and dynamic unhidden client ids.
     /// A mixed rate is only usable unchanged when no client is hidden.
+    /// Match the live-session card's ten-minute average, not the native one-minute default.
     static func query() -> LocalUsageScheduler.Query? {
         ClientRegistry.hiddenTabClients().isEmpty
-            ? .init(kind: "rate")
-            : .init(kind: "trace", windowSecs: 60)
+            ? .init(kind: "rate", windowSecs: 600)
+            : .init(kind: "trace", windowSecs: 600)
     }
 
     static func rate(

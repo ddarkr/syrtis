@@ -127,6 +127,8 @@ Extra roots／Claude account exclusions 的 normalized effective registry 改變
 
 Recent tail holds a disk snapshot handle instead of a raw-event vector; rate and trace query the published generation at the current time. Failed source synchronization does not update freshness. Missing, stale, or evicted handles return errors rather than successful zero values. Query-scope replacement can evict a handle, but does not delete the durable source facts used to prepare a new one.
 
+Popover header、menu-bar rate 與 Live session 卡片皆使用 trailing 600 秒平均。`LiveRate.query` 在無 hidden client 時明確傳入 `rate(windowSecs: 600)`，有 hidden client 時使用相同視窗的 unscoped trace，再依 canonical hidden membership 加總；不能依賴 native rate query 的 60 秒預設值。隱藏 client 不改變時間基準，未知或動態的未隱藏 client 仍保留。
+
 ### Compact usage store
 
 The Syrtis-owned engine stores normalized file and SQLite observations, retained history, and verified Codex resume membership in one durable SQLite backend. Successful ingestion merges observations before publishing a report generation; missing sources or missing historical rows do not delete collected facts. Warm-parser eligibility is separate from durable readability. Readable format-3/4/5 records remain available after parser changes even when the original source is gone. Unknown or corrupt layouts fail explicitly rather than publishing an empty replacement.

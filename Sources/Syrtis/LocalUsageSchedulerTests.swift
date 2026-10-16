@@ -142,10 +142,16 @@ private actor SchedulerFixtureSource: UsageDataSource {
         if shouldFail { throw Failure.sourceUnavailable }
         guard let capturedEvent = capturedRecentEvents[request.leaseToken] else { throw Failure.sourceUnavailable }
         switch request.kind {
-        case "rate":
+        case "rate", "trace":
+            let window = request.windowSecs ?? (request.kind == "rate" ? 60 : 600)
             let now = request.nowMs ?? 0
-            return .rate(capturedEvent > 0 && capturedEvent <= now && now - capturedEvent < 60_000 ? 120 : 0)
-        case "trace": return .trace([])
+            let live = capturedEvent > 0 && capturedEvent <= now && now - capturedEvent <= window * 1000
+            let rate = live ? 120 / (Double(window) / 60) : 0
+            if request.kind == "rate" { return .rate(rate) }
+            return .trace(live ? [
+                TraceBucket(client: "omp", agent: "omp", model: "test-model",
+                            tokens: 120, messages: 1, tokensPerMin: rate)
+            ] : [])
         case "graph":
             let payload = DemoData.payload(for: request.year, today: reportDay)
             guard distinctGraphs else { return .graph(payload) }
@@ -1398,7 +1404,7 @@ extension LocalUsageScheduler {
             at: Int64(replacementClock.wall.timeIntervalSince1970 * 1000))
         replacementModel.configureLocalDemand(view: .daily, clients: [], models: false)
         await replacementScheduler.runDueWork()
-        expect(replacementModel.liveRate == 120, "header receives its first real rate")
+        expect(replacementModel.liveRate == 12, "header receives its first real rate")
         await replacementSource.invalidateBeforeNextSync()
         await replacementSource.pauseNextSync()
         replacementClock.advance(31)
@@ -1408,20 +1414,20 @@ extension LocalUsageScheduler {
         await replacementScheduler.runClockWork()
         let pendingQueryCount = replacementScheduler.queryCount
         for _ in 0..<20 { await Task.yield() }
-        expect(replacementModel.localError == nil && replacementModel.liveRate == 120,
+        expect(replacementModel.localError == nil && replacementModel.liveRate == 12,
                "replacement-owned stale rate preserves last-good header without a false error")
         expect(replacementScheduler.queryCount == pendingQueryCount,
                "replacement-owned stale query waits for ingestion instead of spinning")
         await replacementSource.resumeSync()
         await replacementScheduler.runDueWork()
-        expect(replacementModel.liveRate == 120 && replacementModel.localError == nil,
+        expect(replacementModel.liveRate == 12 && replacementModel.localError == nil,
                "replacement capture restores header publication")
         // A genuinely evicted installed lease must report failure, wait for
         // the retry deadline, then synchronize without recycling that lease.
         await replacementSource.evictCurrentLease()
         replacementClock.advance(11)
         await replacementScheduler.runClockWork()
-        expect(replacementModel.localError != nil && replacementModel.liveRate == 120,
+        expect(replacementModel.localError != nil && replacementModel.liveRate == 12,
                "current lease failure remains visible and keeps last-good rate")
         let failedQueryCount = replacementScheduler.queryCount
         await replacementScheduler.runClockWork()
@@ -1429,7 +1435,7 @@ extension LocalUsageScheduler {
                "invalid lease cannot be queried again before resynchronization")
         replacementClock.advance(11)
         await replacementScheduler.runDueWork()
-        expect(replacementModel.liveRate == 120 && replacementModel.localError == nil,
+        expect(replacementModel.liveRate == 12 && replacementModel.localError == nil,
                "evicted lease automatically recovers by synchronizing")
         let recoveryHistory = await replacementSource.history()
         expect(recoveryHistory.0.last?.previousLeaseToken == nil,
@@ -1441,14 +1447,14 @@ extension LocalUsageScheduler {
             scheduler: replacementScheduler, localSession: reopenedSession)
         reopenedModel.configureLocalDemand(view: .daily, clients: [], models: false)
         await replacementScheduler.runDueWork()
-        expect(reopenedModel.liveRate == 120 && reopenedModel.localError == nil,
+        expect(reopenedModel.liveRate == 12 && reopenedModel.localError == nil,
                "reopened popover model gets a fresh first rate")
         await replacementSource.appendRecentEvent(
             at: Int64(replacementClock.wall.timeIntervalSince1970 * 1000))
         replacementScheduler.sourcesChanged(requiresTopology: false)
         replacementClock.advance(1)
         await replacementScheduler.runDueWork()
-        expect(reopenedModel.liveRate == 120 && reopenedModel.localError == nil,
+        expect(reopenedModel.liveRate == 12 && reopenedModel.localError == nil,
                "failed-capture fixture starts with fresh positive usage")
         await replacementSource.invalidateBeforeNextSync()
         await replacementSource.failNextSync()
@@ -1458,15 +1464,15 @@ extension LocalUsageScheduler {
         replacementClock.advance(1)
         await replacementSource.waitForPausedSync()
         await replacementScheduler.runClockWork()
-        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 120,
+        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 12,
                "old query failure waits for the replacement capture outcome")
         await replacementSource.resumeSync()
         await replacementScheduler.runDueWork()
-        expect(reopenedModel.localError != nil && reopenedModel.liveRate == 120,
+        expect(reopenedModel.localError != nil && reopenedModel.liveRate == 12,
                "replacement ingestion failure is reported without inventing zero usage")
         replacementClock.advance(11)
         await replacementScheduler.runDueWork()
-        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 120,
+        expect(reopenedModel.localError == nil && reopenedModel.liveRate == 12,
                "failed replacement recovers the reopened header on the next synchronization")
         reopenedModel.releaseLocalDemand()
         replacementScheduler.stop()
@@ -1630,6 +1636,41 @@ extension LocalUsageScheduler {
                && (kinds.firstIndex(of: "models") ?? .min) > (kinds.firstIndex(of: "hourly") ?? .max),
                "history runs graph before agents/hourly and models last")
         orderScheduler.stop()
+        // A two-minute-old event is still in the card's trailing ten minutes.
+        // Both rate-query branches must agree with it, then expire together.
+        let defaults = UserDefaults.standard
+        let hiddenBefore = defaults.object(forKey: ClientRegistry.tabHiddenKey)
+        defer {
+            if let hiddenBefore {
+                defaults.set(hiddenBefore, forKey: ClientRegistry.tabHiddenKey)
+            } else {
+                defaults.removeObject(forKey: ClientRegistry.tabHiddenKey)
+            }
+        }
+        for hidden in ["", "codex", "omp"] {
+            defaults.set(hidden, forKey: ClientRegistry.tabHiddenKey)
+            let rateClock = Clock()
+            let rateSource = SchedulerFixtureSource()
+            await rateSource.appendRecentEvent(at: Int64(rateClock.wall.timeIntervalSince1970 * 1000) - 120_000)
+            let rateScheduler = LocalUsageScheduler(
+                source: rateSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { rateClock.monotonic }, wallNow: { rateClock.wall })
+            let rateModel = DashboardModel(
+                cachesSnapshot: false, source: rateSource,
+                scheduler: rateScheduler, localSession: rateScheduler.openSession())
+            rateModel.configureLocalDemand(view: .overview, clients: [], models: false)
+            await rateScheduler.runDueWork()
+            let expected = hidden == "omp" ? 0.0 : 12.0
+            expect(rateModel.liveRate == expected
+                   && TraceBucket.totalRate(rateModel.trace, hidden: ClientRegistry.hiddenTabClients()) == expected,
+                   "header and live session retain the same two-minute-old activity; hidden \(hidden)")
+            rateClock.advance(481)
+            await rateScheduler.runClockWork()
+            expect(rateModel.liveRate == 0 && rateModel.trace.isEmpty,
+                   "header and live session expire together after ten minutes; hidden \(hidden)")
+            rateModel.releaseLocalDemand()
+            rateScheduler.stop()
+        }
         LocalSourceHints.selfTest(expect)
     }
 }

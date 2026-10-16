@@ -172,6 +172,8 @@ Recent rate／trace 的來源視窗保留 inclusive `nowMs`，但不納入 times
 
 獨立 release C ABI smoke 另外在隔離 home／usage root 建立 20-token Claude event，透過正式 `tb_local_usage_sync`／`tb_local_usage_query` 得到 event 前 rate 0／empty trace、event 當下 rate 20／trace 20、過期 rate 0，最後釋放 lease；不呼叫 provider 或讀取 Keychain。這是實際 native query path 的短程證據，不是 GUI 或真實使用資料驗收。
 
+Header／Live session 的視窗一致性 regression 使用兩分鐘前的單一事件，驗證無隱藏、隱藏其他 client、隱藏事件 client，以及超過十分鐘後共同過期。正式 `DashboardModel → LocalUsageScheduler → LiveUsageDataSource → C ABI → Rust` 的隔離 7,200-token fixture 在修正前得到 header 0／trace 720；明確指定 600 秒後得到 720／720，隱藏其他 client 仍相同，event age 601 秒時為 0／empty trace。正式 `PopoverView` 的 own-process bitmap 同時顯示 header `720 tok/min` 與 Live session `720/m`；ScreenCaptureKit 因 TCC `-3801` 拒絕，未取得 compositor capture。此證據使用 synthetic local usage 與隔離 quota adapter，不代表安裝版、真實帳號或 native status-item shell 已驗收。
+
 Automatic scheduler regression 以同一個 paused graph query 驗證 recent rate 的 `120 → 0 → 120`：先按 wall clock 過期，再同步新增事件，兩次發布都必須發生在 historical query 釋放之前。初次隔離比較中，baseline scheduler 有三個失敗斷言，修正後的 scheduler runner 通過 88 個 checks。Bounded wall-time guards 只限制失敗等待，不以 query ordering 或 mock callback 次數作為正確性證據。
 
 實際 `DashboardModel → LiveUsageDataSource → Swift C ABI → Rust` smoke 在初次隔離及整合 Report-index／covered-lens reuse 後都使用隔離 synthetic roots 與 automatic scheduling。初始 rate 為 38；graph query 保持阻塞時，clock expiry 得到 0、新事件得到 118、手動 refresh 得到 158，source pending 在 ingestion 完成後解除。釋放舊 graph 後，manual refresh 完成且沒有 local error。原有 request-after-source barrier、owner／root／lease admission 與 first-paint pinning 不變；native fixture 另驗證 shared capture 的 228、replacement 的 268 與 clock expiry 的 0。
