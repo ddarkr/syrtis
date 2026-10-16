@@ -62,9 +62,9 @@ pub(crate) fn run_from_snapshot(
     snapshot: &syrtis_core::LocalUsageSnapshot,
     options: syrtis_core::ReportOptions,
     pricing: Option<&syrtis_core::pricing::PricingService>,
-) -> Result<crate::EncodedLocalPayload, String> {
+) -> Result<String, String> {
     let report = syrtis_core::get_agents_report_from_snapshot(snapshot, options, pricing)?;
-    crate::encode_local_payload(&map_report(report))
+    crate::encode_local_response(&map_report(report))
 }
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {

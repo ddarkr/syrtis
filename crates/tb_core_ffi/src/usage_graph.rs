@@ -131,7 +131,7 @@ pub(crate) fn run_from_snapshot(
     snapshot: &syrtis_core::LocalUsageSnapshot,
     options: syrtis_core::ReportOptions,
     pricing: Option<&syrtis_core::pricing::PricingService>,
-) -> Result<crate::EncodedLocalPayload, String> {
+) -> Result<String, String> {
     let result = syrtis_core::lean_local_graph_from_snapshot(
         snapshot,
         options,
@@ -141,7 +141,7 @@ pub(crate) fn run_from_snapshot(
     let (graph, contract) = result.into_parts();
     let mut payload = map_graph(graph);
     payload.meta.pricing_contract = Some(contract);
-    crate::encode_local_payload(&payload)
+    crate::encode_local_response(&payload)
 }
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {

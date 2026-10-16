@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-15
+last_verified: 2026-10-17
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -54,6 +54,8 @@ flowchart LR
 ```
 
 Rust owns the raw-session interpretation and all expensive aggregation. Swift calls the blocking FFI entry points away from the main actor, decodes the returned heap JSON, and frees the pointer through `tb_free`. Successful calls use `{"ok":true,"data":...}`; failures use `{"ok":false,"err":"..."}`. `tb_probe` keeps its legacy shape for the smoke path.
+
+Scheduler 的 graph／models／hourly／Agents／rate／trace query 將 typed payload 直接序列化為最終 owned success-envelope buffer，再交給 C caller；不先建立 payload-only `RawValue` 後複製到另一個 JSON buffer。Root-generation 與 lease admission 仍在 pointer publication 前完成。Legacy cache／single-flight 保留共用 encoded payload；sync／release、error envelope、panic boundary 與 `tb_free` ownership 不變。
 
 > **核心不變量：** Rust 產生的 payload 是跨語言契約。Swift 可以格式化、排序或選擇顯示視角，但不能假設自己能從已預聚合的數字反推出每個 client 的貢獻。
 

@@ -670,7 +670,7 @@ fn encode_sync(
     })
 }
 
-pub(crate) fn query(json: &str) -> Result<crate::EncodedLocalPayload, String> {
+pub(crate) fn query(json: &str) -> Result<String, String> {
     let mut request: QueryRequest = parse_request(json)?;
     normalized_clients(&mut request.clients);
     let lease = find_lease(&request.lease_token)?;
@@ -720,14 +720,14 @@ pub(crate) fn query(json: &str) -> Result<crate::EncodedLocalPayload, String> {
             request.window_secs.unwrap_or(60),
             request.now_ms.unwrap_or_else(now_ms),
         )
-        .and_then(|rate| crate::encode_local_payload(&rate)),
+        .and_then(|rate| crate::encode_local_response(&rate)),
         (ScopeKind::Recent, "trace") => crate::usage_tail::trace_from_snapshot(
             &scope.source.snapshot,
             scope.source.cutoff,
             request.window_secs.unwrap_or(600),
             request.now_ms.unwrap_or_else(now_ms),
         )
-        .and_then(|trace| crate::encode_local_payload(&trace)),
+        .and_then(|trace| crate::encode_local_response(&trace)),
         _ => Err("local usage query kind does not match its producing scope".into()),
     }?;
     if lease.root_generation != crate::root_generation() {

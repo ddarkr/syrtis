@@ -352,6 +352,17 @@ pub(crate) fn encode_local_payload<T: serde::Serialize>(
         .map_err(|error| format!("serialize local payload: {error}"))
 }
 
+/// Scheduler queries own their response; serialize directly into its final buffer.
+pub(crate) fn encode_local_response<T: serde::Serialize>(data: &T) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Response<'a, T> {
+        data: &'a T,
+        ok: bool,
+    }
+    serde_json::to_string(&Response { data, ok: true })
+        .map_err(|error| format!("serialize local payload: {error}"))
+}
+
 pub(crate) fn encoded_envelope(result: Result<EncodedLocalPayload, String>) -> *mut c_char {
     match result {
         Ok(data) => {
@@ -4059,7 +4070,10 @@ pub unsafe extern "C" fn tb_local_usage_query(request_json: *const c_char) -> *m
             Ok(request) => request,
             Err(message) => return encoded_envelope(Err(message)),
         };
-        encoded_envelope(local_usage::query(request))
+        match local_usage::query(request) {
+            Ok(json) => into_raw_json(json),
+            Err(error) => envelope(Err(error)),
+        }
     })
 }
 

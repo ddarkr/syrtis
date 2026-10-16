@@ -99,10 +99,10 @@ pub(crate) fn run_from_snapshot(
     snapshot: &syrtis_core::LocalUsageSnapshot,
     mut options: syrtis_core::ReportOptions,
     pricing: Option<&syrtis_core::pricing::PricingService>,
-) -> Result<crate::EncodedLocalPayload, String> {
+) -> Result<String, String> {
     options.group_by = syrtis_core::GroupBy::ClientProviderModel;
     let report = syrtis_core::get_model_report_from_snapshot(snapshot, options, pricing)?;
-    crate::encode_local_payload(&map_report(report, pricing))
+    crate::encode_local_response(&map_report(report, pricing))
 }
 
 /// Conservative configured-rate upper bound for this aggregate, or `None`

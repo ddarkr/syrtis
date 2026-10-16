@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-16
+last_verified: 2026-10-17
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -159,6 +159,12 @@ The integrated owned-engine workspace, including loading-pipeline changes, passe
 The final release Swift bridge also exercised source-specific boundaries: Droid cumulative rewrites, empty input, restoration, and source removal retained 1,200 tokens and two messages without summing obsolete allocations; Roo UI compaction followed by sibling-only annotation changes and source removal retained 280 tokens and two messages; Kiro execution failure and removal retained eight tokens and one authoritative execution without reviving a second lower-authority snapshot. Fresh processes observed the same totals. The permanent Roo regression additionally distinguishes preserved archived annotations from refreshed live annotations.
 
 A fresh release Swift → C ABI → Rust smoke of the integrated code preserved 116 tokens and two messages after truncation, then 244 tokens and three messages after a new turn, complete source-directory deletion, two fresh source-free processes, and restored duplicate transcripts. Each capture also accepted a primary quota scope without `clientId`. This smoke used isolated synthetic roots, not live account data or GUI acceptance.
+
+### Scheduler response serialization
+
+獨立 synthetic smoke 以 8,192 個 Claude events 驅動正式 Swift `TBCore.localUsageSync`／`localUsageQuery`／`releaseLocalUsage`，分別連結變更前與直接序列化 envelope 的 release static archive。兩者均完成六種 query 各五次，保留 163,840 tokens、8,192 messages、非零 pricing、600 秒 rate 46 與 trace 460 tokens；不同 producer clients 與 released lease 均回傳 bridge error，已解碼 graph 在 lease release 後仍可讀。這不是 UI reopen 或安裝版真實語料驗收。
+
+同一 immutable synthetic corpus 的四組獨立 native process 配對採平衡順序與每 arm 五秒 washout，以 `/usr/bin/time -l` 的 maximum RSS 比較，配對差值中央值為 −3.3%，最差為 +2.2%；通過預先設定的 +25% regression bound，但沒有證明一致的 RAM 降幅。六種完整 JSON 皆相等，僅排除 graph `meta.generatedAt`，並正規化 trace 同 token 數的未定序 ties。兩次 isolated `malloc_zone_pressure_relief(NULL, 0)` 均回傳 0 bytes，因此未加入 production hook；不能把 allocator fragmentation 直接當作可回收空間。
 
 ### Live-rate freshness isolation
 
