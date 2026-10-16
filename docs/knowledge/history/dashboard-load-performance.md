@@ -4,7 +4,7 @@ id: kb-history-load-performance
 kind: canonical
 scope: repository
 read_when: investigating dashboard load latency, or planning a scan/cache optimization that might repeat one of these experiments
-last_verified: 2026-09-27
+last_verified: 2026-10-16
 sources: ["macOS sample profiles", "public TokenBar PR #187", "public TokenBar PR #192", "public tokscale-core PR #6", "public tokscale-core PR #7", "docs/knowledge/measurement.md"]
 ---
 
@@ -26,6 +26,7 @@ sources: ["macOS sample profiles", "public TokenBar PR #187", "public TokenBar P
 - [已出貨的三項改動](#已出貨的三項改動)
 - [引擎批次平行解析（撰寫時尚未進 app）](#引擎批次平行解析撰寫時尚未進-app)
 - [一條沒有被採納的路](#一條沒有被採納的路)
+- [2026-10-16 scanner candidate（未採納）](#2026-10-16-scanner-candidate未採納)
 
 ---
 
@@ -217,3 +218,22 @@ hit-marker 的設計論證仍然成立——分批會提高同時保留量，而
 ## 一條沒有被採納的路
 
 回到上游 materialized 路徑以取回平行度——**不可行，而且不是記憶體的理由**。那條路徑的文件註解明載它不對 `simple_lane!` 的 client 做 per-client 跨檔 dedup，且解析出較窄的 client 集合，**總量會與其他報表分歧**。它是保留的 public API，不是可以直接切回去的實作。
+
+## 2026-10-16 scanner candidate（未採納）
+
+本輪調查發現 `scan_directory_path` 對非 Cursor patterns 也逐檔檢查 `archive` path component；候選實作將該檢查延後至兩個 Cursor patterns。這確實省去其他 patterns 不使用的字串工作，但沒有證明整體掃描更快，因此未保留 production patch。
+
+Baseline 是 `91dcad8`，candidate 只改 archive predicate 的求值時機。Release binary SHA-256 分別為 `bbe157f73417a57c28babeb6c2f1dd6ddb41d5d286e44b01b01411bc1f056552` 與 `13653ce352516de46418a72d7fa9fad5ffbf7012d9728e9dd8fded4b230d1595`。環境為 macOS arm64、Rust 1.96.1；單一不變的合成 corpus 有 100 branches、每支 12 層目錄與 24 files，一半放在 mixed-case `ArChIvE` 下。每個 arm 對 25 patterns 各掃描 20 次；每輪都比對 sorted paths，兩個 binaries 的 path count／digest 在全部四對中一致。
+
+量測前固定四對順序（OLD→NEW、NEW→OLD、重複），每個 arm 前等待兩秒。下表是每個 arm 的 25-pattern 累積 scanner 時間，不含 corpus 建立；不是 app 啟動或單次 scan latency。
+
+| Pair | Order | Baseline ms | Candidate ms | Candidate change |
+|---|---|---|---|---|
+| 1 | OLD→NEW | 9,774.8 | 11,434.7 | +16.98% |
+| 2 | NEW→OLD | 13,772.6 | 14,546.4 | +5.62% |
+| 3 | OLD→NEW | 11,430.5 | 11,414.1 | −0.14% |
+| 4 | NEW→OLD | 11,117.8 | 11,768.3 | +5.85% |
+
+配對變化中央值為 +5.73%，最差為 +16.98%；沒有排除任何較慢結果。其他 build／verification 同時進行、沒有獨立 thermal admission，因此這組只能說「尚無可信改善證據」，不能斷言 candidate 本身造成固定幅度退化，也不能當作通過資源驗收。保守決策是不合併該候選。
+
+後續量測應優先區分 source discovery／known-input verification、changed-source durable reconciliation、historical prepare／fold 的實際成本，而非由省掉某個 loop 推導使用者 latency 改善。原始合成 harness、binary 與 paired results 留在 repository 外；這份紀錄不含個人資料或機器路徑。
