@@ -55,7 +55,7 @@ struct QuotaView: View {
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: NativeDesign.spacing) {
             if let singleClient {
                 if let windowCard {
                     // Above its siblings: a `zIndex` set inside the card orders

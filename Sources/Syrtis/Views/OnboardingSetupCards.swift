@@ -110,21 +110,20 @@ struct OnboardingSetupCards: View {
     private func header(_ remaining: Int) -> some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(OnboardingSetupCopy.headerTitle.localized).font(.headline)
+                Text(OnboardingSetupCopy.headerTitle.localized).font(NativeDesign.sectionFont)
                 Text(OnboardingSetupCopy.headerRemaining.localized(Int64(remaining)))
-                    .font(.caption)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             Button(OnboardingSetupCopy.skipAll.localized) { OnboardingSetup.skipAll() }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onboardingCardStyle()
+        .padding(.horizontal, 4)
+        .padding(.vertical, 4)
     }
 
     // MARK: - Agents
@@ -133,15 +132,16 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.agentsTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.agentsBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(NativeDesign.detailFont).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if presentClients.isEmpty {
                     Text(OnboardingSetupCopy.agentsNone.localized)
-                        .font(.caption2).foregroundStyle(.tertiary)
+                        .font(NativeDesign.detailFont).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text(presentClients.map { ClientRegistry.style($0).displayName }
                         .joined(separator: " · "))
-                        .font(.caption)
+                        .font(NativeDesign.bodyFont)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 answerRow(
@@ -152,7 +152,6 @@ struct OnboardingSetupCards: View {
                     primary: (OnboardingSetupCopy.looksGood, { OnboardingSetup.answer(.agents) }))
             }
         }
-        .onboardingCardStyle()
     }
 
     // MARK: - Icon
@@ -161,15 +160,18 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.iconTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.iconBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(NativeDesign.detailFont).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 // Picking applies at once, so the live menu-bar icon can be
                 // tried; "Done" answers the card.
-                choiceGrid(options: TrayAnimator.iconStyleOptions, selected: style) { style = $0 }
+                SegmentedPicker(
+                    selection: $style,
+                    options: TrayAnimator.iconStyleOptions,
+                    wraps: true)
+                    .accessibilityLabel(OnboardingSetupCopy.iconTitle.localized)
                 doneRow { OnboardingSetup.answer(.icon) }
             }
         }
-        .onboardingCardStyle()
     }
 
     // MARK: - Title
@@ -178,15 +180,16 @@ struct OnboardingSetupCards: View {
         DashCard(OnboardingSetupCopy.titleTitle) {
             VStack(alignment: .leading, spacing: 8) {
                 Text(OnboardingSetupCopy.titleBody.localized)
-                    .font(.caption).foregroundStyle(.secondary)
-                choiceGrid(
+                    .font(NativeDesign.detailFont).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                SegmentedPicker(
+                    selection: $trayModeRaw,
                     options: TrayMode.allCases.map { ($0.rawValue, $0.label) },
-                    selected: trayModeRaw
-                ) { trayModeRaw = $0 }
+                    wraps: true)
+                    .accessibilityLabel(OnboardingSetupCopy.titleTitle.localized)
                 doneRow { OnboardingSetup.answer(.title) }
             }
         }
-        .onboardingCardStyle()
     }
 
     // MARK: - Discord
@@ -196,7 +199,7 @@ struct OnboardingSetupCards: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text((DiscordPresence.enabled()
                     ? OnboardingSetupCopy.discordAlreadyOn : OnboardingSetupCopy.discordBody).localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(NativeDesign.detailFont).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 // Two buttons of equal weight, neither filled nor the default:
                 // a prominent "set up" next to a plain "no" is a thumb on the
@@ -223,36 +226,9 @@ struct OnboardingSetupCards: View {
                 }
             }
         }
-        .onboardingCardStyle()
     }
 
     // MARK: - Shared controls
-
-    private func choiceGrid(
-        options: [(value: String, label: String)], selected: String,
-        pick: @escaping (String) -> Void
-    ) -> some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
-            ForEach(options, id: \.value) { option in
-                Button { pick(option.value) } label: {
-                    Text(option.label.localized)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 5)
-                        .background(
-                            Color.accentColor.opacity(option.value == selected ? 0.28 : 0.08),
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .strokeBorder(
-                                    Color.accentColor.opacity(option.value == selected ? 0.7 : 0.2),
-                                    lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
 
     private func doneRow(_ done: @escaping () -> Void) -> some View {
         HStack {
@@ -270,7 +246,7 @@ struct OnboardingSetupCards: View {
             Spacer()
             Button(secondary.0.localized, action: secondary.1)
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             Button(primary.0.localized, action: primary.1)
                 .buttonStyle(.borderedProminent)
@@ -290,11 +266,11 @@ private struct LoginCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text((enabled == true ? OnboardingSetupCopy.loginAlreadyOn : OnboardingSetupCopy.loginBody)
                     .localized)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(NativeDesign.detailFont).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if failed {
                     Text(OnboardingSetupCopy.loginFailed.localized)
-                        .font(.caption2).foregroundStyle(.red)
+                        .font(NativeDesign.detailFont).foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack(spacing: 10) {
@@ -306,7 +282,7 @@ private struct LoginCard: View {
                     } else {
                         Button(OnboardingSetupCopy.loginOff.localized) { OnboardingSetup.answer(.login) }
                             .buttonStyle(.plain)
-                            .font(.caption)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                         Button(OnboardingSetupCopy.loginOn.localized) {
                             // Answered only when it took: a failed register
@@ -325,7 +301,6 @@ private struct LoginCard: View {
                 }
             }
         }
-        .onboardingCardStyle()
         .task { enabled = await AutostartService.readEnabled() }
     }
 }

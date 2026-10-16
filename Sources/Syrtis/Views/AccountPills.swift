@@ -75,7 +75,9 @@ struct AccountPills: View {
 
     /// The pills, or none: rule 1 says a row only with at least two accounts, so
     /// this is the one statement of that threshold. Value "" is the primary.
-    static func options(
+    /// UI-free pure helper (resolved labels only), so `nonisolated`: the
+    /// Sendable card context's `showsPills` calls it off the main actor.
+    nonisolated static func options(
         clientId: String, accounts: [String?], primaryEmail: String? = nil
     ) -> [(value: String, label: String)] {
         guard accounts.count >= 2 else { return [] }

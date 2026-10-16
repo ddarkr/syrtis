@@ -10,6 +10,12 @@ import TokenBarCore
 
     func setDemand(wanted: Bool, confirmed: [UsageAttribution.Record]) {
         guard let scheduler, let localSession, scheduler.contains(localSession) else { return }
+        if wanted {
+            let rows = Self.acquiredTimeZone == TimeZone.current.identifier ? Self.lastRows : nil
+            contributions = rows
+            displayedTimeZone = rows == nil ? nil : Self.acquiredTimeZone
+            points = rows.map { AttributedDailySeries.points(contributions: $0, confirmed: confirmed) }
+        }
         scheduler.update(localSession, queries: wanted ? [.init(kind: "graph")] : [], active: true) {
             [weak self] _, result in
             guard let self, scheduler.contains(localSession) else { return }
@@ -17,6 +23,8 @@ import TokenBarCore
             case .success(.graph(let payload)):
                 self.contributions = payload.contributions
                 self.displayedTimeZone = TimeZone.current.identifier
+                Self.lastRows = payload.contributions
+                Self.acquiredTimeZone = self.displayedTimeZone
                 self.points = AttributedDailySeries.points(contributions: payload.contributions, confirmed: confirmed)
             case .failure:
                 if self.displayedTimeZone != TimeZone.current.identifier {
@@ -61,11 +69,12 @@ import TokenBarCore
          scheduler: LocalUsageScheduler? = nil, localSession: LocalUsageScheduler.Session? = nil) {
         precondition((scheduler == nil) == (localSession == nil), "Local usage owner and session must be paired")
         self.scheduler = scheduler; self.localSession = localSession
-        if scheduler != nil { return }
-        guard !Self.cacheTrustLost, Self.acquiredTimeZone == timeZone,
+        Self.installTimeZoneObserver()
+        guard scheduler != nil || !Self.cacheTrustLost, Self.acquiredTimeZone == timeZone,
               let rows = Self.lastRows
         else { return }
         contributions = rows
+        displayedTimeZone = timeZone
         points = AttributedDailySeries.points(
             contributions: rows,
             // The same single reader `load`'s caller uses, not a second parse
@@ -73,8 +82,8 @@ import TokenBarCore
             confirmed: UsageAttribution.confirmed().records)
     }
 
-    /// Cache provenance for legacy one-shot diagnostics only. Runtime series
-    /// are rebucketed by their explicit owner and retain no process-wide rows.
+    /// Reopen rows are display-only; native ownership still controls fresh
+    /// publication, rebucketing and release.
     ///
     /// nil means nobody recorded it, so the cache's provenance is unknown and
     /// the next acquisition recomputes rather than trusting it.

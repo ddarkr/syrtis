@@ -422,6 +422,14 @@ enum DiscordPresence {
         graph: UsagePayload, hidden: Set<String>, today: String, costStyle: CostStyle,
         components: Set<Component>, selection: ClientSelection = .mostUsed
     ) -> Payload? {
+        payload(projection: TrayDisplayProjection(graph: graph), hidden: hidden, today: today,
+                costStyle: costStyle, components: components, selection: selection)
+    }
+
+    static func payload(
+        projection: TrayDisplayProjection, hidden: Set<String>, today: String, costStyle: CostStyle,
+        components: Set<Component>, selection: ClientSelection = .mostUsed
+    ) -> Payload? {
         // Derived HERE, not in the wiring. Putting it in `AppDelegate` would
         // repeat the earlier breach word for word: logic the payload fixtures
         // cannot see, guarded only by a source scan that keeps passing while
@@ -451,7 +459,7 @@ enum DiscordPresence {
         case .malformed:
             return nil
         }
-        let totals = graph.trayTotals(hidden: hidden, today: today, only: only)
+        let totals = projection.totals(hidden: hidden, today: today, only: only)
         // Non-finite numbers must never be published — garbage on a public
         // profile is worse than no presence at all. Scoped to a cost that will
         // actually be serialized: `costBucket` maps a non-finite value to the

@@ -124,13 +124,13 @@ struct QuotaHistoryCard: View {
                 LoadingLine(title: "Reading quota history…")
             } else if cycles.isEmpty, curveUnreadable {
                 Text("Quota history could not be read. It will be retried.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if cycles.isEmpty {
                 Text("No earlier windows recorded yet. They accumulate as Syrtis runs.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -176,7 +176,7 @@ struct QuotaHistoryCard: View {
             VStack(alignment: .leading, spacing: 3) {
                 if let title = hovered.title {
                     Text(title)
-                        .font(.system(size: 9).weight(.semibold))
+                        .font(NativeDesign.detailFont.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Divider().padding(.vertical, 1)
@@ -187,7 +187,7 @@ struct QuotaHistoryCard: View {
                             .fill(Color(hex: kind.color))
                             .frame(width: 6, height: 6)
                         Text(kind.label.localized)
-                            .font(.system(size: 9))
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                         Spacer(minLength: 6)
                         // Share of the total beside the count. A lane is easier
@@ -199,21 +199,21 @@ struct QuotaHistoryCard: View {
                         Text(total > 0
                              ? "%@%%".localized(String(Int((Double(value) / Double(total) * 100).rounded())))
                              : "—")
-                            .font(.system(size: 9).monospacedDigit())
+                            .font(NativeDesign.detailFont.monospacedDigit())
                             .foregroundStyle(.tertiary)
                             .frame(width: 30, alignment: .trailing)
                         Text(Format.compactTokens(value))
-                            .font(.system(size: 9).monospacedDigit())
+                            .font(NativeDesign.detailFont.monospacedDigit())
                             .frame(width: 44, alignment: .trailing)
                     }
                 }
                 Divider().padding(.vertical, 1)
                 HStack(spacing: 5) {
                     Text("Total".localized)
-                        .font(.system(size: 9).weight(.semibold))
+                        .font(NativeDesign.detailFont.weight(.semibold))
                     Spacer(minLength: 6)
                     Text(Format.compactTokens(total))
-                        .font(.system(size: 9).weight(.semibold).monospacedDigit())
+                        .font(NativeDesign.detailFont.weight(.semibold).monospacedDigit())
                         .frame(width: 44, alignment: .trailing)
                 }
             }
@@ -286,7 +286,7 @@ struct QuotaHistoryCard: View {
                 shownCount += Self.visibleRows
             } label: {
                 Text("Show %@ more".localized(String(more)))
-                    .font(.caption2)
+                    .font(NativeDesign.bodyFont)
             }
             .buttonStyle(.link)
             .padding(.top, 6)
@@ -304,13 +304,13 @@ struct QuotaHistoryCard: View {
                     .foregroundStyle(.tertiary)
                     .frame(width: 8)
                 Text(Format.windowStamp(ms: cycle.startMs))
-                    .font(.caption2.monospacedDigit())
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .fixedSize()
                 bars(cycle, row: row)
                 Text(verbatim: "\(Int(cycle.usedPercent.rounded()))%")
-                    .font(.caption2.monospacedDigit())
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     .frame(width: 30, alignment: .trailing)
                 Spacer(minLength: 4)
                 if let row {
@@ -318,7 +318,7 @@ struct QuotaHistoryCard: View {
                     // assigned here has no token count, and printing "0" states
                     // a measurement nobody took. Same dash, same reason.
                     Text(Format.tokens(tokens: row.mineTokens, cost: row.mineCost))
-                        .font(.caption2.monospacedDigit())
+                        .font(NativeDesign.detailFont.monospacedDigit())
                         .foregroundStyle(.secondary)
                     // A dash, not "$0.00", when tokens were recorded and none
                     // of them carried a price. This is a fixed-width column, so
@@ -326,11 +326,11 @@ struct QuotaHistoryCard: View {
                     // same missing-metric-as-a-measured-zero the other-line
                     // below avoids, in the column above it.
                     Text(Format.money(tokens: row.mineTokens, cost: row.mineCost))
-                        .font(.caption2.monospacedDigit())
+                        .font(NativeDesign.detailFont.monospacedDigit())
                         .frame(width: 54, alignment: .trailing)
                 } else {
                     Text(verbatim: "·")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                         .frame(width: 54, alignment: .trailing)
                 }
@@ -446,12 +446,12 @@ struct QuotaHistoryCard: View {
             // one place with room for it, and it is what a reader opens a row
             // to confirm.
             Text(Format.clockRange(fromMs: cycle.startMs, toMs: cycle.resetAtMs))
-                .font(.system(size: 9).monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .foregroundStyle(.tertiary)
             if cycle.observedFraction < Self.thinObservation {
                 Text("Syrtis observed %@%% of this window, so its usage figure is a floor."
                     .localized(String(Int((cycle.observedFraction * 100).rounded()))))
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -470,7 +470,7 @@ struct QuotaHistoryCard: View {
                         Text(Format.money(tokens: model.tokens, cost: model.cost))
                             .frame(width: 54, alignment: .trailing)
                     }
-                    .font(.system(size: 10).monospacedDigit())
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     // Each model line carries its own breakdown. The row's
                     // hover would otherwise cover these, leaving the per-model
                     // split reachable nowhere -- and a model line and the row
@@ -490,7 +490,7 @@ struct QuotaHistoryCard: View {
                 }
                 if row.models.isEmpty {
                     Text("Nothing in this window was charged to this subscription.")
-                        .font(.system(size: 10))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 }
                 // The line that explains a flat bar. Without it a 1% window
@@ -543,7 +543,7 @@ struct QuotaHistoryCard: View {
                                 : Format.usdOrBelowCent(row.otherCost))
                         return "%@ %@".localized(lead.localized, value)
                     }())
-                        .font(.system(size: 9))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                         .padding(.top, 1)
                 }
@@ -552,11 +552,11 @@ struct QuotaHistoryCard: View {
                     account, hasUsage: false, scanFailed: scanFailed) {
                 case .notAttributable:
                     Text("Local usage can't be attributed to this account yet.".localized)
-                        .font(.system(size: 10))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 case .unreadable:
                     Text("Local usage could not be read.".localized)
-                        .font(.system(size: 10))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 case .spinner, .numbers:
                     LoadingLine(title: "Reading local usage…")
@@ -591,7 +591,7 @@ struct QuotaHistoryCard: View {
                 })
             Text(WindowEquivalence.text(
                 row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -601,7 +601,7 @@ struct QuotaHistoryCard: View {
             if case .undeclared = row {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(AttributionOnboardingCard.Copy.historyZeroNote.localized)
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     AttributionSetupLink()
@@ -615,7 +615,7 @@ struct QuotaHistoryCard: View {
     private var footnote: some View {
         Text("Amounts are API list-price equivalents for usage you declared as %@ — not what the subscription charged."
             .localized(ClientRegistry.style(clientId).displayName))
-            .font(.system(size: 9))
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -84,11 +84,11 @@ struct UsageAttributionBreakdownCard: View {
                 LoadingLine(title: "Loading…")
             case .unavailable:
                 Text(UsageAttributionBreakdown.Copy.unavailable.localized)
-                    .font(.caption)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             case .empty:
                 Text(UsageAttributionBreakdown.Copy.noUsage.localized)
-                    .font(.caption)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             case .rows:
                 if confirmed.isEmpty {
@@ -96,7 +96,7 @@ struct UsageAttributionBreakdownCard: View {
                         SettingsWindowController.shared.showFromPopover(scrollingTo: .usageAttribution)
                     } label: {
                         Text(UsageAttributionBreakdown.Copy.hint.localized)
-                            .font(.caption)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                             .underline()
                             .multilineTextAlignment(.leading)
@@ -157,24 +157,26 @@ struct UsageAttributionBreakdownCard: View {
             label = UsageAttributionSettings.Copy.unassigned.localized
         }
 
-        return HStack(spacing: 8) {
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(label)
-                .font(.caption.weight(tint == .assigned ? .regular : .semibold))
+                .font(NativeDesign.bodyFont.weight(tint == .assigned ? .regular : .semibold))
                 .foregroundStyle(tint.label)
-                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(label)
             Spacer(minLength: 8)
             // Both figure columns reserve a minimum width and align trailing,
             // so short values pad with blank space instead of sliding their
             // column's left edge per row. minWidth rather than a fixed width:
             // an unusually long total still grows instead of clipping.
             Text(Format.compactTokens(row.tokens))
-                .font(.caption.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .frame(minWidth: 52, alignment: .trailing)
             Text(Format.money(tokens: row.tokens, cost: row.cost))
-                .font(.caption.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .foregroundStyle(tint.amount)
                 .frame(minWidth: 76, alignment: .trailing)
         }
+        .accessibilityElement(children: .combine)
         // Every row carries the same inset so a tinted row's text and figures
         // stay on the same left and right edges as the untinted ones; padding
         // only the tinted rows visibly shortened them at both ends.

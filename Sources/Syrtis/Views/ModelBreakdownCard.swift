@@ -72,7 +72,7 @@ struct ModelBreakdownCard: View {
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
             }
         ) {
             if rows.isEmpty, report == nil, loading {
@@ -81,7 +81,7 @@ struct ModelBreakdownCard: View {
                     .accessibilityLabel("Loading…")
             } else if rows.isEmpty {
                 Text("No model usage in this range")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 legend
@@ -123,7 +123,7 @@ struct ModelBreakdownCard: View {
                         expanded.toggle()
                     }
                     .buttonStyle(.plain)
-                    .font(.caption2.weight(.medium))
+                    .font(NativeDesign.detailFont.weight(.medium))
                     .foregroundStyle(.secondary)
                 }
             }
@@ -140,7 +140,7 @@ struct ModelBreakdownCard: View {
                         .frame(width: 7, height: 7)
                     Text(kind.label.localized)
                 }
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             }
         }
@@ -162,7 +162,7 @@ struct ModelBreakdownCard: View {
                     radius: isHovered ? 3 : 0)
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.model)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 segmentBar(entry, isHovered: isHovered)
@@ -170,7 +170,7 @@ struct ModelBreakdownCard: View {
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 2) {
                 Text(Format.compactTokens(entry.total))
-                    .font(.caption.monospacedDigit())
+                    .font(NativeDesign.bodyFont.monospacedDigit())
                 HStack(spacing: 3) {
                     if let ratio = entry.implausibleCostRatio {
                         Image(systemName: CostPlausibility.symbol)
@@ -184,7 +184,7 @@ struct ModelBreakdownCard: View {
                     Text(Format.money(tokens: entry.total, cost: entry.cost))
                         .foregroundStyle(Color(hex: "#22c55e"))
                 }
-                .font(.caption2.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
             }
         }
         // Float the rich tooltip near the cursor anywhere on the row — the

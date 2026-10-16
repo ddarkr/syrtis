@@ -1315,7 +1315,7 @@ enum SelfTest {
             glassCloseResult.3,
             "glass panel hides directly once no session is open")
 
-        // Closed-shell work is driven by consumers, not by process lifetime.
+        // Closed-shell live-rate work is driven by its consumers.
         for style in ["cat", "parrot"] {
             expect(
                 !TrayAnimator.needsLocalRate(style: style, animated: false, mode: .hidden)
@@ -1335,23 +1335,6 @@ enum SelfTest {
                         style: style.rawValue, animated: false, mode: .tokensPerMin),
                 "quota icon \(style.rawValue) has no local rate demand of its own")
         }
-        let graphModes: Set<TrayMode> = [.todayTokens, .todayCost, .totalTokens, .totalCost]
-        for mode in TrayMode.allCases {
-            expect(
-                AppDelegate.needsGraph(
-                    mode: mode, enabledClients: [], hiddenClients: [], discordEnabled: false)
-                    == graphModes.contains(mode),
-                "\(mode.rawValue) requests graph only for graph-derived titles")
-        }
-        expect(
-            AppDelegate.needsGraph(
-                mode: .hidden, enabledClients: ["claude"], hiddenClients: [], discordEnabled: false)
-                && !AppDelegate.needsGraph(
-                    mode: .hidden, enabledClients: ["claude"], hiddenClients: ["claude"],
-                    discordEnabled: false)
-                && AppDelegate.needsGraph(
-                    mode: .hidden, enabledClients: [], hiddenClients: [], discordEnabled: true),
-            "visible client-item reconciliation and Discord independently keep graph demand alive")
         expect(
             TrayMode.tokensPerMin.title(graph: nil, tokensPerMin: 42) == "42/m"
                 && TrayMode.tokensPerMin.title(graph: nil, tokensPerMin: nil) == "—/m"
@@ -6646,6 +6629,53 @@ enum SelfTest {
         """
         let trayPayload = try! JSONDecoder().decode(UsagePayload.self, from: Data(trayJSON.utf8))
         let today = "2026-07-01"
+        let displayProjection = TrayDisplayProjection(graph: trayPayload)
+        for _ in 0..<3 {
+            expect(displayProjection.totals(hidden: ["codex"], today: today).todayTokens == 150,
+                   "unchanged display keeps the visible client's ordered total")
+        }
+        expect(displayProjection.totals(hidden: ["claude"], today: today).todayTokens == 200
+            && displayProjection.totals(hidden: [], today: today, only: []).todayTokens == 0
+            && displayProjection.totals(hidden: [], today: today, only: nil).todayTokens == 350,
+            "display refreshes exact hidden membership and distinguishes nil from empty allowlist")
+        expect(displayProjection.totals(hidden: ["codex"], today: "2026-06-01",
+                                        timeZone: "UTC").todayTokens == 300
+            && displayProjection.totals(hidden: ["codex"], today: "2026-07-02",
+                                       timeZone: "Asia/Seoul").todayTokens == 0,
+            "display advances local day and timezone without retaining an old daily figure")
+        do {
+            let replacementDisplayGraph = try JSONDecoder().decode(UsagePayload.self, from: Data(
+                trayJSON.replacingOccurrences(of: "\"input\":100", with: "\"input\":101").utf8))
+            let replacementDisplay = TrayDisplayProjection(graph: replacementDisplayGraph)
+            expect(replacementDisplayGraph.meta.generatedAt == trayPayload.meta.generatedAt
+                && replacementDisplay.totals(hidden: ["codex"], today: today).todayTokens == 151
+                && displayProjection.totals(hidden: ["codex"], today: today).todayTokens == 150,
+                "accepted graph identity replaces totals even when timestamps collide")
+        } catch {
+            expect(false, "replacement display graph fixture decodes: \(error)")
+        }
+        // Consumer seam only: rebuilding the discarded projection must restore
+        // the same title and client shells without a replacement graph. This
+        // does not exercise AppDelegate's private session lifecycle.
+        let resumedDisplay = TrayDisplayProjection(graph: trayPayload)
+        let lastGoodTitle = TrayMode.totalTokens.title(
+            graph: trayPayload, tokensPerMin: nil, projection: displayProjection)
+        expect(
+            !lastGoodTitle.isEmpty
+                && TrayMode.hidden.title(
+                    graph: trayPayload, tokensPerMin: nil, projection: nil).isEmpty
+                && TrayMode.totalTokens.title(
+                    graph: nil, tokensPerMin: nil, projection: resumedDisplay) == lastGoodTitle,
+            "graph to icon to graph restores the last-good projected title without replacement")
+        let resumedClients = ClientTray.runtimePresentations(
+            graph: resumedDisplay.graph, payload: nil,
+            enabled: ["claude", "codex"], selections: [:], hidden: ["codex"],
+            officialClients: ["claude", "codex"])
+        expect(
+            resumedClients.map(\.clientId) == ["claude"]
+                && resumedDisplay.totals(hidden: ["codex"], today: today).todayTokens == 150
+                && resumedDisplay.totals(hidden: ["claude"], today: today).todayTokens == 200,
+            "resumed last-good client membership and exact privacy filters need no successful refresh")
         // (a) Empty hidden set == unfiltered totals (byte-identical fast path).
         let unfiltered = trayPayload.trayTotals(hidden: [], today: today)
         expect(unfiltered.totalTokens == trayPayload.summary.totalTokens
@@ -9443,6 +9473,23 @@ enum SelfTest {
             && dpHidden?.state.contains("Claude Code") == false,
             "the top client skips the hidden client (mutation: dropping the hidden filter from "
                 + "the fold publishes Claude Code)")
+        let discordDisplay = TrayDisplayProjection(graph: dpHiddenGraph)
+        let cachedDiscord = DiscordPresence.payload(
+            projection: discordDisplay, hidden: ["claude"], today: dpToday,
+            costStyle: .banded, components: dpAllComponents)
+        expect(cachedDiscord?.fields == dpHidden?.fields
+            && DiscordPresence.payload(
+                projection: discordDisplay, hidden: ["codex"], today: dpToday,
+                costStyle: .banded, components: [.client], selection: .only("claude"))?.details
+                == "Claude Code"
+            && DiscordPresence.payload(
+                projection: discordDisplay, hidden: [], today: dpToday,
+                costStyle: .banded, components: dpAllComponents,
+                selection: .only("unregistered")) == nil
+            && DiscordPresence.payload(
+                projection: discordDisplay, hidden: [], today: "2099-01-01",
+                costStyle: .banded, components: dpAllComponents) == nil,
+            "Discord projection preserves published bytes, validates selection and advances day")
 
         // Outbound allowlist, at the PRODUCER. The busiest stripe by far is an
         // UNREGISTERED id whose suffix comes from a local config file; a

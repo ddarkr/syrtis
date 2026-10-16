@@ -404,11 +404,12 @@ struct ContributionGraph3D: View {
     private func button(_ label: String, action: @escaping () -> Void) -> some View {
         Button(label, action: action)
             .buttonStyle(.plain)
-            .font(.caption2.weight(.medium))
+            .font(NativeDesign.detailFont.weight(.medium))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
             .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary))
+            .help(label)
     }
 }
 

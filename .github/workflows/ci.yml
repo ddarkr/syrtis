@@ -239,18 +239,18 @@ jobs:
 
       - name: Build Swift package
         if: steps.scope.outputs.docs_only != 'true'
-        run: swift build
+        run: swift build --build-system native
 
       - name: Core logic selftest
         if: steps.scope.outputs.docs_only != 'true'
         # Pace copy and Format's date output are localized, and several
         # assertions compare against the English text. Pin the language so the
         # result never depends on the runner's locale.
-        run: swift run Syrtis --selftest -AppleLanguages "(en)"
+        run: swift run --build-system native Syrtis --selftest -AppleLanguages "(en)"
 
       - name: FFI smoke test
         if: steps.scope.outputs.docs_only != 'true'
-        run: swift run Syrtis --smoke
+        run: swift run --build-system native Syrtis --smoke
 
       # Last, so only a main commit that passed every step above — build,
       # selftest and smoke test — can publish the library PRs will link. The

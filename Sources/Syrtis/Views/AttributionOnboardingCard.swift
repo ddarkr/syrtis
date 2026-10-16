@@ -16,12 +16,6 @@ enum AttributionOnboardingCard {
     /// growing the card without bound.
     static let maxVisibleLines = 4
 
-    /// The card has to stand out from the dashboard cards around it: in its
-    /// first round it was a plain DashCard and the maintainer did not notice
-    /// it. An accent wash and an accent border, both kept low enough that the
-    /// card still reads as part of the panel.
-    static let accentFill = 0.10
-    static let accentStroke = 0.55
 
     enum Copy {
         static let title = "Attribute usage to subscriptions"
@@ -158,7 +152,6 @@ struct AttributionOnboardingCardView: View {
                 DashCard(AttributionOnboardingCard.Copy.title) {
                     content(summary)
                 }
-                .onboardingCardStyle()
             }
         }
     }
@@ -167,13 +160,13 @@ struct AttributionOnboardingCardView: View {
     private func content(_ summary: UsageAttributionSettings.OnboardingSummary) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(AttributionOnboardingCard.Copy.subtitle.localized)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             if let applyFailure {
                 Text(applyFailure.localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -184,20 +177,21 @@ struct AttributionOnboardingCardView: View {
                     id: \.offset
                 ) { _, record in
                     Text(AttributionOnboardingCard.suggestionLine(record))
-                        .font(.caption)
-                        .lineLimit(1)
+                        .font(NativeDesign.bodyFont)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if summary.records.count > AttributionOnboardingCard.maxVisibleLines {
                     Text(AttributionOnboardingCard.Copy.moreCount.localized(
                         Int64(summary.records.count - AttributionOnboardingCard.maxVisibleLines)))
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
                 }
                 if summary.unsuggestedCount > 0 {
                     Text(AttributionOnboardingCard.Copy.unsuggestedHint.localized(
                         Int64(summary.unsuggestedCount)))
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -206,14 +200,14 @@ struct AttributionOnboardingCardView: View {
                     AttributionOnboardingCard.markDismissed()
                 }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
 
                 Button(AttributionOnboardingCard.Copy.setUpManually.localized) {
                     SettingsWindowController.shared.showFromPopover(scrollingTo: .usageAttribution)
                 }
                 .buttonStyle(.plain)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
 
                 Spacer()
 
@@ -237,34 +231,15 @@ struct AttributionSetupLink: View {
             SettingsWindowController.shared.showFromPopover(scrollingTo: .usageAttribution)
         }
         .buttonStyle(.link)
-        .font(.caption)
+        .font(NativeDesign.detailFont)
     }
-}
-
-/// The accent wash and border every onboarding card wears, so the attribution
-/// card and the animation-pace card read as the same kind of prompt.
-struct OnboardingCardStyle: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .background(
-                Color.accentColor.opacity(AttributionOnboardingCard.accentFill),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(
-                        Color.accentColor.opacity(AttributionOnboardingCard.accentStroke),
-                        lineWidth: 1))
-    }
-}
-
-extension View {
-    func onboardingCardStyle() -> some View { modifier(OnboardingCardStyle()) }
 }
 
 /// Hosts an onboarding card and animates it away when it is answered: it
-/// fades while sliding up and shrinking toward its top edge, and the cards
-/// below close the gap over the same curve, instead of the card vanishing in
-/// one frame. The maintainer asked for a dismissal animation on every card.
+/// keeps the needed fade and closes the gap over the same curve, instead of
+/// the card vanishing in one frame. The maintainer asked for a dismissal
+/// animation on every card; reduced motion keeps the fade but drops the
+/// slide and scale.
 struct OnboardingCardContainer<Card: View>: View {
     let visible: Bool
     @ViewBuilder let card: () -> Card
@@ -278,10 +253,15 @@ struct OnboardingCardContainer<Card: View>: View {
     /// Long enough to read as a deliberate exit, short enough not to hold up
     /// the dashboard behind it.
     static var dismissAnimation: Animation { .easeInOut(duration: 0.32) }
-    static var removal: AnyTransition {
-        .opacity
-            .combined(with: .move(edge: .top))
-            .combined(with: .scale(scale: 0.96, anchor: .top))
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var removal: AnyTransition {
+        reduceMotion
+            ? .opacity
+            : .opacity
+                .combined(with: .move(edge: .top))
+                .combined(with: .scale(scale: 0.96, anchor: .top))
     }
 
     var body: some View {
@@ -289,9 +269,9 @@ struct OnboardingCardContainer<Card: View>: View {
             if visible {
                 card()
                     .padding(.bottom, Self.gap)
-                    .transition(.asymmetric(insertion: .opacity, removal: Self.removal))
+                    .transition(.asymmetric(insertion: .opacity, removal: removal))
             }
         }
-        .animation(Self.dismissAnimation, value: visible)
+        .animation(reduceMotion ? nil : Self.dismissAnimation, value: visible)
     }
 }

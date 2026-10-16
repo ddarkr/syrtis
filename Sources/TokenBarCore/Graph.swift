@@ -369,3 +369,31 @@ extension UsagePayload {
             todayTopClient: todayTopClient)
     }
 }
+
+/// One accepted graph's current presentation, never a historical report cache.
+/// Replacing this owner is the acceptance identity, even if generatedAt repeats.
+public final class TrayDisplayProjection {
+    public let graph: UsagePayload
+    private struct Key: Equatable {
+        let hidden: Set<String>
+        let today: String
+        let timeZone: String
+        let only: Set<String>?
+    }
+    private var current: (key: Key, totals: TrayTotals)?
+
+    public init(graph: UsagePayload) {
+        self.graph = graph
+    }
+
+    public func totals(
+        hidden: Set<String>, today: String, timeZone: String = TimeZone.current.identifier,
+        only: Set<String>? = nil
+    ) -> TrayTotals {
+        let key = Key(hidden: hidden, today: today, timeZone: timeZone, only: only)
+        if let current, current.key == key { return current.totals }
+        let totals = graph.trayTotals(hidden: hidden, today: today, only: only)
+        current = (key, totals)
+        return totals
+    }
+}

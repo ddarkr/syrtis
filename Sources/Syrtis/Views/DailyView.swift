@@ -130,13 +130,13 @@ struct DailyView: View {
             trailing: {
                 Text((rows.count == 1 ? "%lld active day" : "%lld active days")
                     .localized(rows.count))
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             }
         ) {
             if rows.isEmpty {
                 Text("No usage in this range")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 2) {
@@ -165,28 +165,31 @@ struct DailyView: View {
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isOpen ? 90 : 0))
-                    Text(Format.monthDay(row.date))
-                        .font(.caption)
-                    Text("%@ msgs".localized(row.messages.formatted()))
-                        .font(.caption2)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Format.monthDay(row.date))
+                            .font(NativeDesign.bodyFont)
+                        HStack(spacing: 6) {
+                            Text("%@ msgs".localized(row.messages.formatted()))
+                            if let turns = row.turns {
+                                Text("%@ turns".localized(turns.formatted()))
+                            }
+                        }
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
-                    if let turns = row.turns {
-                        Text("%@ turns".localized(turns.formatted()))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
                     }
-                    Spacer()
-                    Text(Format.compactTokens(row.tokens))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    Text(Format.money(tokens: row.tokens, cost: row.cost))
-                        .font(.caption.monospacedDigit())
-                        .frame(minWidth: 56, alignment: .trailing)
+                    Spacer(minLength: 8)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(Format.compactTokens(row.tokens))
+                            .font(NativeDesign.bodyFont.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Text(Format.money(tokens: row.tokens, cost: row.cost))
+                            .font(NativeDesign.detailFont.monospacedDigit())
+                            .frame(minWidth: 56, alignment: .trailing)
+                    }
                 }
                 .padding(.vertical, 4)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if isOpen {
                 VStack(spacing: 4) {
@@ -205,15 +208,16 @@ struct DailyView: View {
                                     color: Color.primary.opacity(isHovered ? 0.65 : 0),
                                     radius: isHovered ? 3 : 0)
                             Text(slice.model)
-                                .font(.caption2)
+                                .font(NativeDesign.detailFont)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Spacer()
+                                .help(slice.model)
+                            Spacer(minLength: 8)
                             Text(Format.compactTokens(slice.tokens))
-                                .font(.caption2.monospacedDigit())
+                                .font(NativeDesign.detailFont.monospacedDigit())
                                 .foregroundStyle(.secondary)
                             Text(Format.money(tokens: slice.tokens, cost: slice.cost))
-                                .font(.caption2.monospacedDigit())
+                                .font(NativeDesign.detailFont.monospacedDigit())
                                 .frame(minWidth: 50, alignment: .trailing)
                         }
                         .contentShape(Rectangle())

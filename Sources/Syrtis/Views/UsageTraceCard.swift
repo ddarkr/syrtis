@@ -36,12 +36,12 @@ struct UsageTraceCard: View {
             // separately would pin the English word order.
             Text("last %lldm · %@/m total".localized(
                 windowMin, Format.compactTokens(Int64(totalRate.rounded()))))
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
         }) {
             if top.isEmpty {
                 Text("No activity in this window")
-                    .font(.caption)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 8)
@@ -60,17 +60,20 @@ struct UsageTraceCard: View {
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text(Self.clientLabel(bucket.client))
-                    .font(.caption2.weight(.semibold))
+                    .font(NativeDesign.detailFont.weight(.semibold))
+                    .help(Self.clientLabel(bucket.client))
                 Text(bucket.agent)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
+                    .help(bucket.agent)
                 Text(bucket.model)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                    .help(bucket.model)
                 Spacer()
                 Text("\(Format.compactTokens(Int64(bucket.tokensPerMin.rounded())))/m")
-                    .font(.caption2.monospacedDigit())
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             GeometryReader { geo in

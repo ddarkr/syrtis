@@ -1357,8 +1357,16 @@ impl QueryState {
             .query(params![query.from_ms, query.until_ms])
             .map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            let bytes: Vec<u8> = row.get(0).map_err(|error| error.to_string())?;
-            let message = bincode::deserialize(&bytes).map_err(|error| error.to_string())?;
+            let bytes = row.get_ref(0).map_err(|error| error.to_string())?;
+            let bytes = bytes.as_blob().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(
+                    0,
+                    row.as_ref().column_name(0).unwrap_or("").to_string(),
+                    bytes.data_type(),
+                )
+                .to_string()
+            })?;
+            let message = bincode::deserialize(bytes).map_err(|error| error.to_string())?;
             sink(&message);
         }
         Ok(())
@@ -2467,11 +2475,22 @@ fn decode_staged_message(row: &rusqlite::Row<'_>) -> Result<UnifiedMessage, Stri
     REPORT_DECODED_ROWS.with(|count| count.set(count.get() + 1));
     let value = row.get_ref(0).map_err(|error| error.to_string())?;
     let payload = value.as_blob().map_err(|error| error.to_string())?;
-    let digest: Option<Vec<u8>> = row.get(7).map_err(|error| error.to_string())?;
-    if digest
-        .as_ref()
-        .is_some_and(|digest| Sha256::digest(payload)[..] != digest[..])
-    {
+    let digest = match row.get_ref(7).map_err(|error| error.to_string())? {
+        rusqlite::types::ValueRef::Null => None,
+        rusqlite::types::ValueRef::Blob(bytes) => Some(bytes),
+        value => {
+            return Err(rusqlite::Error::InvalidColumnType(
+                7,
+                row.as_ref()
+                    .column_name(7)
+                    .map_err(|error| error.to_string())?
+                    .to_string(),
+                value.data_type(),
+            )
+            .to_string())
+        }
+    };
+    if digest.is_some_and(|digest| Sha256::digest(payload).as_slice() != digest) {
         return Err("usage snapshot row checksum mismatch".into());
     }
     let recorded: Option<u32> = row.get(9).map_err(|error| error.to_string())?;
@@ -2932,6 +2951,48 @@ mod tests {
         );
         message.dedup_key = key.map(str::to_string);
         message
+    }
+
+    #[test]
+    fn staged_message_borrows_digest_and_returns_owned_output() {
+        use rusqlite::types::Value;
+        use sha2::{Digest, Sha256};
+        let db = Connection::open_in_memory().unwrap();
+        let original = message("amp", "session", 100, None, 7);
+        let payload = bincode::serialize(&original).unwrap();
+        let workspace = bincode::serialize(&original.workspace_key).unwrap();
+        let label = bincode::serialize(&original.workspace_label).unwrap();
+        let mut statement = db
+            .prepare("SELECT ?1,0,0,100,?2,?3,0,?4,'model',NULL")
+            .unwrap();
+        for digest in [Value::Null, Value::Blob(Sha256::digest(&payload).to_vec())] {
+            let decoded = {
+                let mut rows = statement
+                    .query(params![payload, workspace, label, digest])
+                    .unwrap();
+                decode_staged_message(rows.next().unwrap().unwrap()).unwrap()
+            };
+            assert_eq!(bincode::serialize(&decoded).unwrap(), payload);
+        }
+        for (digest, expected) in [
+            (
+                Value::Blob(vec![0; 32]),
+                "usage snapshot row checksum mismatch".to_string(),
+            ),
+            (
+                Value::Text("wrong type".into()),
+                rusqlite::Error::InvalidColumnType(7, "?4".into(), rusqlite::types::Type::Text)
+                    .to_string(),
+            ),
+        ] {
+            let mut rows = statement
+                .query(params![payload, workspace, label, digest])
+                .unwrap();
+            assert_eq!(
+                decode_staged_message(rows.next().unwrap().unwrap()).unwrap_err(),
+                expected,
+            );
+        }
     }
 
     fn inputs(query: &QueryState, lane: &str, from: Option<i64>, until: Option<i64>) -> Vec<i64> {

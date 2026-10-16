@@ -12,23 +12,6 @@ enum AnimationPaceOnboarding {
         static let recommended = "Most people: Moderate"
     }
 
-    /// A tint per pace: one family deepening from slate blue through indigo
-    /// to amethyst. Not red, amber and green: a pace is a preference, not a
-    /// limit, and traffic-light colours would read as a warning.
-    static func tint(_ pace: AnimationPace) -> (top: Color, bottom: Color) {
-        switch pace {
-        case .light: (Color(red: 0.56, green: 0.66, blue: 0.80), Color(red: 0.42, green: 0.53, blue: 0.68))
-        case .moderate: (Color(red: 0.45, green: 0.46, blue: 0.88), Color(red: 0.32, green: 0.36, blue: 0.80))
-        case .heavy: (Color(red: 0.66, green: 0.40, blue: 0.86), Color(red: 0.48, green: 0.25, blue: 0.74))
-        }
-    }
-    /// Option wash and border strength over the card's own accent wash; the
-    /// picked option is drawn stronger so the current choice is obvious.
-    static let optionFill = 0.16
-    static let optionStroke = 0.45
-    static let selectedFill = 0.34
-    static let selectedStroke = 0.95
-
     /// Set by "Done" (or "Skip setup"). Choosing a pace alone does not answer
     /// the card: the maintainer wanted to try several before confirming.
     static let answeredKey = OnboardingSetup.keyPrefix + "pace"
@@ -56,27 +39,40 @@ struct AnimationPaceOnboardingCardView: View {
             isNonUserRuntime: BuildIdentity.isNonUserRuntime(CommandLine.arguments))
     }
 
-    private var current: AnimationPace { AnimationPace(rawValue: paceRaw) ?? .default }
-
     var body: some View {
         OnboardingCardContainer(visible: visible) {
             DashCard(AnimationPaceOnboarding.Copy.title) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(AnimationPaceOnboarding.Copy.body.localized)
-                        .font(.caption)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    ForEach(AnimationPace.allCases, id: \.self) { pace in
-                        Button {
-                            paceRaw = pace.rawValue
-                        } label: {
-                            option(pace)
+                    // Display the running icon's effective pace without
+                    // committing an unanswered or unknown stored choice.
+                    Picker(selection: Binding(
+                        get: { (AnimationPace(rawValue: paceRaw) ?? .default).rawValue },
+                        set: { paceRaw = $0 }
+                    )) {
+                        ForEach(AnimationPace.allCases, id: \.self) { pace in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(pace.label.localized)
+                                    .font(NativeDesign.bodyFont)
+                                Text(pace.detail.localized)
+                                    .font(NativeDesign.detailFont)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .fixedSize(horizontal: false, vertical: true)
+                            .tag(pace.rawValue)
                         }
-                        .buttonStyle(.plain)
+                    } label: {
+                        EmptyView()
                     }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                    .accessibilityLabel(AnimationPaceOnboarding.Copy.title.localized)
                     HStack {
                         Text(AnimationPaceOnboarding.Copy.recommended.localized)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.tertiary)
                         Spacer()
                         Button(OnboardingSetupCopy.done.localized) {
@@ -90,38 +86,6 @@ struct AnimationPaceOnboardingCardView: View {
                     }
                 }
             }
-            .onboardingCardStyle()
         }
-    }
-
-    private func option(_ pace: AnimationPace) -> some View {
-        let tint = AnimationPaceOnboarding.tint(pace)
-        let picked = pace == current
-        let gradient = LinearGradient(
-            colors: [tint.top, tint.bottom], startPoint: .top, endPoint: .bottom)
-        return HStack(spacing: 8) {
-            Capsule()
-                .fill(gradient)
-                .frame(width: 3)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(pace.label.localized).font(.caption.weight(.semibold))
-                Text(pace.detail.localized)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 5)
-        .padding(.horizontal, 8)
-        .background(
-            gradient.opacity(
-                picked ? AnimationPaceOnboarding.selectedFill : AnimationPaceOnboarding.optionFill),
-            in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .strokeBorder(
-                    tint.top.opacity(
-                        picked ? AnimationPaceOnboarding.selectedStroke : AnimationPaceOnboarding.optionStroke),
-                    lineWidth: picked ? 1.5 : 1))
     }
 }

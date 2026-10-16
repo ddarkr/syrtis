@@ -8,6 +8,10 @@ import TokenBarCore
 /// the whole roster can be screenshotted without needing local session
 /// fixtures for every client.
 struct IconGalleryView: View {
+    /// Initial window content size; the window is resizable down to `minSize`.
+    static let contentSize = CGSize(width: 900, height: 820)
+    static let minSize = CGSize(width: 560, height: 420)
+
     private static let ids = [
         "claude", "gemini", "opencode", "copilot", "qwen",
         "codex", "droid", "kilocode", "kilo", "synthetic", "kiro", "codebuff",
@@ -20,7 +24,6 @@ struct IconGalleryView: View {
     ]
 
     private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
-
     var body: some View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 20) {
@@ -29,19 +32,26 @@ struct IconGalleryView: View {
                         AgentIconView(clientId: id, size: 48)
                         AgentIconView(clientId: id, size: 14)
                         Text(id)
-                            .font(.caption2.monospaced())
+                            .font(.caption.monospaced())
                             .lineLimit(1)
+                            .truncationMode(.middle)
                         Text(ClientRegistry.style(id).displayName)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .frame(width: 110)
+                    .help(ClientRegistry.style(id).displayName)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(ClientRegistry.style(id).displayName), \(id)")
                 }
             }
             .padding(20)
         }
-        .frame(width: 900, height: 820)
-        .background(PopoverBackdrop().ignoresSafeArea())
+        .frame(
+            minWidth: Self.minSize.width,
+            minHeight: Self.minSize.height)
     }
 }

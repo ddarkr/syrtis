@@ -43,7 +43,7 @@ struct OverviewView: View {
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: NativeDesign.spacing) {
             // Quota cards moved to the Quota lens (2026-08-17): the window card
             // and the Agent-limits card answer the same question at two scales,
             // and having them here while the window history lived elsewhere
@@ -101,7 +101,7 @@ struct OverviewView: View {
             if singleClient != nil && !hasLocalUsage {
                 DashCard("Token Usage") {
                     Text("No local usage records in this range.")
-                        .font(.caption)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

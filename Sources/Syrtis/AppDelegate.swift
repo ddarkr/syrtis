@@ -9,8 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let usageSource: any UsageDataSource
     private lazy var localScheduler = LocalUsageScheduler(source: usageSource)
-    private var trayGraphSession: LocalUsageScheduler.Session?
-    private var discordGraphSession: LocalUsageScheduler.Session?
+    private var backgroundUsageSession: LocalUsageScheduler.Session?
     private var installedRootGeneration = UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey)
 
     init(source: any UsageDataSource = UsageDataSources.current) {
@@ -24,6 +23,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var defaultsApplyScheduled = false
     // Last good fetches — a failed refresh keeps showing these.
     private var lastGraph: UsagePayload?
+    private var trayProjection: TrayDisplayProjection?
+    private var discordProjection: TrayDisplayProjection?
     private var refreshIntervalMin = AppDelegate.readIntervalMin()
     // Value gate for immediate filtered-rate replacement. Unrelated defaults
     // writes do not restart the local-source reader.
@@ -52,6 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static func readIntervalMin() -> Int {
         max(1, UserDefaults.standard.object(forKey: intervalKey).flatMap { $0 as? Int } ?? 30)
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        SettingsWindowController.shared.registerSceneIfNeeded()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -111,7 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         animator.onQuotaUpdated = { [weak self] in self?.applyMenuBarState() }
         animator.start()
         startTitleRefresh()
-        reconcileGraphDemand()
+        reconcileBackgroundUsageDemand()
 
         // didChangeNotification carries no key and fires for EVERY write — the
         // popover height slider mid-drag, active tab, lens, quota cache. Coalesce
@@ -346,9 +351,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `trayTotals` folds the very same stripes with. Nothing is published
     /// before the first graph arrives.
     private func discordPayload() -> DiscordPresence.Payload? {
-        guard let lastGraph else { return nil }
+        guard let discordProjection else { return nil }
         return DiscordPresence.payload(
-            graph: lastGraph,
+            projection: discordProjection,
             hidden: ClientRegistry.hiddenTabClients(),
             today: Format.todayKey(),
             // Read here and passed down. `DiscordPresence` performs no
@@ -398,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.installedRootGeneration = installed
                 self.localScheduler.rootsChanged()
             }
-            self.reconcileGraphDemand()
+            self.reconcileBackgroundUsageDemand()
 
             // Hiding a client has to leave the published presence in the SAME
             // turn — waiting for the next refresh cycle would keep that client
@@ -516,7 +521,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trayAnimator?.syncStaleGauge()
         let rate = trayAnimator?.tokensPerMinRate
         statusController?.updateTitle(
-            mode.title(graph: lastGraph, tokensPerMin: rate, quotaRemaining: quotaRemaining),
+            mode.title(graph: lastGraph, tokensPerMin: rate, quotaRemaining: quotaRemaining,
+                       projection: trayProjection),
             color: mode.titleColor(quotaRemaining: quotaRemaining),
             quotaRemaining: mode == .quotaLeft ? quotaRemaining : nil,
             stale: mode == .quotaLeft && (trayAnimator?.readingIsStaleNow ?? false))
@@ -530,38 +536,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             officialClients: AgentIconView.availableOfficialClientIDs()))
     }
 
-    nonisolated static func needsGraph(
-        mode: TrayMode, enabledClients: Set<String>, hiddenClients: Set<String>,
-        discordEnabled: Bool
-    ) -> Bool {
-        mode.needsGraph || !enabledClients.subtracting(hiddenClients).isEmpty || discordEnabled
-    }
-
-
-    private func reconcileGraphDemand() {
+    /// Keep default display reports prepared even while every window is closed.
+    private func reconcileBackgroundUsageDemand() {
         let trayNeedsGraph = TrayMode.current.needsGraph
             || !ClientTray.enabled().subtracting(ClientRegistry.hiddenTabClients()).isEmpty
         let discordNeedsGraph = DiscordPresence.mayConnect(
             arguments: CommandLine.arguments, enabled: DiscordPresence.enabled())
-        trayGraphSession = reconcileGraphSession(trayGraphSession, wanted: trayNeedsGraph)
-        discordGraphSession = reconcileGraphSession(discordGraphSession, wanted: discordNeedsGraph)
-    }
-
-    private func reconcileGraphSession(
-        _ existing: LocalUsageScheduler.Session?, wanted: Bool
-    ) -> LocalUsageScheduler.Session? {
-        guard wanted else {
-            if let existing { localScheduler.release(existing) }
-            return nil
+        // lastGraph is last-good display state, not a native lease. Dropping it
+        // here blanks resumed titles/client items until a refresh succeeds.
+        if trayNeedsGraph {
+            if trayProjection == nil, let lastGraph {
+                trayProjection = TrayDisplayProjection(graph: lastGraph)
+            }
+        } else {
+            trayProjection = nil
         }
-        let session = existing ?? localScheduler.openSession()
-        localScheduler.update(session, queries: [.init(kind: "graph")], active: false) { [weak self] _, result in
-            guard let self, case .success(.graph(let graph)) = result else { return }
+        if discordNeedsGraph {
+            if discordProjection == nil, let lastGraph {
+                discordProjection = TrayDisplayProjection(graph: lastGraph)
+            }
+        } else {
+            discordProjection = nil
+        }
+        let session = backgroundUsageSession ?? localScheduler.openSession()
+        backgroundUsageSession = session
+        let year = DashboardModel.resolveYear()
+        let queries: Set<LocalUsageScheduler.Query> = [
+            .init(kind: "graph"),
+            .init(kind: "graph", year: year),
+            .init(kind: "models", year: year)
+        ]
+        localScheduler.update(session, queries: queries, active: false) { [weak self] query, result in
+            guard let self, query.year == nil,
+                  case .success(.graph(let graph)) = result else { return }
             self.lastGraph = graph
+            self.trayProjection = trayNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
+            self.discordProjection = discordNeedsGraph ? TrayDisplayProjection(graph: graph) : nil
             self.applyMenuBarState()
             self.applyDiscordPresence()
         }
-        return session
     }
 
     /// Stale quota rendering has its own cheap cadence, even when no local

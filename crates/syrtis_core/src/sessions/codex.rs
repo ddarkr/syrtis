@@ -79,7 +79,7 @@ pub struct CodexPayload {
     /// Deliberately `Value` rather than a typed struct. `CodexEntry` is
     /// deserialized one whole line at a time, so a single field whose JSON type
     /// does not match its Rust type rejects the entire line: the entry is then
-    /// unhandled and falls through to `parse_codex_headless_line`, which
+    /// unhandled and falls through to `parse_codex_headless_value`, which
     /// overwrites `current_model` before its usage check and mints a message
     /// from any `usage` object anywhere in the line. `item` holds a different
     /// payload per item type — `CommandExecution`, `Reasoning`, `AgentMessage`,
@@ -766,22 +766,26 @@ where
             continue;
         }
 
-        if state.forked_child_waiting_for_turn_context {
-            let mut json_probe = trimmed.as_bytes().to_vec();
-            if simd_json::from_slice::<Value>(&mut json_probe).is_ok() {
-                continue;
-            }
+        // SIMD parsing mutates its input, including on typed decode failure.
+        // Restore the original line while retaining the scratch allocation.
+        buffer.clear();
+        buffer.extend_from_slice(trimmed.as_bytes());
+        let value = simd_json::from_slice::<Value>(&mut buffer).ok();
+        if state.forked_child_waiting_for_turn_context && value.is_some() {
+            continue;
         }
 
-        let headless_message = parse_codex_headless_line(
-            trimmed,
-            session_id,
-            &mut state.current_model,
-            fallback_timestamp,
-            state.session_provider.as_deref(),
-            &state.session_agent,
-            state.session_is_headless,
-        );
+        let headless_message = value.as_ref().and_then(|value| {
+            parse_codex_headless_value(
+                value,
+                session_id,
+                &mut state.current_model,
+                fallback_timestamp,
+                state.session_provider.as_deref(),
+                &state.session_agent,
+                state.session_is_headless,
+            )
+        });
         if !pending_model_messages.is_empty() {
             if let Some(model) = state.current_model.clone() {
                 pending_model_messages.flush(sink, &model)?;
@@ -799,8 +803,7 @@ where
             continue;
         }
 
-        let mut json_probe = trimmed.as_bytes().to_vec();
-        if simd_json::from_slice::<Value>(&mut json_probe).is_err() {
+        if value.is_none() {
             parse_succeeded = false;
             continue;
         }
@@ -1508,8 +1511,8 @@ struct CodexHeadlessUsage {
     timestamp_ms: Option<i64>,
 }
 
-fn parse_codex_headless_line(
-    line: &str,
+fn parse_codex_headless_value(
+    value: &Value,
     session_id: &str,
     current_model: &mut Option<String>,
     fallback_timestamp: i64,
@@ -1517,14 +1520,11 @@ fn parse_codex_headless_line(
     session_agent: &Option<String>,
     session_is_headless: bool,
 ) -> Option<(UnifiedMessage, bool)> {
-    let mut bytes = line.as_bytes().to_vec();
-    let value: Value = simd_json::from_slice(&mut bytes).ok()?;
-
-    if let Some(model) = extract_model_from_value(&value) {
+    if let Some(model) = extract_model_from_value(value) {
         *current_model = Some(model);
     }
 
-    let usage = extract_headless_usage(&value)?;
+    let usage = extract_headless_usage(value)?;
     let model = usage
         .model
         .or_else(|| current_model.clone())
@@ -2075,6 +2075,53 @@ mod tests {
         assert!(!parsed.unresolved_model_events);
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].model_id, "gpt-5.5");
+    }
+
+    #[test]
+    fn test_fallback_restores_escaped_lines_and_distinguishes_invalid_json() {
+        for waiting in [false, true] {
+            for malformed in [false, true] {
+                let mut content = concat!(
+                    r#"{"type":"metadata","model":"gpt-\u0035.5","payload":false}"#,
+                    "\n",
+                    r#"{"type":"unknown","payload":42,"extra":{"ignored":true}}"#,
+                    "\n",
+                    r#"{"type":"result","payload":false,"data":{"model_name":42,"usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}"#,
+                    "\n"
+                )
+                .to_string();
+                if malformed {
+                    content.push_str("{\"model\":\"broken\\u0035\",\n");
+                }
+                let parsed = parse_codex_reader(
+                    std::io::Cursor::new(content),
+                    "session",
+                    123,
+                    0,
+                    CodexParseState {
+                        forked_child_waiting_for_turn_context: waiting,
+                        ..CodexParseState::default()
+                    },
+                );
+                assert_eq!(parsed.parse_succeeded, !malformed);
+                assert_eq!(parsed.state.forked_child_waiting_for_turn_context, waiting);
+                if waiting {
+                    assert!(parsed.messages.is_empty());
+                    assert!(parsed.state.current_model.is_none());
+                } else {
+                    assert_eq!(parsed.state.current_model.as_deref(), Some("gpt-5.5"));
+                    assert_eq!(parsed.messages.len(), 1);
+                    let message = &parsed.messages[0];
+                    assert_eq!(message.model_id, "gpt-5.5");
+                    assert_eq!(message.tokens.input, 8);
+                    assert_eq!(message.tokens.cache_read, 2);
+                    assert_eq!(message.tokens.output, 3);
+                    assert_eq!(message.timestamp, 123);
+                    assert!(!message.is_turn_start);
+                    assert_eq!(parsed.fallback_timestamp_indices, vec![0]);
+                }
+            }
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ struct QuotaSummaryLine: View {
                 } else if summary.otherWindows > 0, summary.paceCheckedWindows > 0 {
                     row(label: "Pace", tint: .secondary) {
                         Text("Every measured window is under its expected pace")
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -68,12 +68,12 @@ struct QuotaSummaryLine: View {
                         Text(verbatim: "%@ tokens".localized(
                             Format.compactTokens(today.tokens)) + " · "
                             + Format.money(tokens: today.tokens, cost: today.cost))
-                            .font(.caption)
+                            .font(NativeDesign.bodyFont)
                     }
                 }
             } else if attempted {
                 Text("No subscription is reporting a usage window right now.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 LoadingLine(title: "Checking agent limits…")
@@ -81,7 +81,7 @@ struct QuotaSummaryLine: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(NativeDesign.cardPadding)
         .glassCard()
     }
 
@@ -98,7 +98,7 @@ struct QuotaSummaryLine: View {
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(label.localized)
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(tint)
                 .frame(width: Self.labelWidth, alignment: .leading)
                 .fixedSize()
@@ -134,18 +134,17 @@ struct QuotaSummaryLine: View {
         let reset = summary.resetsAt.flatMap { UsagePace.resetText(for: $0) }
         return row(label: "Tightest", tint: .secondary) {
             Text(verbatim: "\(name) · \(summary.tightestLabel.localized)")
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
+                .font(NativeDesign.bodyFont.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
             Text(verbatim: [
                 "%lld%% left".localized(Int(summary.remainingPercent.rounded())),
                 reset,
             ].compactMap(\.self).joined(separator: " · "))
-                .font(.caption)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             if summary.otherWindows > 0 {
                 Text(othersText(summary))
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -173,14 +172,13 @@ struct QuotaSummaryLine: View {
         let tail = [burning.riskText, burning.etaText].compactMap(\.self).first
         return row(label: "Burning fastest", tint: .secondary) {
             Text(verbatim: "\(name) · \(burning.label.localized)")
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
+                .font(NativeDesign.bodyFont.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
             Text(verbatim: [
                 "%lld%% ahead of pace".localized(Int(burning.aheadPercent.rounded())),
                 tail,
             ].compactMap(\.self).joined(separator: " · "))
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.orange)
         }
     }

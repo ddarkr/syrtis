@@ -544,6 +544,60 @@ impl PricingService {
         }
     }
 
+    /// Conservative configured-rate bound after request boundaries, cache TTLs
+    /// and service tiers have been aggregated away. Never use this for billing.
+    pub fn calculate_aggregate_cost_upper_bound_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> Option<f64> {
+        let result = self.lookup_with_source_and_provider(model_id, None, provider_id)?;
+        let p = &result.pricing;
+        let maximum = |rates: &[Option<f64>]| {
+            rates.iter().flatten().copied()
+                .filter(|rate| rate.is_finite() && *rate >= 0.0)
+                .fold(0.0_f64, f64::max)
+        };
+        let input = maximum(&[
+            p.input_cost_per_token,
+            p.input_cost_per_token_above_128k_tokens,
+            p.input_cost_per_token_above_200k_tokens,
+            p.input_cost_per_token_above_256k_tokens,
+            p.input_cost_per_token_above_272k_tokens,
+        ]);
+        let output = maximum(&[
+            p.output_cost_per_token,
+            p.output_cost_per_token_above_128k_tokens,
+            p.output_cost_per_token_above_200k_tokens,
+            p.output_cost_per_token_above_256k_tokens,
+            p.output_cost_per_token_above_272k_tokens,
+        ]);
+        let read = maximum(&[
+            p.cache_read_input_token_cost,
+            p.cache_read_input_token_cost_above_200k_tokens,
+            p.cache_read_input_token_cost_above_272k_tokens,
+        ]);
+        let write = maximum(&[
+            p.cache_creation_input_token_cost,
+            p.cache_creation_input_token_cost_above_200k_tokens,
+        ]).max(2.0 * input);
+        let bound = usage.input.max(0) as f64 * input
+            + usage.output.max(0) as f64 * output
+            + usage.reasoning.max(0) as f64 * output
+            + usage.cache_read.max(0) as f64 * read
+            + usage.cache_write.max(0) as f64 * write;
+        let multiplier = if provider_id
+            .and_then(crate::provider_identity::canonical_provider)
+            .as_deref() == Some("openai")
+        {
+            2.0
+        } else {
+            1.0
+        };
+        Some(bound * multiplier)
+    }
+
     pub fn lookup_with_source(
         &self,
         model_id: &str,

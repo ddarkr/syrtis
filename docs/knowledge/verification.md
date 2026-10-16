@@ -95,9 +95,9 @@ The current CI runtime sources are [`.github/workflows/ci.yml`](../../.github/wo
 
 ```bash
 cargo build --release
-swift build
-make selftest          # = swift run Syrtis --selftest -AppleLanguages "(en)"
-swift run Syrtis --smoke
+swift build --build-system native
+make selftest          # = swift run --build-system native Syrtis --selftest -AppleLanguages "(en)"
+swift run --build-system native Syrtis --smoke
 ```
 
 每一項都跑 debug configuration 的 bare executable，`Bundle.main.bundleIdentifier` 因此是 nil。凡是以那個差異為條件的值，在 suite 看得到的地方是一種樣子、在出貨的地方是另一種樣子，而任何 source scan 都關不掉這個缺口（#146 寫過三道、三道都被繞過，缺口不在原始碼文字裡）。CI 因此在 push 到 main 時多跑一次 `make selftest-bundled`：release build、裝進 `.app`、從 bundled binary 執行同一套 suite。
@@ -121,8 +121,8 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --workspace --all-targets
 make build
-make selftest          # = swift run Syrtis --selftest -AppleLanguages "(en)"
-swift run Syrtis --smoke
+make selftest          # = swift run --build-system native Syrtis --selftest -AppleLanguages "(en)"
+swift run --build-system native Syrtis --smoke
 ```
 
 `cargo test` and `cargo clippy --workspace --all-targets` are local full code-change gates. CI's Rust-build subset runs `cargo test -p tb_core_ffi --locked` and `cargo clippy -p tb_core_ffi --all-targets --locked --no-deps`; neither replaces workspace engine verification. The owned engine retains `#![deny(clippy::all)]` and the repository pins its Rust toolchain. A cached-library PR skips rebuilding unchanged Rust inputs.
@@ -133,7 +133,7 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 |---|---|
 | Rust | Release static library builds from the current source |
 | Swift | SwiftPM links against the freshly built library from repository root |
-| Selftest | UI-free TokenBarCore assertions pass。部分斷言逐字比對英文 UI 文案，因此語系必須鎖定 `en`（用 `make selftest`，或自行帶 `-AppleLanguages "(en)"`）；在中文系統上直接跑 `swift run Syrtis --selftest` 會因 `Format` 輸出中文而假性失敗，入口會先印出提示 |
+| Selftest | UI-free TokenBarCore assertions pass。部分斷言逐字比對英文 UI 文案，因此語系必須鎖定 `en`（用 `make selftest`，或自行帶 `-AppleLanguages "(en)"`）；在中文系統上直接跑 `swift run --build-system native Syrtis --selftest` 會因 `Format` 輸出中文而假性失敗，入口會先印出提示 |
 | Bundled selftest | 同一套 suite 從 `dist/selftest/Syrtis.app` 的 release binary 通過（`make selftest-bundled`），證明斷言看到的是出貨 configuration。CI 只在 push 到 main 時跑（`.github/workflows/ci-release.yml`，與 `ci.yml` 平行；打 tag 前兩個 run 都要綠），並以 `SELFTEST_BUNDLE_ID=` 帶出貨 identifier；本機預設拋棄式 identifier＝較弱版本。斷言數少於 debug run（`#if DEBUG` 的部分不存在），不是超集 |
 | Smoke | Every C ABI entry point decodes or reports an intentional error envelope；account-scope path不得存取Keychain或顯示credential authorization UI |
 | Account-scope storage | Hermetic security tests先證明permission、path、locking、atomicity與recovery；live smoke只驗證shipping data flow不彈授權UI，不取代fixture correctness |
@@ -346,9 +346,19 @@ The actual native sand tray renderer kept 144 frames at 24 fps in both Debug arm
 
 Final workspace Rust tests passed 2,532 top-level cases plus one child-process check, with six ignored. Workspace Clippy passed with the existing 15 library／22 test-target FFI warnings. Fresh release Rust linkage、debug and default isolated-identifier bundled selftests、bundle signature verification and all 15 task-owned Rust formatting checks passed. Repository-wide `cargo fmt` still reports the same five unrelated files as the immutable baseline; those files are byte-identical and were not reformatted. Rust LSP was unavailable. Seven changed Swift files retained the baseline's 281 SwiftLint errors, with no added error rule/count; this is not a clean lint result. The knowledge checker passed 19 self-tests and repository validation.
 
+### Integrated display readiness and native presentation
+
+The combined background-ready／reopen／native-design／allocation-reduction／aggregate-price-bound source passed 2,555 top-level workspace Rust tests plus one child-process check, with six ignored. Workspace Clippy completed with the existing 15 library／22 test-target FFI warnings. Debug and isolated-identifier bundled selftests passed; all six changed Rust files passed stdin-scoped formatting checks. The bundled executable links SDK 27.0 with minimum macOS 14.0. The current toolchain requires `--build-system native` for that linked SDK; compiling against a recent SDK alone is insufficient, and the deprecated build-engine workaround must be revisited on toolchain upgrade.
+
+Permanent regressions cover background constructor seeding, producer matching, pending／failed refresh retention, year／client／root／timezone invalidation, and model／hourly／Agents reopen values. Allocation changes preserve malformed Codex fallback handling, late Copilot context／precedence, SQLite type／checksum failures and owned decoded output. Aggregate anomaly-bound cases cover unknown cache TTL, canonical OpenAI priority and decreasing custom tiers while ordinary billing remains unchanged.
+
+A fresh native Swift → C ABI → Rust smoke used isolated Claude fixtures and real FSEvents: closed-window totals advanced 128 → 356, synchronous model construction retained 356 during blocked and failed replacement, and recovery reached 684 before reopening. Own-window compositor captures of the production `PopoverView` showed the retained and recovered token totals. This is not installed-app or real-corpus acceptance.
+
+A private demo harness exercised the production Settings scene across Menu bar／Dashboard／Usage attribution／General destinations, one-window routing, minimum resize, close／reopen size preservation, minimize／restore and session teardown. A 400pt production popover rendered populated light／dark states and released its sessions on disappearance. Settings activation calls were suppressed only in the private copy; the harness itself remained inactive at its checkpoints, but this does not verify untouched focus behavior. Minimum-size Settings and popover compositor captures were inspected; initial full-size Settings captures had scaled content with black margins and are not full-layout visual evidence. Sidebar input, About, all eight lens interactions, accessibility／localization matrices, native status-item pixels, older OS runtime and installed preferences were not exercised. No live-provider／Keychain smoke was run.
+
 ## Local build and UX acceptance
 
-> **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
+> **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run --build-system native Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
 >
 > 凡是驗收由偏好驅動的畫面——**usage attribution 宣告、Settings 持久化、狀態列項目狀態**——一律用 `make bundle` 產生的 `dist/Syrtis.app`，並在**出貨 identifier 下**跑，前後備份還原使用者的偏好：
 >
@@ -388,24 +398,24 @@ Final workspace Rust tests passed 2,532 top-level cases plus one child-process c
 
 > **不要**讓裸執行檔改讀 `UserDefaults(suiteName: "com.nyanako.tokenbar")` 來迴避這件事：那會讓開發執行檔寫進使用者正式的偏好網域，摧毀 `SELFTEST_BUNDLE_ID` 建立的隔離。
 
-不需要 `.app` bundle 語意、且不依賴 `UserDefaults` 的人工 UI 檢查，優先從 repository root 執行 `swift run Syrtis --open-popover`。需要 `make bundle` 產生的 `dist/Syrtis.app` 的有兩類：一是 icon、`Info.plist`、`LSUIElement`、Sparkle、autostart 或安裝路徑等 bundle-only 行為；二是**任何由偏好驅動的畫面**（usage attribution、Settings 持久化、狀態列項目狀態），且必須照上方網域警告的備份還原程序走。以 Argument Domain 注入初始偏好的 deterministic 檢查**不需要備份還原**，因為它們跑在裸執行檔上、只碰 `Syrtis` 網域，動不到使用者正式的偏好。但**不要以為它們因此就與既有網域無關**：Argument Domain 只覆寫命令列傳進去的鍵，其餘一律往下落到 application domain。例如 `SettingsWindowView.swift:56` 讀 `tokenbar.tabs.hidden`，而下方那組指令沒有注入它，於是開發過程累積在 `Syrtis` 網域的舊值會改變你看到的列。這類檢查的 deterministic 只在「該畫面的每一個輸入都被注入」時成立；做不到就先 `defaults delete Syrtis` 清掉再跑。
+不需要 `.app` bundle 語意、且不依賴 `UserDefaults` 的人工 UI 檢查，優先從 repository root 執行 `swift run --build-system native Syrtis --open-popover`。需要 `make bundle` 產生的 `dist/Syrtis.app` 的有兩類：一是 icon、`Info.plist`、`LSUIElement`、Sparkle、autostart 或安裝路徑等 bundle-only 行為；二是**任何由偏好驅動的畫面**（usage attribution、Settings 持久化、狀態列項目狀態），且必須照上方網域警告的備份還原程序走。以 Argument Domain 注入初始偏好的 deterministic 檢查**不需要備份還原**，因為它們跑在裸執行檔上、只碰 `Syrtis` 網域，動不到使用者正式的偏好。但**不要以為它們因此就與既有網域無關**：Argument Domain 只覆寫命令列傳進去的鍵，其餘一律往下落到 application domain。例如 `SettingsWindowView.swift` 讀 `tokenbar.tabs.hidden`，而下方那組指令沒有注入它，於是開發過程累積在 `Syrtis` 網域的舊值會改變你看到的列。這類檢查的 deterministic 只在「該畫面的每一個輸入都被注入」時成立；做不到就先 `defaults delete Syrtis` 清掉再跑。
 
-Provider quota pace 以 `swift run Syrtis --demo --open-popover` 提供 deterministic 人工驗收面；snapshot badge 明示 `FIXTURE`，且 `DemoUsageDataSource` 不呼叫 live FFI、不讀寫 quota cache。Historical／Linear／Off 都要實際呈現；驗收時必須區分低 remaining 觸發的 quota 長條黃／紅健康色，與 deficit stage 觸發的 pace marker／footer 橘色。橘色只看 actual 有沒有越過 expected 線，不看是哪個 estimator 畫出那條線——Historical 與 Linear 的 deficit 同色，狀態文案仍必須分辨兩者。舊規則（只有 `available` 可上色）已廢止：`available` 由每次 refresh 重跑的 out-of-sample fit gate 決定，同一張卡會在 Historical 與 `learningHistory` 之間來回，把顏色綁在 basis 上會讓使用者看到預測「一下子就不見了」，而底層 deficit 其實一直存在。
+Provider quota pace 以 `swift run --build-system native Syrtis --demo --open-popover` 提供 deterministic 人工驗收面；snapshot badge 明示 `FIXTURE`，且 `DemoUsageDataSource` 不呼叫 live FFI、不讀寫 quota cache。Historical／Linear／Off 都要實際呈現；驗收時必須區分低 remaining 觸發的 quota 長條黃／紅健康色，與 deficit stage 觸發的 pace marker／footer 橘色。橘色只看 actual 有沒有越過 expected 線，不看是哪個 estimator 畫出那條線——Historical 與 Linear 的 deficit 同色，狀態文案仍必須分辨兩者。舊規則（只有 `available` 可上色）已廢止：`available` 由每次 refresh 重跑的 out-of-sample fit gate 決定，同一張卡會在 Historical 與 `learningHistory` 之間來回，把顏色綁在 basis 上會讓使用者看到預測「一下子就不見了」，而底層 deficit 其實一直存在。
 
 Menu bar 的「Font color」驗收涵蓋 Automatic／Custom 切換、正常／偏低／不足三個獨立色塊下方的 16 色面板與 HEX 輸入、深淺預覽、主項目與獨立用戶端數值未改變時立即換色，以及切回 Automatic 後恢復額度／系統字色。以獨立 UserDefaults suite 驗證舊單色設定保留為正常色、另外兩色的預設、三色保存後重讀、25%／10% 邊界與邊界上方的色階選擇、非額度文字／無額度使用正常色、無效儲存值只回退該檔位，以及恢復自動時保留自訂值；同時鎖定自動 gauge 的原始色值。這些 selftest 不取代實際互動。GUI 需確認面板位於自訂顏色列下方、沒有系統調色盤，連續切換三個色塊會更新同一面板的編輯檔位，分別換色不改動其他兩色，並驗證輸入 `#000000`、小寫與省略 `#` 的正規化，以及未完成／無效輸入不改動上一個有效顏色，並在輸入框失去焦點時清空。Argument Domain 注入可驗初始配色，不代表互動寫入或跨 process 持久化已驗證。
 
 Individual client items的deterministic Settings檢查以Argument Domain注入初始偏好；這只驗visual state與initial routing，不在同一process宣稱toggle persistence：
 
 ```bash
-swift run Syrtis --demo --settings \
+swift run --build-system native Syrtis --demo --settings \
   -tokenbar.tray.clients.enabled claude,codex \
   -tokenbar.tray.clients.quotaSelections '{"claude":"auto","codex":"weekly.v1"}'
 
-swift run Syrtis --demo --settings \
+swift run --build-system native Syrtis --demo --settings \
   -tokenbar.tray.clients.enabled claude,codex \
   -tokenbar.tray.clients.quotaSelections '{"claude":"auto","codex":"missing.v1"}'
 
-swift run Syrtis --demo --settings \
+swift run --build-system native Syrtis --demo --settings \
   -tokenbar.tray.clients.enabled claude,codex \
   -tokenbar.tray.clients.quotaSelections '{"claude":"auto","codex":"weekly.v1"}' \
   -tokenbar.tabs.hidden codex
@@ -419,7 +429,7 @@ swift run Syrtis --demo --settings \
 
 | UX surface | Preferred path | Completion evidence |
 |---|---|---|
-| Popover、lens、keyboard、scroll、appearance | `swift run Syrtis --open-popover`；但 lens 記憶與 appearance 的互動寫入是偏好驅動的，那部分依上方網域警告改用 bundle 加備份還原 | 實際操作與必要截圖；結束測試 process |
+| Popover、lens、keyboard、scroll、appearance | `swift run --build-system native Syrtis --open-popover`；但 lens 記憶與 appearance 的互動寫入是偏好驅動的，那部分依上方網域警告改用 bundle 加備份還原 | 實際操作與必要截圖；結束測試 process |
 | Individual client status items | `--demo --settings`配合兩個M2 Argument Domain keys驗initial visual state；本機資料、placement／right-click／跨螢幕則用同一`dist/Syrtis.app`（placement 記憶存在 app 自己的偏好網域，依上方網域警告備份還原，不要換 identifier——換了等於記憶歸零） | 預設只有主item；switch點擊後立即以`.mini`原生狀態更新，client shell可稍後於同一defaults reconciliation建立但不得阻塞control setter；Settings body重建不得同步呼叫`SMAppService.status`（本機量測單次約0.5～0.9秒），關閉／重開與連續toggle都須維持可互動；enable／disable／hide／restore保留selection與`tokenbar-client-<id>` placement；`antigravity-cli`在本機error-only provider狀態仍可配置；dashboard選定單一年份時，Settings仍以all-time graph保留所有live client item rows並可停用；client A→B沿用同一popover並各自恢復本次app session停留的lens；主item恢復自己的client-plus-lens route，不被individual item覆寫；主item right-click仍只改global source；1x／2x雙向移動圖示清晰；VoiceOver label不含raw card／error，explicit error fallback固定讀作last-known而非current quota；0與8 items的idle profile沒有per-client loop |
 | Icon、bundle identity、Sparkle、autostart | `make bundle` 後啟動 `dist/Syrtis.app` | 記錄 bundle-only 行為；完成後 unregister 並移除本機 bundle |
 | Homebrew、Sparkle stable update、正式安裝路徑 | `/Applications/Syrtis.app` | 不以 `dist/Syrtis.app` 代替 installed-app 驗收 |
@@ -503,8 +513,8 @@ Windows 的 crosscheck oracle 釘在一個固定的 macOS commit（不是 `main`
 
 | 項目 | 內容 |
 |---|---|
-| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run crosscheck-harness <fixtures> <out> [usage-pace|format|provider-quota-pace-v3] -AppleLanguages "(en)"`；selector 省略時維持 legacy complete run，所有路徑使用 shipping 程式碼 |
-| 語系鎖定 | `Format` 的日期／相對時間與 `UsagePace.durationText` 自 i18n 後具語系相依（查表工具在 `Sources/TokenBarCore/Localization.swift`，harness 透過連結 TokenBarCore 取得）。`make build` 會把 `Sources/Syrtis/Resources/Localizations/*.lproj` 複製到 `.build/debug/`；裸 `swift run Syrtis` 會在入口從 SwiftPM resource bundle 暫存同樣的目錄，harness 本身沒有該 target resource，沒有 `.lproj` 時解析為 `en`。對拍因此**必須**帶 `-AppleLanguages "(en)"`。harness 對此 **fail closed**：解析時只認 `-AppleLanguages <value>`（其餘 dash 開頭的 token 一律拒絕，避免吃掉 fixture 路徑後對錯誤目錄執行），並在 TZ guard 之後檢查 `preferredLocalizations` 必須為 `en`，否則 exit——寧可拒跑，也不要靜默產生對拍永遠對不上的在地化輸出。 |
+| Swift harness | [`Sources/CrossCheckHarness/main.swift`](../../Sources/CrossCheckHarness/main.swift)，`TZ=Asia/Taipei swift run --build-system native crosscheck-harness <fixtures> <out> [usage-pace|format|provider-quota-pace-v3] -AppleLanguages "(en)"`；selector 省略時維持 legacy complete run，所有路徑使用 shipping 程式碼 |
+| 語系鎖定 | `Format` 的日期／相對時間與 `UsagePace.durationText` 自 i18n 後具語系相依（查表工具在 `Sources/TokenBarCore/Localization.swift`，harness 透過連結 TokenBarCore 取得）。`make build` 會把 `Sources/Syrtis/Resources/Localizations/*.lproj` 複製到 `.build/debug/`；裸 `swift run --build-system native Syrtis` 會在入口從 SwiftPM resource bundle 暫存同樣的目錄，harness 本身沒有該 target resource，沒有 `.lproj` 時解析為 `en`。對拍因此**必須**帶 `-AppleLanguages "(en)"`。harness 對此 **fail closed**：解析時只認 `-AppleLanguages <value>`（其餘 dash 開頭的 token 一律拒絕，避免吃掉 fixture 路徑後對錯誤目錄執行），並在 TZ guard 之後檢查 `preferredLocalizations` 必須為 `en`，否則 exit——寧可拒跑，也不要靜默產生對拍永遠對不上的在地化輸出。 |
 | 契約與 fixture | Windows repo 的 legacy `crosscheck/` 保留既有 116-case reference；provider v3 handoff 由 Mac-owned [`provider-quota-pace-v3.json`](../../Fixtures/CrossCheck/provider-quota-pace-v3.json) 提供，Rust production serializer 鎖定 payload，Swift／Windows 都必須用 production decoder，無自製 wire mapping |
 | 比對 | Windows repo 的 `crosscheck/diff.py`：字串逐 byte、數字 epsilon 1e-9、缺鍵視同 null |
 | 執行時機 | `Sources/TokenBarCore` 邏輯或 `Format` 語意變更後；Windows app-owned delta 或 reviewed engine pin advance 後 |

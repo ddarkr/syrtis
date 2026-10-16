@@ -2,31 +2,63 @@ import AppKit
 import TokenBarCore
 import SwiftUI
 
+/// Shared state observed by the macOS 26+ Scene bridge.
+@MainActor
+final class SettingsWindowState: ObservableObject {
+    @Published var session: LocalUsageScheduler.Session?
+    @Published var destination: SettingsWindowController.Destination?
+    @Published var scheduler: LocalUsageScheduler?
+    @Published var source: (any UsageDataSource)?
+    @Published var isContentActive = false
+}
+
 /// Owns the standalone settings window (gear button, Cmd-comma, `--settings`).
-/// One window per app, kept alive across closes so its position persists;
-/// `show()` re-fronts it. The popover stays `.transient` and uninvolved —
-/// the window carries its own live preview instead of pinning the popover.
+/// On macOS 26+, uses public NSHostingSceneRepresentation and a native SwiftUI
+/// WindowGroup scene for integrated split material, unified
+/// toolbar, and native sidebar. On macOS 14-25, falls back to NSHostingController.
 @MainActor
 final class SettingsWindowController {
     static let shared = SettingsWindowController()
+    static let sceneWindowID = "syrtis-settings"
+    static let singleWindowIdentity = "settings"
+
+    let state = SettingsWindowState()
+    private var sceneBridge: AnyObject?
 
     private var window: NSWindow?
-    // AnyView so the live UI can be swapped for a static placeholder on close.
+    // AnyView so the live UI can be swapped for a static placeholder on close in fallback host.
     private var host: NSHostingController<AnyView>?
-    private var closeObserver: NSObjectProtocol?
     private var visibilityObservers: [NSObjectProtocol] = []
     private var scheduler: LocalUsageScheduler?
     private var source: (any UsageDataSource)?
     private var localSession: LocalUsageScheduler.Session?
+    private var hasOpenedOnce = false
+    private var lastClosedFrameSize: CGSize?
+
+    isolated deinit {
+        for observer in visibilityObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     func configure(scheduler: LocalUsageScheduler, source: any UsageDataSource) {
-        self.scheduler = scheduler; self.source = source
+        self.scheduler = scheduler
+        self.source = source
+        state.scheduler = scheduler
+        state.source = source
+        registerSceneIfNeeded()
+    }
+
+    func registerSceneIfNeeded() {
+        if #available(macOS 26.0, *) {
+            ensureSceneBridge()
+        }
     }
 
     /// A place in Settings a caller wants brought into view. The intro card
     /// uses it so "Open Settings" lands on the section it just described
     /// instead of the top of the first page.
-    enum Destination {
+    enum Destination: Equatable {
         case discord
         case usageAttribution
         case dashboard
@@ -72,42 +104,113 @@ final class SettingsWindowController {
 
     func show(scrollingTo destination: Destination? = nil) {
         guard let scheduler, let source else { return }
-        let existing = self.window
-        if let existing, existing.isVisible, !existing.isMiniaturized, localSession != nil, destination == nil {
+
+        if #available(macOS 26.0, *) {
+            ensureSceneBridge()
+            if let existing = self.window, existing.isVisible, !existing.isMiniaturized, localSession != nil, destination == nil {
+                NSApp.activate(ignoringOtherApps: true)
+                existing.makeKeyAndOrderFront(nil)
+                return
+            }
+
+            if localSession == nil {
+                localSession = scheduler.openSession()
+            }
+            state.scheduler = scheduler
+            state.source = source
+            state.session = localSession
+            state.isContentActive = true
+            state.destination = destination
+
             NSApp.activate(ignoringOtherApps: true)
-            existing.makeKeyAndOrderFront(nil)
+            if let window = self.window {
+                if window.isMiniaturized { window.deminiaturize(nil) }
+                window.makeKeyAndOrderFront(nil)
+            } else {
+                (sceneBridge as? SettingsSceneBridge)?.open()
+            }
             return
         }
-        let window = existing ?? makeWindow()
+
+        // macOS 14-25 Fallback host
+        showFallback(scrollingTo: destination)
+    }
+
+    private func ensureSceneBridge() {
+        if #available(macOS 26.0, *) {
+            if sceneBridge == nil {
+                sceneBridge = SettingsSceneBridge(state: state)
+            }
+        }
+    }
+
+    func bindSceneWindow(_ window: NSWindow) {
+        guard self.window !== window else { return }
         self.window = window
-        if let localSession { scheduler.release(localSession) }
-        let session = scheduler.openSession()
-        localSession = session
-        host?.rootView = AnyView(SettingsWindowView(
-            scheduler: scheduler, source: source, localSession: session, destination: destination)
-            .id(session))
-        if window.isMiniaturized { window.deminiaturize(nil) }
-        let firstShow = !window.isVisible
-        // Accessory apps are never frontmost; activate or the window opens
-        // behind whatever app currently has focus.
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        // Dead-center on open (but never yank an already-open window).
-        // NSWindow.center() sits noticeably above center, so place by hand —
-        // and only after ordering front: the hosting view inflates the frame
-        // by the title-bar safe area (580 -> 612) on its first layout, so
-        // centering the pre-show frame sat ~16pt low. The move lands in the
-        // same runloop turn, before the window is on screen.
-        if firstShow {
+        window.contentMinSize = SettingsWindowView.minSize
+        if !hasOpenedOnce {
+            hasOpenedOnce = true
+            window.setContentSize(SettingsWindowView.contentSize)
             center(window)
+            DispatchQueue.main.async { [weak window, weak self] in
+                guard let window, let self else { return }
+                window.setContentSize(SettingsWindowView.contentSize)
+                self.center(window)
+            }
+        } else if let lastClosedFrameSize {
+            DispatchQueue.main.async { [weak window] in
+                guard let window else { return }
+                window.setFrame(NSRect(origin: window.frame.origin, size: lastClosedFrameSize), display: true)
+            }
+        }
+        observeWindow(window)
+    }
+
+    private func removeWindowObservers() {
+        for observer in visibilityObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        visibilityObservers.removeAll()
+    }
+
+    private func observeWindow(_ window: NSWindow) {
+        removeWindowObservers()
+        visibilityObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleWindowClose() }
+        })
+        visibilityObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didMiniaturizeNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.releaseContent() }
+        })
+        visibilityObservers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.show() }
+        })
+    }
+
+    private func handleWindowClose() {
+        if let window = self.window {
+            lastClosedFrameSize = window.frame.size
+        }
+        releaseContent()
+        if #available(macOS 26.0, *) {
+            self.window = nil
         }
     }
 
     private func releaseContent() {
         if let localSession { scheduler?.release(localSession) }
         localSession = nil
-        host?.rootView = AnyView(Color.clear.frame(
-            width: SettingsWindowView.contentSize.width, height: SettingsWindowView.contentSize.height))
+        state.session = nil
+        state.isContentActive = false
+
+        // Fallback placeholder teardown
+        host?.rootView = AnyView(Color.clear)
+        window?.contentMinSize = SettingsWindowView.minSize
     }
 
     private func center(_ window: NSWindow) {
@@ -119,56 +222,156 @@ final class SettingsWindowController {
             y: visible.midY - window.frame.height / 2))
     }
 
-    private func makeWindow() -> NSWindow {
-        let host = NSHostingController(rootView: AnyView(
-            Color.clear.frame(width: SettingsWindowView.contentSize.width,
-                              height: SettingsWindowView.contentSize.height)))
+    // MARK: - macOS 14-25 Fallback Hosting
+
+    private func showFallback(scrollingTo destination: Destination? = nil) {
+        guard let scheduler, let source else { return }
+        let existing = self.window
+        if let existing, existing.isVisible, !existing.isMiniaturized, localSession != nil, destination == nil {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = existing ?? makeFallbackWindow()
+        self.window = window
+        if let localSession { scheduler.release(localSession) }
+        let session = scheduler.openSession()
+        localSession = session
+        host?.rootView = AnyView(SettingsWindowView(
+            scheduler: scheduler, source: source, localSession: session, destination: destination)
+            .id(session))
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        let firstShow = !hasOpenedOnce
+        if firstShow {
+            hasOpenedOnce = true
+            window.setContentSize(SettingsWindowView.contentSize)
+            center(window)
+            DispatchQueue.main.async { [weak window, weak self] in
+                guard let window, let self else { return }
+                window.setContentSize(SettingsWindowView.contentSize)
+                self.center(window)
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeFallbackWindow() -> NSWindow {
+        let host = NSHostingController(rootView: AnyView(Color.clear))
+        host.sizingOptions = [.minSize]
         self.host = host
-        let window = NSWindow(contentViewController: host)
-        // NSWindow(contentViewController:) sizes lazily (the frame is still
-        // 1x0 at show time, which broke the centering math) — force the
-        // SwiftUI fitting size up front.
-        window.setContentSize(host.view.fittingSize)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: SettingsWindowView.contentSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        window.contentViewController = host
         window.title = "Syrtis Settings".localized
-        window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
-        // The glass backdrop runs under the title bar (the popover look);
-        // scroll views inset their content via the safe area.
-        window.titlebarAppearsTransparent = true
-        // macOS 26 draws the native title flush left next to the traffic lights
-        // and an opaque title bar only trades the seamless glass for a solid
-        // band without centering it, so show no title at all — the sidebar and
-        // the window's own content already say what this is. `window.title`
-        // stays set for Mission Control and the Window menu.
-        window.titleVisibility = .hidden
+        window.contentMinSize = SettingsWindowView.minSize
+        window.backgroundColor = NSColor.windowBackgroundColor
+        window.isOpaque = false
+        window.hasShadow = true
+        window.titlebarAppearsTransparent = false
+        window.titleVisibility = .visible
+        window.titlebarSeparatorStyle = .none
+        window.toolbarStyle = .unified
         window.isReleasedWhenClosed = false
-        // Swap the live UI for a static, same-size placeholder when the window
-        // closes so its preview timelines + polling .tasks are torn down (a
-        // kept-alive closed window otherwise keeps rendering in the
-        // background); show() reinstalls the live UI on the next open.
-        closeObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification, object: window, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.releaseContent() }
-        }
-        visibilityObservers.append(NotificationCenter.default.addObserver(
-            forName: NSWindow.didMiniaturizeNotification, object: window, queue: .main
-        ) { [weak self] _ in MainActor.assumeIsolated { self?.releaseContent() } })
-        visibilityObservers.append(NotificationCenter.default.addObserver(
-            forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main
-        ) { [weak self] _ in MainActor.assumeIsolated { self?.show() } })
-        // The hosting view inflates the frame by the title-bar safe area
-        // (580 -> 612) in a layout pass after the first order-front that no
-        // amount of layoutIfNeeded forces early — re-center once when it
-        // lands so the first open sits dead-center (one-shot; later opens
-        // start from the final size and never resize again).
-        var token: NSObjectProtocol?
-        token = NotificationCenter.default.addObserver(
-            forName: NSWindow.didResizeNotification, object: window, queue: .main
-        ) { [weak self] notification in
-            if let token { NotificationCenter.default.removeObserver(token) }
-            guard let window = notification.object as? NSWindow else { return }
-            MainActor.assumeIsolated { self?.center(window) }
-        }
+        observeWindow(window)
         return window
+    }
+}
+
+// MARK: - macOS 26+ Scene Integration
+
+@available(macOS 26.0, *)
+struct SettingsWindowScene: Scene {
+    @ObservedObject var state: SettingsWindowState
+
+    var body: some Scene {
+        WindowGroup(
+            Text("Syrtis Settings".localized),
+            id: SettingsWindowController.sceneWindowID,
+            for: String.self
+        ) { _ in
+            SettingsSceneHostView(state: state)
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: SettingsWindowView.contentSize.width, height: SettingsWindowView.contentSize.height)
+        .windowToolbarStyle(.unified)
+    }
+}
+
+@available(macOS 26.0, *)
+struct SettingsSceneHostView: View {
+    @ObservedObject var state: SettingsWindowState
+
+    var body: some View {
+        Group {
+            if let session = state.session,
+               let scheduler = state.scheduler,
+               let source = state.source,
+               state.isContentActive {
+                SettingsWindowView(
+                    scheduler: scheduler,
+                    source: source,
+                    localSession: session,
+                    destination: state.destination
+                )
+                .id(session)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(minWidth: SettingsWindowView.minSize.width, minHeight: SettingsWindowView.minSize.height)
+        .background(SettingsWindowAccessor { window in
+            SettingsWindowController.shared.bindSceneWindow(window)
+        })
+    }
+}
+
+private struct SettingsWindowAccessor: NSViewRepresentable {
+    let onWindow: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> WindowView {
+        let view = WindowView()
+        view.onWindow = onWindow
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowView, context: Context) {
+        nsView.onWindow = onWindow
+    }
+
+    final class WindowView: NSView {
+        var onWindow: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let self, let window, self.window === window else { return }
+                self.onWindow?(window)
+            }
+        }
+    }
+}
+
+@available(macOS 26.0, *)
+@MainActor
+private final class SettingsSceneBridge {
+    let representation: NSHostingSceneRepresentation<SettingsWindowScene>
+
+    init(state: SettingsWindowState) {
+        let rep = NSHostingSceneRepresentation {
+            SettingsWindowScene(state: state)
+        }
+        self.representation = rep
+        NSApplication.shared.addSceneRepresentation(rep)
+    }
+
+    func open() {
+        representation.environment.openWindow(
+            id: SettingsWindowController.sceneWindowID,
+            value: SettingsWindowController.singleWindowIdentity
+        )
     }
 }

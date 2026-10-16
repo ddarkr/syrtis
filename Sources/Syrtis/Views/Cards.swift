@@ -117,37 +117,39 @@ enum PopoverTooltipPlacement {
     }
 }
 
-/// Liquid Glass card surface on macOS 26+, material fallback below — the
-/// glass lives on the cards themselves (the Control Center look), not on a
-/// backdrop hidden behind opaque fills.
+/// Readable content surface beneath the native glass shell: a quiet adaptive
+/// fill, not nested glass (glass nested inside the panel's glass rendered as
+/// a murky dark blob). Glass lives on the chrome (panel, navigation), never
+/// as a fake glow on rows. Signature stable; macOS 14-safe, no glassEffect.
 struct GlassCardBackground: ViewModifier {
     var cornerRadius: CGFloat = 10
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.inGlassPanel) private var inGlassPanel
 
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            // .clear glass lets the wallpaper breathe through the cards
-            // themselves (.regular reads as a dense dark slab when cards
-            // fill the whole scroll area). The tint follows the appearance:
-            // smoked glass in dark mode (a plain white tint washed the dark
-            // theme out), a faint white lift in light mode — the Control
-            // Center pebble look in both.
-            // Smoke layer drawn over the glass (Glass.tint barely moves the
-            // needle on .clear): dark mode gets a deterministic dark scrim,
-            // light mode a faint white lift.
-            content
-                .background(
-                    colorScheme == .dark
-                        ? Color.black.opacity(0.32)
-                        : inGlassPanel ? GlassPanelStyle.lightCardScrim : Color.white.opacity(0.10),
-                    in: RoundedRectangle(cornerRadius: cornerRadius))
-                .glassEffect(.clear, in: .rect(cornerRadius: cornerRadius))
-        } else {
-            content
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
+        content
+            .background(cardFill, in: RoundedRectangle(cornerRadius: cornerRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .strokeBorder(borderFill, lineWidth: colorSchemeContrast == .increased ? 1 : 0.5))
+    }
+
+    private var cardFill: Color {
+        if reduceTransparency || colorSchemeContrast == .increased {
+            return Color(nsColor: .controlBackgroundColor)
         }
+        // Translucent system fill: the panel's glass stays visible through it
+        // while content stays legible over any wallpaper in either appearance.
+        return Color(nsColor: .controlBackgroundColor).opacity(inGlassPanel ? 0.72 : 0.85)
+    }
+
+    private var borderFill: Color {
+        colorSchemeContrast == .increased
+            ? Color(nsColor: .separatorColor)
+            : Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.08)
     }
 }
 
@@ -217,17 +219,17 @@ struct DashCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: NativeDesign.spacing) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(title.localized)
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(NativeDesign.sectionFont)
                         if let titleAccessory { titleAccessory }
                     }
                     if let subtitle {
                         Text(subtitle.localized)
-                            .font(.caption)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -236,7 +238,7 @@ struct DashCard<Content: View>: View {
             }
             content()
         }
-        .padding(12)
+        .padding(NativeDesign.cardPadding)
         .glassCard()
     }
 }
@@ -254,7 +256,7 @@ struct LoadingLine: View {
                 .controlSize(.small)
                 .frame(width: 14, height: 14)
             Text(title.localized)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
         }
     }
@@ -283,8 +285,9 @@ struct TokenUsageRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(num)
                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                .foregroundStyle(.primary)
             Text(label.localized)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             Text(sub)
                 .font(.caption2)
@@ -311,9 +314,9 @@ struct StreaksCard: View {
     private func item(_ days: Int, _ label: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             (Text("\(days)").font(.system(size: 17, weight: .semibold).monospacedDigit())
-                + Text(" days").font(.caption).foregroundStyle(.secondary))
+                + Text(" days").font(NativeDesign.detailFont).foregroundStyle(.secondary))
             Text(label.localized)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -336,8 +339,9 @@ enum TokenKindPalette {
 
 /// Compact segmented control, tighter than the native picker. Lifted out of
 /// UsageChartCard when a second card needed one — including the part that is
-/// not obvious: a plain adaptive fill, because these ride *inside* the card's
-/// glass and nesting glass effects renders as a murky dark blob.
+/// not obvious: plain adaptive fills, never nested glass. Signatures, focus,
+/// and AX behavior are unchanged; only the chrome is native now, with no
+/// shadow glow on the thumb.
 struct SegmentedPicker<Value: Hashable>: View {
     @Binding var selection: Value
     let options: [(value: Value, label: String)]
@@ -349,7 +353,9 @@ struct SegmentedPicker<Value: Hashable>: View {
     var wraps = false
 
     @Environment(\.inGlassPanel) private var inGlassPanel
-    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var thumb
 
     var body: some View {
@@ -375,13 +381,12 @@ struct SegmentedPicker<Value: Hashable>: View {
     /// The same buttons in a wrapping row, on a rounded track (a capsule does
     /// not hold more than one line).
     private var wrapped: some View {
-        FlowLayout(hSpacing: 2, vSpacing: 2) {
-            buttons
-        }
-        .padding(2)
-        .background(Color.primary.opacity(inGlassPanel ? GlassPanelStyle.segmentTrack : 0.07),
-                    in: RoundedRectangle(cornerRadius: 8))
-        .panelSelectionSlide(selection)
+        sliding(
+            FlowLayout(hSpacing: 2, vSpacing: 2) {
+                buttons
+            }
+            .padding(2)
+            .background(trackFill, in: RoundedRectangle(cornerRadius: 8)))
     }
 
     private var buttons: some View {
@@ -416,39 +421,54 @@ struct SegmentedPicker<Value: Hashable>: View {
                 }
             }
             .padding(1)
-            .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+            .background(trackFill, in: RoundedRectangle(cornerRadius: 6))
     }
 
     /// Under the glass panel: the macOS 26 segmented shape — a capsule track
     /// with a raised thumb that slides to the selection. Still plain fills,
     /// not glass, for the nesting reason above.
     private var panelBody: some View {
-        let dark = colorScheme == .dark
-        return HStack(spacing: 2) {
-            ForEach(options, id: \.value) { option in
-                let on = selection == option.value
-                Button { selection = option.value } label: {
-                    label(option.label, on: on)
-                        .padding(.horizontal, 2)
-                        .background {
-                            if on {
-                                Capsule()
-                                    .fill(dark ? GlassPanelStyle.segmentThumbDark
-                                               : GlassPanelStyle.segmentThumbLight)
-                                    .shadow(color: .black.opacity(GlassPanelStyle.segmentThumbShadow),
-                                            radius: 1, y: 0.5)
-                                    .matchedGeometryEffect(id: "thumb", in: thumb)
+        sliding(
+            HStack(spacing: 2) {
+                ForEach(options, id: \.value) { option in
+                    let on = selection == option.value
+                    Button { selection = option.value } label: {
+                        label(option.label, on: on)
+                            .padding(.horizontal, 2)
+                            .background {
+                                if on {
+                                    Capsule()
+                                        .fill(thumbFill)
+                                        .matchedGeometryEffect(id: "thumb", in: thumb)
+                                }
                             }
-                        }
-                        .contentShape(Capsule())
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help(help[option.value] ?? "")
                 }
-                .buttonStyle(.plain)
-                .help(help[option.value] ?? "")
             }
+            .padding(2)
+            .background(trackFill, in: Capsule()))
+    }
+
+    private var trackFill: Color {
+        Color.primary.opacity(colorSchemeContrast == .increased || reduceTransparency ? 0.12 : 0.07)
+    }
+
+    private var thumbFill: Color {
+        Color.primary.opacity(colorSchemeContrast == .increased ? 0.24 : 0.16)
+    }
+
+    /// Selection slide, skipped under reduce motion (the thumb still moves,
+    /// it just lands instead of gliding).
+    @ViewBuilder
+    private func sliding<Body: View>(_ body: Body) -> some View {
+        if reduceMotion {
+            body
+        } else {
+            body.panelSelectionSlide(selection)
         }
-        .padding(2)
-        .background(Color.primary.opacity(GlassPanelStyle.segmentTrack), in: Capsule())
-        .panelSelectionSlide(selection)
     }
 
     private func label(_ text: String, on: Bool) -> some View {

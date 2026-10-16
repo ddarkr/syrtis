@@ -11,6 +11,8 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var queries: [LocalUsageQueryRequest] = []
     private var releases: [String] = []
     private var capturedRecentEvents: [String: Int64] = [:]
+    private var graphGenerations: [String: UInt64] = [:]
+    private var distinctGraphs = false
     private var pauseObservers: [CheckedContinuation<Void, Never>] = []
     private var releaseObservers: [(Int, CheckedContinuation<Void, Never>)] = []
     private var pauseNextWindow = false
@@ -31,11 +33,15 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var lastGeneration: UInt64?
     private var lastPrice: String?
     private var lastSyncResult: LocalUsageSyncResult?
+    private var reportDay = Format.todayKey()
+
+    func setReportDay(_ day: String) { reportDay = day; generation += 1 }
 
     func capturedQuotaToken(for scope: LocalUsageScope) -> String? {
         lastSyncResult?.scopes.first(where: { $0.id == scope.id })?.quotaSnapshotToken
     }
 
+    func useDistinctGraphs() { distinctGraphs = true }
     func pauseNextSync() { pauseNext = true }
     func isPaused() -> Bool { paused != nil }
     func resumeSync() { paused?.resume(); paused = nil }
@@ -102,6 +108,7 @@ private actor SchedulerFixtureSource: UsageDataSource {
         } else {
             token = "fixture:\(syncRequests.count):\(capturedGeneration)"
             capturedRecentEvents[token] = capturedEvent
+            graphGenerations[token] = capturedGeneration
             lastScopeIDs = scopeIDs
             lastToken = token
             lastGeneration = capturedGeneration
@@ -139,10 +146,17 @@ private actor SchedulerFixtureSource: UsageDataSource {
             let now = request.nowMs ?? 0
             return .rate(capturedEvent > 0 && capturedEvent <= now && now - capturedEvent < 60_000 ? 120 : 0)
         case "trace": return .trace([])
-        case "graph": return .graph(DemoData.payload(for: request.year))
-        case "models": return .models(DemoData.modelReport(for: request.year))
-        case "hourly": return .hourly(DemoData.hourlyReport(for: request.year, clients: request.clients))
-        case "agents": return .agents(DemoData.agentsReport(for: request.year, clients: request.clients))
+        case "graph":
+            let payload = DemoData.payload(for: request.year, today: reportDay)
+            guard distinctGraphs else { return .graph(payload) }
+            var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as! [String: Any]
+            var meta = object["meta"] as! [String: Any]
+            meta["generatedAt"] = "fixture-generation-\(graphGenerations[request.leaseToken] ?? 0)"
+            object["meta"] = meta
+            return .graph(try JSONDecoder().decode(UsagePayload.self, from: JSONSerialization.data(withJSONObject: object)))
+        case "models": return .models(DemoData.modelReport(for: request.year, today: reportDay))
+        case "hourly": return .hourly(DemoData.hourlyReport(for: request.year, clients: request.clients, today: reportDay))
+        case "agents": return .agents(DemoData.agentsReport(for: request.year, clients: request.clients, today: reportDay))
         default: throw Failure.unexpectedLegacyCall
         }
     }
@@ -180,6 +194,99 @@ extension LocalUsageScheduler {
             var wall = Date(timeIntervalSince1970: 1_800_000_000)
             func advance(_ seconds: TimeInterval) { monotonic += seconds; wall.addTimeInterval(seconds) }
         }
+        // An app-lifetime owner prepares display facts without a dashboard.
+        DashboardModel.invalidateScanDerivedCaches()
+        let displayClock = Clock()
+        let displaySource = SchedulerFixtureSource()
+        await displaySource.useDistinctGraphs()
+        let displayScheduler = LocalUsageScheduler(
+            source: displaySource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { displayClock.monotonic }, wallNow: { displayClock.wall })
+        let background = displayScheduler.openSession()
+        let displayGraph = Query(kind: "graph", year: "2026")
+        let displayModels = Query(kind: "models", year: "2026")
+        displayScheduler.update(background, queries: [displayGraph, displayModels], active: false) { _, _ in }
+        await displayScheduler.runDueWork()
+        let originalCapture = displayScheduler.displaySnapshot(for: displayGraph)?.capturedAt
+        displayClock.advance(301)
+        func opened(_ year: String? = "2026") -> DashboardModel {
+            DashboardModel(source: displaySource, scheduler: displayScheduler,
+                           localSession: displayScheduler.openSession(), initialYear: year, buildIdentity: nil)
+        }
+        let prepared = opened()
+        expect({
+            if case .ready = prepared.phase { return true }; return false
+        }() && prepared.payload?.meta.generatedAt == "fixture-generation-1"
+               && prepared.modelReport != nil && prepared.restoredSnapshot?.savedAt == originalCapture,
+               "background display seeds actual graph and matching models synchronously with original capture age")
+        let wrongYear = opened("2025")
+        expect({
+            if case .loading = wrongYear.phase { return true }; return false
+        }() && wrongYear.payload == nil, "prepared display requires the exact selected year")
+        wrongYear.releaseLocalDemand()
+        prepared.releaseLocalDemand()
+
+        await displaySource.pauseNextSync()
+        let pendingRefresh = Task { await displayScheduler.runDueWork() }
+        await displaySource.waitForPausedSync()
+        let pendingDisplay = opened()
+        expect(pendingDisplay.payload != nil && pendingDisplay.localPending
+               && pendingDisplay.restoredSnapshot?.savedAt == originalCapture,
+               "opening during blocked background verification keeps last-good display and pending state")
+        await displaySource.failNextSync()
+        await displaySource.resumeSync()
+        await pendingRefresh.value
+        let failedDisplay = opened()
+        expect(failedDisplay.payload != nil && failedDisplay.localError != nil
+               && failedDisplay.restoredSnapshot?.failed == true,
+               "failed background verification retains ready display with an honest error")
+        pendingDisplay.releaseLocalDemand()
+        failedDisplay.releaseLocalDemand()
+
+        displayClock.advance(301)
+        await displaySource.appendRecentEvent(at: Int64(displayClock.wall.timeIntervalSince1970 * 1000))
+        await displaySource.failNextQuery(kind: "models")
+        await displayScheduler.runDueWork()
+        let recovered = opened()
+        expect(recovered.payload?.meta.generatedAt == "fixture-generation-2"
+               && recovered.restoredSnapshot?.savedAt != originalCapture,
+               "next open uses the latest successful background graph generation")
+        expect(recovered.modelReport == nil,
+               "old model generation cannot be labeled as the newly prepared graph")
+        recovered.releaseLocalDemand()
+        displayClock.advance(301)
+        await displayScheduler.runDueWork()
+        let complete = opened()
+        expect(complete.payload != nil && complete.modelReport != nil && complete.localError == nil,
+               "background recovery restores a matching graph and model pair")
+        complete.releaseLocalDemand()
+        await displaySource.pauseNextSync()
+        var forceCompleted = false
+        let forcedDisplay = Task {
+            defer { forceCompleted = true }
+            return try await displayScheduler.acquire(displayGraph, session: background, force: true)
+        }
+        while displayScheduler.pendingAcquisitions == 0, !forceCompleted { await Task.yield() }
+        let forcedWork = Task { await displayScheduler.runDueWork() }
+        await displaySource.waitForPausedSync()
+        expect(!forceCompleted && displayScheduler.displaySnapshot(for: displayGraph) != nil,
+               "last-good display never satisfies a forced freshness barrier")
+        await displaySource.resumeSync()
+        await forcedWork.value
+        _ = try? await forcedDisplay.value
+        let previousRootsProvider = ClaudeExtraRoots.appliedProvider
+        ClaudeExtraRoots.appliedProvider = { "{\"claude\":[\"/synthetic-new-root\"]}" }
+        expect(displayScheduler.displaySnapshot(for: displayGraph) == nil,
+               "installed root change rejects old display before the coalesced scheduler notification")
+        ClaudeExtraRoots.appliedProvider = previousRootsProvider
+        displayScheduler.rootsChanged()
+        DashboardModel.invalidateScanDerivedCaches()
+        let otherRoot = opened()
+        expect(otherRoot.payload == nil && otherRoot.modelReport == nil,
+               "root invalidation cannot leak a previous prepared display")
+        otherRoot.releaseLocalDemand()
+        displayScheduler.release(background)
+        displayScheduler.stop()
         // Cadence belongs to the exact recent question, not to global activity.
         for mode in 0..<4 {
             let cadenceClock = Clock()
@@ -916,9 +1023,121 @@ extension LocalUsageScheduler {
                "source verification does not resurrect a collapsed model consumer")
         visibleModel.releaseLocalDemand()
         modelScheduler.stop()
-        // RAM-first: closed/lens-away reports are never retained. Contracted
-        // demand leaves the installed capture alone; reexpansion refolds the
-        // historical aggregate from that capture without recollecting, and a
+
+        // Reopen must draw the last exact lens before any new source capture,
+        // retain it through a failed refresh, then replace it on recovery.
+        func displayedTotal(_ model: DashboardModel, view: AppView) -> Int64? {
+            switch view {
+            case .models: return model.modelReport?.entries.reduce(0) { $0 + $1.total }
+            case .hourly: return model.hourlyReport(for: ["claude"])?.entries.reduce(0) { $0 + $1.total }
+            case .agents: return model.agents?.entries.reduce(0) { $0 + $1.total }
+            default: return nil
+            }
+        }
+        for view in [AppView.models, .hourly, .agents] {
+            DashboardModel.invalidateScanDerivedCaches()
+            let reopenClock = Clock()
+            let reopenSource = SchedulerFixtureSource()
+            await reopenSource.setReportDay("2026-01-02")
+            let reopenScheduler = LocalUsageScheduler(
+                source: reopenSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { reopenClock.monotonic }, wallNow: { reopenClock.wall })
+            let seed = DashboardModel(
+                cachesSnapshot: true, source: reopenSource, scheduler: reopenScheduler,
+                localSession: reopenScheduler.openSession(), initialYear: "2026", buildIdentity: nil)
+            seed.configureLocalDemand(view: view, clients: ["claude"])
+            await reopenScheduler.runDueWork()
+            let lastTotal = displayedTotal(seed, view: view)
+            expect(lastTotal != nil, "\(view) seed has a renderable report")
+            seed.releaseLocalDemand()
+            let rebuilt = DashboardModel(
+                cachesSnapshot: true, source: reopenSource, scheduler: reopenScheduler,
+                localSession: reopenScheduler.openSession(), initialYear: "2026", buildIdentity: nil)
+            expect(displayedTotal(rebuilt, view: view) == lastTotal && lastTotal != nil,
+                   "\(view) reopen draws its last report before starting a task")
+            await reopenSource.setReportDay("2026-01-03")
+            await reopenSource.pauseNextSync()
+            await reopenSource.failNextQuery(kind: view.rawValue)
+            rebuilt.configureLocalDemand(view: view, clients: ["claude"])
+            let reopenTurn = Task { await reopenScheduler.runDueWork() }
+            await reopenSource.waitForPausedSync()
+            expect(rebuilt.localPending && displayedTotal(rebuilt, view: view) == lastTotal,
+                   "\(view) pending source capture does not blank the last-good lens")
+            await reopenSource.resumeSync()
+            await reopenTurn.value
+            expect(rebuilt.localError != nil && displayedTotal(rebuilt, view: view) == lastTotal,
+                   "\(view) failed refresh retains its prior totals")
+            reopenClock.advance(11)
+            await reopenScheduler.runDueWork()
+            let nextTotal = displayedTotal(rebuilt, view: view)
+            expect(rebuilt.localError == nil && nextTotal != nil && nextTotal != lastTotal,
+                   "\(view) recovery replaces stale totals with the new source result")
+            rebuilt.releaseLocalDemand()
+            let wrongYear = DashboardModel(
+                source: reopenSource, initialYear: "2025", buildIdentity: nil)
+            expect(wrongYear.payload == nil && displayedTotal(wrongYear, view: view) == nil,
+                   "\(view) reopen cannot reuse another year's data")
+            let next = DashboardModel(
+                cachesSnapshot: true, source: reopenSource, scheduler: reopenScheduler,
+                localSession: reopenScheduler.openSession(), initialYear: "2026", buildIdentity: nil)
+            if view == .hourly {
+                expect(next.hourlyReport(for: ["codex"]) == nil,
+                       "Hourly cannot show a cached Claude fold on a Codex tab")
+            }
+            if view == .agents {
+                next.configureLocalDemand(view: view, clients: ["codex"])
+                expect(next.agents == nil, "Agents discards a cached fold when the client scope changes")
+            }
+            next.releaseLocalDemand()
+            let closedSyncs = reopenScheduler.syncCount
+            reopenClock.advance(1000)
+            await reopenScheduler.runDueWork()
+            expect(reopenScheduler.syncCount == closedSyncs,
+                   "\(view) retained display does not keep closed source work alive")
+            DashboardModel.invalidateScanDerivedCaches()
+            let changedRoots = DashboardModel(source: reopenSource, initialYear: "2026", buildIdentity: nil)
+            expect(changedRoots.payload == nil && displayedTotal(changedRoots, view: view) == nil,
+                   "\(view) changed roots invalidate the retained display")
+            reopenScheduler.stop()
+        }
+        AttributedSeriesModel.resetForTesting()
+        let seriesSource = SchedulerFixtureSource()
+        let seriesScheduler = LocalUsageScheduler(
+            source: seriesSource, observesSources: false, automaticallySchedules: false)
+        let seriesSeed = AttributedSeriesModel(
+            scheduler: seriesScheduler, localSession: seriesScheduler.openSession())
+        seriesSeed.setDemand(wanted: true, confirmed: [])
+        await seriesScheduler.runDueWork()
+        let lastPoints = seriesSeed.points
+        seriesSeed.releaseDemand()
+        let seriesReopen = AttributedSeriesModel(
+            scheduler: seriesScheduler, localSession: seriesScheduler.openSession())
+        expect(seriesReopen.points == lastPoints && lastPoints != nil,
+               "Quota trend restores its previous points before source work starts")
+        await seriesSource.pauseNextSync()
+        seriesReopen.setDemand(wanted: true, confirmed: [])
+        let seriesTurn = Task { await seriesScheduler.runDueWork() }
+        await seriesSource.waitForPausedSync()
+        expect(seriesReopen.points == lastPoints,
+               "Quota trend remains visible during a blocked reopen capture")
+        AttributedSeriesModel.invalidateRowCache()
+        let changedSeries = AttributedSeriesModel(
+            scheduler: seriesScheduler, localSession: seriesScheduler.openSession())
+        expect(changedSeries.points == nil, "Quota trend cannot restore rows from changed roots")
+        changedSeries.releaseDemand()
+        await seriesSource.resumeSync()
+        await seriesTurn.value
+        seriesReopen.releaseDemand()
+        AttributedSeriesModel.invalidateTimeZoneProvenance()
+        let changedZone = AttributedSeriesModel(
+            scheduler: seriesScheduler, localSession: seriesScheduler.openSession())
+        expect(changedZone.points == nil, "Quota trend cannot restore unverified timezone buckets")
+        changedZone.releaseDemand()
+        seriesScheduler.stop()
+        AttributedSeriesModel.resetForTesting()
+        // The scheduler itself retains only demanded reports; display-only
+        // reopen snapshots do not retain native captures. Contracted demand
+        // leaves installed coverage alone; reexpansion refolds from it, and a
         // valid demanded aggregate replays without any DB refold on demand
         // moves or irrelevant clock ticks.
         let coverageClock = Clock()

@@ -29,6 +29,7 @@ struct DashboardTabs: View {
     @State private var overId: String?
     @State private var tabFrames: [String: CGRect] = [:]
     @Namespace private var thumb
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private static let dragSpace = "client-tabs-row"
 
@@ -81,8 +82,12 @@ struct DashboardTabs: View {
                 .background(HorizontalWheelScroll())
             }
             .onChange(of: active) { _, next in
-                withAnimation(.easeOut(duration: 0.15)) {
+                if reduceMotion {
                     proxy.scrollTo(next, anchor: nil)
+                } else {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo(next, anchor: nil)
+                    }
                 }
             }
         }
@@ -97,7 +102,7 @@ struct DashboardTabs: View {
                     AgentIconView(clientId: id, size: 14)
                 }
                 Text(label)
-                    .font(.caption.weight(active == id ? .semibold : .regular))
+                    .font(active == id ? NativeDesign.bodyFont.weight(.semibold) : NativeDesign.bodyFont)
                     .lineLimit(1)
                     .fixedSize()
                 if kbdHints && index <= 9 {
@@ -112,12 +117,20 @@ struct DashboardTabs: View {
             .foregroundStyle(active == id ? .primary : .secondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .modifier(SelectionBackground(
-                isSelected: active == id, shape: Capsule(), namespace: thumb))
+            .background {
+                // One glass selection surface; no glass behind every client.
+                if active == id {
+                    Capsule()
+                        .fill(.clear)
+                        .navigationGlass(cornerRadius: 12)
+                        .matchedGeometryEffect(id: "thumb", in: thumb)
+                }
+            }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(active == id ? .isSelected : [])
+        .accessibilityLabel(label)
         .id(id)
     }
 
