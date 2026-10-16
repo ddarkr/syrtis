@@ -215,3 +215,27 @@
 "Done" = "Done";
 "Discord is showing your usage. Settings has what appears and how to stop it." = "Discord is showing your usage. Settings has what appears and how to stop it.";
 "macOS did not add Syrtis to your login items. Check System Settings → General → Login Items." = "macOS did not add Syrtis to your login items. Check System Settings → General → Login Items.";
+
+/* ===== settings AX / native Picker labels ===== */
+"Show %@ quota card" = "Show %@ quota card";
+"Show %@ tab" = "Show %@ tab";
+"Move %@ earlier" = "Move %@ earlier";
+"Move %@ later" = "Move %@ later";
+"Remove %@" = "Remove %@";
+"Show %@ card" = "Show %@ card";
+"Show %@ view" = "Show %@ view";
+"Quota agent" = "Quota agent";
+"Quota window" = "Quota window";
+"Menubar icon" = "Menubar icon";
+"Discord client" = "Discord client";
+"Popover height" = "Popover height";
+"Layout" = "Layout";
+"Hide Sidebar" = "Hide Sidebar";
+"Show Sidebar" = "Show Sidebar";
+"Color mode" = "Color mode";
+"Animation pace" = "Animation pace";
+"Coloring" = "Coloring";
+"Color on warning only" = "Color on warning only";
+"Always colored" = "Always colored";
+"Never colored" = "Never colored";
+"Unavailable selection" = "Unavailable selection";

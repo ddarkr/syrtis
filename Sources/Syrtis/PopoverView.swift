@@ -222,15 +222,15 @@ struct PopoverView: View {
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
-            // Show the tabs row (which always starts with Overview) as soon as
-            // there is client data, so Overview is visible alongside the clients.
+            // WHO axis: capsule client pills. WHAT axis below: a tracked lens
+            // switch. Distinct treatments so the two choices never read as one.
             if !displayClients.isEmpty {
                 DashboardTabs(
                     clients: displayClients,
                     presentClients: presentTabClients,
                     active: clientTab, kbdHints: cmdHeld)
                     .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
+                    .padding(.bottom, 6)
             }
             ViewSwitch(active: activeView, views: visibleViews)
                 .padding(.horizontal, 12)
@@ -243,6 +243,14 @@ struct PopoverView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(OverlayScrollerEnforcer())
                 }
+                // The chrome above (header, glass nav rows, divider) is the
+                // floating control layer; this ScrollView is the scrolling
+                // content layer. The VStack already keeps them separate —
+                // chrome never scrolls — so only the edge needs dressing:
+                // lens content softens as it slides under the divider on
+                // 26+, untouched below. Heights, lifetimes and the per-lens
+                // `.id` reset below are unchanged.
+                .modifier(LensScrollEdge())
                 // Live global frame for tooltip clamp. While the height
                 // handle is dragged, publish nil so placement falls back to
                 // the source card only — avoids every-pixel env churn AND a
@@ -258,16 +266,23 @@ struct PopoverView: View {
                 // Scrolling one shared ScrollView back up would show the old
                 // lens scroll before the crossfade, and delay it.
                 .id(lensKey)
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+                // Calm lens swap: short opacity only, no scale/slide travel.
+                // Honors reduce motion without a separate timer or branch.
+                .transition(.opacity)
             }
+            // Keep pending and failure states distinct; never nil-as-zero.
             if model.payload != nil, model.localError != nil || model.localPending {
                 HStack(spacing: 5) {
                     Image(systemName: model.localError == nil ? "clock" : "exclamationmark.triangle")
+                        .foregroundStyle(model.localError == nil ? Color.secondary : Color.orange)
                     Text(model.localError == nil ? "Checking local usage…" : "Local usage could not be refreshed.")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .foregroundStyle(.secondary)
                 .help(model.localError ?? "")
+                .padding(.horizontal, 12)
                 .padding(.bottom, 4)
             }
             PanelDivider()
@@ -423,14 +438,18 @@ struct PopoverView: View {
     // MARK: - Sections
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 6) {
             BrandMark()
                 .frame(width: 17, height: 17)
+                .accessibilityHidden(true)
             Text("Σύρτις")
                 .font(.syrtisWordmark(size: 15))
                 .foregroundStyle(Color.syrtisAccent)
+                .lineLimit(1)
+                .layoutPriority(1)
             Spacer()
             liveRateBadge
+                .layoutPriority(1)
             yearMenu
             refreshButton
         }
@@ -590,8 +609,10 @@ struct PopoverView: View {
         HStack(spacing: 4) {
             activityLED
             Text(tokensPerMin.map { "\(Format.compactTokens(Int64($0.rounded()))) tok/min" } ?? "— tok/min")
-                .font(.caption.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
         }
     }
 
@@ -810,8 +831,9 @@ struct PopoverView: View {
     private var footer: some View {
         HStack {
             Text(effectiveView.label)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
+                .lineLimit(1)
             Spacer()
             if let version = UpdaterService.shared.availableVersion {
                 Button {
@@ -984,5 +1006,22 @@ struct PopoverView: View {
             cmdHeld = false
         }
     }
+}
 
+/// Soft top edge where lens content scrolls under the divider: 26+ only,
+/// standard transparency/contrast only. Older systems and accessible modes
+/// render the ScrollView exactly as before — no visual fallback needed, the
+/// divider alone already separates chrome from content.
+private struct LensScrollEdge: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    func body(content: Content) -> some View {
+        // Static fade, not motion: reduceMotion users keep it.
+        if #available(macOS 26.0, *), !reduceTransparency, contrast == .standard {
+            content.scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            content
+        }
+    }
 }

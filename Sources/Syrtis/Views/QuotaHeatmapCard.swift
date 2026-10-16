@@ -32,9 +32,9 @@ struct QuotaHeatmapCard: View {
     @State private var tooltipSize: CGSize = .zero
     @Environment(\.popoverScrollViewport) private var viewport
 
-    private static let rowHeight: CGFloat = 13
+    private static let rowHeight: CGFloat = 16
     private static let cellGap: CGFloat = 1
-    private static let labelWidth: CGFloat = 18
+    private static let labelWidth: CGFloat = 32
     private static let tooltipWidth: CGFloat = 186
     /// Faintest and strongest fill for a slot that carries anything. An
     /// occupied slot never drops to invisible: "a little" and "nothing" are
@@ -70,19 +70,19 @@ struct QuotaHeatmapCard: View {
                 // of the truth, and hid the one line that explains it.
                 Text("%@%% consumed, but every pair of readings was too far apart to place on the grid. It fills in as sampling gets denser."
                     .localized(Self.percent(grid.unplacedPercent)))
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if attempted, unreadable, windows.isEmpty {
                 Text("Quota history could not be read. It will be retried.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if attempted {
                 Text("No allowance movement recorded yet. It accumulates as Syrtis runs.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -119,11 +119,9 @@ struct QuotaHeatmapCard: View {
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 6))
             }
-            // Below the subtitle's `.caption` and well below the 13pt title:
-            // this is a control label, not content. Weight matters as much as
-            // size here — dropping it to secondary is what stops it reading as
-            // a second heading beside the real one.
-            .font(.system(size: 8))
+            // A control label, not content: secondary detail size keeps it
+            // below the card title without shrinking to an axis tick.
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton)
@@ -155,7 +153,7 @@ struct QuotaHeatmapCard: View {
                 VStack(spacing: Self.cellGap) {
                     ForEach(0..<7, id: \.self) { weekday in
                         Text(Self.weekdayLabels[weekday].localized)
-                            .font(.system(size: 8))
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.tertiary)
                             .frame(width: Self.labelWidth,
                                    height: Self.rowHeight, alignment: .leading)
@@ -231,7 +229,7 @@ struct QuotaHeatmapCard: View {
                 if hour == 18 { Spacer(minLength: 0) }
             }
         }
-        .font(.system(size: 8))
+        .font(NativeDesign.detailFont)
         .foregroundStyle(.tertiary)
     }
 
@@ -244,7 +242,7 @@ struct QuotaHeatmapCard: View {
             // gap with no explanation.
             Text("%@%% consumed between readings too far apart to place"
                 .localized(String(Int(grid.unplacedPercent.rounded()))))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -257,10 +255,10 @@ struct QuotaHeatmapCard: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: Self.weekdayLabels[hover.weekday].localized
                      + String(format: " %02d:00", hover.hour))
-                    .font(.caption2.weight(.semibold))
+                    .font(NativeDesign.detailFont.weight(.semibold))
                 if value <= 0 {
                     Text("No allowance consumed in this slot")
-                        .font(.system(size: 9))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 } else {
                     // Points, not "% of the allowance". A slot accumulates
@@ -270,7 +268,7 @@ struct QuotaHeatmapCard: View {
                     // percentage points of allowance were spent in this slot,
                     // summed over the window's whole recorded history.
                     Text("%@ allowance-points spent here".localized(Self.percent(value)))
-                        .font(.caption2)
+                        .font(NativeDesign.bodyFont)
                     equivalent(value, row: equivalences[selected.id])
                 }
             }
@@ -305,10 +303,10 @@ struct QuotaHeatmapCard: View {
             let share = percent / 10
             Text(verbatim: "≈ " + Format.compactTokens(
                 WindowEquivalence.clamped((Double(tokensPerTenth) * share).rounded())))
-                .font(.caption2)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             Text("unpriced models, ±%@%%".localized(String(errorPercent)))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         } else if case let .costOnly(costPerTenth, errorPercent) = row {
@@ -322,10 +320,10 @@ struct QuotaHeatmapCard: View {
             // shrinks without bound, a 0.05-point cell still draws, and an
             // ordinary `costPerTenth` scaled by it lands under half a cent.
             Text(verbatim: "~ " + Format.usdOrBelowCent(costPerTenth * (percent / 10)))
-                .font(.caption2)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             Text("tokens unavailable, ±%@%%".localized(String(errorPercent)))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         } else if case let .ratio(tokensPerTenth, costPerTenth, errorPercent) = row {
@@ -334,11 +332,11 @@ struct QuotaHeatmapCard: View {
             // above 10% scales it further, past what `Int64(_:)` accepts.
             Text(verbatim: "≈ " + Format.compactTokens(
                 WindowEquivalence.clamped((Double(tokensPerTenth) * share).rounded())))
-                .font(.caption2)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             Text("~ %@ API-equivalent, ±%@%%".localized(
                 Format.usdOrBelowCent(costPerTenth * share), String(errorPercent)))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         } else if case let .spread(lowPerTenth, highPerTenth, lowCost, highCost) = row {
@@ -355,17 +353,17 @@ struct QuotaHeatmapCard: View {
                 + "–"
                 + Format.compactTokens(
                     WindowEquivalence.clamped((Double(highPerTenth) * share).rounded())))
-                .font(.caption2)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             Text("~ %@ – %@ API-equivalent".localized(
                 Format.usdOrBelowCent(lowCost * share),
                 Format.usdOrBelowCent(highCost * share)))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             Text(Self.noFigureReason(row).localized)
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -552,7 +552,7 @@ struct AgentLimitsCard: View {
                     ProgressView().controlSize(.small)
                     Text("Checking agent limits…".localized)
                 }
-                .font(.caption)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
@@ -563,7 +563,7 @@ struct AgentLimitsCard: View {
                             opencodeSubs.joined(separator: " · "))
                         : "No supported agents yet".localized
                 )
-                .font(.caption)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
@@ -598,7 +598,7 @@ struct AgentLimitsCard: View {
             let projected = Int(hoverTrend.trend.projectedUsedPercent.rounded())
             VStack(alignment: .leading, spacing: 4) {
                 Text("Recent consumption")
-                    .font(.caption.weight(.semibold))
+                    .font(NativeDesign.bodyFont.weight(.semibold))
                 // Two indicators, two questions. Measured 2026-08-17, pace and
                 // this trend disagreed on 3 of 7 live windows and both were
                 // right: pace compares the LEVEL against the usual pattern,
@@ -608,10 +608,10 @@ struct AgentLimitsCard: View {
                      ? "At this rate it runs out before reset · projected %lld%% used"
                         .localized(projected)
                      : "At this rate it reaches %lld%% used by reset".localized(projected))
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .fixedSize(horizontal: false, vertical: true)
                 Text("The pace line beside it compares you with your usual pattern instead.")
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -631,13 +631,13 @@ struct AgentLimitsCard: View {
 
     private var noteLabel: some View {
         Text(note.localized)
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.tertiary)
     }
 
     private func integrationLine(_ text: String) -> some View {
         Text(text.localized)
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.secondary)
     }
 
@@ -732,26 +732,28 @@ struct AgentLimitsCard: View {
         let primaryOrder = visible.filter(\.isPrimary).map(\.clientId)
         let edge = row.isPrimary ? dropEdge(id, in: primaryOrder) : nil
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 if reorderable, row.isPrimary {
                     Text("⠿")
-                        .font(.caption)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(dragId == id ? .primary : .tertiary)
                         .help("Drag to reorder")
                         .gesture(dragGesture(for: id, visible: primaryOrder))
                 }
                 AgentIconView(clientId: id, size: 14)
                 Text(style.displayName)
-                    .font(.caption.weight(.semibold))
+                    .font(NativeDesign.bodyFont.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(style.displayName)
                 if let account = row.accountLabel {
                     Text(account)
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.accountTooltip ?? account)
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 statusBadge(snapshot: snapshot, isLive: isLive)
             }
             if snapshot?.source == "unconfigured" {
@@ -764,18 +766,18 @@ struct AgentLimitsCard: View {
                 Text((usageAttempted
                     ? "Sign in to Grok Bot on this Mac, then refresh to see its weekly limits."
                     : "Loading Grok Bot limits…").localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 if let detail = detailText(snapshot) {
                     Text(detail)
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                         .help(snapshot?.error ?? detail)
                 }
-                VStack(spacing: 8) {
+                VStack(spacing: NativeDesign.spacing) {
                     if !uniqueWindows.isEmpty {
                         ForEach(uniqueWindows, id: \.cardId) { window in
                             windowRow(window, row: row, brand: style.color)
@@ -831,7 +833,7 @@ struct AgentLimitsCard: View {
             claudeSetupPrompt()
         case .providerMessage(let detail):
             Text(detail)
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         case .none:
@@ -842,12 +844,12 @@ struct AgentLimitsCard: View {
     @ViewBuilder private func claudeSetupPrompt() -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Using a Claude `setup-token`? Syrtis reads `CLAUDE_CODE_OAUTH_TOKEN` from your login shell. If your limits don't show, save the token to Keychain with this command:")
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: 6) {
                 Text(Self.claudeSetupCommand)
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(NativeDesign.detailFont.monospaced())
                     .textSelection(.enabled)
                     .lineLimit(3)
                     .truncationMode(.middle)
@@ -858,7 +860,7 @@ struct AgentLimitsCard: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(Self.claudeSetupCommand, forType: .string)
                 } label: {
-                    Image(systemName: "doc.on.doc").font(.caption2)
+                    Image(systemName: "doc.on.doc").font(NativeDesign.detailFont)
                 }
                 .buttonStyle(.borderless)
                 .help("Copy command")
@@ -883,14 +885,13 @@ struct AgentLimitsCard: View {
                 // The user said yes here and macOS said no. Naming which half
                 // failed is the whole point: a generic error would send them
                 // looking for a problem in Syrtis, and the collapsed
-                // "not reading your limits" line would imply they chose this.
                 Text("macOS blocked access to the Grok Bot login, so Syrtis stopped asking. Choose Allow to try again.")
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else if consentDeclined {
                 Text("Syrtis isn't reading your Grok Bot limits.")
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -913,7 +914,7 @@ struct AgentLimitsCard: View {
                 // cannot be checked does not belong in a permission prompt,
                 // even when it is probably true.
                 Text("To show your weekly Grok Bot limits, Syrtis reads Grok Bot's login from your Keychain after macOS asks you. The login is sent only to Grok Bot's usage service (api2.cursor.sh) and is never saved or logged.")
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -987,7 +988,7 @@ struct AgentLimitsCard: View {
             text = "No quota".localized
         }
         return Text(text)
-            .font(.caption2.weight(.medium))
+            .font(NativeDesign.detailFont.weight(.medium))
             .foregroundStyle(color)
     }
 
@@ -1042,37 +1043,46 @@ struct AgentLimitsCard: View {
 
         if classic {
             VStack(alignment: .leading, spacing: 3) {
-                HStack {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     // Display only — the payload's `label` stays untranslated
                     // so QuotaResolver's legacy-selection matching still works.
                     Text(window.label.localized)
-                        .font(.caption2.weight(.medium))
+                        .font(NativeDesign.detailFont.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(window.label.localized)
                     trendIndicator(trend, id: curveKey)
-                    Spacer()
-                    Text(resetText ?? leftLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 8)
+                    Text(leftLabel)
+                        .font(NativeDesign.bodyFont.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.primary)
+                    if let reset = resetText {
+                        Text(reset)
+                            .font(NativeDesign.detailFont)
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 bar(fillPercent: fill, color: gauge, paceLeft: nil, paceIsDeficit: false)
-                if resetText != nil {
-                    Text(leftLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
             }
         } else {
             VStack(alignment: .leading, spacing: 3) {
-                HStack {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     // Display only — the payload's `label` stays untranslated
                     // so QuotaResolver's legacy-selection matching still works.
                     Text(window.label.localized)
-                        .font(.caption2.weight(.medium))
+                        .font(NativeDesign.detailFont.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(window.label.localized)
                     trendIndicator(trend, id: curveKey)
-                    Spacer()
+                    Spacer(minLength: 8)
+                    Text(leftLabel)
+                        .font(NativeDesign.bodyFont.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.primary)
                     if let reset = resetText {
                         Text(reset)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 // The line replaces the bar only when the user asked for it AND
@@ -1093,13 +1103,13 @@ struct AgentLimitsCard: View {
                         },
                         paceIsDeficit: Self.PacePresentation.isDeficit(pace))
                 }
-                paceFooter(window: window, leftLabel: leftLabel, pace: pace)
+                paceFooter(window: window, pace: pace)
             }
         }
     }
 
     @ViewBuilder private func paceFooter(
-        window: UsageWindow, leftLabel: String, pace: UsagePace?
+        window: UsageWindow, pace: UsagePace?
     ) -> some View {
         let status = Self.PacePresentation.statusText(
             state: window.paceStatus.state,
@@ -1115,38 +1125,14 @@ struct AgentLimitsCard: View {
             .compactMap(\.self).joined(separator: " · ")
         let paceText = [status, pace?.label]
             .compactMap(\.self).joined(separator: " · ")
-
-        if paceText.isEmpty {
-            paceLeftLabel(leftLabel)
-        } else if projectionText.isEmpty {
-            HStack(spacing: 8) {
-                paceLeftLabel(leftLabel)
-                Spacer(minLength: 8)
-                paceTextLabel(paceText, pace: pace)
-            }
-        } else {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    paceLeftLabel(leftLabel)
-                        .fixedSize(horizontal: true, vertical: false)
-                    Spacer(minLength: 8)
-                    paceTextLabel("\(paceText) · \(projectionText)", pace: pace)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-
-                VStack(alignment: .trailing, spacing: 1) {
-                    HStack(spacing: 8) {
-                        paceLeftLabel(leftLabel)
-                        Spacer(minLength: 8)
-                        paceTextLabel(paceText, pace: pace)
-                    }
-                    paceTextLabel(projectionText, pace: pace)
-                        .multilineTextAlignment(.trailing)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+        let secondary = [paceText, projectionText]
+            .filter { !$0.isEmpty }.joined(separator: " · ")
+        // The value already leads the header row; this line carries only the
+        // secondary pace/freshness reading, wrapping instead of shrinking.
+        if !secondary.isEmpty {
+            paceTextLabel(secondary, pace: pace)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1231,7 +1217,7 @@ struct AgentLimitsCard: View {
                         .lineLimit(1)
                 }
             }
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(
                 runsOutEarly ? AnyShapeStyle(.red)
                     : direction == .flat ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
@@ -1249,15 +1235,9 @@ struct AgentLimitsCard: View {
         }
     }
 
-    private func paceLeftLabel(_ text: String) -> some View {
-        Text(text)
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-    }
-
     private func paceTextLabel(_ text: String, pace: UsagePace?) -> some View {
         Text(text)
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(
                 Self.PacePresentation.isDeficit(pace)
                     ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
@@ -1276,22 +1256,17 @@ struct AgentLimitsCard: View {
 
     private func placeholderRow(_ label: String, brand: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(label.localized)
-                    .font(.caption2.weight(.medium))
-                Spacer()
-                if classic {
-                    Text(placeholderValueLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
-            if !classic {
+                    .font(NativeDesign.detailFont.weight(.medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(label.localized)
+                Spacer(minLength: 8)
                 Text(placeholderValueLabel)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
             }
+            bar(fillPercent: 0, color: Color(hex: brand), paceLeft: nil, paceIsDeficit: false)
         }
     }
 

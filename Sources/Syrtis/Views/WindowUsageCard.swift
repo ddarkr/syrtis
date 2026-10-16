@@ -91,7 +91,7 @@ struct WindowUsageCard: View {
             DashCard("%@ window".localized(ClientRegistry.style(clientId).displayName),
                      subtitle: "Quota unavailable") {
                 Text(reason)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -102,7 +102,7 @@ struct WindowUsageCard: View {
                 accountPills
                 windowButtons(candidates: candidates, cardId: cardId)
                 Text("This window has no recorded quota history, so there is no line to draw.".localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -144,7 +144,7 @@ struct WindowUsageCard: View {
                     nowX: q.nowX, firstSampleX: q.firstSampleX,
                     bars: usage?.bars ?? [], hits: usage?.hits ?? [],
                     samplePoints: q.samplePoints, curve: q.curve)
-                headline(geo)
+                headline(geo, reset: resetLine(quota))
                 chart(geo, window: quota.cardId).zIndex(1)
                 legend(geo).frame(height: Self.legendHeight)
                 undatedNote(usage)
@@ -157,7 +157,7 @@ struct WindowUsageCard: View {
                         // local logs, or its scan failed. One fixed line, in
                         // place of numbers that would be another account's.
                         Text("Local usage can't be attributed to this account yet.".localized)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                     case .numbers:
                         if let usage {
@@ -169,7 +169,7 @@ struct WindowUsageCard: View {
                         // is drawn from the quota half and stays correct; only
                         // this line has nothing to report.
                         Text("Local usage could not be read.".localized)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                     case .spinner:
                         LoadingLine(title: "Reading local usage…")
@@ -179,8 +179,9 @@ struct WindowUsageCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(emptyText(quota))
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -203,7 +204,7 @@ struct WindowUsageCard: View {
     private var accountHeaderLabel: AnyView? {
         AccountPills.headerLabel(account).map { label in
             AnyView(Text(verbatim: label)
-                .font(.caption)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .help(account?.tooltip ?? ""))
@@ -261,6 +262,23 @@ struct WindowUsageCard: View {
         }
     }
 
+    /// The reset countdown next to the value, so the two primary facts —
+    /// how much is left/used and when it renews — read in one line. Same
+    /// source as `stateLine`, not a second clock; nil while placing/idle.
+    private func resetLine(_ quota: WindowQuotaHalf) -> String? {
+        guard !quota.placementPending else { return nil }
+        switch quota.resolution {
+        case let .active(_, end):
+            return "Resets in %@".localized(Format.duration(ms: end - quota.nowMs))
+        case let .inferred(_, end):
+            // Same key as `stateLine`: no new copy, the headline shortens
+            // nothing and translators see one string.
+            return "Inferred window · resets in %@".localized(
+                Format.duration(ms: end - quota.nowMs))
+        case .idle, .unavailable: return nil
+        }
+    }
+
     private func emptyText(_ quota: WindowQuotaHalf) -> String {
         switch quota.resolution {
         case .idle:
@@ -272,18 +290,26 @@ struct WindowUsageCard: View {
     }
 
     @ViewBuilder
-    private func headline(_ geo: ChartGeometry) -> some View {
+    private func headline(_ geo: ChartGeometry, reset: String?) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             if let latest = geo.samplePoints.last {
                 Text(verbatim: "\(Int(latest.y.rounded()))%")
-                    .font(.system(size: 22, weight: .semibold))
+                    .font(NativeDesign.titleFont.monospacedDigit())
                 Text((asUsed ? "used" : "remaining").localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
+                if let reset {
+                    Text(reset)
+                        .font(NativeDesign.detailFont)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(reset)
+                }
             } else {
                 Text("No quota reading in this window".localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -460,11 +486,11 @@ struct WindowUsageCard: View {
             key(Color.accentColor, "Quota", line: true)
             key(Color.accentColor.opacity(0.5), "Usage")
             key(.secondary.opacity(0.3), "No sample")
-            Spacer()
+            Spacer(minLength: 8)
             Text("%@ readings".localized(String(geo.samplePoints.count)))
                 .foregroundStyle(.tertiary)
         }
-        .font(.caption2)
+        .font(NativeDesign.detailFont)
     }
 
     /// Stated, not swallowed. The engine counts rows it could not place in time
@@ -495,7 +521,7 @@ struct WindowUsageCard: View {
             // the single call site keeps the next caller from missing it.
             Text("No local usage matched %@, though this subscription has other usage in this window"
                 .localized(label.localized))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -506,7 +532,7 @@ struct WindowUsageCard: View {
         if let usage, usage.undatedCount > 0 {
             Text("%@ scanned rows have no usable timestamp, so no window can count them"
                 .localized(String(usage.undatedCount)))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -542,7 +568,7 @@ struct WindowUsageCard: View {
         let plain: Bool = { if case .ratio = row { return false }; return true }()
         return Text(WindowEquivalence.text(
             row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(plain ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
             .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -575,9 +601,9 @@ private struct WindowHoverTooltip: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(Format.clockRange(fromMs: zone.loMs, toMs: zone.hiMs))
-                .font(.caption.weight(.semibold))
+                .font(NativeDesign.bodyFont.weight(.semibold))
             Text(subtitle)
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
             // The quota row keeps the spike's three states; a zone with no
             // closing sample is the hatched stretch, and must say so rather
@@ -587,7 +613,7 @@ private struct WindowHoverTooltip: View {
                     String(Int(metric.value(fromUsedPercent: $0.usedPercent).rounded())),
                     (metric == .used ? "used" : "remaining").localized)
             } ?? "No quota reading in this interval".localized)
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             // What this interval actually cost, signed the way the card is
             // currently read: counting up it rises, counting down it falls.
@@ -596,7 +622,7 @@ private struct WindowHoverTooltip: View {
             if let delta = zone.consumed(metric) {
                 Text("%@%@%% this interval".localized(
                     delta > 0 ? "+" : "", String(format: "%g", delta)))
-                    .font(.caption2.weight(.medium))
+                    .font(NativeDesign.detailFont.weight(.medium))
                     .foregroundStyle(delta == 0 ? AnyShapeStyle(.tertiary)
                                                 : AnyShapeStyle(.primary))
             }
@@ -615,7 +641,7 @@ private struct WindowHoverTooltip: View {
                 Text(Format.money(
                     tokens: total, cost: counter.cost))
             }
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.secondary)
             ForEach(kinds, id: \.label) { kind in
                 HStack(spacing: 4) {
@@ -628,11 +654,11 @@ private struct WindowHoverTooltip: View {
                          + "\(Int((Double(kind.value) / Double(max(1, total)) * 100).rounded()))%")
                         .foregroundStyle(.secondary)
                 }
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
             }
             if kinds.isEmpty && counter.messageCount == 0 {
                 Text("No usage in this interval".localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -664,6 +690,7 @@ private struct QuotaChartStage: View {
     let draw: (GraphicsContext, ChartGeometry) -> Void
 
     @Environment(\.inGlassPanel) private var inGlassPanel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var from: ChartGeometry?
     @State private var drawnWindow: String?
     @State private var spanProgress: Double = 1
@@ -680,7 +707,10 @@ private struct QuotaChartStage: View {
                 defer { drawnWindow = window }
                 guard inGlassPanel, drawnWindow != nil, drawnWindow != window else { return }
                 from = old
-                spanProgress = 0
+                // Reduce motion skips the spatial morph; the new geometry
+                // still lands in the same update, so no value is lost.
+                spanProgress = reduceMotion ? 1 : 0
+                guard !reduceMotion else { return }
                 // Next turn: set and animated in one update would coalesce
                 // into a single no-op change from 1 to 1.
                 DispatchQueue.main.async {

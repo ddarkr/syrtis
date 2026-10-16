@@ -641,3 +641,25 @@
 "Couldn't save to the login keychain." = "無法存進登入鑰匙圈。";
 "Couldn't delete the copy from the login keychain." = "無法從登入鑰匙圈刪除副本。";
 "Something went wrong. Try again." = "發生錯誤，請再試一次。";
+
+/* ===== 設定：AX／原生 Picker 標籤 ===== */
+"Show %@ quota card" = "顯示 %@ 的額度卡片";
+"Show %@ tab" = "顯示 %@ 分頁";
+"Move %@ earlier" = "將 %@ 前移";
+"Move %@ later" = "將 %@ 後移";
+"Remove %@" = "移除 %@";
+"Show %@ card" = "顯示 %@ 卡片";
+"Show %@ view" = "顯示 %@ 畫面";
+"Quota agent" = "額度來源 Agent";
+"Discord client" = "Discord 用戶端";
+"Popover height" = "彈出視窗高度";
+"Layout" = "版面";
+"Hide Sidebar" = "隱藏側邊欄";
+"Show Sidebar" = "顯示側邊欄";
+"Color mode" = "色彩模式";
+"Animation pace" = "動畫節奏";
+"Coloring" = "著色方式";
+"Color on warning only" = "僅在警告時著色";
+"Always colored" = "一律著色";
+"Never colored" = "從不著色";
+"Unavailable selection" = "無法使用的選項";

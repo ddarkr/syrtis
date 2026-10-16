@@ -201,12 +201,13 @@ struct UsageChartCard: View {
                         Circle().fill(Color(hex: item.color)).frame(width: 6, height: 6)
                         Text(item.label).lineLimit(1)
                     }
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
+                    .help(item.label)
                 }
                 if hidden > 0 {
                     Text("+\(hidden)")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -313,7 +314,7 @@ struct UsageChartCard: View {
 
     private func axisLabel(_ date: String?) -> some View {
         Text(date.map(Format.monthDay) ?? "")
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.tertiary)
     }
 
@@ -332,13 +333,13 @@ struct UsageChartCard: View {
     private func tooltip(_ bar: DayBar) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(Format.monthDay(bar.date))
-                .font(.caption.weight(.semibold))
+                .font(NativeDesign.bodyFont.weight(.semibold))
             HStack {
                 Text("%@ tokens".localized(Format.exactTokens(bar.totalTokens)))
                 Spacer()
                 Text(Format.money(tokens: bar.totalTokens, cost: bar.totalCost))
             }
-            .font(.caption2)
+            .font(NativeDesign.detailFont)
             .foregroundStyle(.secondary)
             ForEach(
                 bar.segments.sorted { $0.tokens > $1.tokens }.prefix(6), id: \.key
@@ -350,7 +351,8 @@ struct UsageChartCard: View {
                     Text("\(Format.compactTokens(segment.tokens)) · \(Format.money(tokens: segment.tokens, cost: segment.cost))")
                         .foregroundStyle(.secondary)
                 }
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
+                .help(segment.label)
             }
         }
         .padding(8)

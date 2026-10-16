@@ -59,7 +59,7 @@ jobs:
       # PR iteration is a bad trade. Running it on main still guarantees the tag
       # is never the first time this configuration is compiled.
       - name: Build Swift package (release configuration)
-        run: swift build -c release
+        run: swift build --build-system native -c release
 
       # ci.yml runs only the bare executable, where
       # `Bundle.main.bundleIdentifier` is nil. A value keyed on that is literal

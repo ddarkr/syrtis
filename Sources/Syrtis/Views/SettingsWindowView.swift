@@ -2,40 +2,14 @@ import AppKit
 import SwiftUI
 import TokenBarCore
 
-/// Standalone settings window: the settings form on the left, a live preview
-/// column on the right. Every control writes UserDefaults and every preview
-/// piece reads the same keys (plus the real menu bar reacts anyway), so
-/// changes reflect instantly without touching the popover's transient
-/// behavior.
-/// Sidebar footer link: plain (not the loud system link blue), a pointing-hand
-/// cursor AppKit does not give `Link` on its own, and a hover chip so two
-/// adjacent links read as two separate targets.
-private struct FooterLink: View {
-    let title: String
-    let systemImage: String
-    let url: String
-
-    @State private var hovering = false
-
-    var body: some View {
-        Link(destination: URL(string: url)!) {
-            Label(title.localized, systemImage: systemImage)
-                .font(.caption2)
-                .foregroundStyle(hovering ? Color.primary : Color.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.primary.opacity(hovering ? 0.09 : 0)))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .hoverCursor(.pointingHand) { hovering = $0 }
-    }
-}
+/// Native settings sidebar with a scrollable form and an optional page preview.
+/// Controls and previews share UserDefaults; previews never persist dashboard
+/// snapshots or change the popover's transient state.
 
 struct SettingsWindowView: View {
-    static let contentSize = CGSize(width: 856, height: 580)
+    /// Initial window content size; the window is resizable down to `minSize`.
+    static let contentSize = CGSize(width: 1040, height: 700)
+    static let minSize = CGSize(width: 800, height: 560)
 
     // Settings manages process-wide tray preferences, so its client universe
     // stays all-time even when the dashboard is scoped to one saved year. The
@@ -46,15 +20,18 @@ struct SettingsWindowView: View {
 
     init(scheduler: LocalUsageScheduler, source: any UsageDataSource,
          localSession: LocalUsageScheduler.Session,
-         destination: SettingsWindowController.Destination? = nil) {
+         destination: SettingsWindowController.Destination? = nil,
+         destinationRequest: UInt64 = 0) {
         _model = State(initialValue: DashboardModel(
             source: source, scheduler: scheduler, localSession: localSession, initialYear: nil))
         self.destination = destination
+        self.destinationRequest = destinationRequest
     }
     /// Set only when a caller asked for a specific place; the intro card is
     /// the one caller today. Nil means an ordinary open, which must land
     /// wherever the user last was.
     var destination: SettingsWindowController.Destination?
+    private let destinationRequest: UInt64
     @State private var selectedPage = SettingsPanel.Page.menuBar
     /// Master switch: off hides the preview's Agent-limits card too.
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
@@ -114,86 +91,32 @@ struct SettingsWindowView: View {
     }
 
     private static let pageTop = "settings.page.top"
+    private static let featurePages: [SettingsPanel.Page] = [
+        .menuBar,
+        .dashboard,
+        .usageAttribution,
+    ]
+    private static let appPages: [SettingsPanel.Page] = [
+        .general,
+        .about,
+    ]
+    private static let githubURL = URL(string: "https://github.com/Nanako0129/syrtis")!
+    private static let sponsorURL = URL(string: "https://www.patreon.com/cw/Nanako0129/membership")!
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        HStack(spacing: 0) {
-            // The footer rides in the List's own safe area, not a sibling VStack:
-            // .sidebar vibrancy belongs to the List, so anything outside it shows
-            // the window backdrop instead and reads as the wrong material.
-            List(SettingsPanel.Page.allCases, selection: $selectedPage) { page in
-                Label(page.localizedTitle, systemImage: page.symbolName)
-                    .tag(page)
-            }
-            .listStyle(.sidebar)
-            .safeAreaInset(edge: .bottom, spacing: 0) { sidebarFooter }
-            .frame(width: 170)
-            // The columns sit inside the title-bar safe area, so a plain Divider
-            // stops ~32pt short of the top edge and reads as a broken seam.
-            Divider().ignoresSafeArea(edges: .top)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    // Zero-height marker at the top of the page, so switching
-                    // pages can scroll back to it; a ScrollView keeps its
-                    // offset when only its content changes.
-                    VStack(spacing: 0) {
-                        Color.clear.frame(height: 0).id(Self.pageTop)
-                        SettingsPanel(
-                            page: selectedPage,
-                            agentUsage: model.agentUsage,
-                            modelReport: model.modelReport,
-                            presentClients: model.stats?.presentClients,
-                            isLoading: isInitialLoad,
-                            reportLoading: model.modelLoading)
-                            .padding(14)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(OverlayScrollerEnforcer())
-                    }
-                }
-                .scrollIndicators(.never)
-                .frame(width: 354)
-                .safeAreaInset(edge: .bottom) {
-                    if model.localError != nil || model.localPending {
-                        Text(model.localError == nil ? "Checking local usage…" : "Local usage could not be refreshed.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .help(model.localError ?? "")
-                            .padding(8)
-                    }
-                }
-                .onChange(of: selectedPage) {
-                    proxy.scrollTo(Self.pageTop, anchor: .top)
-                }
-                .onAppear {
-                    guard let destination else { return }
-                    selectedPage = destination.page
-                    // A nil anchor means the page itself is the destination
-                    // (usage attribution has one section, at the top) — there
-                    // is nothing further to scroll to.
-                    guard let anchor = destination.anchor else { return }
-                    // Next runloop turn: the page's own sections have to exist
-                    // before the anchor can be resolved, and selecting the page
-                    // above is what creates them.
-                    DispatchQueue.main.async {
-                        withAnimation(.easeOut(duration: 0.25)) {
-                            proxy.scrollTo(anchor, anchor: .top)
-                        }
-                    }
-                }
-            }
-            Divider().ignoresSafeArea(edges: .top)
-            ScrollView {
-                previewColumn
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(OverlayScrollerEnforcer())
-            }
-            .scrollIndicators(.never)
-            .frame(width: 330)
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            sidebarView
+        } detail: {
+            detailView
         }
-        .frame(width: Self.contentSize.width, height: Self.contentSize.height)
-        .background(PopoverBackdrop().ignoresSafeArea())
-        .task(id: "\(selectedPage.rawValue)|\(tabsHiddenRaw)") {
-            model.configureLocalDemand(view: .daily, clients: [], settings: true,
+        .frame(
+            minWidth: Self.minSize.width, idealWidth: Self.contentSize.width,
+            minHeight: Self.minSize.height, idealHeight: Self.contentSize.height)
+        .task(id: "\(selectedPage.rawValue)|\(previewExpanded)|\(tabsHiddenRaw)") {
+            model.configureLocalDemand(view: .daily, clients: [], settings: wantsTracePreview,
                                        models: selectedPage == .usageAttribution)
         }
         // See `PopoverView`: keyed so removing an account takes its card away
@@ -231,15 +154,147 @@ struct SettingsWindowView: View {
         // popover gives it, and `refreshWindowQuotaHalves` derives membership
         // from them plus the quota publication, which is also what keeps it
         // current as later publications arrive.
-        .task(id: "\(tabsHiddenRaw)|\(tabsOrderRaw)|\(limitsHiddenRaw)|"
-              + previewClients.joined(separator: ",")) {
-            model.configureQuotaVisibility(
-                tabHidden: ClientRegistry.parseIdSet(tabsHiddenRaw),
-                limitsHidden: ClientRegistry.parseIdSet(limitsHiddenRaw),
-                orderRaw: tabsOrderRaw)
+        .task(id: "\(selectedPage.rawValue)|\(previewExpanded)|\(limitsEnabled)|\(tabsHiddenRaw)|\(tabsOrderRaw)|\(limitsHiddenRaw)") {
+            if wantsQuotaCurves {
+                model.configureQuotaVisibility(
+                    tabHidden: ClientRegistry.parseIdSet(tabsHiddenRaw),
+                    limitsHidden: ClientRegistry.parseIdSet(limitsHiddenRaw),
+                    orderRaw: tabsOrderRaw)
+            } else {
+                // No rendered curve while hidden: exclude every registered id so
+                // the refresh below prunes retained curves. Real preference keys
+                // stay untouched; membership still derives from the quota
+                // publication, not the usage-derived preview list.
+                model.configureQuotaVisibility(
+                    tabHidden: Set(ClientRegistry.allIds),
+                    limitsHidden: Set(ClientRegistry.allIds),
+                    orderRaw: tabsOrderRaw)
+            }
             model.refreshWindowQuotaHalves()
         }
         .onDisappear { model.releaseLocalDemand() }
+    }
+
+    private var sidebarView: some View {
+        List(selection: $selectedPage) {
+            Section {
+                ForEach(Self.featurePages) { page in
+                    sidebarRow(for: page)
+                }
+            }
+            Section {
+                ForEach(Self.appPages) { page in
+                    sidebarRow(for: page)
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            sidebarFooter
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+        }
+        .navigationSplitViewColumnWidth(min: 190, ideal: 216, max: 260)
+    }
+
+    private func sidebarRow(for page: SettingsPanel.Page) -> some View {
+        Label {
+            Text(page.localizedTitle)
+        } icon: {
+            Image(systemName: page.symbolName)
+                .foregroundStyle(selectedPage == page ? Color.primary : Color.accentColor)
+        }
+        .tag(page)
+    }
+
+    private var detailView: some View {
+        ScrollViewReader { proxy in
+            Form {
+                SettingsPanel(
+                    page: selectedPage,
+                    agentUsage: model.agentUsage,
+                    modelReport: model.modelReport,
+                    presentClients: model.stats?.presentClients,
+                    isLoading: isInitialLoad,
+                    reportLoading: model.modelLoading
+                )
+                .id(Self.pageTop)
+
+                if showsPreview {
+                    Section {
+                        previewGroup
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .safeAreaInset(edge: .bottom) {
+                if model.localError != nil || model.localPending {
+                    Text(model.localError == nil ? "Checking local usage…" : "Local usage could not be refreshed.")
+                        .font(NativeDesign.detailFont)
+                        .foregroundStyle(.secondary)
+                        .help(model.localError ?? "")
+                        .padding(8)
+                }
+            }
+            .navigationTitle(selectedPage.localizedTitle)
+            .onChange(of: selectedPage) {
+                previewExpanded = true
+                proxy.scrollTo(Self.pageTop, anchor: .top)
+            }
+            .onChange(of: destinationRequest) {
+                applyDestination(destination, proxy: proxy)
+            }
+            .onAppear {
+                applyDestination(destination, proxy: proxy)
+            }
+        }
+    }
+
+    private func applyDestination(_ destination: SettingsWindowController.Destination?, proxy: ScrollViewProxy) {
+        guard let destination else { return }
+        selectedPage = destination.page
+        guard let anchor = destination.anchor else { return }
+        DispatchQueue.main.async {
+            let animation: Animation? = reduceMotion ? nil : .easeOut(duration: 0.25)
+            withAnimation(animation) {
+                proxy.scrollTo(anchor, anchor: .top)
+            }
+        }
+    }
+    /// Trace-600 demand follows the only surface rendering UsageTraceCard:
+    /// the expanded Dashboard preview. Curves follow the rendered expanded
+    /// limits card on top of that.
+    private var wantsTracePreview: Bool {
+        selectedPage == .dashboard && previewExpanded
+    }
+    private var wantsQuotaCurves: Bool {
+        selectedPage == .dashboard && previewExpanded && limitsEnabled
+    }
+    /// Preview is relevant only to the Menu bar and Dashboard pages: the actual
+    /// menu-bar strips and the actual cards those pages configure. Every other
+    /// page gets the full width for its form, with no unrelated cards stack.
+    private var showsPreview: Bool {
+        selectedPage == .menuBar || selectedPage == .dashboard
+    }
+
+    /// Collapsible via a native control so narrow widths can reclaim the space;
+    /// reset to expanded on page switch. Existing copy doubles as the label so
+    /// no new string is introduced.
+    @State private var previewExpanded = true
+
+    private var previewGroup: some View {
+        DisclosureGroup(
+            isExpanded: $previewExpanded,
+            content: {
+                // Unmount while collapsed so PreviewIcon frames and the
+                // menu-bar TimelineView release instead of hiding retained.
+                if previewExpanded { previewColumn }
+            },
+            label: {
+                Text("Live preview — settings apply immediately.")
+                    .font(NativeDesign.detailFont)
+                    .foregroundStyle(.secondary)
+            })
     }
 
     /// Clients the preview card renders, derived exactly as the card itself
@@ -273,37 +328,28 @@ struct SettingsWindowView: View {
         return !agentUsageAttempted
     }
 
-    /// Fills the empty bottom of the sidebar: app icon, name, running version
-    /// (the first thing an issue report needs), and the two outbound links. Name
-    /// and version come from the bundle, so a rename does not leave a stale
-    /// brand here. `Link` opens the default browser without an NSWorkspace detour.
+    /// Compact native accessory anchoring app identity, running version, and outbound
+    /// links to a platform Menu. System controls and fonts without custom hover chips.
     private var sidebarFooter: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 8) {
-                BrandMark()
-                    .frame(width: 26, height: 26)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(AppInfo.name)
-                        .font(.caption.weight(.medium))
-                    Text(AppInfo.version)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
+        Menu {
+            Text("\("Version".localized) \(AppInfo.version)")
+            Divider()
+            Link(destination: Self.githubURL) {
+                Label("GitHub".localized, systemImage: "chevron.left.forwardslash.chevron.right")
             }
-            .padding(.leading, 6)
-            HStack(spacing: 4) {
-                FooterLink(
-                    title: "GitHub",
-                    systemImage: "chevron.left.forwardslash.chevron.right",
-                    url: "https://github.com/Nanako0129/syrtis")
-                FooterLink(
-                    title: "Sponsor",
-                    systemImage: "heart",
-                    url: "https://www.patreon.com/cw/Nanako0129/membership")
+            Link(destination: Self.sponsorURL) {
+                Label("Sponsor".localized, systemImage: "heart")
+            }
+        } label: {
+            HStack(spacing: 7) {
+                BrandMark()
+                    .frame(width: 16, height: 16)
+                Text(AppInfo.name)
+                    .font(NativeDesign.bodyFont.weight(.medium))
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.bottom, 12)
+        .help(AppInfo.name)
+        .accessibilityLabel(AppInfo.name)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -325,49 +371,49 @@ struct SettingsWindowView: View {
     // MARK: - Preview column
 
     private var previewColumn: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Live preview — settings apply immediately.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            section("Menu bar") {
-                // The stale rule reads the clock, so with polls failing and
-                // the payload unchanged nothing else would redraw the preview
-                // when a reading crosses the 30-minute threshold (#420).
-                TimelineView(.periodic(from: .now, by: 60)) { _ in
-                    VStack(spacing: 6) {
-                        MenuBarMock(
-                            dark: true, graph: model.payload,
-                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
-                            allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
-                        MenuBarMock(
-                            dark: false, graph: model.payload,
-                            tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
-                            allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
+        VStack(alignment: .leading, spacing: NativeDesign.spacing) {
+            if selectedPage == .menuBar {
+                section("Menu bar") {
+                    // The stale rule reads the clock, so with polls failing and
+                    // the payload unchanged nothing else would redraw the preview
+                    // when a reading crosses the 30-minute threshold (#420).
+                    TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        VStack(spacing: 6) {
+                            MenuBarMock(
+                                dark: true, graph: model.payload,
+                                tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
+                                allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
+                            MenuBarMock(
+                                dark: false, graph: model.payload,
+                                tokensPerMin: tokensPerMin, agentUsage: model.agentUsage,
+                                allowsQuotaCachePersistence: model.allowsQuotaCachePersistence)
+                        }
                     }
                 }
             }
 
-            if limitsEnabled {
-                section("Agent limits card") {
-                    AgentLimitsCard(
-                        clients: previewClients,
-                        trace: model.trace, agentUsage: model.agentUsage,
-                        reorderable: true, curves: model.windowCurves)
+            if selectedPage == .dashboard {
+                if limitsEnabled {
+                    section("Agent limits card") {
+                        AgentLimitsCard(
+                            clients: previewClients,
+                            trace: model.trace, agentUsage: model.agentUsage,
+                            reorderable: true, curves: model.windowCurves)
+                    }
                 }
-            }
 
-            section("Live session card") {
-                UsageTraceCard(buckets: model.trace, windowSecs: 600, hidden: hiddenClients)
+                section("Live session card") {
+                    UsageTraceCard(buckets: model.trace, windowSecs: 600, hidden: hiddenClients)
+                }
             }
         }
     }
 
     private func section(_ label: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label.localized.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            Text(label.localized)
+                .font(NativeDesign.detailFont.weight(.semibold))
+                .foregroundStyle(.secondary)
             content()
         }
     }

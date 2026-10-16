@@ -18,13 +18,6 @@ struct HourlyView: View {
 
     private enum Mode: String {
         case timeline, profile
-
-        var label: String {
-            switch self {
-            case .timeline: return "Timeline".localized
-            case .profile: return "Profile".localized
-            }
-        }
     }
 
     private static let timelineInitial = 200
@@ -92,7 +85,7 @@ struct HourlyView: View {
                 LoadingLine(title: "Loading…")
             } else if !hasData {
                 Text("No usage in this range")
-                    .font(.caption)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             } else if mode == .profile {
                 let maxTokens = max(buckets.map(\.tokens).max() ?? 1, 1)
@@ -126,7 +119,7 @@ struct HourlyView: View {
                         visible = min(visible + Self.timelineStep, timeline.count)
                     }
                     .buttonStyle(.plain)
-                    .font(.caption2.weight(.medium))
+                    .font(NativeDesign.detailFont.weight(.medium))
                     .foregroundStyle(.secondary)
                 }
             }
@@ -154,28 +147,12 @@ struct HourlyView: View {
     }
 
     private var modeToggle: some View {
-        HStack(spacing: 2) {
-            ForEach([Mode.timeline, Mode.profile], id: \.rawValue) { m in
-                Button {
-                    modeRaw = m.rawValue
-                } label: {
-                    Text(m.label)
-                        .font(.caption2.weight(mode == m ? .semibold : .regular))
-                        .foregroundStyle(mode == m ? .primary : .secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            mode == m
-                                ? AnyShapeStyle(Color.primary.opacity(0.16))
-                                : AnyShapeStyle(.clear),
-                            in: RoundedRectangle(cornerRadius: 4))
-                        .contentShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(1)
-        .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+        SegmentedPicker(
+            selection: $modeRaw,
+            options: [
+                (Mode.timeline.rawValue, "Timeline"),
+                (Mode.profile.rawValue, "Profile"),
+            ])
     }
 
     private func hourRow(
@@ -183,7 +160,7 @@ struct HourlyView: View {
     ) -> some View {
         HStack(spacing: 8) {
             Text(label)
-                .font(.caption2.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .foregroundStyle(isCurrent ? .primary : .secondary)
                 .frame(width: mode == .profile ? 38 : 74, alignment: .leading)
             GeometryReader { geo in
@@ -197,11 +174,11 @@ struct HourlyView: View {
             }
             .frame(height: 8)
             Text(tokens > 0 ? Format.compactTokens(tokens) : "")
-                .font(.caption2.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)
             Text(cost > 0 ? Format.usd(cost) : "")
-                .font(.caption2.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
                 .frame(width: 52, alignment: .trailing)
         }
     }

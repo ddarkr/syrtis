@@ -99,11 +99,11 @@ struct SubscriptionTrendCard: View {
                     (metric == .cost
                         ? "Usage recorded, but none of it is priced."
                         : "Usage recorded, but it carries no token counts.").localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary))
             case .noUsage:
                 placeholder(Text("No usage recorded in this range.".localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary))
             case .loading:
                 placeholder(LoadingLine(title: "Reading daily usage…"))
@@ -238,10 +238,10 @@ struct SubscriptionTrendCard: View {
             let day = trend.days[hoverIndex]
             VStack(alignment: .leading, spacing: 4) {
                 Text(Format.monthDay(day.date))
-                    .font(.caption.weight(.semibold))
+                    .font(NativeDesign.bodyFont.weight(.semibold))
                 if day.isEmpty {
                     Text("No usage this day")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.tertiary)
                 } else {
                     // Largest first, matching the legend and `UsageChartCard`'s
@@ -256,6 +256,7 @@ struct SubscriptionTrendCard: View {
                                     .fill(color(target))
                                     .frame(width: 6, height: 6)
                                 Text(name(target))
+                                    .help(name(target))
                                 Spacer(minLength: 6)
                                 Text(verbatim: metric == .cost
                                      ? Format.money(
@@ -264,7 +265,7 @@ struct SubscriptionTrendCard: View {
                                         tokens: bucket.tokens, cost: bucket.cost))
                                     .foregroundStyle(.secondary)
                             }
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                         }
                     }
                     Divider().opacity(0.4)
@@ -280,7 +281,7 @@ struct SubscriptionTrendCard: View {
                              : Format.tokens(
                                 tokens: day.totalTokens, cost: day.totalCost))
                     }
-                    .font(.caption2.weight(.medium))
+                    .font(NativeDesign.detailFont.weight(.medium))
                 }
             }
             .padding(8)
@@ -305,7 +306,7 @@ struct SubscriptionTrendCard: View {
             Spacer()
             Text(verbatim: trend.days.last.map { Format.monthDay($0.date) } ?? "")
         }
-        .font(.caption2)
+        .font(NativeDesign.detailFont)
         .foregroundStyle(.tertiary)
     }
 
@@ -317,6 +318,7 @@ struct SubscriptionTrendCard: View {
                         .fill(color(target))
                         .frame(width: 6, height: 6)
                     Text(name(target))
+                        .help(name(target))
                 }
             }
             // Same overflow marker as `UsageChartCard`: without it a fifth
@@ -327,7 +329,7 @@ struct SubscriptionTrendCard: View {
             }
             Spacer()
         }
-        .font(.caption2)
+        .font(NativeDesign.detailFont)
         .foregroundStyle(.secondary)
         .lineLimit(1)
     }
@@ -346,7 +348,7 @@ struct SubscriptionTrendCard: View {
                 SettingsWindowController.shared.showFromPopover(scrollingTo: .usageAttribution)
             } label: {
                 Text("Nothing is classified yet. Settings › Usage attribution splits this by subscription.")
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                     .underline()
                     .fixedSize(horizontal: false, vertical: true)

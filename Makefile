@@ -1,5 +1,7 @@
 # Build order matters: the Rust staticlib must exist before swift build links.
 # Run everything from the repo root (the -L path in Package.swift is relative).
+# Xcode 27's swiftbuild engine records SDK 14 in LC_BUILD_VERSION, disabling
+# native Liquid Glass. The native engine preserves SDK 27 and deployment 14.
 
 .PHONY: all rust build run clean check-docs selftest selftest-bundled
 
@@ -15,19 +17,19 @@ rust:
 build: rust
 	@$(call relink_if_stale,debug)
 	@$(call rebuild_if_header_stale,debug)
-	swift build
+	swift build --build-system native
 	@$(call sync_localizations,debug)
 
 # Depends on `build`, not `rust`: the localization sync copies into
 # .build/debug, which only SwiftPM creates. Running it before a build fails on a
 # fresh or freshly cleaned checkout.
 run: build
-	swift run Syrtis
+	swift run --build-system native Syrtis
 
 # Several assertions compare against English UI copy, so the language is
 # pinned here rather than inherited from the developer's Mac.
 selftest: build
-	swift run Syrtis --selftest -AppleLanguages "(en)"
+	swift run --build-system native Syrtis --selftest -AppleLanguages "(en)"
 
 # The same suite from the configuration that ships: release, inside a .app.
 #
@@ -79,7 +81,7 @@ selftest: build
 SELFTEST_BUNDLE_ID ?= com.nyanako.tokenbar.selftest
 selftest-bundled: rust
 	@$(call relink_if_stale,release)
-# scripts/bundle.sh runs a plain `swift build -c release`, which keeps an
+# scripts/bundle.sh builds release with the native engine, which keeps an
 # imported CTB module built against the previous header. Without this the
 # bundled ABI-seam gate can pass on an incremental checkout against
 # declarations the library no longer has — the exact failure the debug target
@@ -95,7 +97,7 @@ clean:
 bundle: rust
 	@$(call relink_if_stale,release)
 	@$(call rebuild_if_header_stale,release)
-	swift build -c release
+	swift build --build-system native -c release
 	scripts/bundle.sh
 
 # SwiftPM does not track the Rust staticlib as a dependency: with no Swift

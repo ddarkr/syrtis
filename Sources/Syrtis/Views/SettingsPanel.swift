@@ -156,7 +156,7 @@ struct SettingsPanel: View {
         return (a + b).filter { seen.insert($0).inserted }
     }
 
-    // MARK: - Client tabs drag reorder helpers (adapted from AgentLimitsCard)
+    // MARK: - Client tabs reorder helpers (drag + keyboard chevrons)
 
     private func dropEdge(for id: String, in orderList: [String]) -> VerticalEdge? {
         guard let dragId = tabsDragId,
@@ -185,6 +185,22 @@ struct SettingsPanel: View {
             }
     }
 
+    private func canMoveTab(id: String, by delta: Int, in orderList: [String]) -> Bool {
+        guard let index = orderList.firstIndex(of: id) else { return false }
+        let neighborIndex = index + delta
+        return neighborIndex >= 0 && neighborIndex < orderList.count
+    }
+
+    /// Keyboard/chevron neighbor move, routed through the canonical
+    /// `ClientRegistry.reorder` so mouse drag and buttons share one order.
+    private func moveTab(id: String, by delta: Int, in orderList: [String]) {
+        guard let index = orderList.firstIndex(of: id) else { return }
+        let neighborIndex = index + delta
+        guard neighborIndex >= 0, neighborIndex < orderList.count else { return }
+        let next = ClientRegistry.reorder(orderList, from: id, to: orderList[neighborIndex])
+        tabsOrderRaw = next.joined(separator: ",")
+    }
+
     var body: some View {
         // Computed once and shared by the two sections below (Agent limits +
         // Client tabs), instead of re-deriving `knownClientIds` per section.
@@ -203,7 +219,7 @@ struct SettingsPanel: View {
         let tabsUniverse = ClientRegistry.orderedClients(
             Self.orderedUnion(tabClients, knownIds), orderRaw: tabsOrderRaw)
 
-        VStack(alignment: .leading, spacing: 14) {
+        Group {
             switch page {
             case .menuBar:
                 menuBarPage()
@@ -272,15 +288,16 @@ struct SettingsPanel: View {
     @ViewBuilder
     private func menuBarPage() -> some View {
         section("Menubar title") {
-            radioGroup(
+            optionPicker(
                 selection: $trayModeRaw,
-                options: TrayMode.allCases.map { ($0.rawValue, $0.label) })
+                options: TrayMode.allCases.map { ($0.rawValue, $0.label) },
+                label: "Menubar title")
         }
-
         section("Font color") {
-            radioGroup(
+            optionPicker(
                 selection: $textColorMode,
-                options: MenuBarTextColor.allCases.map { ($0.rawValue, $0.label) })
+                options: MenuBarTextColor.allCases.map { ($0.rawValue, $0.label) },
+                label: "Color mode")
             if textColorMode == MenuBarTextColor.custom.rawValue {
                 row("Custom color") {
                     HStack(spacing: 14) {
@@ -289,7 +306,7 @@ struct SettingsPanel: View {
                                 level: level, hex: textColorBinding(level), editingLevel: $editingTextColor)
                                 .popover(
                                     isPresented: textColorEditorPresented(level), arrowEdge: .bottom
-                                ) {
+                               ) {
                                     MenuBarTextColorPopover(
                                         hex: textColorBinding(level), level: level)
                                         .id(level)
@@ -302,22 +319,22 @@ struct SettingsPanel: View {
         }
 
         section("Menubar icon") {
-            radioGroup(
-                selection: $animationStyle,
-                options: TrayAnimator.iconStyleOptions)
+            iconStyleGrid()
             if isAnimatedStyle {
                 toggleRow("Animate based on token usage", isOn: $animateTray)
                 if animateTray {
-                    radioGroup(
+                    optionPicker(
                         selection: $animationPaceRaw,
-                        options: AnimationPace.allCases.map { ($0.rawValue, $0.label) })
+                        options: AnimationPace.allCases.map { ($0.rawValue, $0.label) },
+                        label: "Animation pace")
                     hint((AnimationPace(rawValue: animationPaceRaw) ?? .default).detail)
                     hint("The cat and parrot speed up and the sand gets busier as the live token rate climbs. The pace sets how much traffic reaches the top: Light at 600K tokens/min, Moderate at 3M, Heavy at 10M.")
                 }
             } else {
-                radioGroup(
+                optionPicker(
                     selection: $iconColoringRaw,
-                    options: IconColoring.allCases.map { ($0.rawValue, $0.label) })
+                    options: IconColoring.allCases.map { ($0.rawValue, $0.label) },
+                    label: "Coloring")
                 hint("Gauge icons empty as quota is used. \"Color on warning only\" keeps one color until 25% is left, then amber, and red at 10%.")
             }
         }
@@ -347,7 +364,7 @@ struct SettingsPanel: View {
                 LoadingLine(title: "Looking for eligible clients…")
             } else if rows.isEmpty {
                 Text("No clients with quota yet.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 1) {
@@ -355,7 +372,6 @@ struct SettingsPanel: View {
                         individualItemRow(row)
                     }
                 }
-                .glassCard(cornerRadius: 8)
             }
         }
     }
@@ -384,11 +400,12 @@ struct SettingsPanel: View {
                 AgentIconView(clientId: row.clientId, size: 16)
                     .accessibilityHidden(true)
                 Text(row.displayName)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(1)
                     .accessibilityHidden(true)
-                Spacer()
                 Text(row.valueText)
-                    .font(.caption.monospacedDigit())
+                    .font(NativeDesign.bodyFont.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .accessibilityLabel(row.accessibilityLabel)
                 Toggle("", isOn: Binding(
@@ -411,9 +428,9 @@ struct SettingsPanel: View {
             if row.isEnabled {
                 HStack {
                     Text("Window")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
-                    Spacer()
+                    Spacer(minLength: 16)
                     Picker("", selection: Binding(
                         get: { row.selection },
                         set: { next in
@@ -434,19 +451,18 @@ struct SettingsPanel: View {
                     .labelsHidden()
                     .accessibilityLabel("Quota window for %@".localized(row.displayName))
                     .pickerStyle(.menu)
-                    .frame(maxWidth: 210)
+                    .frame(minWidth: 140, maxWidth: 280, alignment: .trailing)
                 }
             }
 
             if let statusHint = row.statusHint {
                 Text(statusHint.localized)
-                    .font(.caption2)
-                    .foregroundStyle(row.status == .errorExplicit ? .secondary : .tertiary)
+                    .font(NativeDesign.detailFont)
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 4)
     }
 
     @ViewBuilder
@@ -462,14 +478,16 @@ struct SettingsPanel: View {
             if limitsEnabled {
                 toggleRow("Show as used", isOn: $limitsAsUsed)
                 hint("On: bars show how much you've used. Off: bars show what's left.")
-                radioGroup(
+                optionPicker(
                     selection: $layoutRaw,
-                    options: LimitsLayout.allCases.map { ($0.rawValue, "Layout: \($0.rawValue.capitalized)") })
+                    options: LimitsLayout.allCases.map { ($0.rawValue, "Layout: \($0.rawValue.capitalized)") },
+                    label: "Layout")
                 hint("Full: bar with a pace marker. Classic: compact bar, no pace. Chart: quota over time, with pace as a second line; windows without history show a bar.")
                 if LimitsLayout(rawValue: layoutRaw) != .classic {
-                    radioGroup(
+                    optionPicker(
                         selection: $paceModeRaw,
-                        options: PaceMode.allCases.map { ($0.rawValue, "Pace: \($0.rawValue.capitalized)") })
+                        options: PaceMode.allCases.map { ($0.rawValue, "Pace: \($0.rawValue.capitalized)") },
+                        label: "Pace")
                     hint("Shows whether you're using quota faster or slower than expected. Historical compares with your past windows and uses Linear until it has enough history. Linear assumes even use until the reset.")
                 }
 
@@ -479,7 +497,6 @@ struct SettingsPanel: View {
                     // toggle here reflects that (off + disabled) rather than
                     // offering a state the card can never actually reach.
                     let tabHiddenSet = ClientRegistry.withGroupMembers(ClientRegistry.parseIdSet(tabsHiddenRaw))
-                    Divider()
                     VStack(spacing: 1) {
                         ForEach(limitOrdered, id: \.self) { id in
                             let tabHidden = tabHiddenSet.contains(id)
@@ -487,9 +504,10 @@ struct SettingsPanel: View {
                                 HStack(spacing: 6) {
                                     AgentIconView(clientId: id, size: 14)
                                     Text(ClientRegistry.shortName(id))
-                                        .font(.caption)
+                                        .font(NativeDesign.bodyFont)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .layoutPriority(1)
                                 }
-                                Spacer()
                                 Toggle("", isOn: Binding(
                                     get: { !tabHidden && !limitsHiddenSet.contains(id) },
                                     set: { show in
@@ -506,13 +524,12 @@ struct SettingsPanel: View {
                                 .toggleStyle(.switch)
                                 .controlSize(.mini)
                                 .labelsHidden()
+                                .accessibilityLabel("Show %@ quota card".localized(ClientRegistry.shortName(id)))
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
+                            .padding(.vertical, 4)
                             .opacity(tabHidden ? 0.5 : 1)
                         }
                     }
-                    .glassCard(cornerRadius: 8)
                     hint("Hide one client's quota card and keep its tab. Grayed out when the tab is hidden, which already hides the card.")
                 }
             }
@@ -522,28 +539,19 @@ struct SettingsPanel: View {
             let hiddenCards = ClientRegistry.parseIdSet(overviewHiddenRaw)
             VStack(spacing: 1) {
                 ForEach(OverviewCard.toggleable, id: \.self) { card in
-                    HStack {
-                        Text(card.label.localized)
-                            .font(.caption)
-                        Spacer()
-                        Toggle("", isOn: Binding(
+                    toggleRow(
+                        card.label,
+                        isOn: Binding(
                             get: { !hiddenCards.contains(card.rawValue) },
                             set: { show in
                                 var hidden = hiddenCards
                                 if show { hidden.remove(card.rawValue) }
                                 else { hidden.insert(card.rawValue) }
                                 overviewHiddenRaw = hidden.sorted().joined(separator: ",")
-                            }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
+                            }),
+                        axLabel: "Show %@ card".localized(card.label.localized))
                 }
             }
-            .glassCard(cornerRadius: 8)
             hint("Choose which cards Overview shows. The usage chart always stays.")
         }
 
@@ -551,27 +559,18 @@ struct SettingsPanel: View {
             let hiddenViews = ClientRegistry.parseIdSet(hiddenViewsRaw)
             VStack(spacing: 1) {
                 ForEach(AppView.toggleable, id: \.self) { view in
-                    HStack {
-                        Text(view.label)
-                            .font(.caption)
-                        Spacer()
-                        Toggle("", isOn: Binding(
+                    toggleRow(
+                        view.label,
+                        isOn: Binding(
                             get: { !hiddenViews.contains(view.rawValue) },
                             set: { show in
                                 var hidden = hiddenViews
                                 if show { hidden.remove(view.rawValue) } else { hidden.insert(view.rawValue) }
                                 hiddenViewsRaw = hidden.sorted().joined(separator: ",")
-                            }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
+                            }),
+                        axLabel: "Show %@ view".localized(view.label))
                 }
             }
-            .glassCard(cornerRadius: 8)
             hint("Hide views you don't use from the tab row.")
         }
 
@@ -580,12 +579,12 @@ struct SettingsPanel: View {
 
             if tabsUniverse.isEmpty {
                 Text("No clients found yet.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card.")
-                        .font(.caption2)
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.secondary)
 
                     VStack(spacing: 1) {
@@ -598,24 +597,45 @@ struct SettingsPanel: View {
                             // card, so they show a caption instead.
                             let canTab = presentSet.contains(id)
                             HStack(spacing: 8) {
-                                // Drag handle - always shown for every provider
                                 Text("⠿")
-                                    .font(.caption)
+                                    .font(NativeDesign.bodyFont)
                                     .foregroundStyle(tabsDragId == id ? .primary : .tertiary)
                                     .help("Drag to reorder")
                                     .gesture(dragGestureForTab(id: id, orderList: tabsUniverse))
-
                                 AgentIconView(clientId: id, size: 14)
                                 Text(ClientRegistry.tabLabel(id))
-                                    .font(.caption)
+                                    .font(NativeDesign.bodyFont)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .layoutPriority(1)
 
                                 if !canTab {
                                     Text("(quota card only)")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        .font(NativeDesign.detailFont)
+                                        .foregroundStyle(.secondary)
                                 }
 
-                                Spacer()
+                                Button {
+                                    moveTab(id: id, by: -1, in: tabsUniverse)
+                                } label: {
+                                    Image(systemName: "chevron.up")
+                                        .font(NativeDesign.detailFont.weight(.semibold))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(canMoveTab(id: id, by: -1, in: tabsUniverse) ? .secondary : .tertiary)
+                                .disabled(!canMoveTab(id: id, by: -1, in: tabsUniverse))
+                                .help("Move %@ earlier".localized(ClientRegistry.tabLabel(id)))
+                                .accessibilityLabel("Move %@ earlier".localized(ClientRegistry.tabLabel(id)))
+                                Button {
+                                    moveTab(id: id, by: 1, in: tabsUniverse)
+                                } label: {
+                                    Image(systemName: "chevron.down")
+                                        .font(NativeDesign.detailFont.weight(.semibold))
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(canMoveTab(id: id, by: 1, in: tabsUniverse) ? .secondary : .tertiary)
+                                .disabled(!canMoveTab(id: id, by: 1, in: tabsUniverse))
+                                .help("Move %@ later".localized(ClientRegistry.tabLabel(id)))
+                                .accessibilityLabel("Move %@ later".localized(ClientRegistry.tabLabel(id)))
 
                                 if canTab {
                                     Toggle("", isOn: Binding(
@@ -634,10 +654,10 @@ struct SettingsPanel: View {
                                     .toggleStyle(.switch)
                                     .controlSize(.mini)
                                     .labelsHidden()
+                                    .accessibilityLabel("Show %@ tab".localized(ClientRegistry.tabLabel(id)))
                                 }
                             }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
+                            .padding(.vertical, 4)
                             .opacity(tabsDragId == id ? 0.5 : 1)
                             .overlay(alignment: dropEdge(for: id, in: tabsUniverse) == .top ? .top : .bottom) {
                                 if let edge = dropEdge(for: id, in: tabsUniverse) {
@@ -657,7 +677,6 @@ struct SettingsPanel: View {
                     }
                     .coordinateSpace(name: Self.tabsDragSpace)
                     .onPreferenceChange(TabsCardFramesKey.self) { tabsCardFrames = $0 }
-                    .glassCard(cornerRadius: 8)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -670,32 +689,31 @@ struct SettingsPanel: View {
         }
 
         section("Popover size") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Height")
-                        .font(.caption)
-                    Spacer()
-                    Text("\(Int(popoverHeightBinding.wrappedValue.rounded())) pt")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                    if popoverHeight > 0 {
-                        Button("Auto") { popoverHeight = 0 }
-                            .controlSize(.mini)
-                            .buttonStyle(.plain)
-                            .font(.caption2)
-                            .foregroundStyle(.tint)
-                            .help("Fit the height to the screen automatically")
-                    }
+            HStack {
+                Text("Height")
+                    .font(NativeDesign.bodyFont)
+                    .accessibilityHidden(true)
+                Spacer()
+                Text("\(Int(popoverHeightBinding.wrappedValue.rounded())) pt")
+                    .font(NativeDesign.bodyFont.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                if popoverHeight > 0 {
+                    Button("Auto") { popoverHeight = 0 }
+                        .controlSize(.mini)
+                        .buttonStyle(.plain)
+                        .font(NativeDesign.detailFont)
+                        .foregroundStyle(.tint)
+                        .help("Fit the height to the screen automatically")
                 }
-                Slider(
-                    value: popoverHeightBinding,
-                    in: Double(PopoverChrome.minHeight)...popoverHeightMax,
-                    step: 10)
-                    .controlSize(.small)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .glassCard(cornerRadius: 8)
+            Slider(
+                value: popoverHeightBinding,
+                in: Double(PopoverChrome.minHeight)...popoverHeightMax,
+                step: 10)
+                .controlSize(.small)
+                .accessibilityLabel("Popover height".localized)
+                .accessibilityValue("\(Int(popoverHeightBinding.wrappedValue.rounded())) pt")
             hint("You can also drag the bottom edge of the popover. Auto uses about 60% of your screen height.")
         }
     }
@@ -722,7 +740,7 @@ struct SettingsPanel: View {
 
             if let attributionNotice {
                 Text(attributionNotice.localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -749,11 +767,11 @@ struct SettingsPanel: View {
                 LoadingLine(title: "Loading usage…")
             case .unavailable:
                 Text(UsageAttributionSettings.Copy.unavailable.localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             case .empty:
                 Text(UsageAttributionSettings.Copy.noRows.localized)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             case .rows:
                 VStack(spacing: 1) {
@@ -761,7 +779,6 @@ struct SettingsPanel: View {
                         attributionRow(row, targetClients: targetClients)
                     }
                 }
-                .glassCard(cornerRadius: 8)
             }
         }
     }
@@ -792,10 +809,10 @@ struct SettingsPanel: View {
                     Text(UsageAttributionSettings.Copy.source.localized(
                         ClientRegistry.style(row.client).displayName,
                         row.providerLabel.localized))
-                        .font(.caption.weight(.medium))
+                        .font(NativeDesign.bodyFont.weight(.medium))
                     Text(UsageAttributionSettings.Copy.observed.localized(
                         Format.compactTokens(row.tokens), Format.money(tokens: row.tokens, cost: row.cost)))
-                        .font(.caption2.monospacedDigit())
+                        .font(NativeDesign.detailFont.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 // The label takes the slack instead of a Spacer so a long
@@ -822,19 +839,18 @@ struct SettingsPanel: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(width: 168)
+                .frame(minWidth: 140, maxWidth: 280, alignment: .trailing)
                 .accessibilityLabel(UsageAttributionSettings.Copy.classificationFor.localized(
                     row.providerLabel.localized))
             }
 
             if let suggestedState = row.suggestedState {
                 Text(Self.suggestionLabel(for: suggestedState))
-                    .font(.caption2.weight(.medium))
+                    .font(NativeDesign.detailFont.weight(.medium))
                     .foregroundStyle(.orange)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 4)
     }
 
     /// A suggestion can propose "not a subscription" as readily as a target, so
@@ -928,13 +944,14 @@ struct SettingsPanel: View {
         }
 
         section("Data refresh") {
-            radioGroup(
+            optionPicker(
                 selection: Binding(
                     get: { String(refreshIntervalMin) },
                     set: { refreshIntervalMin = Int($0) ?? 30 }),
                 options: Self.refreshIntervalOptions.map {
                     (String($0), $0 == 60 ? "Every hour" : "Every %lld min".localized($0))
-                })
+                },
+                label: "Data refresh")
             hint("How often Syrtis rereads all logs in full. In between, new activity still shows up within 5 minutes.")
         }
 
@@ -965,7 +982,7 @@ struct SettingsPanel: View {
             // another row. Touching the @AppStorage raw is what re-renders.
             let selectionRaw = discordSelectionRaw
             let discordSelection = DiscordPresence.selection()
-            radioGroup(
+            optionPicker(
                 selection: Binding(
                     get: {
                         // Read for the SwiftUI dependency only; the ANSWER comes
@@ -987,13 +1004,14 @@ struct SettingsPanel: View {
                         hiddenRaw: tabsHiddenRaw,
                         orderRaw: tabsOrderRaw,
                         selection: discordSelection
-                    ).map { ($0, ClientRegistry.style($0).displayName) })
-            // Nothing is ticked when the stored value is malformed, which is
+                    ).map { ($0, ClientRegistry.style($0).displayName) },
+                label: "Discord client")
+            // A malformed stored value shows the Picker's disabled unavailable
+            // row (tagged with the sentinel, never written back), which is
             // honest: the runtime publishes nothing, and no option describes
             // that. Picking any row writes a well-formed value and recovers.
-            // Two consequences, and neither is obvious from the control. The
-            // first reads as a bug when it is a decision; the second is the one
-            // that compounds with the switch below it.
+            // The mismatch still reads as a bug when it is a decision, and the
+            // scope switch below it still compounds the confusion.
             hint("Picking one client shows only its usage and spend, so the numbers may not match the menu bar.")
             toggleRow("Show cost as a figure instead of a range", isOn: $discordWholeDollars)
             // Says what the trade is, not that there is one. A range puts you
@@ -1008,7 +1026,7 @@ struct SettingsPanel: View {
         antigravityAccountsSection()
 
         section("Language") {
-            radioGroup(
+            optionPicker(
                 selection: Binding(
                     get: { languageRaw },
                     set: { next in
@@ -1019,7 +1037,8 @@ struct SettingsPanel: View {
                         AppLanguage(rawValue: next)?.apply()
                         showLanguageRestartPrompt = true
                     }),
-                options: AppLanguage.allCases.map { ($0.rawValue, $0.label) })
+                options: AppLanguage.allCases.map { ($0.rawValue, $0.label) },
+                label: "Language")
             hint("Takes effect the next time Syrtis starts.")
         }
     }
@@ -1037,7 +1056,7 @@ struct SettingsPanel: View {
                     HStack(spacing: 6) {
                         if missingClaudeRoots.contains(path) {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption2)
+                                .font(NativeDesign.detailFont)
                                 .foregroundStyle(.orange)
                                 .help("Folder not found. Kept in case the drive is disconnected or the path needs fixing.".localized)
                         }
@@ -1049,6 +1068,8 @@ struct SettingsPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Remove".localized)
+                        .accessibilityLabel("Remove %@".localized(path))
                     }
                 }
             }
@@ -1056,10 +1077,10 @@ struct SettingsPanel: View {
                 addClaudeExtraRoot()
             } label: {
                 Label("Add config dir…".localized, systemImage: "plus.circle")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
             if let result = claudeExtraRootsResult, !result.unreadable.isEmpty {
                 hint("%lld of %lld folders can't be read right now; Syrtis will retry on the next scan.".localized(
                     result.unreadable.count, result.registeredCount))
@@ -1072,7 +1093,6 @@ struct SettingsPanel: View {
         }
         .onAppear { refreshMissingClaudeRoots() }
     }
-
     /// Extra Google accounts for Antigravity, each its own card. The copy says
     /// what is read, where it is kept, where it is sent and what Remove does;
     /// each claim is checked against `agent_antigravity.rs`'s captured-account
@@ -1093,6 +1113,7 @@ struct SettingsPanel: View {
                     .buttonStyle(.plain)
                     .disabled(busy)
                     .help("Remove".localized)
+                    .accessibilityLabel("Remove %@".localized(account.label))
                 }
             }
             Button {
@@ -1101,14 +1122,14 @@ struct SettingsPanel: View {
                 Label(
                     (busy ? "Capturing…" : "Capture current agy login").localized,
                     systemImage: "plus.circle")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
             }
             .buttonStyle(.plain)
             .disabled(busy)
-            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
             if let message = antigravityAutoCapture.message {
                 Text(message.localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1119,12 +1140,12 @@ struct SettingsPanel: View {
                     set: { on in Task { await antigravityAutoCapture.setEnabled(on) } }))
             if antigravityAutoCaptureOn, antigravityAutoCapture.paused {
                 Text("Automatic capture is paused because the login keychain didn't answer. Press Capture to resume.".localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             } else if antigravityAutoCaptureOn, antigravityAutoCapture.unavailable {
                 Text("Automatic capture is unavailable on this Mac.".localized)
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1170,7 +1191,7 @@ struct SettingsPanel: View {
         section("About") {
             row("Version") {
                 Text(AppInfo.version)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             }
             if UpdaterService.isAvailable {
@@ -1178,12 +1199,7 @@ struct SettingsPanel: View {
                     Button("Check Now") { UpdaterService.shared.checkForUpdates() }
                         .controlSize(.small)
                 }
-                row("Receive beta updates") {
-                    Toggle("", isOn: $betaUpdates)
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                }
+                toggleRow("Receive beta updates", isOn: $betaUpdates)
             }
             hint("Syrtis started as a fork of tokcat by handlecusion. Log parsing and pricing come from tokscale by Junho Yeo, the menu bar design draws on CodexBar by Peter Steinberger, and the running cat comes from RunCat by Takuto Nakamura. MIT licensed.")
         }
@@ -1257,7 +1273,8 @@ struct SettingsPanel: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .frame(maxWidth: 190)
+            .frame(minWidth: 140, maxWidth: 280, alignment: .trailing)
+            .accessibilityLabel("Quota agent".localized)
         }
 
         if let selectedClientId {
@@ -1287,10 +1304,11 @@ struct SettingsPanel: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
-                    .frame(maxWidth: 190)
+                    .frame(minWidth: 140, maxWidth: 280, alignment: .trailing)
+                    .accessibilityLabel("Quota window".localized)
                 } else {
                     Text("—")
-                        .font(.caption)
+                        .font(NativeDesign.bodyFont)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1307,10 +1325,7 @@ struct SettingsPanel: View {
     // MARK: - Building blocks
 
     private func section(_ label: String, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label.localized.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+        Section(label.localized) {
             content()
         }
     }
@@ -1318,13 +1333,65 @@ struct SettingsPanel: View {
     private func row(_ label: String, @ViewBuilder trailing: () -> some View) -> some View {
         HStack {
             Text(label.localized)
-                .font(.caption)
-            Spacer()
+                .font(NativeDesign.bodyFont)
+            Spacer(minLength: 16)
             trailing()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .glassCard(cornerRadius: 8)
+    }
+
+    /// Visual icon choice: one static SF/asset preview per style, no frame
+    /// cohorts or animation. Animated styles preview their first bundled
+    /// frame; gauge styles draw one TrayIcons image at a live-like level.
+    private func iconStyleGrid() -> some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+            spacing: 8
+        ) {
+            ForEach(TrayAnimator.iconStyleOptions, id: \.value) { option in
+                iconStyleCell(value: option.value, label: option.label)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Menubar icon".localized)
+    }
+
+    private func iconStyleCell(value: String, label: String) -> some View {
+        let selected = animationStyle == value
+        return Button {
+            animationStyle = value
+        } label: {
+            VStack(spacing: 4) {
+                iconStylePreview(value: value)
+                    .frame(width: 22, height: 22)
+                Text(label.localized)
+                    .font(NativeDesign.detailFont)
+                    .foregroundStyle(selected ? .primary : .secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(selected ? Color.accentColor.opacity(0.12) : Color.clear))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(selected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: selected ? 1.5 : 0.5))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label.localized)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    @ViewBuilder
+    private func iconStylePreview(value: String) -> some View {
+        if let gauge = QuotaIconStyle(rawValue: value) {
+            IconStyleGaugePreview(
+                style: gauge,
+                coloring: IconColoring(rawValue: iconColoringRaw) ?? .warningOnly)
+        } else {
+            IconStyleFramePreview(style: value)
+        }
     }
 
     /// One checkbox over the shared composition string. Written back in
@@ -1352,56 +1419,42 @@ struct SettingsPanel: View {
             })
     }
 
-    private func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {
-        row(label) {
-            Toggle("", isOn: isOn)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .labelsHidden()
-        }
+    private func toggleRow(_ label: String, isOn: Binding<Bool>, axLabel: String? = nil) -> some View {
+        Toggle(label.localized, isOn: isOn)
+            .toggleStyle(.switch)
+            .accessibilityLabel(axLabel ?? label.localized)
     }
 
-    private func radioGroup(
-        selection: Binding<String>, options: [(value: String, label: String)]
+    /// Native platform menu Picker for options appropriate to macOS HIG.
+    /// A persisted value absent from the options (e.g. the Discord binding's
+    /// malformed sentinel, which publishes nothing) gets a disabled tagged
+    /// unavailable row in the Picker below, so the control shows honest
+    /// state without writing a valid value on the user's behalf.
+    @ViewBuilder
+    private func optionPicker(
+        selection: Binding<String>,
+        options: [(value: String, label: String)],
+        label: String? = nil
     ) -> some View {
-        VStack(spacing: 1) {
+        let title = label?.localized ?? options.first?.label.localized ?? ""
+        Picker(title, selection: selection) {
             ForEach(options, id: \.value) { option in
-                radioOption(
-                    selection: selection,
-                    value: option.value,
-                    label: option.label)
+                Text(option.label.localized).tag(option.value)
+            }
+            if !options.contains(where: { $0.value == selection.wrappedValue }) {
+                Text("Unavailable selection".localized)
+                    .tag(selection.wrappedValue)
+                    .disabled(true)
             }
         }
-        .glassCard(cornerRadius: 8)
-    }
-
-    private func radioOption(
-        selection: Binding<String>, value: String, label: String
-    ) -> some View {
-        Button {
-            selection.wrappedValue = value
-        } label: {
-            HStack {
-                Text(label.localized)
-                    .font(.caption)
-                Spacer()
-                if selection.wrappedValue == value {
-                    Image(systemName: "checkmark")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
+        .pickerStyle(.menu)
     }
 
     private func hint(_ text: String) -> some View {
         Text(text.localized)
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
+            .font(NativeDesign.detailFont)
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 2)
             .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -1415,7 +1468,7 @@ private struct MenuBarTextColorControl: View {
     var body: some View {
         VStack(spacing: 3) {
             Text(level.label.localized)
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             Button { editingLevel = editingLevel == level ? nil : level } label: {
                 Capsule()
@@ -1449,7 +1502,7 @@ private struct MenuBarTextColorPopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(level.label.localized)
-                .font(.caption)
+                .font(NativeDesign.bodyFont)
                 .foregroundStyle(.secondary)
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 8), spacing: 6) {
                 ForEach(MenuBarTextColor.presets, id: \.hex) { preset in
@@ -1457,9 +1510,9 @@ private struct MenuBarTextColorPopover: View {
                 }
             }
             HStack(spacing: 8) {
-                Text("HEX").font(.caption)
+                Text("HEX").font(NativeDesign.bodyFont)
                 TextField("#000000", text: $input)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.system(size: 13, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
                     .focused($inputFocused)
                     .accessibilityLabel("Hex color".localized)
@@ -1472,7 +1525,7 @@ private struct MenuBarTextColorPopover: View {
             }
             if !input.isEmpty, MenuBarTextColor.normalizedHex(input) == nil {
                 Text("Enter a 6-digit hex color, e.g. #000000.")
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1512,6 +1565,72 @@ private struct MenuBarTextColorPopover: View {
         .accessibilityLabel(name.localized + " " + colorHex)
         .accessibilityIdentifier("settings.menuBar.textColor." + String(colorHex.dropFirst()))
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// One static gauge preview, held only while visible — no retained images
+/// beyond the on-screen cell, no animation.
+private struct IconStyleGaugePreview: View {
+    let style: QuotaIconStyle
+    let coloring: IconColoring
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var icon: NSImage?
+
+    var body: some View {
+        Group {
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: "app.dashed")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { reload() }
+        .onChange(of: colorScheme) { reload() }
+        .onChange(of: coloring) { reload() }
+        .onDisappear { icon = nil }
+    }
+
+    private func reload() {
+        icon = TrayIcons.image(
+            style: style, remaining: 72,
+            dark: colorScheme == .dark, coloring: coloring)
+    }
+}
+
+/// One static first-frame preview of an animated style, held only while
+/// visible — never the full cohort, never animated.
+private struct IconStyleFramePreview: View {
+    let style: String
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var held: NSImage?
+
+    var body: some View {
+        Group {
+            if let held {
+                Image(nsImage: held)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: "app.dashed")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { reload(dark: colorScheme == .dark) }
+        .onChange(of: colorScheme) { _, next in reload(dark: next == .dark) }
+        .onDisappear { held = nil }
+    }
+
+    private func reload(dark: Bool) {
+        let directory = TrayAnimator.frameDirectory(style: style, dark: dark)
+        var loaded = TrayAnimator.loadFirstFrame(directory: directory)
+        if loaded.isEmpty {
+            loaded = TrayAnimator.loadFirstFrame(
+                directory: TrayAnimator.frameDirectory(style: "cat", dark: dark))
+        }
+        held = loaded.first
     }
 }
 

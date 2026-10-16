@@ -23,7 +23,8 @@ APP="$OUT_DIR/$APP_NAME.app"
 
 echo "==> building release binaries"
 cargo build --release
-swift build -c release
+# Preserve the actual SDK version in LC_BUILD_VERSION (see Makefile).
+swift build --build-system native -c release
 
 echo "==> assembling $APP ($VERSION, build $BUILD_NUMBER, $BUNDLE_ID)"
 rm -rf "$APP"

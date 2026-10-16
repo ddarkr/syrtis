@@ -32,7 +32,7 @@ struct StatsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: NativeDesign.spacing) {
             UsageChartCard(
                 payload: payload, clientIds: clientIds, stats: stats, colors: colors,
                 year: year)
@@ -44,10 +44,10 @@ struct StatsView: View {
     }
 
     private var summaryCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: NativeDesign.spacing) {
             (Text("Your total spending is ")
                 + Text(Format.usd(stats.totalCost)).bold().foregroundStyle(Color(hex: "#22c55e")))
-                .font(.system(size: 14))
+                .font(NativeDesign.bodyFont)
 
             let metrics: [(label: String, value: String, accent: Bool)] = [
                 ("Total tokens", Format.compactTokens(stats.totalTokens), false),
@@ -58,7 +58,8 @@ struct StatsView: View {
                 ("Longest streak", "%lldd".localized(stats.streaks.longest), false),
             ]
             LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: 3),
+                columns: Array(
+                    repeating: GridItem(.flexible(), alignment: .leading), count: 3),
                 spacing: 10
             ) {
                 ForEach(metrics, id: \.label) { m in
@@ -67,41 +68,46 @@ struct StatsView: View {
                             .font(.system(size: 14, weight: .semibold).monospacedDigit())
                             .foregroundStyle(m.accent ? AnyShapeStyle(Color(hex: "#22c55e")) : AnyShapeStyle(.primary))
                         Text(m.label.localized)
-                            .font(.caption2)
+                            .font(NativeDesign.detailFont)
                             .foregroundStyle(.secondary)
                     }
+                    .accessibilityElement(children: .combine)
                 }
             }
 
+            Divider()
+
             VStack(alignment: .leading, spacing: 5) {
                 if let favorite {
-                    HStack {
+                    HStack(alignment: .firstTextBaseline) {
                         Text("Favorite model")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        HStack(spacing: 5) {
+                        HStack(alignment: .top, spacing: 5) {
                             Circle()
                                 .fill(Color(hex: colors.color(favorite.provider, favorite.model)))
                                 .frame(width: 7, height: 7)
+                                .padding(.top, 4)
                             Text(favorite.model)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                                .multilineTextAlignment(.trailing)
+                                .help(favorite.model)
                         }
                     }
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                 }
                 if let bestDay = stats.bestDay {
-                    HStack {
+                    HStack(alignment: .firstTextBaseline) {
                         Text("Best day")
                             .foregroundStyle(.secondary)
                         Spacer()
                         Text("\(Format.monthDay(bestDay.date)) · \(Format.usd(bestDay.cost))")
+                            .monospacedDigit()
                     }
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                 }
             }
         }
-        .padding(12)
+        .padding(NativeDesign.cardPadding)
         .glassCard()
     }
 }

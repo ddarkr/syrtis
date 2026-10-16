@@ -4,7 +4,7 @@ id: kb-index
 kind: index
 scope: repository
 read_when: before any Syrtis task or handoff
-last_verified: 2026-10-08
+last_verified: 2026-10-12
 sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swift", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/pages.yml", ".github/workflows/release.yml", ".github/workflows/update-install-count.yml"]
 ---
 
@@ -39,6 +39,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 | 效能／正確性 before-after 量測、對拍 oracle | [`measurement.md`](measurement.md) | [`history/dashboard-load-performance.md`](history/dashboard-load-performance.md) |
 | Provider quota pace／historical calculation | [`plans/provider-quota-pace.md`](plans/provider-quota-pace.md) | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md)、[`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
 | Syrtis engine、永久使用量或 upstream-derived parser | [`architecture.md`](architecture.md) | [`vendor-tokscale.md`](vendor-tokscale.md)、[`verification.md`](verification.md) |
+| Settings、dashboard、lens、card、typography、glass、motion | [`design.md`](design.md) | [`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
 | Sparkle、appcast、Homebrew、Pages | [`release.md`](release.md) | [`workflow.md`](workflow.md) |
 | 維護期優先順序 | [`current-state.md`](current-state.md) | [`history/README.md`](history/README.md) |
 | 歷史根因或已 parked 調查 | [`history/README.md`](history/README.md) | 對應的 history 文件 |
@@ -57,6 +58,7 @@ landing/AGENTS.md
 docs/knowledge/
 ├── README.md
 ├── architecture.md
+├── design.md
 ├── workflow.md
 ├── verification.md
 ├── measurement.md

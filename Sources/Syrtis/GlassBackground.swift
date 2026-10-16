@@ -34,8 +34,13 @@ import SwiftUI
 struct GlassBackground: View {
     var cornerRadius: CGFloat = 0
 
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     var body: some View {
-        if #available(macOS 26.0, *) {
+        if reduceTransparency {
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .fill(Color(nsColor: .windowBackgroundColor))
+        } else if #available(macOS 26.0, *) {
             GlassEffectContainer {
                 Rectangle()
                     .fill(.clear)
@@ -53,10 +58,13 @@ struct GlassBackground: View {
 /// wallpaper blur that makes Liquid Glass cards come alive).
 struct PopoverBackdrop: View {
     @Environment(\.inGlassPanel) private var inGlassPanel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         if inGlassPanel {
             Color.clear // the panel's own .regular glass is the backdrop
+        } else if reduceTransparency {
+            Color(nsColor: .windowBackgroundColor)
         } else {
             VisualEffectBackground(material: .hudWindow)
         }
@@ -77,5 +85,36 @@ struct VisualEffectBackground: NSViewRepresentable {
 
     func updateNSView(_ view: NSVisualEffectView, context: Context) {
         view.material = material
+    }
+}
+
+extension View {
+    /// Liquid Glass belongs to navigation and controls, not data cards.
+    func navigationGlass(cornerRadius: CGFloat = 20) -> some View {
+        modifier(NavigationGlass(cornerRadius: cornerRadius))
+    }
+}
+
+private struct NavigationGlass: ViewModifier {
+    let cornerRadius: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if reduceTransparency || contrast == .increased {
+            content.background {
+                RoundedRectangle(cornerRadius: cornerRadius)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: cornerRadius)
+                            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                    }
+            }
+        } else if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .rect(cornerRadius: cornerRadius))
+        } else {
+            content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
+        }
     }
 }

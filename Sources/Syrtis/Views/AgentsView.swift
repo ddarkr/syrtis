@@ -6,7 +6,7 @@ import TokenBarCore
 /// source clients they ran under, message count, total tokens, and cost.
 struct AgentsView: View {
     let report: AgentsReport?
-    /// Restrict to agents that ran under any of these clients; empty = all.
+    /// Restrict to agents that ran under these clients; empty selects none.
     var clientIds: [String] = []
 
     var body: some View {
@@ -21,7 +21,7 @@ struct AgentsView: View {
             trailing: {
                 Text((rows.count == 1 ? "%lld agent · %@" : "%lld agents · %@")
                     .localized(rows.count, Format.usd(totalCost)))
-                    .font(.caption2)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
             }
         ) {
@@ -29,7 +29,7 @@ struct AgentsView: View {
                 LoadingLine(title: "Loading…")
             } else if rows.isEmpty {
                 Text("No agent activity in this range")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 10) {
@@ -46,15 +46,15 @@ struct AgentsView: View {
         let sources = entry.clients.map { ClientRegistry.style($0).displayName }
             .joined(separator: " · ")
         return VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(spacing: 6) {
                 Text(entry.agent)
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(entry.agent)
-                Spacer()
+                Spacer(minLength: 8)
                 Text(String(format: "%.1f%%", share))
-                    .font(.caption2.monospacedDigit())
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
             GeometryReader { geo in
@@ -67,17 +67,19 @@ struct AgentsView: View {
                 }
             }
             .frame(height: 6)
-            HStack {
+            HStack(spacing: 4) {
                 Text(sources)
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                     .help(sources)
-                Spacer()
+                Spacer(minLength: 8)
                 Text("%@ msgs".localized(entry.messages.formatted()) + " · \(Format.compactTokens(entry.total)) · \(Format.money(tokens: entry.total, cost: entry.cost))")
+                    .font(NativeDesign.detailFont.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .layoutPriority(1)
             }
-            .font(.caption2)
         }
     }
 }

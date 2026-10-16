@@ -4,7 +4,7 @@ id: kb-history-liquid-glass
 kind: canonical
 scope: repository
 read_when: considering a glass, popover, panel, or transparency redesign
-last_verified: 2026-09-27
+last_verified: 2026-10-12
 sources: ["sanitized local experiment source", "sanitized Liquid Glass project memory", "Sources/Syrtis/GlassBackground.swift", "Sources/Syrtis/Views/Cards.swift", "Sources/Syrtis/GlassPanelPresenter.swift", "Sources/Syrtis/StatusItemController.swift", "macOS 27.0 SDK AppKit headers (NSStatusItem.h, NSGlassEffectView.h)", "2026-09-24/25 live panel spike rounds"]
 ---
 
@@ -82,6 +82,7 @@ A hover-tooltip z-order bug independently exposed the same behavior: the Streaks
 
 ## Shipping recipe
 
+> **Superseded by the current native contract.** The nested-`.clear` recipe below is preserved as history; current content cards use the quiet adaptive fill in [`../design.md`](../design.md#surfaces-and-glass), with glass only on chrome. Do not read this section as the current palette.
 Below macOS 27 the shipping app keeps the popover and this card recipe in `Sources/Syrtis/Views/Cards.swift`:
 
 ```swift

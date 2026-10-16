@@ -55,6 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         max(1, UserDefaults.standard.object(forKey: intervalKey).flatMap { $0 as? Int } ?? 30)
     }
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        SettingsWindowController.shared.registerSceneIfNeeded()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 #if DEBUG

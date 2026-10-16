@@ -456,7 +456,7 @@ struct ContributionHeatmap: View {
             Canvas { context, _ in
                 for (col, label) in state.monthLabelCols {
                     context.draw(
-                        Text(label).font(.caption2).foregroundStyle(.secondary),
+                        Text(label).font(NativeDesign.detailFont).foregroundStyle(.secondary),
                         at: CGPoint(
                             x: HeatmapLayout.gridLeading + CGFloat(col) * HeatmapLayout.step,
                             y: HeatmapLayout.monthLabelHeight / 2),
@@ -572,12 +572,12 @@ struct ContributionHeatmap: View {
 
     private func tooltip(_ cell: GridCell) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(Format.monthDay(cell.date)).font(.caption.weight(.semibold))
+            Text(Format.monthDay(cell.date)).font(NativeDesign.bodyFont.weight(.semibold))
             Text("%@ tokens".localized(Format.exactTokens(cell.tokens)))
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
             Text(Format.money(tokens: cell.tokens, cost: cell.cost))
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.secondary)
         }
         .padding(6)

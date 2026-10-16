@@ -46,13 +46,13 @@ struct QuotaHistoryStripCard: View {
                 }
             } else if attempted, unreadable {
                 Text("Quota history could not be read. It will be retried.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if attempted {
                 Text("No completed windows recorded yet. They accumulate as Syrtis runs.")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -77,18 +77,18 @@ struct QuotaHistoryStripCard: View {
             let ago = summary.recent.count - 1 - hover.index
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: Self.rowLabel(summary))
-                    .font(.caption2.weight(.semibold))
+                    .font(NativeDesign.detailFont.weight(.semibold))
                 Text(ago == 0 ? "Most recent window".localized
                               : "%@ windows ago".localized(String(ago)))
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
                 Text("Consumed %@%% of the allowance".localized(
                     String(Int(value.rounded()))))
-                    .font(.caption2)
+                    .font(NativeDesign.bodyFont)
                 if summary.recentPeaks.indices.contains(hover.index),
                    summary.recentPeaks[hover.index] >= QuotaOverviewFold.exhaustedPercent {
                     Text("Ran out")
-                        .font(.system(size: 9))
+                        .font(NativeDesign.detailFont)
                         .foregroundStyle(.orange)
                 }
             }
@@ -133,21 +133,21 @@ struct QuotaHistoryStripCard: View {
             HStack(spacing: 5) {
                 AgentIconView(clientId: summary.clientId, size: 11)
                 Text(verbatim: Self.rowLabel(summary))
-                    .font(.caption2)
+                    .font(NativeDesign.bodyFont)
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 Text("%@ windows".localized(String(summary.cycleCount)))
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.tertiary)
             }
             strip(summary)
             Text(headline(summary))
-                .font(.system(size: 9))
+                .font(NativeDesign.detailFont)
                 .foregroundStyle(.tertiary)
             if let row = equivalences[summary.id] {
                 Text(WindowEquivalence.text(
                     row, tokens: Format.compactTokens, money: Format.usdOrBelowCent))
-                    .font(.system(size: 9))
+                    .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }

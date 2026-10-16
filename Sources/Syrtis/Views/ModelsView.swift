@@ -58,7 +58,7 @@ struct ModelsView: View {
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
                     }
                 }
-                .font(.caption2)
+                .font(NativeDesign.detailFont)
             }
         ) {
             if rows.isEmpty, report == nil, loading {
@@ -67,7 +67,7 @@ struct ModelsView: View {
                     .accessibilityLabel("Loading…")
             } else if rows.isEmpty {
                 Text("No model usage in this range")
-                    .font(.caption)
+                    .font(NativeDesign.bodyFont)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 10) {
@@ -118,18 +118,18 @@ struct ModelsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(entry.model)
-                        .font(.caption)
+                        .font(NativeDesign.bodyFont)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Text(String(format: "%.1f%%", share))
-                        .font(.caption2.monospacedDigit())
+                        .font(NativeDesign.detailFont.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
                 HStack(spacing: 8) {
                     ForEach(Self.kinds, id: \.label) { kind in
                         (Text(kind.label.localized + " ").foregroundStyle(.tertiary)
                             + Text(Format.compactTokens(kind.pick(entry))))
-                            .font(.caption2.monospacedDigit())
+                            .font(NativeDesign.detailFont.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -137,7 +137,7 @@ struct ModelsView: View {
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 2) {
                 Text(Format.compactTokens(entry.total))
-                    .font(.caption.monospacedDigit())
+                    .font(NativeDesign.bodyFont.monospacedDigit())
                 HStack(spacing: 3) {
                     if let ratio = entry.implausibleCostRatio {
                         Image(systemName: CostPlausibility.symbol)
@@ -152,7 +152,7 @@ struct ModelsView: View {
                     Text(Format.money(tokens: entry.total, cost: entry.cost))
                         .foregroundStyle(Color(hex: "#22c55e"))
                 }
-                .font(.caption2.monospacedDigit())
+                .font(NativeDesign.detailFont.monospacedDigit())
             }
         }
         // Whole-row hit area and a hand-drawn tooltip, matching

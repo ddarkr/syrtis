@@ -164,6 +164,8 @@ final class GlassPanelPresenter {
             panel.alphaValue = 1
             return
         }
+        // Reduce motion skips the spatial drop; the fade keeps its timing.
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         CATransaction.begin()
         CATransaction.setCompletionBlock { [weak self] in
             MainActor.assumeIsolated { self?.panel.invalidateShadow() }
@@ -171,16 +173,22 @@ final class GlassPanelPresenter {
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
         fade.toValue = 1
-        let slide = CABasicAnimation(keyPath: "transform.translation.y")
-        slide.fromValue = GlassPanelStyle.openSlide
-        slide.toValue = 0
-        let group = CAAnimationGroup()
-        group.animations = [fade, slide]
-        group.duration = GlassPanelStyle.openDuration
-        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fade.duration = GlassPanelStyle.openDuration
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
         layer.removeAnimation(forKey: Self.closeAnimationKey)
         layer.opacity = 1 // a reopen mid-fade skipped the close's reset
-        layer.add(group, forKey: "open")
+        if reduceMotion {
+            layer.add(fade, forKey: "open")
+        } else {
+            let slide = CABasicAnimation(keyPath: "transform.translation.y")
+            slide.fromValue = GlassPanelStyle.openSlide
+            slide.toValue = 0
+            let group = CAAnimationGroup()
+            group.animations = [fade, slide]
+            group.duration = GlassPanelStyle.openDuration
+            group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(group, forKey: "open")
+        }
         panel.alphaValue = 1
         CATransaction.commit()
     }
@@ -249,13 +257,6 @@ enum GlassPanelStyle {
     /// darken the panel was tried and rejected — untinted reads better.)
     static let lightSecondaryText = Color.black.opacity(0.70)
     static let lightTertiaryText = Color.black.opacity(0.50)
-    static let lightCardScrim = Color.black.opacity(0.04)
-    /// Hover tooltips under the panel: .regular glass over a scrim that keeps
-    /// the text legible. 0.20 read too see-through; 0.35 is the second round.
-    /// The glass was .clear until #398: it barely blurs, so a tooltip over a
-    /// list showed the rows beneath it sharp through the scrim. The maintainer
-    /// compared both on the live panel and chose .regular. Both were seen to
-    /// follow the system glass setting (NSGlassTintAmount, no public API).
     /// The popover separators (under the lens row, above the footer). The
     /// system `Divider` is a solid hairline that reads as a hard edge across
     /// the glass; a user found it abrupt ("很突兀"), and the maintainer's
@@ -264,21 +265,6 @@ enum GlassPanelStyle {
     /// mode keeps the system divider, as v2.0.1 drew it, at the maintainer's
     /// call after comparing the rounds on the live panel.
     static let lightDivider = Color.black.opacity(0.14)
-    static let tooltipScrimDark = Color.black.opacity(0.35)
-    static let tooltipScrimLight = Color.white.opacity(0.35)
-    /// Gray tooltip text over see-through glass washed out; lifting the text
-    /// keeps the transparency, where a darker scrim would give it back.
-    static let tooltipSecondaryDark = Color.white.opacity(0.80)
-    static let tooltipTertiaryDark = Color.white.opacity(0.60)
-    static let tooltipSecondaryLight = Color.black.opacity(0.75)
-    static let tooltipTertiaryLight = Color.black.opacity(0.55)
-    /// SegmentedPicker under the panel: capsule track plus a raised thumb in
-    /// the macOS 26 segmented shape. Plain fills — glass nested inside the
-    /// card's glass renders murky (see SegmentedPicker).
-    static let segmentTrack: Double = 0.07
-    static let segmentThumbDark = Color.white.opacity(0.18)
-    static let segmentThumbLight = Color.white.opacity(0.90)
-    static let segmentThumbShadow: Double = 0.15
     /// Tab-row selection thumb (client tabs, lens tabs) under the panel. A
     /// share of `.primary`, not `.quaternary`: over a bright wallpaper the glass
     /// turns its content dark while the app stays in dark mode, and
@@ -318,10 +304,16 @@ extension EnvironmentValues {
 /// which washed secondary text out in light mode.
 struct GlassPanelSurface: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: GlassPanelStyle.cornerRadius)
-        if #available(macOS 26.0, *) {
+        if reduceTransparency || colorSchemeContrast == .increased {
+            styledText(content.environment(\.inGlassPanel, true))
+                .background(Color(nsColor: .windowBackgroundColor))
+                .clipShape(shape)
+        } else if #available(macOS 26.0, *) {
             styledText(content.environment(\.inGlassPanel, true))
                 .clipShape(shape)
                 .background {
@@ -354,9 +346,10 @@ private struct PanelValueAnimation<Value: Equatable>: ViewModifier {
     let animation: Animation
     let value: Value
     @Environment(\.inGlassPanel) private var inGlassPanel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        if inGlassPanel {
+        if inGlassPanel, !reduceMotion {
             content.animation(animation, value: value)
         } else {
             content
@@ -413,9 +406,10 @@ extension View {
 private struct PanelChartRegrow<Value: Equatable>: ViewModifier {
     let value: Value
     @Environment(\.inGlassPanel) private var inGlassPanel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        if inGlassPanel {
+        if inGlassPanel, !reduceMotion {
             content.keyframeAnimator(initialValue: 1.0, trigger: value) { view, revealed in
                 view.mask(alignment: .bottom) {
                     GeometryReader { proxy in
@@ -466,32 +460,11 @@ extension View {
     }
 }
 
-/// The chart hover tooltips' chrome. Outside the panel it is the original
-/// .regularMaterial with a quaternary border; under the panel it is glass,
-/// whose own rim replaces the border.
+/// The chart hover tooltips' chrome: the shared quiet card surface, never
+/// nested glass. Text sizes are set by each tooltip's content.
 private struct TooltipSurface: ViewModifier {
-    @Environment(\.inGlassPanel) private var inGlassPanel
-    @Environment(\.colorScheme) private var colorScheme
-
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 8)
-        if inGlassPanel, #available(macOS 26.0, *) {
-            let dark = colorScheme == .dark
-            content
-                .foregroundStyle(
-                    Color.primary,
-                    dark ? GlassPanelStyle.tooltipSecondaryDark : GlassPanelStyle.tooltipSecondaryLight,
-                    dark ? GlassPanelStyle.tooltipTertiaryDark : GlassPanelStyle.tooltipTertiaryLight)
-                .background(
-                    dark ? GlassPanelStyle.tooltipScrimDark
-                                         : GlassPanelStyle.tooltipScrimLight,
-                    in: shape)
-                .glassEffect(.regular, in: .rect(cornerRadius: 8))
-        } else {
-            content
-                .background(.regularMaterial, in: shape)
-                .overlay(shape.strokeBorder(.quaternary))
-        }
+        content.glassCard(cornerRadius: 8)
     }
 }
 
