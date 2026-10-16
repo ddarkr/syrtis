@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-15
+last_verified: 2026-10-16
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -157,6 +157,10 @@ The final release Swift bridge also exercised source-specific boundaries: Droid 
 A fresh release Swift → C ABI → Rust smoke of the integrated code preserved 116 tokens and two messages after truncation, then 244 tokens and three messages after a new turn, complete source-directory deletion, two fresh source-free processes, and restored duplicate transcripts. Each capture also accepted a primary quota scope without `clientId`. This smoke used isolated synthetic roots, not live account data or GUI acceptance.
 
 ### Live-rate freshness isolation
+
+Recent rate／trace 的來源視窗保留 inclusive `nowMs`，但不納入 timestamp 大於 query clock 的事件；共用 `usage_tail::visit_snapshot` 將 upper bound 轉為 exclusive `now.checked_add(1)`，因此 scheduler 與 legacy rate／trace callers 同時受保護。`i64::MAX` 不加 upper bound，因為不存在更大的有效 timestamp。Hermetic C ABI fixture 在 event 前 1 ms 必須得到 rate 0／empty trace，在 event 當下仍得到 38 tokens；修正前的前一個查詢錯誤回傳 38。
+
+獨立 release C ABI smoke 另外在隔離 home／usage root 建立 20-token Claude event，透過正式 `tb_local_usage_sync`／`tb_local_usage_query` 得到 event 前 rate 0／empty trace、event 當下 rate 20／trace 20、過期 rate 0，最後釋放 lease；不呼叫 provider 或讀取 Keychain。這是實際 native query path 的短程證據，不是 GUI 或真實使用資料驗收。
 
 Automatic scheduler regression 以同一個 paused graph query 驗證 recent rate 的 `120 → 0 → 120`：先按 wall clock 過期，再同步新增事件，兩次發布都必須發生在 historical query 釋放之前。初次隔離比較中，baseline scheduler 有三個失敗斷言，修正後的 scheduler runner 通過 88 個 checks。Bounded wall-time guards 只限制失敗等待，不以 query ordering 或 mock callback 次數作為正確性證據。
 

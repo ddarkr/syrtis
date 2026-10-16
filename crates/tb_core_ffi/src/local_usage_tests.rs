@@ -149,6 +149,18 @@ mod tests {
         assert_eq!(empty_agents["entries"], json!([]));
         assert_eq!(query_at(token, "live", "rate", now), 38.0);
         assert_eq!(query_at(token, "live", "trace", now)[0]["tokens"], 38);
+        // A captured future event must not count until the query clock reaches
+        // it. Preserve the existing inclusive current-millisecond boundary.
+        assert_eq!(
+            query_at(token, "live", "rate", timestamp.saturating_sub(1)),
+            0.0
+        );
+        assert_eq!(
+            query_at(token, "live", "trace", timestamp.saturating_sub(1)),
+            json!([])
+        );
+        assert_eq!(query_at(token, "live", "rate", timestamp), 38.0);
+        assert_eq!(query_at(token, "live", "trace", timestamp)[0]["tokens"], 38);
         assert_eq!(
             query_at(token, "live", "rate", now.saturating_add(61_000)),
             0.0
