@@ -14,6 +14,29 @@ struct ModelsView: View {
     /// fetch is not the same as a completed fetch that found nothing.
     var loading = false
 
+
+    var body: some View {
+        let allow = Set(clientIds)
+        let rows = (report?.modelLevelEntries ?? [])
+            .filter { allow.contains($0.client) }
+            .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
+        let totalCost = rows.reduce(0) { $0 + $1.cost }
+        let totalTokens = rows.reduce(Int64(0)) { $0.saturatingAdding($1.total) }
+
+        ModelsPresentation(
+            rows: rows, totalCost: totalCost, totalTokens: totalTokens,
+            pricingUpdatedAt: report?.pricingUpdatedAt,
+            awaitingReport: report == nil && loading, colors: colors)
+    }
+}
+
+private struct ModelsPresentation: View {
+    let rows: [ModelReportEntry]
+    let totalCost: Double
+    let totalTokens: Int64
+    let pricingUpdatedAt: UInt64?
+    let awaitingReport: Bool
+    let colors: ModelColorMap
     @State private var hover: HoverState?
     @State private var tooltipSize: CGSize = .zero
     @Environment(\.popoverScrollViewport) private var popoverScrollViewport
@@ -32,15 +55,7 @@ struct ModelsView: View {
         ("CR", { $0.cacheRead }),
         ("CW", { $0.cacheWrite }),
     ]
-
     var body: some View {
-        let allow = Set(clientIds)
-        let rows = (report?.modelLevelEntries ?? [])
-            .filter { allow.contains($0.client) }
-            .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
-        let totalCost = rows.reduce(0) { $0 + $1.cost }
-        let totalTokens = rows.reduce(Int64(0)) { $0.saturatingAdding($1.total) }
-
         DashCard(
             "Models by cost",
             trailing: {
@@ -52,7 +67,7 @@ struct ModelsView: View {
                             rows.count, Format.compactTokens(totalTokens),
                             Format.money(tokens: totalTokens, cost: totalCost)))
                         .foregroundStyle(.secondary)
-                    if let updatedAt = report?.pricingUpdatedAt {
+                    if let updatedAt = pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
                             .foregroundStyle(.tertiary)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
@@ -61,7 +76,7 @@ struct ModelsView: View {
                 .font(NativeDesign.detailFont)
             }
         ) {
-            if rows.isEmpty, report == nil, loading {
+            if rows.isEmpty, awaitingReport {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityLabel("Loading…")

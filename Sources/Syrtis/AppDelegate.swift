@@ -527,13 +527,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quotaRemaining: mode == .quotaLeft ? quotaRemaining : nil,
             stale: mode == .quotaLeft && (trayAnimator?.readingIsStaleNow ?? false))
 
+        let enabledClients = ClientTray.enabled()
         statusController?.reconcileClientItems(ClientTray.runtimePresentations(
             graph: lastGraph,
             payload: trayAnimator?.quota,
-            enabled: ClientTray.enabled(),
+            enabled: enabledClients,
             selections: ClientTray.selections(),
             hidden: ClientRegistry.hiddenTabClients(),
-            officialClients: AgentIconView.availableOfficialClientIDs()))
+            officialClients: enabledClients.isEmpty ? [] : AgentIconView.availableOfficialClientIDs()))
     }
 
     /// Keep default display reports prepared even while every window is closed.

@@ -14,7 +14,8 @@
 //! `:` replaced by `-` for filesystem safety (e.g. `2025-12-14T10-00-00.000Z`).
 
 use super::utils::{
-    file_modified_timestamp_ms, parse_timestamp_str, parse_timestamp_value, read_file_or_none,
+    file_modified_timestamp_ms, open_source_file, parse_timestamp_str, parse_timestamp_value,
+    visit_simd_json_array,
 };
 use super::UnifiedMessage;
 use crate::{provider_identity, TokenBreakdown};
@@ -25,19 +26,23 @@ const DEFAULT_MODEL: &str = "codebuff-unknown";
 
 /// Parse a single `chat-messages.json` file into UnifiedMessages.
 pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {
-    let Some(bytes) = read_file_or_none(path) else {
-        return Vec::new();
-    };
-    let mut bytes = bytes;
-    let root: Value = match simd_json::from_slice(&mut bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+    let mut messages = Vec::new();
+    if visit_codebuff_file(path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
 
-    let messages = match root.as_array() {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
+pub(crate) fn visit_codebuff_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let reader = std::io::BufReader::new(open_source_file(path).map_err(|e| e.to_string())?);
 
     let (channel, project_basename, chat_id) = derive_context_from_path(path);
     let session_id = format!("{}/{}/{}", channel, project_basename, chat_id);
@@ -45,15 +50,17 @@ pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {
     let chat_id_ts = parse_chat_id_to_millis(&chat_id).unwrap_or(0);
     let file_mtime_ms = file_modified_timestamp_ms(path);
 
-    let mut results = Vec::new();
-    for (ordinal, msg) in messages.iter().enumerate() {
-        if !is_assistant_role(msg) {
-            continue;
+    let mut next_ordinal = 0;
+    visit_simd_json_array(reader, &mut |msg: Value| {
+        let ordinal = next_ordinal;
+        next_ordinal += 1;
+        if !is_assistant_role(&msg) {
+            return Ok(());
         }
 
-        let usage = extract_assistant_usage(msg);
+        let usage = extract_assistant_usage(&msg);
         if !usage.has_signal() {
-            continue;
+            return Ok(());
         }
 
         let chat_id_fallback = if chat_id_ts > 0 {
@@ -61,7 +68,7 @@ pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {
         } else {
             None
         };
-        let ts = message_timestamp(msg)
+        let ts = message_timestamp(&msg)
             .or(chat_id_fallback)
             .unwrap_or(file_mtime_ms);
 
@@ -71,10 +78,10 @@ pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let provider = provider_identity::inferred_provider_from_model(&model).unwrap_or("unknown");
 
-        let dedup_key = upstream_message_id(msg)
+        let dedup_key = upstream_message_id(&msg)
             .unwrap_or_else(|| derive_dedup_key(&session_id, ts, &model, &usage, ordinal));
 
-        results.push(UnifiedMessage::new_with_dedup(
+        sink(UnifiedMessage::new_with_dedup(
             "codebuff",
             &model,
             provider,
@@ -90,10 +97,8 @@ pub fn parse_codebuff_file(path: &Path) -> Vec<UnifiedMessage> {
             },
             usage.credits.max(0.0),
             Some(dedup_key),
-        ));
-    }
-
-    results
+        ))
+    })
 }
 
 /// Extract the upstream `ChatMessage.id` if present, so dedup keys remain
@@ -414,6 +419,61 @@ fn pick_number(value: &Value, keys: &[&str]) -> Option<i64> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn visitor_keeps_simd_cost_bits_and_deep_unused_values() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let row = format!(
+            r#"{{"variant":"ai","timestamp":"2025-12-20T12:00:05Z","credits":51.248178375505404,"unused":{}0{}}}"#,
+            "[".repeat(160),
+            "]".repeat(160)
+        );
+        let mut original = format!("[{row}]").into_bytes();
+        let baseline: Vec<Value> = simd_json::from_slice(&mut original).unwrap();
+        let expected = baseline[0]["credits"].as_f64().unwrap().to_bits();
+        assert_eq!(expected, 51.248178375505404_f64.to_bits());
+        std::fs::write(file.path(), format!("[{row}]")).unwrap();
+        let messages = parse_codebuff_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost.to_bits(), expected);
+    }
+    #[test]
+    fn visitor_preserves_original_ordinals_and_aborts_invalid_documents() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let row = serde_json::json!({
+            "variant": "ai", "timestamp": "2025-12-20T12:00:05Z",
+            "metadata": { "model": "gpt-5", "usage": { "inputTokens": 10 } }
+        });
+        let data = serde_json::json!([
+            {"variant": "user"}, null, {"variant": "ai"}, row, row
+        ]);
+        std::fs::write(file.path(), data.to_string()).unwrap();
+        let messages = parse_codebuff_file(file.path());
+        assert_eq!(messages.len(), 2);
+        let (channel, project, chat) = derive_context_from_path(file.path());
+        let session = format!("{channel}/{project}/{chat}");
+        let timestamp = parse_timestamp_str("2025-12-20T12:00:05Z").unwrap();
+        for (message, ordinal) in messages.iter().zip([3, 4]) {
+            assert_eq!(
+                message.dedup_key.as_deref(),
+                Some(format!("codebuff:{session}:{timestamp}:gpt-5:{ordinal}:10:0:0:0").as_str())
+            );
+        }
+        let mut calls = 0;
+        let error = visit_codebuff_file(file.path(), &mut |_| {
+            calls += 1;
+            Err("sink stopped".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("sink stopped"));
+        assert_eq!(calls, 1);
+
+        for malformed in [format!("[{row},"), format!("[{row}] trailing")] {
+            std::fs::write(file.path(), malformed).unwrap();
+            assert!(visit_codebuff_file(file.path(), &mut |_| Ok(())).is_err());
+            assert!(parse_codebuff_file(file.path()).is_empty());
+        }
+    }
 
     #[test]
     fn test_derive_context_from_path_extracts_channel_project_and_chat_id() {

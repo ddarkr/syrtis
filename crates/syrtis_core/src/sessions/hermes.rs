@@ -34,6 +34,22 @@ fn valid_cost(cost: Option<f64>) -> Option<f64> {
 }
 
 pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+    let mut messages = Vec::new();
+    if visit_hermes_sqlite(db_path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
+
+pub(crate) fn visit_hermes_sqlite(
+    db_path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
     let conn = match super::utils::observe_sqlite(Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -45,7 +61,7 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 error = %err,
                 "Failed to open Hermes state database"
             );
-            return Vec::new();
+            return Err(err.to_string());
         }
     };
 
@@ -108,7 +124,7 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 error = %err,
                 "Failed to prepare Hermes session query"
             );
-            return Vec::new();
+            return Err(err.to_string());
         }
     };
 
@@ -137,23 +153,12 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 error = %err,
                 "Failed to execute Hermes session query"
             );
-            return Vec::new();
+            return Err(err.to_string());
         }
     };
 
-    rows.filter_map(|row| match row {
-        Ok(row) => Some(row),
-        Err(err) => {
-            warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "Failed to decode Hermes session row"
-            );
-            None
-        }
-    })
-    .map(
-        |(
+    for row in rows {
+        let (
             session_id,
             model_id,
             billing_provider,
@@ -166,48 +171,100 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             reasoning,
             estimated_cost,
             actual_cost,
-        )| {
-            let provider = resolved_provider(billing_provider, &model_id);
-            let (cost, is_provider_reported, is_estimated) =
-                if let Some(cost) = valid_cost(actual_cost) {
-                    (cost, true, false)
-                } else if let Some(cost) = valid_cost(estimated_cost) {
-                    (cost, false, true)
-                } else {
-                    (0.0, false, false)
-                };
-            let mut msg = UnifiedMessage::new_with_agent(
-                "hermes",
-                model_id,
-                provider,
-                session_id.clone(),
-                timestamp_secs_to_ms(started_at),
-                TokenBreakdown {
-                    input: input.max(0),
-                    output: output.max(0),
-                    cache_read: cache_read.max(0),
-                    cache_write: cache_write.max(0),
-                    reasoning: reasoning.max(0),
-                    cache_write_1h: 0,
-                },
-                cost,
-                Some(HERMES_AGENT_NAME.to_string()),
-            );
-            if is_provider_reported {
-                msg.mark_provider_reported_cost();
-            } else if is_estimated {
-                msg.mark_estimated_cost();
+        ) = match row {
+            Ok(row) => row,
+            Err(err) => {
+                warn!(
+                    db_path = %db_path.display(),
+                    error = %err,
+                    "Failed to decode Hermes session row"
+                );
+                if super::utils::sqlite_read_failed(&err) {
+                    return Err(err.to_string());
+                }
+                continue;
             }
-            msg.message_count = message_count.max(0);
-            msg.dedup_key = Some(session_id);
-            msg
-        },
-    )
-    .collect()
+        };
+        let provider = resolved_provider(billing_provider, &model_id);
+        let (cost, is_provider_reported, is_estimated) = if let Some(cost) = valid_cost(actual_cost)
+        {
+            (cost, true, false)
+        } else if let Some(cost) = valid_cost(estimated_cost) {
+            (cost, false, true)
+        } else {
+            (0.0, false, false)
+        };
+        let mut msg = UnifiedMessage::new_with_agent(
+            "hermes",
+            model_id,
+            provider,
+            session_id.clone(),
+            timestamp_secs_to_ms(started_at),
+            TokenBreakdown {
+                input: input.max(0),
+                output: output.max(0),
+                cache_read: cache_read.max(0),
+                cache_write: cache_write.max(0),
+                reasoning: reasoning.max(0),
+                cache_write_1h: 0,
+            },
+            cost,
+            Some(HERMES_AGENT_NAME.to_string()),
+        );
+        if is_provider_reported {
+            msg.mark_provider_reported_cost();
+        } else if is_estimated {
+            msg.mark_estimated_cost();
+        }
+        msg.message_count = message_count.max(0);
+        msg.dedup_key = Some(session_id);
+        sink(msg)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visitor_skips_invalid_rows_and_stops_on_sink_error() {
+        let (_dir, path) = create_test_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, model, started_at, message_count, input_tokens)
+             VALUES ('first', 'gpt-5', 1700000000, 7, 10),
+                    ('invalid', 'gpt-5', 'not-a-time', 1, 10),
+                    ('last', 'gpt-5', 1700000001, 3, 20);",
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        visit_hermes_sqlite(&path, &mut |message| {
+            rows.push(message);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+        assert_eq!(rows[0].dedup_key.as_deref(), Some("first"));
+        assert_eq!(rows[0].message_count, 7);
+        assert_eq!(rows[0].provider_id, "openai");
+        let mut calls = 0;
+        assert_eq!(
+            visit_hermes_sqlite(&path, &mut |_| {
+                calls += 1;
+                Err("sink stopped".to_string())
+            }),
+            Err("sink stopped".to_string())
+        );
+        assert_eq!(calls, 1);
+        conn.execute_batch("DROP TABLE sessions;").unwrap();
+        assert!(visit_hermes_sqlite(&path, &mut |_| panic!("unexpected row")).is_err());
+        assert!(parse_hermes_sqlite(&path).is_empty());
+    }
+
     use super::*;
     use rusqlite::params;
     use tempfile::TempDir;

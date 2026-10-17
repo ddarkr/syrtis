@@ -229,15 +229,33 @@ fn parse_cost(cost_str: &str) -> f64 {
 /// the real `conversationId`. `.csv` files are the legacy export format and keep
 /// the synthetic per-day session id for backward compatibility.
 pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
-    let is_json = path
+    let mut messages = Vec::new();
+    if visit_cursor_file(path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
+
+pub(crate) fn visit_cursor_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    if path
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-
-    if is_json {
-        parse_cursor_events_json(path)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        visit_cursor_events_json(path, sink)
     } else {
-        parse_cursor_csv_file(path)
+        for message in parse_cursor_csv_file(path) {
+            sink(message)?;
+        }
+        Ok(())
     }
 }
 
@@ -251,100 +269,273 @@ pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
 /// the whole cache. Events with no usable `conversationId` fall back to a
 /// UTC-stable synthetic per-day id so their cost is never dropped from totals.
 pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
-    let content = match super::utils::read_source_text(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    let mut root: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(root) => root,
-        Err(_) => return vec![],
-    };
-
-    let rows = match root
-        .get_mut("usageEventsDisplay")
-        .map(serde_json::Value::take)
-    {
-        Some(serde_json::Value::Array(rows)) => rows,
-        _ => Vec::new(),
-    };
-
-    let account_id = account_id_from_cursor_cache_path(path);
-    let mut messages = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        // Deserialize each row on its own so one malformed entry (an unexpected
-        // type in a single field) skips just that row instead of discarding the
-        // entire cache.
-        let event: CursorUsageEvent = match serde_json::from_value(row) {
-            Ok(event) => event,
-            Err(_) => continue,
-        };
-
-        let model = event.model.unwrap_or_default();
-        let model = model.trim();
-        if model.is_empty() {
-            continue;
-        }
-
-        let timestamp = event
-            .timestamp
-            .as_ref()
-            .map(parse_ms_timestamp)
-            .unwrap_or(0);
-        if timestamp == 0 {
-            continue;
-        }
-
-        // Prefer the real Cursor session UUID; fall back to the legacy synthetic
-        // per-day id only when the event carries no usable conversation id, so
-        // its cost still lands in the account's totals.
-        let session_id = match event.conversation_id.as_deref().map(str::trim) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => format!(
-                "cursor-{}-{}",
-                account_id,
-                timestamp_to_date_with_timezone(timestamp, &chrono::Utc)
-            ),
-        };
-
-        let token_usage = event.token_usage.unwrap_or_default();
-
-        // Cursor reports two different amounts. `tokenUsage.totalCents` is the
-        // metered cost of the event's own tokens; `chargedCents` is what the
-        // wallet was debited. They agree whenever the user pays, and diverge
-        // exactly on plan-included / free-credit rows, where nothing is billed
-        // but the usage still cost something. Prefer the metered figure so those
-        // rows keep Cursor's own number instead of falling through to local
-        // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
-        // and would drop them into the unpriced bucket at $0.00.
-        let metered_cents = finite_non_negative_cents(token_usage.total_cents)
-            .or_else(|| finite_non_negative_cents(event.charged_cents));
-        let cost = metered_cents.map(|cents| cents / 100.0);
-
-        let mut message = UnifiedMessage::new(
-            "cursor",
-            model,
-            infer_provider(model),
-            session_id,
-            timestamp,
-            TokenBreakdown {
-                input: token_usage.input_tokens.unwrap_or(0).max(0),
-                output: token_usage.output_tokens.unwrap_or(0).max(0),
-                cache_read: token_usage.cache_read_tokens.unwrap_or(0).max(0),
-                cache_write: token_usage.cache_write_tokens.unwrap_or(0).max(0),
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-            cost.unwrap_or(0.0).max(0.0),
-        );
-        if cost.is_some() {
-            message.mark_provider_reported_cost();
-        }
+    let mut messages = Vec::new();
+    if visit_cursor_events_json(path, &mut |message| {
         messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
+
+fn visit_cursor_events_json(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    use serde::de::DeserializeSeed;
+    use std::io::{BufReader, Seek, SeekFrom};
+    let mut file = super::utils::open_source_file(path).map_err(|error| error.to_string())?;
+    let mut count = 0;
+    // Validate the complete document before publishing anything, and select the
+    // last duplicate key just as Value's object map did.
+    {
+        let mut decoder = serde_json::Deserializer::from_reader(super::utils::Utf8Reader::new(
+            BufReader::new(&mut file),
+        ));
+        CursorRoot {
+            count: &mut count,
+            target: None,
+            sink: &mut |_| Ok(()),
+        }
+        .deserialize(&mut decoder)
+        .map_err(|error| error.to_string())?;
+        decoder.end().map_err(|error| error.to_string())?;
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let account_id = account_id_from_cursor_cache_path(path);
+    let mut emit = |row| cursor_event_message(row, &account_id, sink);
+    let mut seen = 0;
+    let mut decoder =
+        serde_json::Deserializer::from_reader(super::utils::Utf8Reader::new(BufReader::new(file)));
+    CursorRoot {
+        count: &mut seen,
+        target: Some(count),
+        sink: &mut emit,
+    }
+    .deserialize(&mut decoder)
+    .map_err(|error| error.to_string())?;
+    decoder.end().map_err(|error| error.to_string())
+}
+
+fn cursor_event_message(
+    row: serde_json::Value,
+    account_id: &str,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    // Deserialize each row on its own so one malformed entry (an unexpected
+    // type in a single field) skips just that row instead of discarding the
+    // entire cache.
+    let event: CursorUsageEvent = match serde_json::from_value(row) {
+        Ok(event) => event,
+        Err(_) => return Ok(()),
+    };
+
+    let model = event.model.unwrap_or_default();
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
     }
 
-    messages
+    let timestamp = event
+        .timestamp
+        .as_ref()
+        .map(parse_ms_timestamp)
+        .unwrap_or(0);
+    if timestamp == 0 {
+        return Ok(());
+    }
+
+    // Prefer the real Cursor session UUID; fall back to the legacy synthetic
+    // per-day id only when the event carries no usable conversation id, so
+    // its cost still lands in the account's totals.
+    let session_id = match event.conversation_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => format!(
+            "cursor-{}-{}",
+            account_id,
+            timestamp_to_date_with_timezone(timestamp, &chrono::Utc)
+        ),
+    };
+
+    let token_usage = event.token_usage.unwrap_or_default();
+
+    // Cursor reports two different amounts. `tokenUsage.totalCents` is the
+    // metered cost of the event's own tokens; `chargedCents` is what the
+    // wallet was debited. They agree whenever the user pays, and diverge
+    // exactly on plan-included / free-credit rows, where nothing is billed
+    // but the usage still cost something. Prefer the metered figure so those
+    // rows keep Cursor's own number instead of falling through to local
+    // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
+    // and would drop them into the unpriced bucket at $0.00.
+    let metered_cents = finite_non_negative_cents(token_usage.total_cents)
+        .or_else(|| finite_non_negative_cents(event.charged_cents));
+    let cost = metered_cents.map(|cents| cents / 100.0);
+
+    let mut message = UnifiedMessage::new(
+        "cursor",
+        model,
+        infer_provider(model),
+        session_id,
+        timestamp,
+        TokenBreakdown {
+            input: token_usage.input_tokens.unwrap_or(0).max(0),
+            output: token_usage.output_tokens.unwrap_or(0).max(0),
+            cache_read: token_usage.cache_read_tokens.unwrap_or(0).max(0),
+            cache_write: token_usage.cache_write_tokens.unwrap_or(0).max(0),
+            cache_write_1h: 0,
+            reasoning: 0,
+        },
+        cost.unwrap_or(0.0).max(0.0),
+    );
+    if cost.is_some() {
+        message.mark_provider_reported_cost();
+    }
+    sink(message)
+}
+
+struct CursorRoot<'a> {
+    count: &'a mut usize,
+    target: Option<usize>,
+    sink: &'a mut dyn FnMut(serde_json::Value) -> Result<(), String>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for CursorRoot<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CursorRoot<'_> {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a Cursor usage document")
+    }
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "usageEventsDisplay" {
+                *self.count += 1;
+                if self.target == Some(*self.count) {
+                    map.next_value_seed(CursorRows(self.sink))?;
+                    continue;
+                }
+            }
+            map.next_value::<CursorDiscard>()?;
+        }
+        Ok(())
+    }
+    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
+        while seq.next_element::<CursorDiscard>()?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+struct CursorRows<'a>(&'a mut dyn FnMut(serde_json::Value) -> Result<(), String>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for CursorRows<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CursorRows<'_> {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("Cursor usage rows")
+    }
+    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
+        while let Some(row) = seq.next_element::<serde_json::Value>()? {
+            (self.0)(row).map_err(serde::de::Error::custom)?;
+        }
+        Ok(())
+    }
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        while map.next_entry::<String, CursorDiscard>()?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+// deserialize_any validates numbers as Value did, but retains no unknown tree.
+struct CursorDiscard;
+
+impl<'de> Deserialize<'de> for CursorDiscard {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        decoder.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CursorDiscard {
+    type Value = Self;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self, M::Error> {
+        while map.next_entry::<String, Self>()?.is_some() {}
+        Ok(Self)
+    }
+    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self, S::Error> {
+        while seq.next_element::<Self>()?.is_some() {}
+        Ok(Self)
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self, E> {
+        Ok(Self)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self, E> {
+        Ok(Self)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self, E> {
+        Ok(Self)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self, E> {
+        Ok(Self)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self, E> {
+        Ok(Self)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(Self)
+    }
 }
 
 /// Parse a Cursor usage CSV file
@@ -545,6 +736,45 @@ fn parse_date_to_timestamp(date_str: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_events_select_last_key_skip_bad_rows_and_validate_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.json");
+        let row = r#"{"timestamp":"1735689600000","model":"gpt-4o","conversationId":"kept","tokenUsage":{"inputTokens":7,"totalCents":25},"chargedCents":99}"#;
+        let document = format!(
+            r#"{{"usageEventsDisplay":[{{"model":"discarded"}}],"partial":true,"usageEventsDisplay":[{{"model":false}},{row},null,{row}],"other":{{"nested":[1,2]}}}}"#
+        );
+        std::fs::write(&path, &document).unwrap();
+        let messages = parse_cursor_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].session_id, "kept");
+        assert_eq!(messages[0].tokens.input, 7);
+        assert_eq!(messages[0].cost, 0.25);
+        let mut calls = 0;
+        assert!(visit_cursor_file(&path, &mut |_| {
+            calls += 1;
+            Err("sink stopped".into())
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+        std::fs::write(&path, format!("{document} trailing")).unwrap();
+        calls = 0;
+        assert!(visit_cursor_file(&path, &mut |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        std::fs::write(&path, format!(r#"{{"usageEventsDisplay":[{row},"#)).unwrap();
+        assert!(parse_cursor_file(&path).is_empty());
+        std::fs::write(
+            &path,
+            format!(r#"{{"usageEventsDisplay":[{row}],"usageEventsDisplay":null}}"#),
+        )
+        .unwrap();
+        assert!(parse_cursor_file(&path).is_empty());
+    }
 
     #[test]
     fn test_infer_provider() {
@@ -782,6 +1012,96 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn ignored_fields_validate_utf8_before_emission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let body = format!(
+            r#"{{"usageEventsDisplay":[{}],"ignored":"λ"}}"#,
+            full_event("1760000000000", "gpt-5", "conv-a", 100, 12.5),
+        );
+        let path = write_usage(dir.path(), "usage.json", &body);
+        assert_eq!(parse_cursor_events_json(&path).len(), 1);
+        let mut invalid = body.into_bytes();
+        let index = invalid.iter().position(|byte| *byte == 0xce).unwrap();
+        invalid[index] = 0xff;
+        std::fs::write(&path, invalid).unwrap();
+        let mut emitted = 0;
+        assert!(visit_cursor_events_json(&path, &mut |_| {
+            emitted += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(emitted, 0);
+        assert!(parse_cursor_events_json(&path).is_empty());
+    }
+
+    #[test]
+    fn ignored_scalars_reject_whole_document_before_emission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let event = full_event("1760000000000", "gpt-5", "conv-a", 100, 12.5);
+        for invalid in [r#"1e400"#, r#""\uD800""#, r#""\uDC00""#, r#"{"\uD800":0}"#] {
+            for body in [
+                format!(r#"{{"usageEventsDisplay":[{event}],"ignored":{invalid}}}"#),
+                format!(r#"{{"usageEventsDisplay":[{event},{invalid}]}}"#),
+                format!(r#"{{"usageEventsDisplay":[{invalid}],"usageEventsDisplay":[{event}]}}"#),
+            ] {
+                assert!(serde_json::from_str::<serde_json::Value>(&body).is_err());
+                let path = write_usage(dir.path(), "usage.json", &body);
+                let mut emitted = 0;
+                assert!(
+                    visit_cursor_events_json(&path, &mut |_| {
+                        emitted += 1;
+                        Ok(())
+                    })
+                    .is_err(),
+                    "{body}"
+                );
+                assert_eq!(emitted, 0);
+                assert!(parse_cursor_events_json(&path).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_nesting_matches_original_value_recursion_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let event = full_event("1760000000000", "gpt-5", "conv-a", 100, 12.5);
+        for depth in 0..=140 {
+            let nested = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+            for body in [
+                format!(r#"{{"usageEventsDisplay":[{event}],"ignored":{nested}}}"#),
+                format!(r#"{{"usageEventsDisplay":[{event},{nested}]}}"#),
+            ] {
+                let accepted = serde_json::from_str::<serde_json::Value>(&body).is_ok();
+                let path = write_usage(dir.path(), "usage.json", &body);
+                let mut emitted = 0;
+                let result = visit_cursor_events_json(&path, &mut |_| {
+                    emitted += 1;
+                    Ok(())
+                });
+                assert_eq!(result.is_ok(), accepted, "depth {depth}");
+                assert_eq!(emitted, usize::from(accepted), "depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_validation_preserves_last_rows_and_default_number_conversion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let body = r#"{"usageEventsDisplay":[{"model":"discarded"}],"ignored":[null,true,false,-1,18446744073709551616,1.2345678901234567,"\uD83D\uDE00"],"usageEventsDisplay":[false,{"model":3},{"timestamp":"1760000000000","model":"old","model":"gpt-5","conversationId":"conv-a","tokenUsage":{"inputTokens":1,"inputTokens":12.75,"totalCents":1.2345678901234567}}]}"#;
+        let original: serde_json::Value = serde_json::from_str(body).unwrap();
+        let path = write_usage(dir.path(), "usage.json", body);
+        let messages = parse_cursor_events_json(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5");
+        assert_eq!(messages[0].session_id, "conv-a");
+        assert_eq!(messages[0].tokens.input, 12);
+        let cents = original["usageEventsDisplay"][2]["tokenUsage"]["totalCents"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(messages[0].cost.to_bits(), (cents / 100.0).to_bits());
     }
 
     #[test]

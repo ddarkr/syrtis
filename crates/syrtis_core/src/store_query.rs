@@ -4312,4 +4312,69 @@ mod tests {
         assert!(inputs(&reader, "pi", None, None).is_empty());
         reader.unpin().unwrap();
     }
+    #[test]
+    fn streamed_array_invalid_tail_discards_staged_prefix() {
+        for tail in [b",".as_slice(), b",\"\xff\"]".as_slice()] {
+            let root = TempDir::new().unwrap();
+            let cache_root = root.path().join("cache");
+            let mut cache = SourceMessageCache::open_from_root(Some(&cache_root));
+            cache.ensure_open().unwrap();
+            let context = ResolvedLocalSourceContext::capture(
+                Some(root.path().join("home")),
+                false,
+                crate::scanner::ScannerSettings::default(),
+            )
+            .unwrap();
+            let source = root.path().join("chat-messages.json");
+            let mut bytes = br#"[{"variant":"ai","timestamp":"2025-12-20T12:00:05Z","metadata":{"model":"gpt-5","usage":{"inputTokens":10}}}"#.to_vec();
+            bytes.extend(std::iter::repeat_n(b' ', 16_384));
+            bytes.extend_from_slice(tail);
+            std::fs::write(&source, bytes).unwrap();
+            let staged = query(&cache_root);
+            let mut snapshot = staged
+                .begin_scope(
+                    &cache_root,
+                    &context,
+                    &["codebuff".into()],
+                    None,
+                    SelectionMode::Report,
+                )
+                .unwrap();
+            let emitted = std::cell::Cell::new(0);
+            let identity = CacheIdentity::for_client(ClientId::Codebuff);
+            let result = ingest_sources_streamed(
+                &staged,
+                &mut cache,
+                identity,
+                std::slice::from_ref(&source),
+                "codebuff",
+                SelectionMode::Report,
+                SourceFingerprint::from_path_samples_only,
+                |path, sink| {
+                    sessions::codebuff::visit_codebuff_file(path, &mut |message| {
+                        emitted.set(emitted.get() + 1);
+                        sink(message)
+                    })
+                },
+                |_| false,
+                false,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                emitted.get(),
+                1,
+                "exercise rollback after a valid emitted prefix"
+            );
+            assert!(cache.metadata(identity, &source).unwrap().is_none());
+            staged.publish(&mut snapshot).unwrap();
+            let reader = query(&cache_root);
+            reader.pin(&snapshot).unwrap();
+            reader.replay_snapshot(&snapshot).unwrap();
+            reader
+                .select_lane("codebuff", SelectionMode::Report, false)
+                .unwrap();
+            assert!(inputs(&reader, "codebuff", None, None).is_empty());
+            reader.unpin().unwrap();
+        }
+    }
 }

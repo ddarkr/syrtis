@@ -1,18 +1,43 @@
 use super::UnifiedMessage;
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub fn parse_antigravity_file(path: &Path) -> Vec<UnifiedMessage> {
-    let content = match super::utils::read_source_text(path) {
-        Ok(content) => content,
-        Err(_) => return Vec::new(),
-    };
-
     let mut messages = Vec::new();
-    let mut session_model: Option<String> = None;
+    match visit_antigravity_file(path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    }) {
+        Ok(()) => messages,
+        Err(_) => Vec::new(),
+    }
+}
 
-    for line in content.lines() {
+pub(crate) fn visit_antigravity_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let file = super::utils::open_source_file(path).map_err(|error| error.to_string())?;
+    visit_antigravity_reader(BufReader::new(file), sink)
+}
+
+fn visit_antigravity_reader(
+    mut reader: impl BufRead,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut session_model: Option<String> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -35,14 +60,14 @@ pub fn parse_antigravity_file(path: &Path) -> Vec<UnifiedMessage> {
             }
             "usage" => {
                 if let Some(message) = parse_usage_row(&value, session_model.as_deref()) {
-                    messages.push(message);
+                    sink(message)?;
                 }
             }
             _ => {}
         }
     }
 
-    messages
+    Ok(())
 }
 
 fn parse_usage_row(value: &Value, fallback_model: Option<&str>) -> Option<UnifiedMessage> {
@@ -124,6 +149,89 @@ fn to_safe_i64(value: Option<&Value>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visitor_preserves_model_transitions_and_explicit_precedence() {
+        let input = concat!(
+            "{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":1,\"input\":1}\n",
+            "{\"type\":\"session_meta\",\"modelId\":\"claude-sonnet-4.6\"}\n",
+            "malformed json\n",
+            "{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":2,\"input\":2,\"responseId\":\"r\"}\n",
+            "{\"type\":\"session_meta\",\"modelId\":\" \"}\n",
+            "{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":3,\"input\":3,\"modelId\":\"gemini-3.1-pro\",\"providerId\":\"google\"}\n",
+            "{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":4,\"input\":4}\n",
+            "{\"type\":\"session_meta\",\"modelId\":\"gemini-3.1-pro\"}\n",
+            "{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":5,\"input\":5}\n",
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), input).unwrap();
+        let messages = parse_antigravity_file(file.path());
+        assert_eq!(messages.len(), 5);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.model_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "unknown",
+                "claude-sonnet-4-6",
+                "gemini-3.1-pro",
+                "claude-sonnet-4-6",
+                "gemini-3.1-pro"
+            ]
+        );
+        assert_eq!(messages[1].dedup_key.as_deref(), Some("r"));
+        assert_eq!(messages[1].provider_id, "anthropic");
+        assert_eq!(messages[2].provider_id, "google");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.input)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn visitor_propagates_read_utf8_and_sink_failures() {
+        use std::io::{self, Cursor, Read};
+
+        struct ReadFailure;
+        impl Read for ReadFailure {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+
+        let row = b"{\"type\":\"usage\",\"sessionId\":\"s\",\"timestamp\":1,\"input\":1}\n";
+        let mut emitted = 0;
+        let result = visit_antigravity_reader(
+            BufReader::new(Cursor::new(row).chain(ReadFailure)),
+            &mut |_| {
+                emitted += 1;
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("injected read failure"));
+        assert_eq!(emitted, 1);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut invalid = row.to_vec();
+        invalid.extend_from_slice(b"\xff\n");
+        std::fs::write(file.path(), invalid).unwrap();
+        assert!(visit_antigravity_file(file.path(), &mut |_| Ok(())).is_err());
+        assert!(parse_antigravity_file(file.path()).is_empty());
+
+        std::fs::write(file.path(), [row.as_slice(), row.as_slice()].concat()).unwrap();
+        let mut calls = 0;
+        let error = visit_antigravity_file(file.path(), &mut |_| {
+            calls += 1;
+            Err("sink rejected".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "sink rejected");
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn parse_usage_row_with_meta_fallback() {

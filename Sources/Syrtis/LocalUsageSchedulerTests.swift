@@ -171,7 +171,8 @@ private actor SchedulerFixtureSource: UsageDataSource {
         for (count, observer) in releaseObservers where releases.count >= count { observer.resume() }
         releaseObservers.removeAll { releases.count >= $0.0 }
     }
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+    func windowUsage(_ encoded: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        let request = encoded.request
         guard let token = request.snapshotToken else { throw Failure.unexpectedLegacyCall }
         let capturedGeneration = generation
         if pauseNextWindow {

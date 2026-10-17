@@ -1,5 +1,21 @@
 import Foundation
 
+/// Immutable wire ownership shared by scheduler flight keys and the native call.
+/// The terminator is appended before these bytes gain any shared owners.
+public struct EncodedWindowUsageRequest: Sendable {
+    public let request: WindowUsageRequest
+    public let canonicalBytes: Data
+
+    public init(_ request: WindowUsageRequest) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var bytes = try encoder.encode(request)
+        bytes.append(0)
+        self.request = request
+        self.canonicalBytes = bytes
+    }
+}
+
 /// One exact account query. Provider policy and Unicode model matching stay in Swift.
 public struct WindowUsageRequest: Codable, Equatable, Sendable {
     public var accountKey: String?

@@ -541,11 +541,16 @@ enum WindowCardLoader {
         // No guard for an unobserved case, twice implemented wrongly, each
         // time causing the failure that IS observed. If a mixed-cycle window
         // ever appears, the fix belongs where the cycle is known: the engine.
-        let persisted = curve.points
-            .filter { $0.sampledAt >= lo && $0.sampledAt <= hi }
-            .sorted { $0.sampledAt < $1.sampledAt }
-            .map { QuotaSample(atMs: $0.sampledAt * 1000, usedPercent: $0.usedPercent) }
-        return persisted + liveReading(window: window, after: persisted.last, nowMs: nowMs)
+        var samples: [QuotaSample] = []
+        samples.reserveCapacity(curve.points.count + 1)
+        for point in curve.points where point.sampledAt >= lo && point.sampledAt <= hi {
+            samples.append(QuotaSample(
+                atMs: point.sampledAt * 1000, usedPercent: point.usedPercent))
+        }
+        if let live = liveReading(window: window, after: samples.last, nowMs: nowMs) {
+            samples.append(live)
+        }
+        return samples
     }
 
     /// The reading the payload is carrying right now, which the store may not
@@ -566,13 +571,13 @@ enum WindowCardLoader {
     /// would claim a measurement nobody took.
     private static func liveReading(
         window: UsageWindow, after last: QuotaSample?, nowMs: Int64
-    ) -> [QuotaSample] {
+    ) -> QuotaSample? {
         let used = window.usedPercent
-        guard used > 0, used <= 100 else { return [] }
+        guard used > 0, used <= 100 else { return nil }
         if let last, last.atMs >= nowMs || abs(last.usedPercent - used) < 0.000_001 {
-            return []
+            return nil
         }
-        return [QuotaSample(atMs: nowMs, usedPercent: used)]
+        return QuotaSample(atMs: nowMs, usedPercent: used)
     }
 }
 

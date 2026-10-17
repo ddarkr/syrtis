@@ -955,12 +955,12 @@ enum WindowProbe {
                 let capture = WindowUsageRequest(
                     accountKey: accountKey, fromMs: fromMs, untilMs: untilMs,
                     includeModelCatalog: true)
-                snapshot = try await live.windowUsage(capture)
+                snapshot = try await live.windowUsage(EncodedWindowUsageRequest(capture))
                 accounts[key] = snapshot
                 try snapshot.validate(capture)
             }
             let job = request(snapshot)
-            let result = try await live.windowUsage(job)
+            let result = try await live.windowUsage(EncodedWindowUsageRequest(job))
             try result.validate(job)
             guard result.snapshotToken == snapshot.snapshotToken,
                   result.sourceGeneration == snapshot.sourceGeneration,

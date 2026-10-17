@@ -32,9 +32,6 @@ struct DailyView: View {
 
     @State private var openDate: String?
     @State private var expansionOwner = UUID()
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
 
     struct DayRow {
         let date: String
@@ -42,7 +39,6 @@ struct DailyView: View {
         let cost: Double
         let messages: Int
         let turns: Int64?
-        let contribution: Contribution
     }
 
     struct ModelSlice {
@@ -59,12 +55,6 @@ struct DailyView: View {
         var cost: Double
     }
 
-    private struct HoverState {
-        let slice: ModelSlice
-        let point: CGPoint
-    }
-
-    private static let rowsSpace = "daily-model-rows"
 
     private static func tokenTotal(_ t: TokenBreakdown) -> Int64 {
         // Delegate to the shared saturating sum (was a plain-`+` 4th copy).
@@ -89,7 +79,7 @@ struct DailyView: View {
             let turns = c.turns(for: turnClientIds)
             return DayRow(
                 date: c.date, tokens: tokens, cost: cost, messages: messages,
-                turns: turns, contribution: c)
+                turns: turns)
         }
         .sorted { $0.date > $1.date }
     }
@@ -123,7 +113,38 @@ struct DailyView: View {
     }
 
     var body: some View {
-        let rows = self.rows
+        DailyPresentation(
+            rows: rows,
+            expandedModels: openDate.flatMap { date in
+                payload.contributions.first { $0.date == date }.map { models(for: $0) }
+            } ?? [],
+            turnClientIds: turnClientIds,
+            openDate: $openDate,
+            expansionOwner: expansionOwner,
+            onExpandedChanged: onExpandedChanged)
+    }
+}
+
+private struct DailyPresentation: View {
+    typealias DayRow = DailyView.DayRow
+    typealias ModelSlice = DailyView.ModelSlice
+
+    let rows: [DayRow]
+    let expandedModels: [ModelSlice]
+    let turnClientIds: [String]
+    @Binding var openDate: String?
+    let expansionOwner: UUID
+    var onExpandedChanged: ((UUID, Bool) -> Void)?
+    @State private var hover: HoverState?
+    @State private var tooltipSize: CGSize = .zero
+    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
+    private struct HoverState {
+        let slice: ModelSlice
+        let point: CGPoint
+    }
+
+    private static let rowsSpace = "daily-model-rows"
+    var body: some View {
         DashCard(
             "Daily",
             subtitle: TurnCountBuckets.scope(turnClientIds),
@@ -193,7 +214,7 @@ struct DailyView: View {
 
             if isOpen {
                 VStack(spacing: 4) {
-                    ForEach(models(for: row.contribution), id: \.key) { slice in
+                    ForEach(expandedModels, id: \.key) { slice in
                         let isHovered = hover?.slice.key == slice.key
                         HStack(spacing: 8) {
                             Circle()

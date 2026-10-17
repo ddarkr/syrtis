@@ -49,19 +49,47 @@ public enum DayBars {
         today: String
     ) -> [DayBar] {
         let allowed = Set(clientIds)
-        var byDate: [String: DayBar] = [:]
-        for contribution in payload.contributions {
-            let day = dayBar(contribution, allowed: allowed, stackBy: stackBy, colors: colors)
-            if day.totalTokens > 0 || day.totalCost > 0 { byDate[day.date] = day }
+        // The anchor needs only selected metric presence, not model segments.
+        // Eligible rows have at least one positive metric, so retain the same
+        // grouped/saturating sums when deciding whether a historical day counts.
+        func hasActivity(_ contribution: Contribution) -> Bool {
+            var grouped: [String: (tokens: Int64, cost: Double)] = [:]
+            for client in contribution.clients where allowed.contains(client.client) {
+                let tokens = client.tokens.total
+                guard tokens > 0 || client.cost > 0 else { continue }
+                let key = stackBy == .model
+                    ? (client.modelId.isEmpty ? "unknown" : ModelGrouping.groupID(client.modelId))
+                    : client.client
+                var slot = grouped[key] ?? (0, 0)
+                slot.tokens = slot.tokens.saturatingAdding(tokens)
+                slot.cost += client.cost
+                grouped[key] = slot
+            }
+            var tokens: Int64 = 0
+            var cost = 0.0
+            for key in grouped.keys.sorted() {
+                let slot = grouped[key]!
+                tokens = tokens.saturatingAdding(slot.tokens)
+                cost += slot.cost
+            }
+            return tokens > 0 || cost > 0
         }
 
         let end: String
         if let year, year != String(today.prefix(4)) {
-            end = byDate.keys.max() ?? (rangeEnd.isEmpty ? "\(year)-12-31" : rangeEnd)
+            end = payload.contributions.lazy.filter { hasActivity($0) }.map(\.date).max()
+                ?? (rangeEnd.isEmpty ? "\(year)-12-31" : rangeEnd)
         } else {
             end = today
         }
         guard let endDay = ISODay(end) else { return [] }
+        let start = ISODay(number: endDay.number - (window - 1)).iso
+        var byDate: [String: DayBar] = [:]
+        for contribution in payload.contributions
+            where contribution.date >= start && contribution.date <= end {
+            let day = dayBar(contribution, allowed: allowed, stackBy: stackBy, colors: colors)
+            if day.totalTokens > 0 || day.totalCost > 0 { byDate[day.date] = day }
+        }
         return (0..<window).map { i in
             let date = ISODay(number: endDay.number - (window - 1) + i).iso
             return byDate[date] ?? DayBar(date: date, segments: [])

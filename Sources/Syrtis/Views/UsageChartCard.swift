@@ -78,10 +78,6 @@ struct UsageChartCard: View {
     /// this used to duplicate (the exact kind of hardcoded state-name string
     /// this round's audit went looking for).
     @AppStorage("tokenbar.chart.view") private var chartViewRaw = ChartView.bars.rawValue
-    @State private var hoverIndex: Int?
-    @State private var hoverPoint: CGPoint = .zero
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
 
     private static let legendMax = 12
 
@@ -104,11 +100,9 @@ struct UsageChartCard: View {
     private var gridYear: String { year ?? String(Format.todayKey().prefix(4)) }
 
     var body: some View {
-        let bars = self.bars
-        let legend = DayBars.legend(bars: bars, metric: metric)
-        let showsTooltip = hoverIndex.map {
-            bars.indices.contains($0) && !bars[$0].isEmpty
-        } ?? false
+        let bars = chartView == .bars ? self.bars : []
+        let legend = chartView == .bars ? DayBars.legend(bars: bars, metric: metric) : []
+        UsageChartTooltipLayer { showsTooltip in
         DashCard(
             "Token Usage",
             subtitle: (is3D || isHeatmap)
@@ -135,7 +129,9 @@ struct UsageChartCard: View {
                     .panelCrossfade(metricRaw)
             } else {
                 legendView(legend)
-                chart(bars)
+                UsageBarsChart(
+                    bars: bars, metric: metric, metricRaw: metricRaw,
+                    stackByRaw: stackByRaw, showsTooltip: showsTooltip)
                 HStack {
                     axisLabel(bars.first?.date)
                     Spacer()
@@ -143,8 +139,8 @@ struct UsageChartCard: View {
                 }
             }
         }
-        .zIndex(showsTooltip ? 1 : 0)
         .panelSwitchAnimation("\(chartViewRaw)|\(stackByRaw)|\(metricRaw)")
+        }
     }
 
     // MARK: - Header toggles
@@ -214,9 +210,42 @@ struct UsageChartCard: View {
         }
     }
 
-    // MARK: - Chart
+    private func axisLabel(_ date: String?) -> some View {
+        Text(date.map(Format.monthDay) ?? "")
+            .font(NativeDesign.detailFont)
+            .foregroundStyle(.tertiary)
+    }
+}
+private struct UsageChartTooltipLayer<Content: View>: View {
+    @State private var showsTooltip = false
+    let content: (Binding<Bool>) -> Content
 
-    private func chart(_ bars: [DayBar]) -> some View {
+    var body: some View {
+        content($showsTooltip)
+            .zIndex(showsTooltip ? 1 : 0)
+    }
+}
+
+
+/// Hover belongs to the rendered window, not the history/legend builder.
+private struct UsageBarsChart: View {
+    let bars: [DayBar]
+    let metric: ChartMetric
+    let metricRaw: String
+    let stackByRaw: String
+    @Binding var showsTooltip: Bool
+    @State private var hoverIndex: Int?
+    @State private var hoverPoint: CGPoint = .zero
+    @State private var tooltipSize: CGSize = .zero
+    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
+
+    private var tooltipIndex: Int? {
+        guard let hoverIndex, bars.indices.contains(hoverIndex),
+              !bars[hoverIndex].isEmpty else { return nil }
+        return hoverIndex
+    }
+
+    var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
             let barWidth = (width - UsageChartGeometry.gap * CGFloat(max(bars.count - 1, 0)))
@@ -235,8 +264,7 @@ struct UsageChartCard: View {
             ZStack(alignment: .topLeading) {
                 canvas(bars: bars, barWidth: barWidth, maxValue: maxValue)
                     .panelChartRegrow("\(metricRaw)|\(stackByRaw)")
-                if let index = hoverIndex, bars.indices.contains(index),
-                   !bars[index].isEmpty {
+                if let index = tooltipIndex {
                     let bar = bars[index]
                     let total = barTotal(bar)
                     if total > 0 {
@@ -277,6 +305,13 @@ struct UsageChartCard: View {
             }
         }
         .frame(height: UsageChartGeometry.chartHeight)
+        .onChange(of: tooltipIndex != nil, initial: true) {
+            showsTooltip = tooltipIndex != nil
+        }
+        .onDisappear {
+            hoverIndex = nil
+            showsTooltip = false
+        }
     }
 
     private func canvas(bars: [DayBar], barWidth: CGFloat, maxValue: Double) -> some View {
@@ -312,11 +347,6 @@ struct UsageChartCard: View {
         }
     }
 
-    private func axisLabel(_ date: String?) -> some View {
-        Text(date.map(Format.monthDay) ?? "")
-            .font(NativeDesign.detailFont)
-            .foregroundStyle(.tertiary)
-    }
 
     private func barTotal(_ bar: DayBar) -> Double {
         metric == .cost ? bar.totalCost : Double(bar.totalTokens)

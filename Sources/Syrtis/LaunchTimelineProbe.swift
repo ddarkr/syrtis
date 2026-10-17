@@ -238,7 +238,7 @@ private final class TimedSource: UsageDataSource, @unchecked Sendable {
         return try await live.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await live.tokensPerMin() }
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
         try await live.windowUsage(request)
     }
     func releaseWindowUsage(_ snapshotToken: String) async {

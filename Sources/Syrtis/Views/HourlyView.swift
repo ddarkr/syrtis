@@ -70,79 +70,84 @@ struct HourlyView: View {
     }
 
     var body: some View {
-        let buckets = self.buckets
-        let timeline = self.timeline
-        let hasData = mode == .profile
-            ? buckets.contains { $0.tokens > 0 || $0.cost > 0 }
-            : !timeline.isEmpty
+        Group {
+            if mode == .profile {
+                profileCard
+            } else {
+                timelineCard
+            }
+        }
+        .onChange(of: modeRaw) {
+            visible = Self.timelineInitial
+        }
+    }
 
-        DashCard(
-            mode == .profile ? "Hourly rhythm" : "Hourly usage",
-            subtitle: subtitle(buckets: buckets, timeline: timeline, hasData: hasData),
-            trailing: { modeToggle }
-        ) {
+    private var profileCard: some View {
+        let buckets = self.buckets
+        let hasData = buckets.contains { $0.tokens > 0 || $0.cost > 0 }
+        let peak = buckets.max { $0.tokens < $1.tokens } ?? buckets[0]
+        let cost = buckets.reduce(0) { $0 + $1.cost }
+        let subtitle = hasData
+            ? "peak %02lld:00 · %@".localized(peak.hour, Format.usd(cost)) : "—"
+        return hourlyCard(title: "Hourly rhythm", subtitle: subtitle, hasData: hasData) {
+            let maxTokens = max(buckets.map(\.tokens).max() ?? 1, 1)
+            VStack(spacing: 3) {
+                ForEach(buckets, id: \.hour) { b in
+                    hourRow(
+                        label: String(format: "%02d:00", b.hour),
+                        tokens: b.tokens, cost: b.cost, maxTokens: maxTokens,
+                        isCurrent: false)
+                }
+            }
+        }
+    }
+
+    private var timelineCard: some View {
+        let timeline = self.timeline
+        let cost = timeline.reduce(0) { $0 + $1.cost }
+        let subtitle = timeline.isEmpty
+            ? "—" : "%lld hrs · %@".localized(timeline.count, Format.usd(cost))
+        return hourlyCard(title: "Hourly usage", subtitle: subtitle, hasData: !timeline.isEmpty) {
+            let shown = Array(timeline.prefix(visible))
+            let maxTokens = max(timeline.map(\.total).max() ?? 1, 1)
+            let now = nowKey
+            LazyVStack(spacing: 3) {
+                ForEach(shown, id: \.hour) { e in
+                    hourRow(
+                        label: String(e.hour.dropFirst(5)),
+                        tokens: e.total, cost: e.cost, maxTokens: maxTokens,
+                        isCurrent: e.hour == now)
+                }
+            }
+            if timeline.count > visible {
+                let remaining = min(Self.timelineStep, timeline.count - visible)
+                Button(
+                    "Show %lld more · %lld of %lld".localized(
+                        Int64(remaining), Int64(visible), Int64(timeline.count))
+                ) {
+                    visible = min(visible + Self.timelineStep, timeline.count)
+                }
+                .buttonStyle(.plain)
+                .font(NativeDesign.detailFont.weight(.medium))
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func hourlyCard<Content: View>(
+        title: String, subtitle: String, hasData: Bool,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        DashCard(title, subtitle: subtitle, trailing: { modeToggle }) {
             if report == nil {
                 LoadingLine(title: "Loading…")
             } else if !hasData {
                 Text("No usage in this range")
                     .font(NativeDesign.detailFont)
                     .foregroundStyle(.secondary)
-            } else if mode == .profile {
-                let maxTokens = max(buckets.map(\.tokens).max() ?? 1, 1)
-                VStack(spacing: 3) {
-                    ForEach(buckets, id: \.hour) { b in
-                        hourRow(
-                            label: String(format: "%02d:00", b.hour),
-                            tokens: b.tokens, cost: b.cost, maxTokens: maxTokens,
-                            isCurrent: false)
-                    }
-                }
             } else {
-                let shown = Array(timeline.prefix(visible))
-                let maxTokens = max(timeline.map(\.total).max() ?? 1, 1)
-                let now = nowKey
-                LazyVStack(spacing: 3) {
-                    ForEach(shown, id: \.hour) { e in
-                        hourRow(
-                            // "YYYY-MM-DD HH:00" → "MM-DD HH:00"
-                            label: String(e.hour.dropFirst(5)),
-                            tokens: e.total, cost: e.cost, maxTokens: maxTokens,
-                            isCurrent: e.hour == now)
-                    }
-                }
-                if timeline.count > visible {
-                    let remaining = min(Self.timelineStep, timeline.count - visible)
-                    Button(
-                        "Show %lld more · %lld of %lld".localized(
-                            Int64(remaining), Int64(visible), Int64(timeline.count))
-                    ) {
-                        visible = min(visible + Self.timelineStep, timeline.count)
-                    }
-                    .buttonStyle(.plain)
-                    .font(NativeDesign.detailFont.weight(.medium))
-                    .foregroundStyle(.secondary)
-                }
+                content()
             }
-        }
-        .onChange(of: modeRaw) {
-            // Reset the window when switching back to timeline so we don't
-            // keep a huge list mounted.
-            visible = Self.timelineInitial
-        }
-    }
-
-    private func subtitle(buckets: [HourBucket], timeline: [HourlyReportEntry], hasData: Bool)
-        -> String
-    {
-        guard hasData else { return "—" }
-        switch mode {
-        case .profile:
-            let peak = buckets.max { $0.tokens < $1.tokens } ?? buckets[0]
-            let cost = buckets.reduce(0) { $0 + $1.cost }
-            return "peak %02lld:00 · %@".localized(peak.hour, Format.usd(cost))
-        case .timeline:
-            let cost = timeline.reduce(0) { $0 + $1.cost }
-            return "%lld hrs · %@".localized(timeline.count, Format.usd(cost))
         }
     }
 

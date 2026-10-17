@@ -20,9 +20,6 @@ struct MonthlyView: View {
 
     @State private var openMonth: String?
     @State private var expansionOwner = UUID()
-    @State private var hover: HoverState?
-    @State private var tooltipSize: CGSize = .zero
-    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
 
     struct MonthRow {
         let month: String  // "YYYY-MM"
@@ -30,7 +27,6 @@ struct MonthlyView: View {
         var cost: Double
         var messages: Int
         var turns: Int64?
-        var contributions: [Contribution]
     }
 
     struct ModelSlice {
@@ -47,12 +43,6 @@ struct MonthlyView: View {
         var cost: Double
     }
 
-    private struct HoverState {
-        let slice: ModelSlice
-        let point: CGPoint
-    }
-
-    private static let rowsSpace = "monthly-model-rows"
 
     /// Pure bucketing, internal (not private) so SelfTest can pin it.
     static func monthRows(
@@ -75,7 +65,7 @@ struct MonthlyView: View {
             var slot = grouped[month]
                 ?? MonthRow(
                     month: month, tokens: 0, cost: 0, messages: 0,
-                    turns: nil, contributions: [])
+                    turns: nil)
             slot.tokens = slot.tokens.saturatingAdding(tokens)
             slot.cost += cost
             slot.messages += messages
@@ -84,7 +74,6 @@ struct MonthlyView: View {
             if let dayTurns = c.turns(for: turnClientIds) {
                 slot.turns = (slot.turns ?? 0).saturatingAdding(dayTurns)
             }
-            slot.contributions.append(c)
             grouped[month] = slot
         }
         return grouped.values.sorted { $0.month > $1.month }
@@ -93,11 +82,20 @@ struct MonthlyView: View {
     /// Drill-down: merge model slices across the month's days (Daily merges
     /// within ONE contribution; Monthly must fold ~31 of them).
     static func modelSlices(
-        for row: MonthRow, clientIds: [String], colors: ModelColorMap
+        for month: String, payload: UsagePayload, clientIds: [String], colors: ModelColorMap
     ) -> [ModelSlice] {
         let allow = Set(clientIds)
         var grouped: [String: ModelSlice] = [:]
-        for c in row.contributions {
+        for c in payload.contributions where String(c.date.prefix(7)) == month {
+            var dayTokens: Int64 = 0
+            var dayCost = 0.0
+            var dayMessages = 0
+            for cc in c.clients where allow.contains(cc.client) {
+                dayTokens = dayTokens.saturatingAdding(cc.tokens.total)
+                dayCost += cc.cost
+                dayMessages += cc.messages
+            }
+            guard dayTokens > 0 || dayCost > 0 || dayMessages > 0 else { continue }
             for cc in c.clients {
                 if !allow.contains(cc.client) { continue }
                 let tokens = cc.tokens.total
@@ -125,8 +123,39 @@ struct MonthlyView: View {
     }
 
     var body: some View {
-        let rows = Self.monthRows(
-            payload: payload, clientIds: clientIds, turnClientIds: turnClientIds)
+        MonthlyPresentation(
+            rows: Self.monthRows(
+                payload: payload, clientIds: clientIds, turnClientIds: turnClientIds),
+            expandedModels: openMonth.map {
+                Self.modelSlices(for: $0, payload: payload, clientIds: clientIds, colors: colors)
+            } ?? [],
+            turnClientIds: turnClientIds,
+            openMonth: $openMonth,
+            expansionOwner: expansionOwner,
+            onExpandedChanged: onExpandedChanged)
+    }
+}
+
+private struct MonthlyPresentation: View {
+    typealias MonthRow = MonthlyView.MonthRow
+    typealias ModelSlice = MonthlyView.ModelSlice
+
+    let rows: [MonthRow]
+    let expandedModels: [ModelSlice]
+    let turnClientIds: [String]
+    @Binding var openMonth: String?
+    let expansionOwner: UUID
+    var onExpandedChanged: ((UUID, Bool) -> Void)?
+    @State private var hover: HoverState?
+    @State private var tooltipSize: CGSize = .zero
+    @Environment(\.popoverScrollViewport) private var popoverScrollViewport
+    private struct HoverState {
+        let slice: ModelSlice
+        let point: CGPoint
+    }
+
+    private static let rowsSpace = "monthly-model-rows"
+    var body: some View {
         DashCard(
             "Monthly",
             subtitle: TurnCountBuckets.scope(turnClientIds),
@@ -197,8 +226,7 @@ struct MonthlyView: View {
 
             if isOpen {
                 VStack(spacing: 4) {
-                    ForEach(Self.modelSlices(for: row, clientIds: clientIds, colors: colors),
-                            id: \.key) { slice in
+                    ForEach(expandedModels, id: \.key) { slice in
                         let isHovered = hover?.slice.key == slice.key
                         HStack(spacing: 8) {
                             Circle()

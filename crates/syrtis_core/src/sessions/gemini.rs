@@ -5,15 +5,15 @@
 //! `session-*.jsonl` chat recordings.
 
 use super::utils::{
-    extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
-    read_file_or_none,
+    extract_i64, extract_string, file_modified_timestamp_ms, open_source_file,
+    parse_timestamp_value,
 };
 use super::UnifiedMessage;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::Path;
 
 /// Gemini session structure
@@ -145,14 +145,36 @@ pub(crate) fn parse_gemini_file_with_cache_status(path: &Path) -> GeminiParseRes
         }
     }
 
-    let Some(data) = read_file_or_none(path) else {
+    let Ok(file) = open_source_file(path) else {
         return GeminiParseResult {
             messages: Vec::new(),
-            cacheable: true,
+            cacheable: false,
         };
     };
+    let size_hint = file
+        .metadata()
+        .map(|metadata| usize::try_from(metadata.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    parse_gemini_json_source(path, fallback_timestamp, file, size_hint)
+}
 
-    let mut bytes = data.clone();
+fn parse_gemini_json_source(
+    path: &Path,
+    fallback_timestamp: i64,
+    mut file: impl Read + Seek,
+    size_hint: usize,
+) -> GeminiParseResult {
+    // Match std::fs::read's metadata-sized allocation. SourceReader uses the
+    // generic Read implementation, which otherwise grows geometrically and
+    // initializes spare capacity through its read-only wrapper.
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size_hint).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return GeminiParseResult {
+            messages: Vec::new(),
+            cacheable: false,
+        };
+    }
+
     if let Ok(session) = simd_json::from_slice::<GeminiSession>(&mut bytes) {
         return GeminiParseResult {
             messages: parse_gemini_session(session, fallback_timestamp),
@@ -160,7 +182,15 @@ pub(crate) fn parse_gemini_file_with_cache_status(path: &Path) -> GeminiParseRes
         };
     }
 
-    let mut bytes = data;
+    // SIMD unescapes in place. Only a failed typed parse pays for another read;
+    // rewind the observed descriptor (not the path) and reuse its allocation.
+    bytes.clear();
+    if file.rewind().is_err() || file.read_to_end(&mut bytes).is_err() {
+        return GeminiParseResult {
+            messages: Vec::new(),
+            cacheable: false,
+        };
+    }
     if let Ok(value) = simd_json::from_slice::<Value>(&mut bytes) {
         let session_id = path
             .file_stem()
@@ -576,6 +606,66 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn typed_session_rejects_invalid_utf8_in_ignored_fields() {
+        let file = tempfile::Builder::new()
+            .prefix("session-")
+            .suffix(".json")
+            .tempfile()
+            .unwrap();
+        let content = r#"{"sessionId":"s","projectHash":"p","startTime":"","lastUpdated":"","messages":[{"id":"m","type":"gemini","model":"gemini-2.5-pro","tokens":{"input":10,"output":20}}],"ignored":"λ"}"#;
+        std::fs::write(file.path(), content).unwrap();
+        let valid = parse_gemini_file_with_cache_status(file.path());
+        assert_eq!(valid.messages.len(), 1);
+        assert!(valid.cacheable);
+        let mut invalid = content.as_bytes().to_vec();
+        let index = invalid.iter().position(|byte| *byte == 0xce).unwrap();
+        invalid[index] = 0xff;
+        std::fs::write(file.path(), invalid).unwrap();
+        let result = parse_gemini_file_with_cache_status(file.path());
+        assert!(result.messages.is_empty());
+        assert!(!result.cacheable);
+    }
+
+    #[test]
+    fn test_parse_gemini_json_fallbacks_preserve_escaped_fields_and_cache_status() {
+        let cases: &[(&[u8], &str, bool)] = &[
+            (
+                br#"{"model":"gemini\u002d2.5-pro","timestamp":"2026-05-01T00:01:00Z","tokens":{"input":10,"output":20}}"#,
+                "file",
+                true,
+            ),
+            (
+                b"{\"type\":\"init\",\"model\":\"gemini\\u002d2.5-pro\",\"session_id\":\"session\\u002d1\"}\n\xff\n{\"type\":\"gemini\",\"timestamp\":\"2026-05-01T00:01:00Z\",\"tokens\":{\"input\":10,\"output\":20}}\n",
+                "session-1",
+                false,
+            ),
+        ];
+        for &(content, session_id, cacheable) in cases {
+            // A .json suffix exercises both fallbacks after typed deserialization fails.
+            let file = tempfile::Builder::new()
+                .prefix("session-")
+                .suffix(".json")
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), content).unwrap();
+            let result = parse_gemini_file_with_cache_status(file.path());
+            assert_eq!(result.cacheable, cacheable);
+            assert_eq!(result.messages.len(), 1);
+            let message = &result.messages[0];
+            let expected_session = if session_id == "file" {
+                file.path().file_stem().unwrap().to_str().unwrap()
+            } else {
+                session_id
+            };
+            assert_eq!(message.session_id, expected_session);
+            assert_eq!(message.model_id, "gemini-2.5-pro");
+            assert_eq!(message.timestamp, 1777593660000);
+            assert_eq!(message.tokens.input, 10);
+            assert_eq!(message.tokens.output, 20);
+        }
+    }
 
     #[test]
     fn test_parse_gemini_structure() {
@@ -1351,5 +1441,128 @@ not-json\n\
         assert_eq!(messages[0].tokens.input, 100);
         assert_eq!(messages[0].tokens.output, 50);
         assert_eq!(messages[0].tokens.cache_read, 5);
+    }
+
+    #[test]
+    fn simd_fallbacks_preserve_scalar_validation_and_duplicates() {
+        for extra in [
+            r#","ignored":1e400"#,
+            r#","ignored":"\ud800""#,
+            r#","sessionId":"replacement""#,
+        ] {
+            let json = format!(
+                r#"{{"sessionId":"original","projectHash":"p","startTime":"s","lastUpdated":"u","messages":[{{"id":"m","type":"gemini","model":"gemini-test","tokens":{{"input":7,"output":3}}}}]{extra}}}"#
+            );
+            let file = tempfile::Builder::new()
+                .prefix("session-")
+                .suffix(".json")
+                .tempfile()
+                .unwrap();
+            std::fs::write(file.path(), &json).unwrap();
+            let timestamp = file_modified_timestamp_ms(file.path());
+            // Original typed -> Value -> JSONL behavior, each SIMD attempt
+            // receiving pristine bytes rather than an already-unescaped buffer.
+            let expected = if let Ok(session) =
+                simd_json::from_slice::<GeminiSession>(&mut json.as_bytes().to_vec())
+            {
+                GeminiParseResult {
+                    messages: parse_gemini_session(session, timestamp),
+                    cacheable: true,
+                }
+            } else if let Ok(value) = simd_json::from_slice::<Value>(&mut json.as_bytes().to_vec())
+            {
+                let session_id = file.path().file_stem().unwrap().to_str().unwrap();
+                let messages = parse_gemini_headless_value(&value, session_id, timestamp);
+                if messages.is_empty() {
+                    parse_gemini_headless_jsonl(file.path(), timestamp)
+                } else {
+                    GeminiParseResult {
+                        messages,
+                        cacheable: true,
+                    }
+                }
+            } else {
+                parse_gemini_headless_jsonl(file.path(), timestamp)
+            };
+            let actual = parse_gemini_file_with_cache_status(file.path());
+            assert_eq!(actual.cacheable, expected.cacheable, "{extra}");
+            assert_eq!(
+                format!("{:?}", actual.messages),
+                format!("{:?}", expected.messages),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_size_hint_does_not_limit_fallback_input() {
+        let json =
+            br#"{"stats":{"models":{"gemini-test":{"tokens":{"prompt":12,"candidates":3}}}}}"#;
+        for size_hint in [0, 1, json.len() + 128] {
+            let parsed = parse_gemini_json_source(
+                Path::new("session-size-hint.json"),
+                123,
+                std::io::Cursor::new(json),
+                size_hint,
+            );
+            assert!(parsed.cacheable);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].model_id, "gemini-test");
+            assert_eq!(parsed.messages[0].tokens.input, 12);
+            assert_eq!(parsed.messages[0].tokens.output, 3);
+        }
+    }
+
+    #[test]
+    fn failed_typed_parse_restores_same_unlinked_descriptor() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("session-unlinked.json");
+        // Legacy headless stats are supported by the Value fallback, not GeminiSession.
+        let json = r#"{"response":"Hi","stats":{"models":{"gemini-\u0074est":{"tokens":{"prompt":12,"candidates":3,"cached":5,"thoughts":2}}}}}"#;
+        assert!(simd_json::from_slice::<GeminiSession>(&mut json.as_bytes().to_vec()).is_err());
+        std::fs::write(&path, json).unwrap();
+        let source = open_source_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let size_hint = source.metadata().unwrap().len() as usize;
+        let parsed = parse_gemini_json_source(&path, 123, source, size_hint);
+        assert!(parsed.cacheable);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].model_id, "gemini-test");
+        assert_eq!(parsed.messages[0].tokens.input, 7);
+        assert_eq!(parsed.messages[0].tokens.output, 3);
+        assert_eq!(parsed.messages[0].tokens.cache_read, 5);
+        assert_eq!(parsed.messages[0].tokens.reasoning, 2);
+        assert_eq!(parsed.messages[0].tokens.total(), 17);
+        assert_eq!(parsed.messages[0].session_id, "session-unlinked");
+        assert_eq!(parsed.messages[0].timestamp, 123);
+    }
+
+    #[test]
+    fn typed_success_large_ignored_content_never_rereads_source() {
+        struct NoRewind(std::io::Cursor<Vec<u8>>);
+        impl Read for NoRewind {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(bytes)
+            }
+        }
+        impl Seek for NoRewind {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                panic!("typed-success source must not be reread");
+            }
+        }
+        let mut bytes = br#"{"sessionId":"s","projectHash":"p","startTime":"s","lastUpdated":"u","messages":[{"id":"m","type":"gemini","model":"gemini-test","tokens":{"input":7,"output":3}}],"ignored":""#.to_vec();
+        bytes.resize(bytes.len() + 64 * 1024 * 1024, b'x');
+        bytes.extend_from_slice(br#""}"#);
+        let size_hint = bytes.len();
+        let parsed = parse_gemini_json_source(
+            Path::new("session-large.json"),
+            123,
+            NoRewind(std::io::Cursor::new(bytes)),
+            size_hint,
+        );
+        assert!(parsed.cacheable);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].session_id, "s");
+        assert_eq!(parsed.messages[0].tokens.input, 7);
     }
 }

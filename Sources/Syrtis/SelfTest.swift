@@ -542,7 +542,8 @@ private final class WindowScanCountingSource: UsageDataSource, @unchecked Sendab
         try await inner.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+    func windowUsage(_ encoded: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        let request = encoded.request
         requests.append(request)
         if request.snapshotToken == nil {
             scans += 1
@@ -628,8 +629,8 @@ private final class RegistryRaceSource: UsageDataSource, @unchecked Sendable {
         try await inner.usageTrace(windowSecs: windowSecs)
     }
     func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
-        .empty(for: request)
+    func windowUsage(_ encoded: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        .empty(for: encoded.request)
     }
 }
 
@@ -3922,6 +3923,27 @@ enum SelfTest {
                 && realCurve??.generation == 3
                 && failedCurve == nil,
             "an empty-history curve decodes as nil while a failure envelope still throws")
+        func sampleKeyCurve(_ points: [String], newest: Int64 = 10) -> QuotaCurve? {
+            let json = """
+            {"points":[\(points.joined(separator: ","))],
+             "coverage":{"oldestSampledAt":10,"newestSampledAt":\(newest),"sampleCount":\(points.count)},
+             "activeResetAt":null,"generation":3}
+            """
+            return try? JSONDecoder().decode(QuotaCurve.self, from: Data(json.utf8))
+        }
+        expect(sampleKeyCurve([
+            curvePointJSON, curvePointJSON.replacingOccurrences(of: "4.5", with: "9.5")
+        ]) == nil, "quota curve rejects a duplicate sample triplet even when its value differs")
+        for (field, old, new, newest) in [
+            ("sampledAt", "10", "11", Int64(11)),
+            ("resetAt", "106", "105", Int64(10)),
+            ("durationSeconds", "96", "97", Int64(10)),
+        ] {
+            let changed = curvePointJSON.replacingOccurrences(
+                of: "\"\(field)\":\(old)", with: "\"\(field)\":\(new)")
+            expect(sampleKeyCurve([curvePointJSON, changed], newest: newest)?.points.count == 2,
+                "quota curve admits samples when \(field) differs")
+        }
 
         // ModelColorMap: cost ranking drives shades; unseen models fall back.
         let map = ModelColorMap(entries: [
@@ -3999,9 +4021,7 @@ enum SelfTest {
             "DayBars merges grok-4.6-build into one grok-4.6 segment with exact sums, "
                 + "leaving the control model alone (got \(groupingSegments.map { ($0.key, $0.tokens, $0.cost) }))")
         let groupingSlices = MonthlyView.modelSlices(
-            for: MonthlyView.MonthRow(
-                month: "2024-12", tokens: 159, cost: 3.5, messages: 3, turns: nil,
-                contributions: groupingPayload.contributions),
+            for: "2024-12", payload: groupingPayload,
             clientIds: ["grok"], colors: groupingColors)
         expect(
             groupingSlices.map(\.model) == ["grok-4.6", "grok-code-fast-1"]
@@ -6793,15 +6813,21 @@ enum SelfTest {
         expect(MonthlyView.monthRows(payload: monthlyPayload, clientIds: []).isEmpty,
             "empty client selection shows no months")
         let mSlices = MonthlyView.modelSlices(
-            for: mRows[0], clientIds: ["a"], colors: ModelColorMap(report: nil))
+            for: mRows[0].month, payload: monthlyPayload, clientIds: ["a"], colors: ModelColorMap(report: nil))
         expect(
             mSlices.count == 1 && mSlices[0].key == "m1|p"
                 && mSlices[0].tokens == .max && mSlices[0].input == .max
                 && mSlices[0].output == 0,
             "drill-down merges the month's model token lanes across days with saturation")
         expect(MonthlyView.modelSlices(
-                for: mRows[0], clientIds: ["a", "b"], colors: ModelColorMap(report: nil)).count == 2,
+                for: mRows[0].month, payload: monthlyPayload, clientIds: ["a", "b"], colors: ModelColorMap(report: nil)).count == 2,
             "drill-down shows client b's model when b is selected")
+        expect(
+            MonthlyView.modelSlices(for: "1999-01", payload: monthlyPayload,
+                clientIds: ["a"], colors: ModelColorMap(report: nil)).isEmpty
+                && MonthlyView.modelSlices(for: mRows[0].month, payload: monthlyPayload,
+                    clientIds: [], colors: ModelColorMap(report: nil)).isEmpty,
+            "monthly drill-down is empty for an absent month or all-hidden clients")
 
         // Message-only activity (PR #54 review r3595383789): a contribution
         // with messages but zero tokens and zero cost must still surface —
@@ -6827,7 +6853,7 @@ enum SelfTest {
             "a message-only month (zero tokens, zero cost) still surfaces in the Monthly lens")
         let monthlyMessageOnlySlice = moRows.first.flatMap {
             MonthlyView.modelSlices(
-                for: $0, clientIds: ["codex"], colors: ModelColorMap(report: nil)
+                for: $0.month, payload: messageOnlyPayload, clientIds: ["codex"], colors: ModelColorMap(report: nil)
             ).first
         }
         expect(
@@ -6950,8 +6976,9 @@ enum SelfTest {
                 && dailyMessageOnlyRows[0].tokens == 0 && dailyMessageOnlyRows[0].cost == 0
                 && dailyMessageOnlyRows[0].turns == 7,
             "Daily retains a message-only day and attaches its positive turn count")
-        let dailyMessageOnlySlice = dailyMessageOnlyRows.first.flatMap {
-            dailyMessageOnlyView.models(for: $0.contribution).first
+        let dailyMessageOnlySlice = dailyMessageOnlyRows.first.flatMap { row in
+            messageOnlyPayload.contributions.first { $0.date == row.date }
+                .flatMap { dailyMessageOnlyView.models(for: $0).first }
         }
         expect(
             dailyMessageOnlySlice?.key == "m1|p" && dailyMessageOnlySlice?.tokens == 0
@@ -8566,6 +8593,23 @@ enum SelfTest {
         expect(
             oldYearBars.last?.date == "2026-07-03" && oldYearBars.last?.totalTokens == 10,
             "an older year retains selected metric activity rather than jumping to today or hidden activity")
+        let costOnlyHistory = activityPayload(end: "2026-07-31", days: [
+            activityDay("vis", "2026-07-02", tokens: 0, cost: 2),
+            activityDay("vis", "2026-07-30", tokens: 0, cost: 0),
+            activityDay("hid", "2026-07-31")])
+        for stack in StackBy.allCases {
+            let costBars = DayBars.build(
+                payload: costOnlyHistory, clientIds: ["vis"], stackBy: stack,
+                colors: chartColors, rangeEnd: "2026-07-31", year: "2026", today: "2027-01-01")
+            let hiddenBars = DayBars.build(
+                payload: costOnlyHistory, clientIds: [], stackBy: stack,
+                colors: chartColors, rangeEnd: "2026-07-31", year: "2026", today: "2027-01-01")
+            expect(costBars.last?.date == "2026-07-02"
+                && costBars.last?.totalTokens == 0 && costBars.last?.totalCost == 2,
+                "historical \(stack) anchors on selected cost-only activity, not messages or hidden rows")
+            expect(hiddenBars.last?.date == "2026-07-31" && hiddenBars.allSatisfy(\.isEmpty),
+                "all-hidden historical \(stack) uses the selected range end with empty bars")
+        }
         let emptyBars = DayBars.build(
             payload: activityPayload(end: "", days: []), clientIds: ["vis"], stackBy: .agent,
             colors: chartColors, rangeEnd: "", year: nil, today: "2026-07-09")
@@ -11747,13 +11791,19 @@ enum SelfTest {
             lp3CorruptBytes != nil && lp3CorruptDecoded == nil,
             "LP3: corrupt (non-JSON) bytes are read as bytes but fail to decode, so the cold "
                 + "fallback triggers at the decode step rather than a crash")
+        let lp3RawDir = lp3TempDir("raw-bytes")
+        for bytes in [Data(), Data([0, 255, 128, 0, 10, 13, 1])] {
+            let wrote = SnapshotStore.write(bytes, in: lp3RawDir)
+            expect(wrote && SnapshotStore.readBytes(in: lp3RawDir) == bytes,
+                "LP3: empty and binary snapshot bytes round-trip exactly")
+        }
 
         let lp3CapDir = lp3TempDir("cap")
         lp3PrepareDir(lp3CapDir)
-        try? Data(repeating: 0x41, count: SnapshotStore.byteCap).write(
-            to: lp3CapDir.appendingPathComponent(lp3FileName))
+        let lp3CapBytes = Data(repeating: 0x41, count: SnapshotStore.byteCap)
+        try? lp3CapBytes.write(to: lp3CapDir.appendingPathComponent(lp3FileName))
         expect(
-            SnapshotStore.readBytes(in: lp3CapDir)?.count == SnapshotStore.byteCap,
+            SnapshotStore.readBytes(in: lp3CapDir) == lp3CapBytes,
             "LP3: a file at EXACTLY the byte cap is read in full")
 
         let lp3OverCapDir = lp3TempDir("overcap")
@@ -12744,6 +12794,31 @@ enum SelfTest {
         let wCurve = windowCurve(
             resetAtSecs: wReset, durationSecs: 18_000,
             at: [(wNow - 3_000, 4), (wNow - 600, 9)])
+        let boundaryReset = ISO8601DateFormatter().string(
+            from: Date(timeIntervalSince1970: 20_000))
+        let boundaryQuota = windowPayload([
+            (client: "codex", windows: [(card: "session.v1", key: "session.v1",
+                resetsAt: boundaryReset, durationSecs: 18_000)]),
+        ])
+        let boundaryPoints = [(Int64(1999), 1.0), (2000, 2), (2000, 3), (10000, 10), (10001, 11)]
+            .enumerated().map { index, item in
+                """
+                {"sampledAt":\(item.0),"usedPercent":\(item.1),"resetAt":\(19_000 + index),
+                 "durationSeconds":18000,"durationSource":"provider","origin":"liveV3","isActiveGroup":false}
+                """
+            }.joined(separator: ",")
+        let boundaryCurve = try! JSONDecoder().decode(QuotaCurve.self, from: Data("""
+            {"points":[\(boundaryPoints)],
+             "coverage":{"oldestSampledAt":1999,"newestSampledAt":10001,"sampleCount":5},
+             "activeResetAt":null,"generation":7}
+            """.utf8))
+        let boundarySamples = WindowCardLoader.curveSamples(
+            payload: boundaryQuota, clientId: "codex", accountKey: nil,
+            window: boundaryQuota.agents[0].windows[0],
+            curve: { _, _, _, _ in boundaryCurve }, nowMs: 10_000_000)
+        expect(boundarySamples?.map(\.atMs) == [2_000_000, 2_000_000, 10_000_000]
+            && boundarySamples?.map(\.usedPercent) == [2, 3, 10],
+            "quota curve window includes both boundaries and equal-time foreign-cycle samples, excludes outside points and redundant live reading")
 
         // PR #316: drive provider discovery through the shipping poll and
         // curve reader, with NO graph load or manually supplied client list.

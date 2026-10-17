@@ -121,6 +121,12 @@ public struct QuotaCurve: Decodable, Sendable, Equatable {
         case points, coverage, activeResetAt, generation
     }
 
+    private struct SampleKey: Hashable {
+        let sampledAt: Int64
+        let resetAt: Int64
+        let durationSeconds: Int64
+    }
+
     /// Mirrors `valid_duration` in `agent_quota_duration.rs`, whose bound is
     /// `1...MAX_DURATION_SECONDS` (400 days). Both ends matter: a sample outside
     /// either one is refused by the writer, so a payload carrying it did not come
@@ -186,9 +192,11 @@ public struct QuotaCurve: Decodable, Sendable, Equatable {
         // language's floating-point rounding once (the printf/Math.Round
         // cross-check drift in verification.md). The exact-repeat check needs
         // only integers.
-        var seen = Set<[Int64]>()
+        var seen = Set<SampleKey>()
         guard points.allSatisfy({
-            seen.insert([$0.sampledAt, $0.resetAt, $0.durationSeconds]).inserted
+            seen.insert(SampleKey(
+                sampledAt: $0.sampledAt, resetAt: $0.resetAt,
+                durationSeconds: $0.durationSeconds)).inserted
         }) else {
             throw Self.corrupted(decoder, "a sample is repeated in the curve")
         }

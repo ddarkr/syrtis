@@ -1878,18 +1878,14 @@ impl<'a> HistoricalReportFold<'a> {
                 false,
                 usage_store::OpenCodeSelectionMode::Report,
                 false,
-                &|raw| {
-                    let mut message = raw.clone();
+                &|message| {
                     message.date = timezone.date(message.timestamp);
-                    apply_pricing_if_available(&mut message, self.pricing);
-                    passes(&message) && filter(&message)
+                    apply_pricing_if_available(message, self.pricing);
                 },
-                &mut |raw| {
-                    let mut message = raw.clone();
-                    message.date = timezone.date(message.timestamp);
-                    apply_pricing_if_available(&mut message, self.pricing);
-                    if passes(&message) && filter(&message) {
-                        push(state, &message);
+                &|message| passes(message) && filter(message),
+                &mut |message| {
+                    if passes(message) && filter(message) {
+                        push(state, message);
                     }
                 },
             )?;
@@ -3160,20 +3156,29 @@ fn ingest_local_usage_inner(
         ($client:expr, $visit:expr, $fingerprint:expr) => {
             ingest_streamed!($client, $visit, $fingerprint, scan_result.get($client));
         };
-        ($client:expr, $visit:expr, $fingerprint:expr, $paths:expr) => {{
+        ($client:expr, $visit:expr, $fingerprint:expr, $paths:expr) => {
+            ingest_streamed!($client, $visit, $fingerprint, $paths, false, false);
+        };
+        ($client:expr, $visit:expr, $fingerprint:expr, $paths:expr, $composite:expr, $empty:expr) => {{
             let client = $client;
-            store_query::ingest_sources_streamed(
-                &query,
-                &mut cache,
-                CacheIdentity::for_client(client),
-                $paths,
-                client.as_str(),
-                mode,
-                $fingerprint,
-                $visit,
-                |path| store_query::local_dedups(client, path),
-                false,
-            )?;
+            if !local_clients || client != ClientId::Cursor {
+                store_query::ingest_sources_streamed(
+                    &query,
+                    &mut cache,
+                    CacheIdentity::for_client(client),
+                    $paths,
+                    client.as_str(),
+                    if $composite {
+                        SelectionMode::LocalClients
+                    } else {
+                        mode
+                    },
+                    $fingerprint,
+                    $visit,
+                    |path| store_query::local_dedups(client, path),
+                    $empty,
+                )?;
+            }
         }};
     }
     ingest!(
@@ -3214,10 +3219,10 @@ fn ingest_local_usage_inner(
             )?;
         }
     }
-    ingest!(ClientId::Cursor, sessions::cursor::parse_cursor_file);
+    ingest_streamed!(ClientId::Cursor, sessions::cursor::visit_cursor_file);
     ingest!(ClientId::Warp, sessions::warp::parse_warp_file);
     ingest!(ClientId::Amp, sessions::amp::parse_amp_file);
-    ingest!(ClientId::Codebuff, sessions::codebuff::parse_codebuff_file);
+    ingest_streamed!(ClientId::Codebuff, sessions::codebuff::visit_codebuff_file);
     ingest!(
         ClientId::Droid,
         sessions::droid::parse_droid_file,
@@ -3249,19 +3254,19 @@ fn ingest_local_usage_inner(
     ingest!(ClientId::Muse, sessions::muse::parse_muse_file);
     ingest!(ClientId::Reasonix, sessions::reasonix::parse_reasonix_file);
     ingest!(ClientId::Qwen, sessions::qwen::parse_qwen_file);
-    ingest!(
+    ingest_streamed!(
         ClientId::RooCode,
-        sessions::roocode::parse_roocode_file,
+        sessions::roocode::visit_roocode_file,
         SourceFingerprint::from_roo_path
     );
-    ingest!(
+    ingest_streamed!(
         ClientId::KiloCode,
-        sessions::kilocode::parse_kilocode_file,
+        sessions::kilocode::visit_kilocode_file,
         SourceFingerprint::from_roo_path
     );
-    ingest!(
+    ingest_streamed!(
         ClientId::Cline,
-        sessions::cline::parse_cline_file,
+        sessions::cline::visit_cline_file,
         SourceFingerprint::from_roo_path
     );
     ingest!(
@@ -3384,14 +3389,13 @@ fn ingest_local_usage_inner(
         false
     );
     let hermes_paths = scan_result.hermes_db_paths();
-    ingest!(
+    ingest_streamed!(
         ClientId::Hermes,
-        sessions::hermes::parse_hermes_sqlite,
+        sessions::hermes::visit_hermes_sqlite,
         SourceFingerprint::from_sqlite_path,
         &hermes_paths,
         true,
-        true,
-        false
+        true
     );
     ingest!(
         ClientId::AntigravityCli,
@@ -3399,14 +3403,13 @@ fn ingest_local_usage_inner(
         SourceFingerprint::from_sqlite_path
     );
     ingest!(ClientId::Gjc, sessions::gjc::parse_gjc_file);
-    ingest!(
+    ingest_streamed!(
         ClientId::Goose,
-        sessions::goose::parse_goose_sqlite,
+        sessions::goose::visit_goose_sqlite,
         SourceFingerprint::from_sqlite_path,
         scan_result.goose_db.as_slice(),
         false,
-        true,
-        false
+        true
     );
     let zed_paths = scan_result.zed_db_paths();
     ingest!(
@@ -3474,13 +3477,14 @@ fn ingest_local_usage_inner(
             &source.workspace_label,
         )?;
     }
-    ingest!(
+    ingest_streamed!(
         ClientId::Antigravity,
-        sessions::antigravity::parse_antigravity_file
+        sessions::antigravity::visit_antigravity_file
     );
-    ingest!(ClientId::Trae, |path| sessions::trae::parse_trae_file(
-        "trae", path
-    ));
+    ingest_streamed!(
+        ClientId::Trae,
+        |path, sink| sessions::trae::visit_trae_file("trae", path, sink)
+    );
     if let Some(path) = scan_result
         .synthetic_db
         .as_ref()
@@ -3723,56 +3727,51 @@ where
             usage_store::OpenCodeSelectionMode::Report
         };
         let mut output_error = None;
+        let opencode_eligible = std::cell::Cell::new(false);
         usage_store::visit_opencode_query_on(
             query.connection(),
             query.is_indexed(),
             opencode_mode,
             options.hydrate_opencode_aliases,
-            &|raw| {
+            &|message| {
+                message.refresh_derived_fields();
+                apply_pricing_if_available(message, pricing);
+                opencode_eligible
+                    .set(passes_client(message) && options.contains(message.timestamp));
+                if mode != SelectionMode::Report && include_synthetic {
+                    sessions::synthetic::normalize_synthetic_gateway_fields(
+                        &mut message.model_id,
+                        &mut message.provider_id,
+                    );
+                }
+            },
+            &|message| {
                 if selection_ignores_filter
                     && options.from_ms.is_none()
                     && options.until_ms.is_none()
                 {
                     return true;
                 }
-                let mut message = raw.clone();
-                message.refresh_derived_fields();
-                apply_pricing_if_available(&mut message, pricing);
-                if !passes_client(&message) || !options.contains(message.timestamp) {
+                if !opencode_eligible.get() {
                     return false;
                 }
-                if mode != SelectionMode::Report && include_synthetic {
-                    sessions::synthetic::normalize_synthetic_gateway_fields(
-                        &mut message.model_id,
-                        &mut message.provider_id,
-                    );
-                }
-                filter(&message)
+                filter(message)
             },
-            &mut |raw| {
+            &mut |message| {
                 if output_error.is_some() {
                     return;
                 }
-                let mut message = raw.clone();
-                message.refresh_derived_fields();
-                apply_pricing_if_available(&mut message, pricing);
-                count_message(&mut counts, ClientId::OpenCode, &message);
-                if !passes_client(&message) || !options.contains(message.timestamp) {
+                count_message(&mut counts, ClientId::OpenCode, message);
+                if !opencode_eligible.get() {
                     return;
                 }
-                if mode != SelectionMode::Report && include_synthetic {
-                    sessions::synthetic::normalize_synthetic_gateway_fields(
-                        &mut message.model_id,
-                        &mut message.provider_id,
-                    );
-                }
-                if filter(&message) {
+                if filter(message) {
                     if buffer {
-                        if let Err(error) = query.buffer_output(&message) {
+                        if let Err(error) = query.buffer_output(message) {
                             output_error = Some(error);
                         }
                     } else {
-                        sink(&message);
+                        sink(message);
                     }
                 }
             },
