@@ -337,12 +337,11 @@ public enum TBCore {
     /// Compact account-scoped aggregates. A first request captures a bounded
     /// native lease; token followups query that source/pricing generation only.
     public static func windowUsage(
-        _ request: WindowUsageRequest
+        _ encoded: EncodedWindowUsageRequest
     ) async throws -> WindowUsageBatch {
         try await Task.detached(priority: .utility) {
-            var bytes = try JSONEncoder().encode(request)
-            bytes.append(0)
-            let batch: WindowUsageBatch = try bytes.withUnsafeBytes { buffer in
+            let request = encoded.request
+            let batch: WindowUsageBatch = try encoded.canonicalBytes.withUnsafeBytes { buffer in
                 try unwrap(tb_window_usage(buffer.baseAddress!.assumingMemoryBound(to: CChar.self)))
             }
             do {

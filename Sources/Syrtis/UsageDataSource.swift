@@ -35,7 +35,7 @@ protocol UsageDataSource: Sendable {
     func tokensPerMin() async throws -> Double
     /// The request carries the exact account, confirmed declarations and compact
     /// jobs. Follow-up queries use its native snapshot lease, never raw rows.
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch
     func releaseWindowUsage(_ snapshotToken: String) async
     /// `accountKey` selects which account of `clientId` to read — nil is the
     /// primary account. Required (not defaulted) so a conformer that forgets
@@ -87,8 +87,8 @@ extension UsageDataSource {
 
     /// Pure test sources have no local usage or native snapshot lease.
     /// Native-backed wrappers must forward both query and release explicitly.
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
-        .empty(for: request)
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        .empty(for: request.request)
     }
 
     func releaseWindowUsage(_ snapshotToken: String) async {}
@@ -230,7 +230,7 @@ struct LiveUsageDataSource: UsageDataSource {
         catch { FileHandle.standardError.write(Data("local usage release failed: \(error)\n".utf8)) }
     }
 
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
         try await TBCore.windowUsage(request)
     }
 
@@ -323,8 +323,8 @@ struct DemoUsageDataSource: UsageDataSource {
     let allowsQuotaCachePersistence = false
 
     /// Demo quota curves intentionally have no corresponding local usage.
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
-        .empty(for: request)
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        .empty(for: request.request)
     }
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {

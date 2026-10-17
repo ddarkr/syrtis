@@ -316,15 +316,15 @@ final class LocalUsageScheduler {
             throw CancellationError()
         }
         let epoch = rootEpoch
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let key = try encoder.encode(request)
+        let encoded = try EncodedWindowUsageRequest(request)
+        let key = encoded.canonicalBytes
         let id: UUID
         let task: Task<WindowUsageBatch, Error>
         if let held = windowFlights[key], let heldID = windowFlightIDs[key] {
             task = held; id = heldID
         } else {
             id = UUID()
-            task = Task { [source] in try await source.windowUsage(request) }
+            task = Task { [source] in try await source.windowUsage(encoded) }
             windowFlights[key] = task; windowFlightIDs[key] = id
         }
         defer {

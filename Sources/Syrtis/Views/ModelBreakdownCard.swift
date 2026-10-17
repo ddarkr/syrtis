@@ -31,6 +31,28 @@ struct ModelBreakdownCard: View {
     /// copy in that window would tell the user they have no model usage.
     var loading = false
 
+
+    var body: some View {
+        let allow = Set(clientIds)
+        let rows = (report?.modelLevelEntries ?? [])
+            .filter { allow.contains($0.client) }
+            .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
+        let totalCost = rows.reduce(0) { $0 + $1.cost }
+
+        ModelBreakdownPresentation(
+            rows: rows, totalCost: totalCost,
+            pricingUpdatedAt: report?.pricingUpdatedAt,
+            awaitingReport: report == nil && loading, colors: colors, title: title)
+    }
+}
+
+private struct ModelBreakdownPresentation: View {
+    let rows: [ModelReportEntry]
+    let totalCost: Double
+    let pricingUpdatedAt: UInt64?
+    let awaitingReport: Bool
+    let colors: ModelColorMap
+    let title: String
     @State private var expanded = false
     @State private var hover: HoverState?
     @State private var tooltipSize: CGSize = .zero
@@ -51,14 +73,7 @@ struct ModelBreakdownCard: View {
     ]
     private static let tokenKinds: [(label: String, color: String, pick: (ModelReportEntry) -> Int64)] =
         zip(TokenKindPalette.all, picks).map { ($0.label, $0.color, $1) }
-
     var body: some View {
-        let allow = Set(clientIds)
-        let rows = (report?.modelLevelEntries ?? [])
-            .filter { allow.contains($0.client) }
-            .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
-        let totalCost = rows.reduce(0) { $0 + $1.cost }
-
         DashCard(
             title,
             trailing: {
@@ -66,7 +81,7 @@ struct ModelBreakdownCard: View {
                     Text((rows.count == 1 ? "%lld model · %@" : "%lld models · %@")
                         .localized(rows.count, Format.usd(totalCost)))
                         .foregroundStyle(.secondary)
-                    if let updatedAt = report?.pricingUpdatedAt {
+                    if let updatedAt = pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
                             .foregroundStyle(.tertiary)
                             .help("LiteLLM pricing data; refreshes automatically about once an hour")
@@ -75,7 +90,7 @@ struct ModelBreakdownCard: View {
                 .font(NativeDesign.detailFont)
             }
         ) {
-            if rows.isEmpty, report == nil, loading {
+            if rows.isEmpty, awaitingReport {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityLabel("Loading…")
@@ -87,7 +102,7 @@ struct ModelBreakdownCard: View {
                 legend
                 VStack(spacing: 8) {
                     ForEach(
-                        expanded ? rows : Array(rows.prefix(Self.maxRows)),
+                        rows.prefix(expanded ? rows.count : Self.maxRows),
                         id: \.self.rowID
                     ) { entry in
                         row(entry)

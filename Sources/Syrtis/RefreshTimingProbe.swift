@@ -175,8 +175,8 @@ private final class CountingSource: UsageDataSource, @unchecked Sendable {
     func releaseLocalUsage(_ token: String) async {
         await live.releaseLocalUsage(token)
     }
-    func windowUsage(_ request: WindowUsageRequest) async throws -> WindowUsageBatch {
-        recordWindow(capturesSnapshot: request.snapshotToken == nil)
+    func windowUsage(_ request: EncodedWindowUsageRequest) async throws -> WindowUsageBatch {
+        recordWindow(capturesSnapshot: request.request.snapshotToken == nil)
         return try await live.windowUsage(request)
     }
     func releaseWindowUsage(_ snapshotToken: String) async {

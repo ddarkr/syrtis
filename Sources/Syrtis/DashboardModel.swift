@@ -2286,7 +2286,7 @@ private struct DashboardSnapshot {
             let catalog: WindowUsageBatch
             if let scheduler, let localSession {
                 catalog = try await scheduler.windowUsage(capture, session: localSession)
-            } else { catalog = try await source.windowUsage(capture) }
+            } else { catalog = try await source.windowUsage(EncodedWindowUsageRequest(capture)) }
             acquired = catalog
             try catalog.validate(capture, snapshot: lease?.batch)
             guard ownsWindowQuery(scanToken, ownership: ownership, rootEpoch: rootEpoch) else {
@@ -2329,7 +2329,7 @@ private struct DashboardSnapshot {
             let batch: WindowUsageBatch
             if let scheduler, let localSession {
                 batch = try await scheduler.windowUsage(request, session: localSession)
-            } else { batch = try await source.windowUsage(request) }
+            } else { batch = try await source.windowUsage(EncodedWindowUsageRequest(request)) }
             try batch.validate(request, snapshot: catalog)
             guard ownsWindowQuery(scanToken, ownership: ownership, rootEpoch: rootEpoch),
                   UsageAttribution.confirmed().records == confirmed else { throw CancellationError() }

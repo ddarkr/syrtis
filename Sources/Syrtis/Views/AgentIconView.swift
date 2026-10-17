@@ -75,21 +75,33 @@ struct AgentIconView: View {
     @MainActor private static func image(_ id: String) -> NSImage? {
         if let cached = cache[id] { return cached }
         guard monoIds.contains(id) || fullIds.contains(id) else { return nil }
+        guard let image = loadImage(id) else { return nil }
+        cache[id] = image
+        return image
+    }
+
+    @MainActor private static func loadImage(_ id: String) -> NSImage? {
         let bundle = Bundle.tokenBarResources
         // SVG (vector) preferred; some brand icons ship only as PNG.
         guard let url = bundle.url(
                 forResource: id, withExtension: "svg", subdirectory: "agent-icons")
                 ?? bundle.url(
-                    forResource: id, withExtension: "png", subdirectory: "agent-icons"),
-              let image = NSImage(contentsOf: url)
+                    forResource: id, withExtension: "png", subdirectory: "agent-icons")
         else { return nil }
-        cache[id] = image
-        return image
+        return NSImage(contentsOf: url)
     }
+
+    /// Validate each resource without retaining its source image. Aliases share
+    /// the result, but keep their own client identity.
+    @MainActor private static let availableIconIDs: Set<String> = {
+        Set(monoIds.union(fullIds).filter { id in
+            autoreleasepool { loadImage(id) != nil }
+        })
+    }()
 
     /// Returns only official IDs whose source asset really loads from the bundle.
     @MainActor static func availableOfficialClientIDs() -> Set<String> {
-        officialClientIDs.filter { image(iconId($0)) != nil }
+        officialClientIDs.filter { availableIconIDs.contains(iconId($0)) }
     }
 
     /// Render a static full-color status image once at each supported backing
@@ -99,7 +111,7 @@ struct AgentIconView: View {
     @MainActor static func statusItemImage(
         clientId: String, size: CGFloat = 18
     ) -> NSImage? {
-        guard availableOfficialClientIDs().contains(clientId) else { return nil }
+        guard officialClientIDs.contains(clientId), image(iconId(clientId)) != nil else { return nil }
         let logicalSize = NSSize(width: size, height: size)
         var representations: [NSBitmapImageRep] = []
         for scale in [CGFloat(1), CGFloat(2)] {

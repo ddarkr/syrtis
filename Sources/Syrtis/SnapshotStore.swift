@@ -149,7 +149,7 @@ enum SnapshotStore {
         // silently truncated. `remaining` is hoisted because reading
         // `buffer.count` inside the closure would overlap the exclusive borrow.
         let capacity = min(Int(info.st_size), byteCap) + 1
-        var buffer = [UInt8](repeating: 0, count: capacity)
+        var buffer = Data(count: capacity)
         var filled = 0
         while filled < capacity {
             let remaining = capacity - filled
@@ -165,7 +165,8 @@ enum SnapshotStore {
             filled += n
         }
         guard filled <= byteCap else { return nil }
-        return Data(buffer[0..<filled])
+        buffer.count = filled
+        return buffer
     }
 
     // MARK: - Write
