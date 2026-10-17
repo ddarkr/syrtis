@@ -56,17 +56,17 @@ impl RemotePricingSnapshot {
     pub fn from_cache_root(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref();
         let files = ["pricing-litellm.json", "pricing-openrouter.json"];
-        let mut descriptor = Vec::new();
-        descriptor.extend_from_slice(b"tokenbar-remote-pricing-v1");
+        let mut descriptor = Sha256::new();
+        descriptor.update(b"tokenbar-remote-pricing-v1");
         if !root.is_absolute() {
             for filename in files {
-                descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
-                descriptor.extend_from_slice(filename.as_bytes());
-                descriptor.extend_from_slice(&u64::MAX.to_be_bytes());
+                descriptor.update((filename.len() as u64).to_be_bytes());
+                descriptor.update(filename.as_bytes());
+                descriptor.update(u64::MAX.to_be_bytes());
             }
             return Self {
                 service: None,
-                digest: Sha256::digest(descriptor).into(),
+                digest: descriptor.finalize().into(),
                 diagnostic: Some(RemotePricingDiagnostic::Missing),
             };
         }
@@ -76,15 +76,15 @@ impl RemotePricingSnapshot {
             let bytes = fs::read(root.join(filename));
             match &bytes {
                 Ok(bytes) => {
-                    descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
-                    descriptor.extend_from_slice(filename.as_bytes());
-                    descriptor.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-                    descriptor.extend_from_slice(bytes);
+                    descriptor.update((filename.len() as u64).to_be_bytes());
+                    descriptor.update(filename.as_bytes());
+                    descriptor.update((bytes.len() as u64).to_be_bytes());
+                    descriptor.update(bytes);
                 }
                 Err(_) => {
-                    descriptor.extend_from_slice(&(filename.len() as u64).to_be_bytes());
-                    descriptor.extend_from_slice(filename.as_bytes());
-                    descriptor.extend_from_slice(&u64::MAX.to_be_bytes());
+                    descriptor.update((filename.len() as u64).to_be_bytes());
+                    descriptor.update(filename.as_bytes());
+                    descriptor.update(u64::MAX.to_be_bytes());
                 }
             }
             match bytes
@@ -106,7 +106,7 @@ impl RemotePricingSnapshot {
                 }
             }
         }
-        let digest = Sha256::digest(descriptor).into();
+        let digest = descriptor.finalize().into();
         let service = PricingService::from_cached_datasets_with_custom(
             CustomPricing::default(),
             datasets.remove(0),
@@ -1140,6 +1140,71 @@ mod tests {
         assert!(service
             .lookup_with_source("gpt-5.2", Some("litellm"))
             .is_some());
+    }
+
+    #[test]
+    fn remote_snapshot_digest_matches_legacy_descriptor_preimage() {
+        let root = tempfile::tempdir().unwrap();
+        let litellm = b"{\"timestamp\":0,\"data\":{}}";
+        let openrouter = b"not-json\0";
+        // Independent, fixed descriptor framing, including lengths and missing sentinel.
+        let prefix = b"tokenbar-remote-pricing-v1\0\0\0\0\0\0\0\x14pricing-litellm.json";
+        let second = b"\0\0\0\0\0\0\0\x17pricing-openrouter.json";
+        // Filename lengths are 20 and 23 bytes respectively, including the full basename.
+        for (first, last, diagnostic) in [
+            (None, None, RemotePricingDiagnostic::Missing),
+            (
+                Some(litellm.as_slice()),
+                None,
+                RemotePricingDiagnostic::Stale,
+            ),
+            (
+                Some(openrouter.as_slice()),
+                None,
+                RemotePricingDiagnostic::Corrupt,
+            ),
+            (
+                Some(litellm.as_slice()),
+                Some(openrouter.as_slice()),
+                RemotePricingDiagnostic::Stale,
+            ),
+            (
+                None,
+                Some(openrouter.as_slice()),
+                RemotePricingDiagnostic::Missing,
+            ),
+        ] {
+            let mut preimage = prefix.to_vec();
+            for (index, bytes) in [first, last].into_iter().enumerate() {
+                if index == 1 {
+                    preimage.extend_from_slice(second);
+                }
+                let name = ["pricing-litellm.json", "pricing-openrouter.json"][index];
+                if let Some(bytes) = bytes {
+                    fs::write(root.path().join(name), bytes).unwrap();
+                    preimage.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                    preimage.extend_from_slice(bytes);
+                } else {
+                    let _ = fs::remove_file(root.path().join(name));
+                    preimage.extend_from_slice(&[0xff; 8]);
+                }
+            }
+            let snapshot = RemotePricingSnapshot::from_cache_root(root.path());
+            assert_eq!(
+                snapshot.content_digest(),
+                <[u8; 32]>::from(Sha256::digest(preimage))
+            );
+            assert_eq!(snapshot.diagnostic(), Some(diagnostic));
+            assert!(snapshot.service().is_none());
+        }
+        let relative = RemotePricingSnapshot::from_cache_root("relative-cache-root");
+        let missing = RemotePricingSnapshot::from_cache_root(root.path().join("absent"));
+        assert_eq!(relative.content_digest(), missing.content_digest());
+        assert_eq!(
+            relative.diagnostic(),
+            Some(RemotePricingDiagnostic::Missing)
+        );
+        assert!(relative.service().is_none());
     }
 
     #[test]

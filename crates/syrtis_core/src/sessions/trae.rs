@@ -118,22 +118,31 @@ fn parse_session(client: &str, session: &serde_json::Value) -> Option<UnifiedMes
 
 /// Parse a cache file containing an array of sessions as returned by the API.
 pub fn parse_trae_file(client: &str, path: &std::path::Path) -> Vec<UnifiedMessage> {
-    let content = match super::utils::read_source_text(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let sessions = match value.as_array() {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    sessions
-        .iter()
-        .filter_map(|s| parse_session(client, s))
-        .collect()
+    let mut messages = Vec::new();
+    if visit_trae_file(client, path, &mut |message| {
+        messages.push(message);
+        Ok(())
+    })
+    .is_err()
+    {
+        messages.clear();
+    }
+    messages
+}
+
+pub(crate) fn visit_trae_file(
+    client: &str,
+    path: &std::path::Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    let reader =
+        std::io::BufReader::new(super::utils::open_source_file(path).map_err(|e| e.to_string())?);
+    super::utils::visit_json_array(reader, &mut |session: serde_json::Value| {
+        if let Some(message) = parse_session(client, &session) {
+            sink(message)?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +155,54 @@ mod tests {
         f.write_all(data.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn visitor_preserves_cost_authority_and_rejects_partial_documents() {
+        let row = serde_json::json!({
+            "model_name": "GPT-5.4", "session_id": "paid",
+            "usage_time": 1776000000, "dollar_float": 0.25,
+            "extra_info": { "input_token": 10 }
+        });
+        let mut free = row.clone();
+        free["session_id"] = serde_json::json!("free");
+        free["dollar_float"] = serde_json::json!(0.0);
+        let mut missing = row.clone();
+        missing["session_id"] = serde_json::json!("missing");
+        missing.as_object_mut().unwrap().remove("dollar_float");
+        let file = write_fixture(&serde_json::json!([null, row, free, missing]).to_string());
+        let mut messages = Vec::new();
+        visit_trae_file("trae-cn", file.path(), &mut |message| {
+            messages.push(message);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages.iter().map(|m| m.cost).collect::<Vec<_>>(),
+            [0.25, 0.0, 0.0]
+        );
+        assert!(messages[0].has_authoritative_cost());
+        assert!(messages[1].has_authoritative_cost());
+        assert!(!messages[2].has_authoritative_cost());
+        assert!(messages.iter().all(|m| m.client == "trae-cn"));
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("trae:paid:1776000000")
+        );
+        let mut calls = 0;
+        let error = visit_trae_file("trae", file.path(), &mut |_| {
+            calls += 1;
+            Err("sink stopped".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("sink stopped"));
+        assert_eq!(calls, 1);
+        for malformed in [format!("[{row},"), format!("[{row}] trailing")] {
+            let file = write_fixture(&malformed);
+            assert!(visit_trae_file("trae", file.path(), &mut |_| Ok(())).is_err());
+            assert!(parse_trae_file("trae", file.path()).is_empty());
+        }
     }
 
     #[test]

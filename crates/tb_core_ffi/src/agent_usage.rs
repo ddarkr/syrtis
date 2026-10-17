@@ -1156,21 +1156,125 @@ enum ClaudeLoginResolution {
     Terminal(String),
 }
 
-#[derive(Debug, Deserialize)]
-struct ClaudeCredentialsRoot {
-    #[serde(default, rename = "claudeAiOauth")]
-    claude_ai_oauth: Option<ClaudeCredentialsOauth>,
+// Keep the retained-DOM duplicate checks tied to serde's actual field names.
+macro_rules! claude_credential_fields {
+    ($name:ident, $known:ident, { $($field:ident: $ty:ty => $wire:literal),* $(,)? }) => {
+        #[derive(Debug, Deserialize)]
+        struct $name {
+            $(#[serde(rename = $wire)] $field: $ty,)*
+        }
+        const $known: &[&str] = &[$($wire),*];
+    };
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ClaudeCredentialsOauth {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_at: Option<f64>,
-    scopes: Option<Vec<String>>,
-    rate_limit_tier: Option<String>,
-    subscription_type: Option<String>,
+claude_credential_fields!(ClaudeCredentialsRoot, CLAUDE_ROOT_FIELDS, {
+    claude_ai_oauth: Option<ClaudeCredentialsOauth> => "claudeAiOauth",
+});
+claude_credential_fields!(ClaudeCredentialsOauth, CLAUDE_OAUTH_FIELDS, {
+    access_token: Option<String> => "accessToken",
+    refresh_token: Option<String> => "refreshToken",
+    expires_at: Option<f64> => "expiresAt",
+    scopes: Option<Vec<String>> => "scopes",
+    rate_limit_tier: Option<String> => "rateLimitTier",
+    subscription_type: Option<String> => "subscriptionType",
+});
+
+struct ClaudeStoredRoot {
+    value: Value,
+    duplicate_known_field: bool,
+}
+
+impl<'de> Deserialize<'de> for ClaudeStoredRoot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Only these two maps are typed credential maps. All other values use
+        // Value's normal last-key-wins behavior, including unknown subtrees.
+        struct CredentialValue<'a> {
+            fields: &'static [&'static str],
+            duplicate: &'a mut bool,
+        }
+        impl<'de> serde::de::DeserializeSeed<'de> for CredentialValue<'_> {
+            type Value = Value;
+
+            fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        impl<'de> serde::de::Visitor<'de> for CredentialValue<'_> {
+            type Value = Value;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a credential value")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Value, M::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if self.fields.contains(&key.as_str()) && object.contains_key(&key) {
+                        *self.duplicate = true;
+                    }
+                    let value = if self.fields == CLAUDE_ROOT_FIELDS && key == "claudeAiOauth" {
+                        map.next_value_seed(CredentialValue {
+                            fields: CLAUDE_OAUTH_FIELDS,
+                            duplicate: self.duplicate,
+                        })?
+                    } else {
+                        map.next_value::<Value>()?
+                    };
+                    object.insert(key, value);
+                }
+                Ok(Value::Object(object))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Value, E> {
+                Ok(v.into())
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Value, E> {
+                Ok(v.into())
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Value, E> {
+                Ok(v.into())
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("invalid number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Value, E> {
+                Ok(Value::String(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Value, E> {
+                Ok(Value::String(v))
+            }
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: S,
+            ) -> Result<Value, S::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<Value>()? {
+                    values.push(value);
+                }
+                Ok(Value::Array(values))
+            }
+        }
+        let mut duplicate_known_field = false;
+        let value = serde::de::DeserializeSeed::deserialize(
+            CredentialValue {
+                fields: CLAUDE_ROOT_FIELDS,
+                duplicate: &mut duplicate_known_field,
+            },
+            deserializer,
+        )?;
+        Ok(Self {
+            value,
+            duplicate_known_field,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3531,12 +3635,13 @@ where
 }
 
 fn resolve_stored_claude_login(raw: &str, source: ClaudeCredentialSource) -> ClaudeLoginResolution {
-    let raw_root: Value = match serde_json::from_str(raw) {
+    let stored: ClaudeStoredRoot = match serde_json::from_str(raw) {
         Ok(root) => root,
         Err(_) => {
             return ClaudeLoginResolution::Terminal(CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())
         }
     };
+    let raw_root = &stored.value;
     // A store with no `claudeAiOauth` at all carries no Claude login (e.g. an
     // mcpOAuth-only Keychain item, issue #219). That is absence, not a malformed
     // or unreadable credential, so it must not fail closed. `null` is folded in
@@ -3552,7 +3657,7 @@ fn resolve_stored_claude_login(raw: &str, source: ClaudeCredentialSource) -> Cla
     if explicitly_logged_out {
         return ClaudeLoginResolution::ExplicitLogout;
     }
-    match parse_claude_credentials_data(raw, source) {
+    match parse_claude_credentials_root(stored, source) {
         Ok(credentials) => ClaudeLoginResolution::Ready(credentials),
         Err(display) => ClaudeLoginResolution::Terminal(display),
     }
@@ -3647,10 +3752,23 @@ fn parse_claude_credentials_data(
 ) -> Result<ClaudeCredentials, String> {
     // Never the serde error's Display: invalid-type errors quote the offending
     // value, which here is credential content, and this string reaches the card.
-    let raw_root: Value =
+    let stored: ClaudeStoredRoot =
         serde_json::from_str(raw).map_err(|_| CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())?;
-    let root: ClaudeCredentialsRoot =
-        serde_json::from_str(raw).map_err(|_| CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())?;
+    parse_claude_credentials_root(stored, source)
+}
+
+fn parse_claude_credentials_root(
+    stored: ClaudeStoredRoot,
+    source: ClaudeCredentialSource,
+) -> Result<ClaudeCredentials, String> {
+    if stored.duplicate_known_field {
+        return Err(CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string());
+    }
+    let raw_root = stored.value;
+    // Borrow the retained DOM; unknown fields remain intact for refresh guards.
+    // Do not expose serde errors, which may contain credential values.
+    let root = ClaudeCredentialsRoot::deserialize(&raw_root)
+        .map_err(|_| CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())?;
     let oauth = root
         .claude_ai_oauth
         .ok_or_else(|| "Claude OAuth credentials are missing claudeAiOauth.".to_string())?;
@@ -9340,11 +9458,76 @@ mod tests {
     }
 
     #[test]
+    fn claude_known_duplicates_reject_only_at_typed_admission() {
+        for field in CLAUDE_OAUTH_FIELDS {
+            let value = match *field {
+                "expiresAt" => "1700000000000",
+                "scopes" => r#"["user:profile"]"#,
+                _ => r#""synthetic""#,
+            };
+            let raw = format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","{field}":{value},"{field}":{value}}}}}"#
+            );
+            assert!(
+                matches!(
+                    resolve_stored_claude_login(&raw, ClaudeCredentialSource::File),
+                    ClaudeLoginResolution::Terminal(error)
+                        if error == CLAUDE_STORED_LOGIN_MALFORMED_ERROR
+                ),
+                "{field}"
+            );
+            assert!(parse_claude_credentials_data(&raw, ClaudeCredentialSource::File).is_err());
+        }
+        for raw in [
+            r#"{"claudeAiOauth":null,"claudeAiOauth":{"accessToken":"a"}}"#,
+            r#"{"claudeAiOauth":{"accessToken":"a","accessToken":"b","refreshToken":"r"}}"#,
+        ] {
+            assert!(
+                matches!(resolve_stored_claude_login(raw, ClaudeCredentialSource::File),
+                ClaudeLoginResolution::Terminal(error)
+                    if error == CLAUDE_STORED_LOGIN_MALFORMED_ERROR)
+            );
+        }
+        for (raw, absent) in [
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a"},"claudeAiOauth":null}"#,
+                true,
+            ),
+            (
+                r#"{"claudeAiOauth":null,"claudeAiOauth":{"refreshToken":"r","refreshToken":"s"}}"#,
+                false,
+            ),
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a","accessToken":null,"refreshToken":"r"}}"#,
+                false,
+            ),
+        ] {
+            let result = resolve_stored_claude_login(raw, ClaudeCredentialSource::File);
+            assert!(if absent {
+                matches!(result, ClaudeLoginResolution::Absent)
+            } else {
+                matches!(result, ClaudeLoginResolution::ExplicitLogout)
+            });
+        }
+        let raw = r#"{"sibling":1,"sibling":2,"claudeAiOauth":{"accessToken":" a ","future":{"scopes":1,"scopes":2},"unknown":1,"unknown":2}}"#;
+        let ClaudeLoginResolution::Ready(credentials) =
+            resolve_stored_claude_login(raw, ClaudeCredentialSource::File)
+        else {
+            panic!("unknown duplicates must remain allowed")
+        };
+        assert_eq!(credentials.access_token, "a");
+        let root = credentials.raw_root.unwrap();
+        assert_eq!(root["sibling"], 2);
+        assert_eq!(root["claudeAiOauth"]["unknown"], 2);
+        assert_eq!(root["claudeAiOauth"]["future"]["scopes"], 2);
+    }
+
+    #[test]
     fn parses_claude_credentials_file() {
         let raw = r#"{
             "claudeAiOauth": {
-                "accessToken": "access",
-                "refreshToken": "refresh",
+                "accessToken": "  access  ",
+                "refreshToken": "  refresh  ",
                 "expiresAt": 1700000000000,
                 "scopes": ["user:profile"],
                 "rateLimitTier": "max",
@@ -9366,11 +9549,21 @@ mod tests {
                 "refreshToken": "old-refresh",
                 "expiresAt": 1700000000000,
                 "scopes": ["user:profile"],
-                "subscriptionType": "pro"
-            }
+                "subscriptionType": "pro",
+                "futureOauth": {"nested": [null, true, "untouched"]}
+            },
+            "mcpOAuth": {"server": {"accessToken": "other-access"}}
         }"#;
-        let mut credentials =
-            parse_claude_credentials_data(raw, ClaudeCredentialSource::File).unwrap();
+        let ClaudeLoginResolution::Ready(mut credentials) =
+            resolve_stored_claude_login(raw, ClaudeCredentialSource::File)
+        else {
+            panic!("synthetic login must resolve");
+        };
+        assert_eq!(credentials.source, ClaudeCredentialSource::File);
+        assert_eq!(
+            credentials.raw_root.as_ref().unwrap()["claudeAiOauth"]["futureOauth"]["nested"][2],
+            "untouched"
+        );
         credentials.access_token = "new-access".to_string();
         credentials.refresh_token = Some("new-refresh".to_string());
         credentials.expires_at = Utc.timestamp_millis_opt(1_700_009_999_000).single();
@@ -9387,6 +9580,15 @@ mod tests {
         // Untouched fields the Claude CLI wrote survive the merge.
         assert_eq!(reparsed.subscription_type.as_deref(), Some("pro"));
         assert_eq!(reparsed.scopes, vec!["user:profile"]);
+        let retained = reparsed.raw_root.as_ref().unwrap();
+        assert_eq!(
+            retained["claudeAiOauth"]["futureOauth"]["nested"],
+            serde_json::json!([null, true, "untouched"])
+        );
+        assert_eq!(
+            retained["mcpOAuth"]["server"]["accessToken"],
+            "other-access"
+        );
     }
 
     #[test]

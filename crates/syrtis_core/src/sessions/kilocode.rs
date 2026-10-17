@@ -2,12 +2,19 @@
 //!
 //! Shares the same task-log format as Roo Code and reuses the same parser helper.
 
-use super::roocode::parse_roo_kilo_file;
+use super::roocode::{parse_roo_kilo_file, visit_roo_kilo_file};
 use super::UnifiedMessage;
 use std::path::Path;
 
 pub fn parse_kilocode_file(path: &Path) -> Vec<UnifiedMessage> {
     parse_roo_kilo_file(path, "kilocode")
+}
+
+pub(crate) fn visit_kilocode_file(
+    path: &Path,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_roo_kilo_file(path, "kilocode", sink)
 }
 
 #[cfg(test)]

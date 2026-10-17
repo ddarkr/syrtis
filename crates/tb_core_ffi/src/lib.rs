@@ -251,9 +251,9 @@ fn serialize_agent_usage_with_bindings<F>(
     generation: u64,
     bindings: Vec<(Option<String>, agent_quota_history::SeriesKey)>,
     serialize: F,
-) -> Result<serde_json::Value, String>
+) -> Result<String, String>
 where
-    F: FnOnce() -> Result<serde_json::Value, String>,
+    F: FnOnce() -> Result<String, String>,
 {
     let value = serialize()?;
     // The account each key was published under travels with it, so two Claude
@@ -265,11 +265,9 @@ where
 fn serialize_agent_usage_payload(
     generation: u64,
     payload: &agent_usage::AgentUsagePayload,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     let bindings = payload.quota_curve_series();
-    serialize_agent_usage_with_bindings(generation, bindings, || {
-        serde_json::to_value(payload).map_err(|error| format!("serialize agent usage: {error}"))
-    })
+    serialize_agent_usage_with_bindings(generation, bindings, || encode_local_response(payload))
 }
 
 /// Cap rayon's global thread pool to 2 workers. syrtis-core uses rayon for
@@ -363,6 +361,13 @@ pub(crate) fn encode_local_response<T: serde::Serialize>(data: &T) -> Result<Str
         .map_err(|error| format!("serialize local payload: {error}"))
 }
 
+fn final_response(result: Result<String, String>) -> *mut c_char {
+    match result {
+        Ok(json) => into_raw_json(json),
+        Err(error) => envelope(Err(error)),
+    }
+}
+
 pub(crate) fn encoded_envelope(result: Result<EncodedLocalPayload, String>) -> *mut c_char {
     match result {
         Ok(data) => {
@@ -449,10 +454,10 @@ struct QuotaCurvePayload {
 }
 
 fn quota_curve_payload(
-    series: &agent_quota_history::SeriesState,
+    series: agent_quota_history::SeriesState,
     generation: u64,
-) -> Result<serde_json::Value, String> {
-    let mut samples = series.samples.clone();
+) -> Result<String, String> {
+    let mut samples = series.samples;
     samples.sort_by(|left, right| {
         left.sampled_at
             .cmp(&right.sampled_at)
@@ -485,7 +490,7 @@ fn quota_curve_payload(
                 .is_some_and(|active| agent_quota_history::is_active_group_sample(active, &sample)),
         })
         .collect::<Vec<_>>();
-    serde_json::to_value(QuotaCurvePayload {
+    encode_local_response(&QuotaCurvePayload {
         coverage: QuotaCurveCoverage {
             oldest_sampled_at,
             newest_sampled_at,
@@ -495,7 +500,6 @@ fn quota_curve_payload(
         active_reset_at: series.active_reset_at,
         generation,
     })
-    .map_err(|error| format!("serialize quota curve: {error}"))
 }
 
 fn history_error_message(error: agent_quota_history::HistoryError) -> String {
@@ -514,7 +518,7 @@ fn quota_curve_result_with_reader<R, H, S>(
     before_history: H,
     before_serialize: S,
     read_history: R,
-) -> Result<serde_json::Value, String>
+) -> Result<String, String>
 where
     H: FnOnce(),
     S: FnOnce(),
@@ -587,12 +591,12 @@ where
     before_serialize();
 
     let Some(series) = series else {
-        return Ok(serde_json::Value::Null);
+        return encode_local_response(&Option::<QuotaCurvePayload>::None);
     };
     if series.samples.is_empty() {
-        return Ok(serde_json::Value::Null);
+        return encode_local_response(&Option::<QuotaCurvePayload>::None);
     }
-    quota_curve_payload(&series, generation)
+    quota_curve_payload(series, generation)
 }
 
 fn quota_curve_result(
@@ -600,7 +604,7 @@ fn quota_curve_result(
     account_key: Option<&str>,
     window_key: &str,
     generation: u64,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     #[cfg(test)]
     if let Some(path) = TEST_QUOTA_CURVE_HISTORY_PATH
         .lock()
@@ -1223,7 +1227,7 @@ pub extern "C" fn tb_agent_usage() -> *mut c_char {
             // the providers that already succeeded — and could cut off the legitimate
             // expired-token path (sequential refresh + fetch, up to ~60s).
             let payload = RUNTIME.block_on(agent_usage::run(generation));
-            envelope(serialize_agent_usage_payload(generation, &payload))
+            final_response(serialize_agent_usage_payload(generation, &payload))
         })
     })
     .unwrap_or_else(|_| {
@@ -1256,7 +1260,7 @@ pub unsafe extern "C" fn tb_quota_curve(
                 quota_curve_result(client, account.as_deref(), window, generation)
             })
         });
-        envelope(result)
+        final_response(result)
     })
 }
 
@@ -2169,6 +2173,11 @@ mod tests {
             || {},
             |key| agent_quota_history::read_series_at_path(key, path, now),
         )
+        .and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(&json)
+                .map(|response| response["data"].clone())
+                .map_err(|error| error.to_string())
+        })
     }
 
     fn set_test_quota_curve_history_path(path: Option<PathBuf>) {
@@ -2293,7 +2302,11 @@ mod tests {
             ],
         };
 
-        let value = quota_curve_payload(&series, 7).expect("serialize curve payload");
+        let response: serde_json::Value =
+            serde_json::from_str(&quota_curve_payload(series, 7).expect("serialize curve payload"))
+                .expect("consumer curve response");
+        assert_eq!(response["ok"], true);
+        let value = &response["data"];
         let object = value.as_object().expect("curve payload object");
         // The running group is marked on the POINT. `active_reset_at` here is
         // 1_000_500 and the third sample's stored `reset_at` is exactly that, so
@@ -2418,7 +2431,11 @@ mod tests {
             series.active_reset_at.unwrap(),
             "the fixture must actually be off-quantum"
         );
-        let value = quota_curve_payload(&series, 7).expect("serialize curve payload");
+        let response: serde_json::Value =
+            serde_json::from_str(&quota_curve_payload(series, 7).expect("serialize curve payload"))
+                .expect("consumer curve response");
+        assert_eq!(response["ok"], true);
+        let value = &response["data"];
         assert_eq!(value["points"][0]["isActiveGroup"], true);
     }
 
@@ -2637,7 +2654,10 @@ mod tests {
             .join()
             .expect("history reader join")
             .expect("guarded read result");
-        assert_eq!(value["points"][0]["usedPercent"], 10.0);
+        let response: serde_json::Value =
+            serde_json::from_str(&value).expect("consumer guarded response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data"]["points"][0]["usedPercent"], 10.0);
         fs::remove_dir_all(directory).expect("remove serialize-guard fixture");
     }
 

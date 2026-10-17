@@ -1601,7 +1601,7 @@ where
     S: FnMut(&UnifiedMessage),
 {
     prepare_opencode_snapshot_on(transaction, scope_generation, hydrate_aliases)?;
-    visit_prepared_opencode_snapshot_on(transaction, mode, hydrate_aliases, filter, sink)
+    visit_prepared_opencode_snapshot_on(transaction, mode, hydrate_aliases, &|_| {}, filter, sink)
 }
 
 /// Transfer immutable facts and aliases while the scope transaction is pinned.
@@ -1676,7 +1676,7 @@ where
     S: FnMut(&UnifiedMessage),
 {
     prepare_query(transaction, hydrate_aliases)?;
-    visit_prepared_opencode_snapshot_on(transaction, mode, hydrate_aliases, filter, sink)
+    visit_prepared_opencode_snapshot_on(transaction, mode, hydrate_aliases, &|_| {}, filter, sink)
 }
 
 pub(crate) fn visit_opencode_query_on<F, S>(
@@ -1684,6 +1684,7 @@ pub(crate) fn visit_opencode_query_on<F, S>(
     indexed: bool,
     mode: OpenCodeSelectionMode,
     hydrate_aliases: bool,
+    prepare: &impl Fn(&mut UnifiedMessage),
     filter: &F,
     sink: &mut S,
 ) -> Result<(), String>
@@ -1692,9 +1693,16 @@ where
     S: FnMut(&UnifiedMessage),
 {
     if indexed {
-        visit_indexed_opencode_on(connection, hydrate_aliases, filter, sink)
+        visit_indexed_opencode_on(connection, hydrate_aliases, prepare, filter, sink)
     } else {
-        visit_prepared_opencode_snapshot_on(connection, mode, hydrate_aliases, filter, sink)
+        visit_prepared_opencode_snapshot_on(
+            connection,
+            mode,
+            hydrate_aliases,
+            prepare,
+            filter,
+            sink,
+        )
     }
 }
 
@@ -1833,6 +1841,7 @@ pub(crate) fn prepare_indexed_opencode_on(
 pub(crate) fn visit_indexed_opencode_on<F, S>(
     connection: &Connection,
     hydrate_aliases: bool,
+    prepare: &impl Fn(&mut UnifiedMessage),
     filter: &F,
     sink: &mut S,
 ) -> Result<(), String>
@@ -1847,6 +1856,7 @@ where
         if hydrate_aliases {
             hydrate_prepared_aliases(connection, sql(row.get(0))?, &mut message)?;
         }
+        prepare(&mut message);
         if filter(&message) {
             sink(&message);
         }
@@ -1880,6 +1890,7 @@ pub(crate) fn visit_prepared_opencode_snapshot_on<F, S>(
     transaction: &Connection,
     mode: OpenCodeSelectionMode,
     hydrate_aliases: bool,
+    prepare: &impl Fn(&mut UnifiedMessage),
     filter: &F,
     sink: &mut S,
 ) -> Result<(), String>
@@ -1893,8 +1904,14 @@ where
     // publication (which already holds its own write transaction) never sees
     // an unconditional begin from shared arbitration.
     sql(transaction.execute_batch("SAVEPOINT ocq_scratch"))?;
-    let result =
-        visit_prepared_opencode_snapshot_inner(transaction, mode, hydrate_aliases, filter, sink);
+    let result = visit_prepared_opencode_snapshot_inner(
+        transaction,
+        mode,
+        hydrate_aliases,
+        prepare,
+        filter,
+        sink,
+    );
     if result.is_err() {
         let _ = transaction.execute_batch("ROLLBACK TO SAVEPOINT ocq_scratch; RELEASE ocq_scratch");
     } else {
@@ -1907,6 +1924,7 @@ pub(crate) fn visit_prepared_opencode_snapshot_inner<F, S>(
     transaction: &Connection,
     mode: OpenCodeSelectionMode,
     hydrate_aliases: bool,
+    prepare: &impl Fn(&mut UnifiedMessage),
     filter: &F,
     sink: &mut S,
 ) -> Result<(), String>
@@ -1930,6 +1948,7 @@ where
             // including JSON eligibility before report fallback arbitration.
             hydrate_prepared_aliases(transaction, id, &mut message)?;
         }
+        prepare(&mut message);
         let passes = filter(&message);
         let emit = if sqlite {
             selection.select_sqlite(id, provider)?
@@ -1954,6 +1973,7 @@ where
             let id: i64 = sql(row.get(1))?;
             hydrate_prepared_aliases(transaction, id, &mut message)?;
         }
+        prepare(&mut message);
         if filter(&message) {
             sink(&message);
         }
@@ -3354,6 +3374,7 @@ mod tests {
                 &reader,
                 OpenCodeSelectionMode::Materialized,
                 true,
+                &|_| {},
                 &|_| {
                     writer
                         .execute_batch(
@@ -3367,6 +3388,26 @@ mod tests {
             .unwrap();
             assert_eq!(observed, expected);
         }
+        let mut prepared_output = Vec::new();
+        visit_opencode_query_on(
+            &reader,
+            false,
+            OpenCodeSelectionMode::Report,
+            true,
+            &|message| {
+                message.cost += 1.0;
+                message.date = "prepared-date".into();
+            },
+            &|message| message.cost == 1.0 && message.date == "prepared-date",
+            &mut |message| prepared_output.push(message.clone()),
+        )
+        .unwrap();
+        let mut prepared_expected = expected;
+        for message in &mut prepared_expected {
+            message.cost += 1.0;
+            message.date = "prepared-date".into();
+        }
+        assert_eq!(prepared_output, prepared_expected);
     }
 
     #[test]

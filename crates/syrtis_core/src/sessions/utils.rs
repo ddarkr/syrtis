@@ -7,6 +7,110 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
 
+/// Validate discarded JSON strings too, without retaining the source document.
+pub(crate) struct Utf8Reader<R> {
+    reader: R,
+    buffer: [u8; 8192],
+    position: usize,
+    valid: usize,
+    length: usize,
+}
+
+impl<R: Read> Utf8Reader<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: [0; 8192],
+            position: 0,
+            valid: 0,
+            length: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for Utf8Reader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        while self.position == self.valid {
+            self.buffer.copy_within(self.valid..self.length, 0);
+            self.length -= self.valid;
+            self.position = 0;
+            self.valid = 0;
+            let count = loop {
+                match self.reader.read(&mut self.buffer[self.length..]) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
+            if count == 0 {
+                return if self.length == 0 {
+                    Ok(0)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "incomplete UTF-8",
+                    ))
+                };
+            }
+            self.length += count;
+            self.valid = match std::str::from_utf8(&self.buffer[..self.length]) {
+                Ok(_) => self.length,
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8")),
+            };
+        }
+        let count = output.len().min(self.valid - self.position);
+        output[..count].copy_from_slice(&self.buffer[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+/// Visit one array element at a time, rejecting malformed tails and trailing JSON.
+pub(crate) fn visit_json_array<T: serde::de::DeserializeOwned>(
+    reader: impl Read,
+    sink: &mut dyn FnMut(T) -> Result<(), String>,
+) -> Result<(), String> {
+    struct ArraySeed<'a, T>(&'a mut dyn FnMut(T) -> Result<(), String>);
+    impl<'de, T: serde::de::DeserializeOwned> serde::de::DeserializeSeed<'de> for ArraySeed<'_, T> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+    }
+    impl<'de, T: serde::de::DeserializeOwned> serde::de::Visitor<'de> for ArraySeed<'_, T> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON array")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(item) = seq.next_element()? {
+                (self.0)(item).map_err(serde::de::Error::custom)?;
+            }
+            Ok(())
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_reader(Utf8Reader::new(reader));
+    serde::de::DeserializeSeed::deserialize(ArraySeed(sink), &mut deserializer)
+        .map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())
+}
+
+/// Keep SIMD number and typed-field semantics while retaining only one raw item.
+pub(crate) fn visit_simd_json_array<T: serde::de::DeserializeOwned>(
+    reader: impl Read,
+    sink: &mut dyn FnMut(T) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_json_array(reader, &mut |raw: Box<serde_json::value::RawValue>| {
+        let text: Box<str> = raw.into();
+        let mut bytes = text.into_string().into_bytes();
+        let item = simd_json::from_slice(&mut bytes).map_err(|error| error.to_string())?;
+        sink(item)
+    })
+}
+
 thread_local! {
     static SOURCE_READ_FAILED: Cell<Option<bool>> = const { Cell::new(None) };
 }
@@ -121,7 +225,7 @@ pub(crate) fn optional_source_exists(path: &Path) -> bool {
     observe_io(std::fs::metadata(path), true).is_ok()
 }
 
-fn sqlite_read_failed(error: &rusqlite::Error) -> bool {
+pub(crate) fn sqlite_read_failed(error: &rusqlite::Error) -> bool {
     !matches!(
         error,
         rusqlite::Error::FromSqlConversionFailure(..)
@@ -479,3 +583,77 @@ mod tests {
 #[cfg(test)]
 #[path = "source_read_tests.rs"]
 mod source_read_tests;
+
+#[cfg(test)]
+mod json_array_tests {
+    use super::visit_json_array;
+
+    #[test]
+    fn rejects_malformed_and_trailing_input_and_propagates_sink_errors() {
+        for input in ["[1,", "[1] false", "{}"] {
+            assert!(visit_json_array::<u64>(input.as_bytes(), &mut |_| Ok(())).is_err());
+        }
+        let mut rows = Vec::new();
+        visit_json_array::<u64>("[1,2,2] \n".as_bytes(), &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, [1, 2, 2]);
+        let mut count = 0;
+        let error = visit_json_array::<u64>("[1,2]".as_bytes(), &mut |_| {
+            count += 1;
+            Err("sink stopped".into())
+        })
+        .unwrap_err();
+        assert_eq!(count, 1);
+        assert!(error.contains("sink stopped"));
+    }
+}
+
+#[cfg(test)]
+mod utf8_reader_tests {
+    use super::{visit_json_array, Utf8Reader};
+    use std::io::{self, Read};
+
+    struct Tiny<'a>(&'a [u8]);
+    impl Read for Tiny<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let count = output.len().min(1).min(self.0.len());
+            output[..count].copy_from_slice(&self.0[..count]);
+            self.0 = &self.0[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn validates_split_characters_and_incomplete_eof() {
+        let text = "aλ😀z";
+        let mut decoded = String::new();
+        Utf8Reader::new(Tiny(text.as_bytes()))
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, text);
+        for bytes in [&b"\xc3"[..], &b"\xf0\x9f\x98"[..], &b"a\xff"[..]] {
+            let error = Utf8Reader::new(Tiny(bytes))
+                .read_to_end(&mut Vec::new())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        let mut count = 0;
+        visit_json_array::<serde::de::IgnoredAny>(
+            Tiny("[{\"ignored\":\"λ😀\"}]".as_bytes()),
+            &mut |_| {
+                count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(visit_json_array::<serde::de::IgnoredAny>(
+            Tiny(b"[{}, {\"ignored\":\"\xff\"}]"),
+            &mut |_| Ok(()),
+        )
+        .is_err());
+    }
+}

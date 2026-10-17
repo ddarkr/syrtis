@@ -24,6 +24,7 @@ use crate::agent_usage::{
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeSeed as _;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -259,15 +260,167 @@ fn usage_request(
         .body("{}")
 }
 
+// Retain only scalar quota fields, but validate every discarded value with the
+// same scalar decoding and container recursion limit as serde_json::Value.
+struct UsageProjection([Value; 12]);
+
+const USAGE_FIELDS: [&str; 12] = [
+    "error",
+    "usesPooledEnterpriseAllowance",
+    "uses_pooled_enterprise_allowance",
+    "hasNonZeroIncludedLimit",
+    "has_non_zero_included_limit",
+    "usagePercent",
+    "usage_percent",
+    "nextResetTimestampUtc",
+    "next_reset_timestamp_utc",
+    "currentPeriodStart",
+    "current_period_start",
+    "grokPlanLabel",
+];
+
+impl UsageProjection {
+    fn get(&self, key: &str) -> Option<&Value> {
+        USAGE_FIELDS
+            .iter()
+            .position(|field| *field == key)
+            .map(|i| &self.0[i])
+    }
+}
+
+struct ScalarProjection(bool);
+
+impl<'de> serde::de::DeserializeSeed<'de> for ScalarProjection {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ScalarProjection {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(if self.0 {
+            Value::Bool(value)
+        } else {
+            Value::Null
+        })
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(if self.0 {
+            Value::from(value)
+        } else {
+            Value::Null
+        })
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(if self.0 {
+            Value::from(value)
+        } else {
+            Value::Null
+        })
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        let number =
+            serde_json::Number::from_f64(value).ok_or_else(|| E::custom("number out of range"))?;
+        Ok(if self.0 {
+            Value::Number(number)
+        } else {
+            Value::Null
+        })
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(if self.0 {
+            Value::String(value.to_owned())
+        } else {
+            Value::Null
+        })
+    }
+
+    fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut seq: S) -> Result<Value, S::Error> {
+        while seq.next_element_seed(ScalarProjection(false))?.is_some() {}
+        Ok(Value::Null)
+    }
+
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Value, M::Error> {
+        while map.next_key_seed(ScalarProjection(false))?.is_some() {
+            map.next_value_seed(ScalarProjection(false))?;
+        }
+        Ok(Value::Null)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UsageProjection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProjectionVisitor;
+        struct Field(Option<usize>);
+        impl<'de> serde::Deserialize<'de> for Field {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+                impl serde::de::Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a field name")
+                    }
+                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Field, E> {
+                        Ok(Field(USAGE_FIELDS.iter().position(|field| *field == value)))
+                    }
+                }
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+        impl<'de> serde::de::Visitor<'de> for ProjectionVisitor {
+            type Value = UsageProjection;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a usage object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut values = std::array::from_fn(|_| Value::Null);
+                while let Some(Field(index)) = map.next_key()? {
+                    let value = map.next_value_seed(ScalarProjection(index.is_some()))?;
+                    if let Some(index) = index {
+                        values[index] = value;
+                    }
+                }
+                Ok(UsageProjection(values))
+            }
+        }
+        deserializer.deserialize_map(ProjectionVisitor)
+    }
+}
+
 /// Pure response mapping, split out so the endpoint contract is unit-testable
 /// without network or credentials. Accepts the dashboard's camelCase and
 /// snake_case shapes (both observed in the wild).
 pub(crate) fn map_response(body: &str, now: DateTime<Utc>) -> Result<GrokBotData, String> {
-    let payload: Value = serde_json::from_str(body)
+    if !body.trim_start().starts_with('{') {
+        let mut deserializer = serde_json::Deserializer::from_str(body);
+        ScalarProjection(false)
+            .deserialize(&mut deserializer)
+            .and_then(|_| deserializer.end())
+            .map_err(|_| "Grok Bot usage response could not be decoded.".to_string())?;
+        return Err("Cursor returned an unexpected response.".to_string());
+    }
+    let projection: UsageProjection = serde_json::from_str(body)
         .map_err(|_| "Grok Bot usage response could not be decoded.".to_string())?;
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| "Cursor returned an unexpected response.".to_string())?;
+    let obj = &projection;
 
     if obj
         .get("error")
@@ -366,20 +519,19 @@ pub(crate) fn map_response(body: &str, now: DateTime<Utc>) -> Result<GrokBotData
     })
 }
 
-fn first_f64(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
-    keys.iter()
-        .find_map(|k| obj.get(*k).and_then(Value::as_f64))
+fn first_f64(obj: &UsageProjection, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| obj.get(k).and_then(Value::as_f64))
 }
 
-fn first_bool(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+fn first_bool(obj: &UsageProjection, keys: &[&str]) -> Option<bool> {
     keys.iter()
-        .find_map(|k| obj.get(*k).and_then(Value::as_bool))
+        .find_map(|k| obj.get(k).and_then(Value::as_bool))
 }
 
 /// Accept ISO-8601 strings and epoch seconds-or-milliseconds (number or
 /// numeric string) — the dashboard has sent all three shapes.
-fn first_timestamp(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<DateTime<Utc>> {
-    keys.iter().find_map(|k| parse_timestamp(obj.get(*k)?))
+fn first_timestamp(obj: &UsageProjection, keys: &[&str]) -> Option<DateTime<Utc>> {
+    keys.iter().find_map(|k| parse_timestamp(obj.get(k)?))
 }
 
 fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
@@ -719,6 +871,83 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-09-10T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn projection_skips_large_unknown_and_wrong_type_trees() {
+        let irrelevant = format!(
+            r#"{{"rows":[{}]}}"#,
+            r#"{"text":"irrelevant"},"#.repeat(50_000).trim_end_matches(',')
+        );
+        let body = format!(
+            r#"{{"unknown":{irrelevant},"usagePercent":{irrelevant},"usage_percent":25,
+            "usesPooledEnterpriseAllowance":{irrelevant},"uses_pooled_enterprise_allowance":false,
+            "hasNonZeroIncludedLimit":{irrelevant},"has_non_zero_included_limit":true,
+            "nextResetTimestampUtc":{irrelevant},"next_reset_timestamp_utc":"2026-09-15T15:40:06Z",
+            "currentPeriodStart":{irrelevant},"current_period_start":"2026-09-08T15:40:06Z",
+            "error":{irrelevant},"grokPlanLabel":{irrelevant}}}"#
+        );
+        let data = map_response(&body, now()).unwrap();
+        assert_eq!(data.windows[0].remaining_for_test(), 75.0);
+        assert!(data.identity.is_none());
+        assert!(map_response(&body[..body.len() - 1], now()).is_err());
+    }
+
+    #[test]
+    fn projection_preserves_alias_precedence_and_last_duplicate() {
+        let data = map_response(
+            r#"{"usagePercent":99,"usagePercent":25,"usage_percent":90,
+            "usesPooledEnterpriseAllowance":false,"uses_pooled_enterprise_allowance":true,
+            "hasNonZeroIncludedLimit":true,"has_non_zero_included_limit":false,
+            "nextResetTimestampUtc":"2026-09-15T15:40:06Z","next_reset_timestamp_utc":"invalid",
+            "currentPeriodStart":"invalid","current_period_start":"2026-09-08T15:40:06Z",
+            "grokPlanLabel":"  Pro  ","grok_plan_label":"ignored","error":false}"#,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(data.windows[0].remaining_for_test(), 75.0);
+        assert_eq!(data.identity.unwrap().plan.as_deref(), Some("  Pro  "));
+        let data = map_response(
+            r#"{"usagePercent":5,"usagePercent":{},"usage_percent":40,
+            "nextResetTimestampUtc":null,"next_reset_timestamp_utc":"2026-09-15T15:40:06Z"}"#,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(data.windows[0].remaining_for_test(), 60.0);
+    }
+
+    #[test]
+    fn selective_projection_rejects_invalid_discarded_scalars_and_depth() {
+        let mut bodies = vec![
+            r#"{"usagePercent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z","unknown":1e400}"#.to_owned(),
+            r#"{"usagePercent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z","unknown":"\uD800"}"#.to_owned(),
+            r#"{"usagePercent":{"nested":1e400},"usage_percent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z"}"#.to_owned(),
+            r#"{"usagePercent":[{"\uD800":0}],"usage_percent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z"}"#.to_owned(),
+        ];
+        bodies.push(format!(
+            r#"{{"usagePercent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z","unknown":{}0{}}}"#,
+            "[".repeat(160),
+            "]".repeat(160),
+        ));
+        for body in bodies {
+            assert!(serde_json::from_str::<Value>(&body).is_err());
+            assert!(map_response(&body, now()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn projection_preserves_response_validation_errors() {
+        for body in ["null", "true", "42", "\"text\"", "[]"] {
+            assert!(map_response(body, now()).is_err());
+        }
+        for body in ["{", "{} trailing", r#"{"unknown":[1,]}"#] {
+            assert!(map_response(body, now()).is_err());
+        }
+        assert!(map_response(
+            r#"{"error":"private","usagePercent":25,"nextResetTimestampUtc":"2026-09-15T15:40:06Z"}"#,
+            now(),
+        )
+        .is_err());
     }
 
     #[test]

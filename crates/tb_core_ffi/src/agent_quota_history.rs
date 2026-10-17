@@ -525,7 +525,11 @@ fn read_series_at_path_with_mode(
         if loaded.quarantined {
             Err(HistoryError::Corrupt)
         } else {
-            Ok(find_target_series(&loaded.store, key).cloned())
+            Ok(loaded
+                .store
+                .series
+                .into_iter()
+                .find(|series| series.key() == *key))
         }
     });
     let unlock = fs2::FileExt::unlock(&lock_file).map_err(|_| HistoryError::LockRelease);
