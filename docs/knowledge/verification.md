@@ -372,6 +372,34 @@ A fresh native Swift → C ABI → Rust smoke used isolated Claude fixtures and 
 
 A private demo harness exercised the production Settings scene across Menu bar／Dashboard／Usage attribution／General destinations, one-window routing, minimum resize, close／reopen size preservation, minimize／restore and session teardown. A 400pt production popover rendered populated light／dark states and released its sessions on disappearance. Settings activation calls were suppressed only in the private copy; the harness itself remained inactive at its checkpoints, but this does not verify untouched focus behavior. Minimum-size Settings and popover compositor captures were inspected; initial full-size Settings captures had scaled content with black margins and are not full-layout visual evidence. Sidebar input, About, all eight lens interactions, accessibility／localization matrices, native status-item pixels, older OS runtime and installed preferences were not exercised. No live-provider／Keychain smoke was run.
 
+### Source and presentation allocation verification
+
+A release C ABI comparison covered 13 synthetic lanes: Gemini、Roo Code、Kilo Code、Cline、Antigravity、Codebuff、Trae、Hermes、Goose、OpenCode JSON、OpenCode SQLite、OpenCode SQLite with JSON fallback、and Cursor `usageEventsDisplay` JSON. Graph／models／hourly／Agents and applicable recent rate／trace outputs matched between baseline and candidate on cold、warm、changed-source、removed-source and candidate reopening of baseline-written storage. Cursor remained report-only. Equality removed only graph generation time and canonicalized equal-token trace ties; token lanes、cost、provider／model identity、source timestamps and message multiplicity were not discarded. Parser-level tests separately cover identities and ordinals that aggregates cannot expose.
+
+Permanent regressions cover atomic malformed-tail／UTF-8 rejection, legacy SIMD cost bits and deep unused values, strict validation of discarded numeric／Unicode／nested fields, Gemini fallback through the same unlinked descriptor and zero／under／oversized reserve hints, Goose legacy prefix compatibility with observed read failure, and OpenCode transformed eligibility with callback writes. The final full Rust workspace passed 2,587 top-level tests plus one child-process check, with seven ignored; all 38 Grok Bot tests passed. Workspace Clippy completed with the existing 15 library／22 test-target warnings. Debug and isolated-identifier bundled selftests passed, and the bundled signature passed deep strict verification. Eighteen changed Rust files passed file-mode formatting checks; the pricing file retained exactly its immutable baseline's three formatting hunks, with no new formatter delta. These are not live-provider、installed-app、Windows or long-duration acceptance results.
+
+Four balanced pairs per source ran in alternating baseline／candidate order, with five seconds before each fresh measured process. All 16 arms completed and matched the exact normalized wire oracle. Gemini contained one 20-token message plus 64 MiB of ignored JSON text; Roo contained 9,000 unrelated UI rows, two usage events and approximately 64 MiB of sibling metadata. Fixture generation remained outside the measured process. `/usr/bin/time -l` measured the native library plus its small Python host, not installed-app physical footprint.
+
+| Synthetic source | Baseline median peak RSS | Candidate median peak RSS | Median paired reduction | Worst paired reduction |
+|---|---|---|---|---|
+| Gemini | 232.14 MiB | 176.17 MiB | 24.45% | 23.22% |
+| Roo Code | 287.05 MiB | 47.42 MiB | 83.45% | 82.48% |
+
+The predeclared 20% RSS reduction passed in every pair. The initial complete attempt was retained: Gemini had regressed by 23.5–30.7% despite matching outputs. Descriptor-sized reservation corrected the generic read buffer's growth／initialization path; the failed attempt was not discarded or substituted with a smaller workload.
+
+| Native sync＋queries | Baseline median | Candidate median |
+|---|---|---|
+| Gemini cold | 103.91 ms | 112.52 ms |
+| Gemini unchanged warm | 38.00 ms | 41.53 ms |
+| Roo Code cold | 133.73 ms | 570.52 ms |
+| Roo Code unchanged warm | 39.83 ms | 45.64 ms |
+
+Memory reduction is not a general speedup: Roo cold collection became slower. All paired warm deltas stayed within the provisional maximum of 100 ms or 25% of baseline warm time, but Roo's candidate warm samples failed the predeclared dispersion bound. Its stable warm-latency acceptance therefore remains inconclusive; no warm-speed improvement is claimed. Raw attempts, binary／fixture hashes and timing evidence remain outside the public repository. These short synthetic runs do not establish production-corpus、installed-app、long-duration or Windows resource acceptance.
+
+A sanitized demo accessory harness exercised the real Swift → C ABI → Rust window capture at exactly 20 tokens／one message, an immutable encoded request and pinned followup. Native checkpoints also passed owned snapshot-byte readback, quota-curve identity rejection, scoped model admission, empty availability／no-client image caches, canonical icon／alias reuse and actual 18／36-pixel status representations. Own-view bitmaps of the populated overview、bar chart、Models and collapsed model breakdown were inspected. The application stayed inactive and the foreground process remained unchanged at captured checkpoints.
+
+Native AX children remained empty, with a sandbox-extension `Operation not permitted` diagnostic. Nineteen AX-driven scenarios therefore could not execute: the eight-lens routing matrix, mode switching, hourly pagination and daily／monthly expansion are skipped interaction verification, not established product failures. Hover scans produced no identifiable tooltip, so hover behavior and stationary empty／filled tooltip stacking remain unverified. No foreground activation, global input, accessibility-permission change or ScreenCaptureKit retry was used. These are own-view bitmap and isolated data-flow checks, not compositor、native status-item shell、installed-app or live-provider acceptance.
+
 ## Local build and UX acceptance
 
 > **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run --build-system native Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
