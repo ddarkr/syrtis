@@ -171,6 +171,11 @@ struct CachedService {
 
 static PRICING_SERVICE: RwLock<Option<CachedService>> = RwLock::const_new(None);
 
+/// Drop shared process pricing after explicitly clearing disposable disk data.
+pub async fn invalidate_cached_service() {
+    *PRICING_SERVICE.write().await = None;
+}
+
 /// How long an in-memory pricing snapshot is reused before a refresh is
 /// attempted. Aligned with the on-disk LiteLLM cache TTL (1h, see
 /// `cache::CACHE_TTL_SECS`) so a refresh past this point re-reads the file

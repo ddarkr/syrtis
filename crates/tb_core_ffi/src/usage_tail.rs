@@ -30,6 +30,9 @@ pub struct UsageTailer {
 }
 
 impl UsageTailer {
+    pub(crate) fn invalidate(&self) {
+        *self.snapshot.lock() = None;
+    }
     pub fn new() -> Self {
         Self {
             snapshot: Mutex::new(None),

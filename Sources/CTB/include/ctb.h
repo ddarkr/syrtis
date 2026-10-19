@@ -63,6 +63,16 @@ char *tb_local_usage_sync(const char *request_json);
 char *tb_local_usage_query(const char *request_json);
 char *tb_local_usage_release(const char *lease_token);
 
+// Storage-only action: {"action":"inspect|clearCache|optimize|resetUsage"}.
+// Data: {usageDirectory, usageBytes, recoveryBytes, cacheBytes, otherBytes,
+// clients:[{client,recordCount,firstTimestampMs,lastTimestampMs}],measuredAtMs}.
+// Allocated bytes where supported; no per-client byte attribution or savings
+// estimate. Inspect never creates/migrates missing stores or scans source logs.
+// Clear removes only the two disposable pricing JSON files; retained parser
+// history is never a cache deletion target. Reset erases own collected facts,
+// invalidates leases, preserves source logs, configuration and quota history.
+char *tb_disk_usage(const char *request_json);
+
 // Contribution graph (UsagePayload). Serves a <=30s-old cached payload.
 char *tb_graph(const char *year);
 // Contribution graph, always recomputed (cache refreshed as a side effect).

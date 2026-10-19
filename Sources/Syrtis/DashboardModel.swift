@@ -335,6 +335,42 @@ private struct DashboardSnapshot {
         // exemption from it.
         AttributedSeriesModel.invalidateRowCache()
     }
+
+    /// A reset is stronger than a root change: no last-good local usage survives.
+    private func resetCollectedUsage() -> URL? {
+        graphFetchToken &+= 1
+        graphLoadTask?.cancel(); graphLoadTask = nil
+        backgroundRefresh = nil
+        fulfillRestoreGate()
+        invalidateModel()
+        invalidateHourly()
+        windowScanToken &+= 1
+        windowRefreshTask?.cancel(); windowRefreshTask = nil
+        releaseWindowUsageQueries()
+        payload = nil; stats = nil; agents = nil
+        agentsClients = nil; agentsYear = nil
+        trace = []; liveRate = nil; knownYears = []
+        restoredSnapshot = nil
+        statsMemoGeneratedAt = nil; statsMemoSelected = nil; statsMemoValue = nil
+        localQueryErrors.removeAll()
+        quotaHistory = []; quotaEquivalences = [:]
+        windowCards = [:]; windowCardAccounts = [:]
+        phase = .loading
+        if cachesSnapshot { Self.lastSnapshotOwner = ObjectIdentifier(self) }
+        return resolvedSnapshotDirectory
+    }
+
+    static func discardPersistedUsage(in directories: Set<URL>) async throws {
+        var directories = directories
+        if BuildIdentity.shipping() != nil, let directory = SnapshotStore.defaultDirectory() {
+            directories.insert(directory)
+        }
+        nextCaptureSequence += 1
+        let barrier = nextCaptureSequence
+        for directory in directories {
+            try await SnapshotWriter.shared.discard(sequence: barrier, directory: directory)
+        }
+    }
     /// Whether this model participates in the shared `lastSnapshot` cache.
     /// The newest participating instance becomes its sole writer.
     private let cachesSnapshot: Bool
@@ -678,6 +714,9 @@ private struct DashboardSnapshot {
                 self?.localPending = pending
                 self?.localError = error
                 if error != nil { self?.restoredSnapshot?.failed = true }
+            }
+            scheduler.setUsageReset(localSession) { [weak self] in
+                self?.resetCollectedUsage()
             }
         }
     }

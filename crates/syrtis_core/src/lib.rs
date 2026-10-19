@@ -3,6 +3,7 @@
 mod aggregator;
 mod cc_mirror;
 pub mod clients;
+pub mod disk_usage;
 pub mod fs_atomic;
 mod message_cache;
 pub mod model_alias;
@@ -2901,6 +2902,7 @@ pub fn try_synchronize_local_usage_sources(
     changed_paths: &[PathBuf],
 ) -> Result<Option<LocalUsageSnapshot>, String> {
     use sha2::{Digest, Sha256};
+    let _storage_management = disk_usage::ingestion_guard(context.usage_dir())?;
     if changed_paths.is_empty()
         || changed_paths.len() > 256
         || options.modified_after.is_some()
@@ -3068,6 +3070,7 @@ fn ingest_local_usage_inner(
     use message_cache::{CacheIdentity, SourceFingerprint};
     use store_query::{ingest_sources, stage_claude, stage_codex, QueryState, SelectionMode};
     let home_dir = source_context.home_dir();
+    let _storage_management = disk_usage::ingestion_guard(source_context.usage_dir())?;
     let local_clients = mode == SelectionMode::LocalClients;
     let scan_result = scan_usage_sources(source_context, clients, modified_after, mode)?;
     let headless_roots = scanner::headless_roots_with_source_context(source_context)
@@ -4637,6 +4640,7 @@ pub fn local_source_change_token_with_source_context(
     context: &ResolvedLocalSourceContext,
     options: &LocalParseOptions,
 ) -> Result<u64, String> {
+    let _storage_management = disk_usage::ingestion_guard(context.usage_dir())?;
     usage_migration::prepare(context.usage_dir(), context.legacy_usage_roots())?;
     let scan_result = scan_local_sources_with_context(context, options)?;
     let scanner_token = local_source_change_token_inner(&scan_result)?;

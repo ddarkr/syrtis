@@ -11982,6 +11982,18 @@ enum SelfTest {
             await SnapshotWriter.shared.submit(
                 sequence: 4, envelope: lp3WEnvelopeAfterFail, directory: lp3WriterDir)
             results["staleAfterFailedWriteRejected"] = bytesNow() == afterC
+            do {
+                try await SnapshotWriter.shared.discard(sequence: 6, directory: lp3WriterDir)
+                results["resetRemovedSnapshot"] = bytesNow() == nil
+                await SnapshotWriter.shared.submit(
+                    sequence: 5, envelope: lp3WEnvelopeB, directory: lp3WriterDir)
+                results["resetRejectedDelayedCapture"] = bytesNow() == nil
+                await SnapshotWriter.shared.submit(
+                    sequence: 7, envelope: lp3WEnvelopeC, directory: lp3WriterDir)
+                results["postResetCaptureAccepted"] = bytesNow() != nil
+            } catch {
+                results["resetRemovedSnapshot"] = false
+            }
             return results
         } ?? [:]
         try? FileManager.default.removeItem(at: lp3WriterDir)
@@ -12010,6 +12022,11 @@ enum SelfTest {
             lp3WriterChecks["staleAfterFailedWriteRejected"] == true,
             "LP3 writer: the high-water mark advances on a FAILED write outcome too, so a "
                 + "delayed capture older than the failed sequence is still rejected")
+        expect(
+            lp3WriterChecks["resetRemovedSnapshot"] == true
+                && lp3WriterChecks["resetRejectedDelayedCapture"] == true
+                && lp3WriterChecks["postResetCaptureAccepted"] == true,
+            "Usage reset removes the disk snapshot, rejects delayed old captures, and accepts new usage")
 
         // --- Isolation: the production directory must never be RESOLVED off ---
         // --- a shipping identity. Every `swift run` invocation — which is    ---

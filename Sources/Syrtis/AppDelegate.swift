@@ -561,6 +561,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let session = backgroundUsageSession ?? localScheduler.openSession()
         backgroundUsageSession = session
+        localScheduler.setUsageReset(session) { [weak self] in
+            guard let self else { return nil }
+            self.lastGraph = nil
+            self.trayProjection = nil
+            self.discordProjection = nil
+            self.applyMenuBarState()
+            self.applyDiscordPresence()
+            return nil
+        }
         let year = DashboardModel.resolveYear()
         let queries: Set<LocalUsageScheduler.Query> = [
             .init(kind: "graph"),

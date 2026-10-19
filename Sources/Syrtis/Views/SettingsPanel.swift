@@ -10,6 +10,7 @@ struct SettingsPanel: View {
         case menuBar = "Menu bar"
         case dashboard = "Dashboard"
         case usageAttribution = "Usage attribution"
+        case diskUsage = "Disk Usage"
         case general = "General"
         case about = "About"
 
@@ -22,6 +23,7 @@ struct SettingsPanel: View {
             case .menuBar: "menubar.rectangle"
             case .dashboard: "chart.bar.xaxis"
             case .usageAttribution: "arrow.triangle.branch"
+            case .diskUsage: "externaldrive"
             case .general: "gearshape"
             case .about: "info.circle"
             }
@@ -29,6 +31,7 @@ struct SettingsPanel: View {
     }
 
     var page: Page = .menuBar
+    var diskUsageAction: (@MainActor (DiskUsageAction) async throws -> DiskUsageReport)? = nil
 
     /// For the quota-source picker (the windows currently known).
     var agentUsage: AgentUsagePayload?
@@ -230,6 +233,8 @@ struct SettingsPanel: View {
                     tabsUniverse: tabsUniverse)
             case .usageAttribution:
                 usageAttributionPage()
+            case .diskUsage:
+                DiskUsageView(perform: diskUsageAction)
             case .general:
                 generalPage()
             case .about:

@@ -264,6 +264,9 @@ impl QueryState {
     }
 
     fn admit_staging(&self, db: &Connection) -> Result<i64, String> {
+        if Self::read_store_epoch(db)? != Some(self.store_epoch) {
+            return Err("usage store was reset; synchronize and reissue".into());
+        }
         let generation = self
             .pending_scope
             .get()

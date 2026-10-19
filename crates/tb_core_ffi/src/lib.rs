@@ -4111,3 +4111,51 @@ pub unsafe extern "C" fn tb_local_usage_release(lease_token: *const c_char) -> *
         encoded_envelope(local_usage::release(token))
     })
 }
+
+/// Inspect/manage only app-owned recorded usage and allowlisted pricing caches.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 JSON object.
+#[no_mangle]
+pub unsafe extern "C" fn tb_disk_usage(request_json: *const c_char) -> *mut c_char {
+    guarded("tb_disk_usage", || {
+        let result = (|| {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                action: syrtis_core::disk_usage::DiskUsageAction,
+            }
+            let text = unsafe { required_str_from(request_json, "request_json") }?;
+            if text.len() > 1024 {
+                return Err("Disk usage request is too large".into());
+            }
+            let request: Request =
+                serde_json::from_str(text).map_err(|_| "Invalid disk usage request".to_string())?;
+            let _lane = local_usage_guard();
+            let local = LocalSourceContext::current();
+            let context = syrtis_core::ResolvedLocalSourceContext::capture(
+                local.home_dir,
+                true,
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            let reset = request.action == syrtis_core::disk_usage::DiskUsageAction::ResetUsage;
+            let clear = request.action == syrtis_core::disk_usage::DiskUsageAction::ClearCache;
+            // Invalidate before mutation too: partial failures cannot expose
+            // pre-reset snapshots through any process cache or lease.
+            if reset {
+                invalidate_scan_caches();
+                TAILER.invalidate();
+            }
+            let report = syrtis_core::disk_usage::disk_usage(&context, request.action);
+            if clear {
+                RUNTIME.block_on(syrtis_core::pricing::invalidate_cached_service());
+            }
+            if reset {
+                invalidate_scan_caches();
+            }
+            encode_local_payload(&report?)
+        })();
+        encoded_envelope(result)
+    })
+}

@@ -952,6 +952,8 @@ fn owned_outputs(context: &ResolvedLocalSourceContext) -> Vec<PathBuf> {
             "source-message-cache.recovery.sqlite3.lock",
             "source-message-cache.lock",
             "usage-migration.lock",
+            "usage-management.lock",
+            "usage-reset.barrier",
         ] {
             paths.insert(root.join(name));
         }

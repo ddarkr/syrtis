@@ -31,6 +31,7 @@ final class LocalUsageScheduler {
         var callback: ((Query, Result<LocalUsageValue, Error>) -> Void)?
         var clock: (() -> Void)?
         var status: ((Bool, String?) -> Void)?
+        var usageReset: (() -> URL?)?
     }
     private struct Waiting {
         let id: UUID
@@ -103,6 +104,7 @@ final class LocalUsageScheduler {
     private var retryAt: TimeInterval = 0
     private var stopped = false
     private var previousLeaseUsable = true
+    private var diskMaintenance = false
     private var windowFlights: [Data: Task<WindowUsageBatch, Error>] = [:]
     private var windowFlightIDs: [Data: UUID] = [:]
     private var ignoredOutputs: Set<String> = []
@@ -224,6 +226,44 @@ final class LocalUsageScheduler {
     private func publishStatus(_ pending: Bool) {
         sourcePending = pending
         for owner in owners.values { owner.status?(pending, lastError) }
+    }
+
+    func setUsageReset(_ session: Session, _ callback: @escaping @MainActor () -> URL?) {
+        guard owners[session] != nil else { return }
+        owners[session]?.usageReset = callback
+    }
+
+    /// Pause and drain the app's source/query lanes before native maintenance.
+    /// Reset invalidates display writers before deletion, including on failure.
+    func diskUsage(_ action: DiskUsageAction) async throws -> DiskUsageReport {
+        guard source.usesNativeLocalUsage else {
+            throw TBCoreError.bridge("Disk usage is unavailable for this data source.")
+        }
+        guard action != .inspect else { return try await TBCore.diskUsage(action) }
+        guard !diskMaintenance else { throw TBCoreError.bridge("Disk maintenance is already running.") }
+        diskMaintenance = true
+        deadline?.cancel(); deadline = nil
+        defer {
+            diskMaintenance = false
+            kick()
+        }
+        if let worker { await worker.value }
+        if let recentQueryWorker { await recentQueryWorker.value }
+        if let historyQueryWorker { await historyQueryWorker.value }
+        for flight in Array(windowFlights.values) { _ = try? await flight.value }
+        if action == .resetUsage {
+            rootsChanged()
+            DashboardModel.invalidateScanDerivedCaches()
+            let directories = Set(owners.values.compactMap { $0.usageReset?() })
+            try await DashboardModel.discardPersistedUsage(in: directories)
+            for entry in Array(waiting.values) {
+                waiting.removeValue(forKey: entry.id)?.continuation.resume(throwing: CancellationError())
+            }
+        }
+        defer {
+            if action == .resetUsage || action == .clearCache { rootsChanged() }
+        }
+        return try await TBCore.diskUsage(action)
     }
 
     func setQuotaScopes(_ session: Session, _ scopes: Set<LocalUsageScope>) {
@@ -588,7 +628,7 @@ final class LocalUsageScheduler {
     }
 
     private func kick() {
-        guard !stopped, automaticallySchedules else { return }
+        guard !stopped, !diskMaintenance, automaticallySchedules else { return }
         deadline?.cancel(); deadline = nil
         refreshDemand()
         if demandedScopes.isEmpty && !owners.values.contains(where: { $0.clock != nil }) { return }
@@ -609,7 +649,7 @@ final class LocalUsageScheduler {
         armDeadline()
     }
     private func armDeadline() {
-        guard !stopped, automaticallySchedules else { return }
+        guard !stopped, !diskMaintenance, automaticallySchedules else { return }
         let now = monotonicNow()
         var due = nextClockDeadline
         if worker == nil, !scopes.isEmpty {
@@ -632,7 +672,7 @@ final class LocalUsageScheduler {
             if scopes.isEmpty { releaseSnapshot() }
             kick()
         }
-        guard !stopped else { return }
+        guard !stopped, !diskMaintenance else { return }
         let now = monotonicNow()
         if needsSync && now >= retryAt {
             publishStatus(true)
@@ -904,7 +944,7 @@ final class LocalUsageScheduler {
     }
 
     private func runQueries(recentOnly: Bool) async {
-        guard !stopped, let snapshot = sync else { return }
+        guard !stopped, !diskMaintenance, let snapshot = sync else { return }
         refreshDemand()
         let epoch = rootEpoch
         // First paint already stages above; remaining turns keep

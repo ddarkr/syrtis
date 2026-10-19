@@ -2026,6 +2026,12 @@ fn migrate_namespace(
     root: &Path,
     identity: CacheIdentity,
 ) -> Result<(), String> {
+    match fs::symlink_metadata(root.join("usage-reset.barrier")) {
+        // Explicit reset permanently retires all legacy shard import paths.
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("usage reset barrier admission failed".into()),
+    }
     let identity = CacheIdentity {
         scope: [0; 32],
         ..identity

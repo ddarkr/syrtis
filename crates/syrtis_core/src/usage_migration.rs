@@ -61,6 +61,7 @@ const MARKER_KEY: &str = "usage_migration_completed_source";
 /// left intact and no success is recorded.
 pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), String> {
     secure_directory(root)?;
+    let _management = crate::usage_store::management_lock(root, false)?;
     let _guard = lock_file(&root.join(LOCK))?;
     // The target appears only through atomic publication below, so an
     // existing target is either a completed migration or a store the opener
@@ -75,6 +76,13 @@ pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), Strin
         // same inode. Never touches unrelated temps.
         recover_interrupted_publication(root)?;
         return Ok(());
+    }
+    match fs::symlink_metadata(root.join("usage-reset.barrier")) {
+        Ok(_) => {
+            return Err("usage store is absent after reset; refusing legacy history import".into())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("usage reset barrier admission failed".into()),
     }
     let Some(source) = select_source(root, legacy_roots)? else {
         return Ok(());

@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-17
+last_verified: 2026-10-19
 sources: ["Cargo.toml", "crates/syrtis_core", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -148,6 +148,12 @@ Legacy SQLite validation and incremental backup share one explicit read transact
 The shard importer also accepts the independently versioned upstream tokscale format-10 Claude parser-2 layout. Its frozen decoder preserves token lane order, original timestamps, turns, and retained ordinals encoded in the upstream index vector; it does not interpret those ordinals as fallback timestamps. Imported messages carry unknown cache-split provenance and remain cold for the current parser. Other unsupported retaining layouts, unexpected client metadata, and unsupported pricing semantics still fail closed. Original shards remain untouched.
 
 Clearing legacy caches, restarting, changing query scopes, and evicting query generations do not clear collected usage. Deleting the durable root does erase its facts; an already captured handle cannot accidentally read a replacement database because each store has a persistent instance epoch. Query prepares file-backed facts and aliases inside a transaction, then releases it before invoking caller predicates or sinks; a callback may synchronize another scope without changing its prepared output.
+
+Settings storage management uses [`disk_usage.rs`](../../crates/syrtis_core/src/disk_usage.rs) through `tb_disk_usage` and [`DiskUsage.swift`](../../Sources/TokenBarCore/DiskUsage.swift). Inspection does not discover logs, fetch providers, migrate legacy data, or create an absent usage store. It reports allocated file bytes: the canonical database and sidecars, recovery database and sidecars, the two allowlisted pricing JSON caches, and remaining entries under the usage root. Unknown entries are measured without following symlinks and are never deletion candidates. Per-client counts and timestamp ranges describe stored records, not deduplicated billing totals or invented per-client SQLite sizes.
+
+Cache clearing removes only those disposable pricing files and invalidates in-memory pricing. Optimization runs SQLite maintenance without deleting facts or promising smaller files. Reset deletes known usage tables transactionally in the existing database rather than unlinking live SQLite handles; it rotates the store epoch and replaces recovery with an empty snapshot. An external durable reset barrier rejects older recovery snapshots and legacy-history import, including when the canonical database is later absent. Available source logs can be collected again; historical records whose sources are gone cannot be reconstructed.
+
+Ingestion and migration hold shared cross-process maintenance locks; mutations take the exclusive lock. The app scheduler pauses and drains its source/query lanes before mutation. Before reset, registered display owners clear local usage and the snapshot writer discards persisted display data with a sequence barrier against delayed writes. Native root-generation invalidation and store-epoch admission reject pre-reset leases and staging. Original logs, preferences, credentials and persisted provider quota history are outside the reset target.
 
 Source scope 以「各來源讀取時的一致快照」為準，不要求所有 log 在整段集計期間停止寫入。每個來源仍驗證讀取與 parser dependencies；publication 在 transaction 內驗證 pinned generation／descriptor，不重新比對已完成讀取的原始檔案。其他來源處理期間新增的內容留到下一次同步，來源之間不保證同一瞬間的 freshness。Scope／account replacement、不可讀來源、損壞的 cache reference 與 failed reads 仍拒絕發布。
 

@@ -16,11 +16,15 @@ struct SettingsWindowView: View {
     // model still defaults cachesSnapshot to false: it must never overwrite the
     // popover's restore snapshot with its independently polled data.
     @State private var model: DashboardModel
+    private let scheduler: LocalUsageScheduler
+    private let usesNativeLocalUsage: Bool
     private var tokensPerMin: Double? { model.liveRate }
 
     init(scheduler: LocalUsageScheduler, source: any UsageDataSource,
          localSession: LocalUsageScheduler.Session,
          destination: SettingsWindowController.Destination? = nil) {
+        self.scheduler = scheduler
+        self.usesNativeLocalUsage = source.usesNativeLocalUsage
         _model = State(initialValue: DashboardModel(
             source: source, scheduler: scheduler, localSession: localSession, initialYear: nil))
         self.destination = destination
@@ -94,6 +98,7 @@ struct SettingsWindowView: View {
         .usageAttribution,
     ]
     private static let appPages: [SettingsPanel.Page] = [
+        .diskUsage,
         .general,
         .about,
     ]
@@ -209,6 +214,9 @@ struct SettingsWindowView: View {
             Form {
                 SettingsPanel(
                     page: selectedPage,
+                    diskUsageAction: usesNativeLocalUsage ? { action in
+                        try await scheduler.diskUsage(action)
+                    } : nil,
                     agentUsage: model.agentUsage,
                     modelReport: model.modelReport,
                     presentClients: model.stats?.presentClients,

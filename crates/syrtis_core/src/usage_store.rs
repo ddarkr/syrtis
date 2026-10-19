@@ -427,6 +427,76 @@ pub(crate) fn open_database(cache_root: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Read-only admission for storage inspection: never create or migrate.
+pub(crate) fn open_existing_database(root: &Path) -> Result<Connection, String> {
+    let path = root.join(DATABASE);
+    let admitted = database_path_metadata(&path)?.ok_or("usage store is absent")?;
+    for extension in ["-wal", "-shm", "-journal"] {
+        admit_sidecar(&suffix(&path, extension))?;
+    }
+    let conn = sql(Connection::open_with_flags(
+        sqlite_open_path(&path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ))?;
+    admit_open_database(&conn, &path, Some(&admitted))?;
+    configure_connection(&conn)?;
+    let application: i64 = sql(conn.pragma_query_value(None, "application_id", |r| r.get(0)))?;
+    let version: i64 = sql(conn.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    if application != APPLICATION_ID || version != SCHEMA_VERSION {
+        return Err("usage store schema is unsupported; existing data preserved".into());
+    }
+    Ok(conn)
+}
+
+pub(crate) fn management_lock(root: &Path, exclusive: bool) -> Result<fs::File, String> {
+    secure_directory(root)?;
+    let path = root.join("usage-management.lock");
+    secure_file(&path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "usage management lock admission failed")?;
+    if exclusive {
+        fs2::FileExt::lock_exclusive(&file)
+    } else {
+        fs2::FileExt::lock_shared(&file)
+    }
+    .map_err(|_| "usage management lock failed")?;
+    Ok(file)
+}
+
+pub(crate) fn write_reset_barrier(root: &Path, epoch: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let path = root.join("usage-reset.barrier");
+    secure_file(&path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "usage reset barrier admission failed")?;
+    file.write_all(epoch)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "usage reset barrier sync failed")?;
+    #[cfg(unix)]
+    fs::File::open(root)
+        .and_then(|f| f.sync_all())
+        .map_err(|_| "usage reset directory sync failed")?;
+    Ok(())
+}
+
 /// Called only after retained-history semantic changes, never on warm queries.
 /// SQLite's destination transaction preserves the previous recovery snapshot if
 /// the backup fails. It is never queried as a second report source.
@@ -482,6 +552,7 @@ pub(crate) fn refresh_retained_recovery(
 /// move all broken files first, so even invalid retained history remains intact.
 pub(crate) fn recover_database(cache_root: &Path) -> Result<(), String> {
     secure_directory(cache_root)?;
+    let _management = management_lock(cache_root, true)?;
     let target = cache_root.join(DATABASE);
     for path in [
         target.clone(),
@@ -513,6 +584,16 @@ pub(crate) fn recover_database(cache_root: &Path) -> Result<(), String> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     ))?;
     admit_open_database(&source, &recovery, Some(&admitted))?;
+    let barrier = cache_root.join("usage-reset.barrier");
+    if database_path_metadata(&barrier)?.is_some() {
+        let expected = fs::read(&barrier).map_err(|_| "usage reset barrier read failed")?;
+        let actual: Vec<u8> = source
+            .query_row("SELECT epoch FROM du_reset", [], |r| r.get(0))
+            .map_err(|_| "recovery predates usage reset; preserved without restoring")?;
+        if expected.len() != 16 || expected != actual {
+            return Err("recovery predates usage reset; preserved without restoring".into());
+        }
+    }
     configure_connection(&source)?;
     let result: String = sql(source.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
     if result != "ok" {

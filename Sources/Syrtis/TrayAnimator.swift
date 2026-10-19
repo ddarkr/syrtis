@@ -738,6 +738,14 @@ final class TrayAnimator {
         }
         let session = rateSession ?? scheduler.openSession()
         rateSession = session
+        scheduler.setUsageReset(session) { [weak self] in
+            guard let self else { return nil }
+            self.tokensPerMinRate = nil
+            self.load = 0
+            self.updateAnimationSpeedIfPresented()
+            self.onQuotaUpdated?()
+            return nil
+        }
         scheduler.update(session, queries: [query], active: true) { [weak self] _, result in
             guard case .success(let value) = result, let rate = LiveRate.rate(from: value) else { return }
             self?.applyRate(rate, generation: generation)

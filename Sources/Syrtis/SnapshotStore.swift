@@ -169,6 +169,25 @@ enum SnapshotStore {
         return buffer
     }
 
+    /// Remove only the verified app snapshot, never the surrounding cache tree.
+    static func remove(in directory: URL) throws {
+        var directoryInfo = stat()
+        if lstat(directory.path, &directoryInfo) != 0, errno == ENOENT { return }
+        guard let dirfd = openDirectory(directory, createIfMissing: false) else {
+            throw TBCoreError.bridge("The dashboard snapshot directory could not be opened safely.")
+        }
+        defer { close(dirfd) }
+        var info = stat()
+        guard fstatat(dirfd, fileName, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT { return }
+            throw TBCoreError.bridge("The dashboard snapshot could not be inspected.")
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(),
+              unlinkat(dirfd, fileName, 0) == 0 else {
+            throw TBCoreError.bridge("The dashboard snapshot could not be removed safely.")
+        }
+    }
+
     // MARK: - Write
 
     /// Encodes, then replaces atomically within the verified directory. Any
@@ -407,6 +426,14 @@ actor SnapshotWriter {
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
+
+    /// A reset's high-water mark rejects delayed pre-reset captures.
+    func discard(sequence: Int, directory: URL) throws {
+        let key = directory.path
+        let previous = states[key]?.highestCompletedSequence ?? 0
+        states[key] = State(highestCompletedSequence: max(previous, sequence))
+        try SnapshotStore.remove(in: directory)
+    }
 
     /// `sequence` was already fixed on the main actor before this call was
     /// even dispatched. The high-water mark advances on every outcome below —
