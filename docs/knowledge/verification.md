@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-19
+last_verified: 2026-10-22
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -300,6 +300,29 @@ The paired comparison used four old／new pairs in alternating orders, two secon
 Cold synchronization pays the once-per-generation Claude／Codex index build; its median increased 9.7%. One optimized cold capture took 2,107.0 ms and remains in the raw results; its cause is not established. The initial variants missed the query threshold, and runtime sampling identified fingerprint-order wide-row reads and a second canonical read for primary identity. Scope-first loading and TEMP identity projection removed that repeated work without changing authority decisions. No raw run or outlier was discarded. These short synthetic measurements do not establish improved initial first paint, production-corpus latency, sustained RAM reduction, GUI／FSEvents behavior or Windows acceptance. Screen-capture and Accessibility permissions were unavailable; actual native model execution is not visual evidence. Diagnostic sources and raw evidence remain outside the public repository.
 
 Final `cargo test --workspace --locked` passed 2,517 top-level cases plus one child-process lock check, with six ignored. Workspace Clippy passed with the existing FFI warnings (15 library／22 test-target); exact task-owned Rust formatting, both `make selftest` and `make selftest-bundled`, isolated bundle signature verification and the knowledge checker (19 self-tests plus repository validation) passed. Rust language-server diagnostics were unavailable, so compiler／Clippy checks provided Rust verification; Swift scheduler diagnostics retained the baseline's three SwiftLint errors and eight warnings, not a clean lint result.
+
+### Snapshot-owned historical preparation
+
+Historical report regressions compare complete graph／model／hourly／Agents payloads across years, repeated OpenCode fallback predicates, pricing／alias／timezone changes, corrected and replaced generations, canonical payload corruption and store reset. Retained connections also reject a replaced database or a managed root replaced by a symlink; restoring the admitted root permits a fresh preparation. Repeated failed reads cannot make corrupt facts admissible.
+
+An isolated native executable linked the actual Swift scheduler／`LiveUsageDataSource`／C ABI／Rust archive. A source hint arriving during a native capture caused the previous scheduler to perform an immediate extra synchronization; the candidate waited for the fixed post-capture deadline, then published 2,600 tokens／130 messages from an initial 2,560／128. Recent rate was 260, and manual forced refresh bypassed the cooldown. Initial graph side-staging is counted separately from subsequent captures. This is a real bridge execution, not a fixture-source echo or visual UI check.
+
+The release-library comparison used 16,384 synthetic Claude events, two models and two years, isolated source／store roots, and frozen pricing. Four pairs used old→new／new→old／old→new／new→old order, five seconds before every cold and fresh-process warm execution, with no excluded run. Cold executes one all-time graph／current-year graph／current-year models cycle; warm executes four. Both additionally check all four report kinds for the prior year and an empty year. Complete normalized JSON matched in all 16 executions; only graph `generatedAt` and unordered contribution-client rows are normalized. Token／cost mutations are detected and unordered-row reversal is ignored. A separate candidate read of the baseline's durable cache matched, and native append／source deletion preserved expected totals while superseded handles and repeated canonical corruption failed.
+
+The table measures the whole native workload through lease release and a fixed one-second drain, not just a window before retained scratch closes. CPU is process user＋system time; writes are macOS process-attributed disk bytes, not logical SQL bytes or SSD NAND writes. RSS is the native process maximum through every query and release. Percentage changes are paired; separate old／new medians are descriptive.
+
+| Whole-workload metric | Baseline median | Candidate median | Median paired reduction | Worst paired reduction |
+|---|---|---|---|---|
+| Cold CPU | 2.837 s | 1.431 s | 50.1% | 47.6% |
+| Warm CPU | 3.401 s | 0.612 s | 82.0% | 80.7% |
+| Cold writes | 147.45 MiB | 65.57 MiB | 55.5% | 55.5% |
+| Warm writes | 168.31 MiB | 12.75 MiB | 92.4% | 92.3% |
+| Cold peak RSS | 39.26 MiB | 36.53 MiB | 6.6% | 4.0% |
+| Warm peak RSS | 38.14 MiB | 30.75 MiB | 18.9% | 16.3% |
+
+All preregistered per-pair bounds passed: warm timed-query CPU improves at least 20%, cold query／whole-workload CPU and cold query writes regress no more than 5%, warm query／whole-workload writes improve at least 50%, and cold peak RSS regresses no more than 25%. Full workspace debug tests passed 2,591 top-level cases plus one child-process lock check, with seven ignored; workspace Clippy passed with the existing 15 library／22 test-target FFI warnings. Task-owned Rust file formatting, `make selftest` and isolated `make selftest-bundled` passed.
+
+These measurements do not establish installed-app CPU／write rates, a real-corpus or long-duration reduction, GUI appearance, Windows behavior, or lower durable-storage size. External commits conservatively invalidate preparation and can reduce reuse under continuous ingestion. Retained TEMP storage remains history-scaled despite the two-preparation cap. Binary hashes, the preregistered plan and raw results remain outside the public repository; no app installation／restart or publication was performed.
 
 
 ### Named source hint verification

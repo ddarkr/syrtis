@@ -1751,7 +1751,7 @@ impl CapturedReportTimezone {
 /// A changed source generation does not enter its key: selected membership
 /// establishes the longest reusable prefix before any payload is decoded.
 struct HistoricalReportFold<'a> {
-    query: store_query::QueryState,
+    query: store_query::HistoricalQuery<'a>,
     checkpoint: usage_store::ReportCheckpoint,
     snapshot: &'a LocalUsageSnapshot,
     pricing: Option<&'a pricing::PricingService>,
@@ -1796,12 +1796,7 @@ impl<'a> HistoricalReportFold<'a> {
         if let Some(timezone) = &timezone {
             hash.update(timezone.digest);
         }
-        let query = store_query::QueryState::open(&snapshot.root)?;
-        query.pin(snapshot)?;
-        let prepared = query.prepare_query(snapshot, LocalUsageQuery::compact());
-        let released = query.unpin();
-        prepared.and(released)?;
-        query.prepare_report_fold(snapshot)?;
+        let query = snapshot.historical_query()?;
         let outside_timezone_range: bool = query
             .connection()
             .query_row(

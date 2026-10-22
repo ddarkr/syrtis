@@ -765,7 +765,12 @@ final class LocalUsageScheduler {
             if topology { lastTopology = completedAt; topologyRequired = false }
             if pricing { lastPricing = completedAt }
             forceVerified = max(forceVerified, forceBarrier)
+            // Events received during capture belong to the next batch. Give
+            // that batch one debounce window after ingestion releases rather
+            // than inheriting the already-due timestamp of the consumed batch.
+            // Later hints keep this deadline, so continuous writes cannot defer it.
             if checkedSequence == dirtySequence { dirtyAt = nil }
+            else if dirtyAt != nil { dirtyAt = completedAt }
             lastError = nil; retryAt = 0
             if observesSources {
                 let manifest = LocalSourceWatchManifest(

@@ -302,6 +302,25 @@ pub(crate) fn admit_open_database(
     Ok(())
 }
 
+/// Reuse the original opener's path, owner, protection and inode guards.
+/// VFSes without the Unix descriptor contract prepare disposable scratch.
+pub(crate) fn admit_retained_database(
+    connection: &Connection,
+    root: &Path,
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        secure_directory(root)?;
+        admit_open_database(connection, &root.join(DATABASE), None)?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (connection, root);
+        Ok(false)
+    }
+}
+
 fn sync_database(connection: &Connection) -> Result<(), String> {
     let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
     // Borrow SQLite's own VFS file for the lifetime of this synchronous call.

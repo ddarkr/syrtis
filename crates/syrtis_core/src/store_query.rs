@@ -98,15 +98,187 @@ pub struct UsageSnapshot {
     pub(crate) mode: SelectionMode,
     pub(crate) selection_ignores_filter: bool,
     pub(crate) modified_after: Option<u64>,
+    preparation: ReportPreparationSlot,
 }
 
+// Equality describes producer identity, never disposable connection-local work.
+#[derive(Clone, Default)]
+struct ReportPreparationSlot(std::sync::Arc<std::sync::Mutex<Option<PreparedHistory>>>);
+
+impl PartialEq for ReportPreparationSlot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ReportPreparationSlot {}
+
+static RETAINED_HISTORY_PREPARATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const MAX_RETAINED_HISTORY_PREPARATIONS: usize = 2;
+
+struct PreparationIdentity {
+    root: PathBuf,
+    scope: Vec<u8>,
+    generation: i64,
+    store_epoch: [u8; 16],
+    clients: Vec<String>,
+    mode: SelectionMode,
+    selection_ignores_filter: bool,
+    modified_after: Option<u64>,
+}
+
+impl PreparationIdentity {
+    fn matches(&self, snapshot: &UsageSnapshot) -> bool {
+        self.root == snapshot.root
+            && self.scope == snapshot.scope
+            && self.generation == snapshot.generation
+            && self.store_epoch == snapshot.store_epoch
+            && self.clients == snapshot.clients
+            && self.mode == snapshot.mode
+            && self.selection_ignores_filter == snapshot.selection_ignores_filter
+            && self.modified_after == snapshot.modified_after
+    }
+}
+
+struct PreparedHistory {
+    query: QueryState,
+    identity: PreparationIdentity,
+    data_version: i64,
+    retained: bool,
+}
+
+impl Drop for PreparedHistory {
+    fn drop(&mut self) {
+        if self.retained {
+            RETAINED_HISTORY_PREPARATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Exclusively borrow a preparation without holding a mutex during a fold.
+/// Concurrent/reentrant consumers use independent scratch, never shared TEMP state.
+pub(crate) struct HistoricalQuery<'a> {
+    prepared: Option<PreparedHistory>,
+    slot: &'a ReportPreparationSlot,
+}
+
+impl std::ops::Deref for HistoricalQuery<'_> {
+    type Target = QueryState;
+    fn deref(&self) -> &QueryState {
+        &self
+            .prepared
+            .as_ref()
+            .expect("historical query is live")
+            .query
+    }
+}
+
+impl Drop for HistoricalQuery<'_> {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        if prepared.retained && !std::thread::panicking() {
+            let mut slot = self
+                .slot
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.is_none() {
+                *slot = Some(prepared);
+            }
+        }
+    }
+}
 impl UsageSnapshot {
+    pub(crate) fn historical_query(&self) -> Result<HistoricalQuery<'_>, String> {
+        use std::sync::atomic::Ordering;
+        let cached = self
+            .preparation
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let mut prepared = cached.filter(|cached| cached.identity.matches(self));
+        if let Some(cached) = &prepared {
+            cached.query.pin(self)?;
+            let admission = (|| {
+                Ok::<_, String>((
+                    crate::usage_store::admit_retained_database(
+                        cached.query.connection(),
+                        &self.root,
+                    )?,
+                    cached.query.data_version()?,
+                ))
+            })();
+            let released = cached.query.unpin();
+            let (identity_available, version) = admission?;
+            released?;
+            if !identity_available || version != cached.data_version {
+                prepared = None;
+            }
+        }
+        if prepared.is_none() {
+            let query = QueryState::open(&self.root)?;
+            query.pin(self)?;
+            // Capture while pinned: writes racing the detached preparation
+            // invalidate its next use rather than admitting unverified facts.
+            let result = (|| {
+                let version = query.data_version()?;
+                query.prepare_query(self, UsageQuery::compact())?;
+                Ok::<_, String>(version)
+            })();
+            let released = query.unpin();
+            let data_version = result?;
+            released?;
+            query.prepare_report_fold(self)?;
+            let identity = PreparationIdentity {
+                root: self.root.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation,
+                store_epoch: self.store_epoch,
+                clients: self.clients.clone(),
+                mode: self.mode,
+                selection_ignores_filter: self.selection_ignores_filter,
+                modified_after: self.modified_after,
+            };
+            let retained = RETAINED_HISTORY_PREPARATIONS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_RETAINED_HISTORY_PREPARATIONS).then_some(count + 1)
+                })
+                .is_ok();
+            prepared = Some(PreparedHistory {
+                query,
+                identity,
+                data_version,
+                retained,
+            });
+        }
+        // Immutable rows/membership survive. OpenCode's visitor resets its own
+        // arbitration; only checkpoint staging needs a per-report reset here.
+        // Reset before the return-to-slot guard so errors discard preparation.
+        prepared
+            .as_ref()
+            .expect("historical preparation is ready")
+            .query
+            .connection()
+            .execute_batch("DROP TABLE IF EXISTS temp.report_checkpoint_staged;")
+            .map_err(|error| error.to_string())?;
+        let result = HistoricalQuery {
+            prepared,
+            slot: &self.preparation,
+        };
+        Ok(result)
+    }
     pub fn generation(&self) -> u64 {
         self.generation as u64
     }
-    /// Retained native snapshot metadata, excluding shared store/pricing state.
+    /// Retained native metadata plus conservative historical pager allowance.
     pub fn metadata_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            // Conservative per-handle pager allowance, including an in-flight
+            // preparation removed from the slot. At most two are retained globally.
+            + 320 * 1024
             + self.root.capacity()
             + self.scope.capacity()
             + self.clients.capacity() * std::mem::size_of::<String>()
@@ -191,6 +363,12 @@ pub(crate) struct IncrementalSource {
 }
 
 impl QueryState {
+    fn data_version(&self) -> Result<i64, String> {
+        self.db
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         let db = crate::usage_store::open_database(root)?;
         let existing:i64=db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sq_meta','sq_scopes','sq_scope_generations','sq_scope_sources')",[],|row|row.get(0)).map_err(|error|error.to_string())?;
@@ -409,6 +587,7 @@ impl QueryState {
             mode,
             selection_ignores_filter: context.selection_ignores_report_filter(),
             modified_after,
+            preparation: ReportPreparationSlot::default(),
         })
     }
     /// Resolve supported primary sources without changing the published scope.

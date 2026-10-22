@@ -1351,6 +1351,20 @@ fn filtered_opencode_json_fallback_still_arbitrates_fresh_per_report() {
     // With no predicate the JSON twin wins (provider-reported cost): the
     // sqlite fallback only surfaces when the predicate rejects the twin.
     assert!(all.contains(&"filtered-model".to_string()));
+    for year in [None, Some("2023"), Some("2024"), Some("2023"), None] {
+        let options = crate::ReportOptions {
+            clients: Some(clients.clone()),
+            year: year.map(str::to_string),
+            ..Default::default()
+        };
+        for kind in ["models", "hourly", "agents", "graph-best-effort"] {
+            assert_eq!(
+                historical_payload(&snapshot, &options, None, kind, true),
+                historical_payload(&snapshot, &options, None, kind, false),
+                "{kind}, year={year:?}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -1672,6 +1686,58 @@ fn publish_historical_fixture(
 }
 
 #[test]
+fn historical_preparation_rejects_reset_and_replaced_databases() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let cache = root.path().join("cache");
+    let options = crate::ReportOptions {
+        clients: Some(vec!["amp".into()]),
+        ..Default::default()
+    };
+    let first = publish_historical_fixture(&cache, &context, 10, None);
+    crate::get_model_report_from_snapshot(&first, options.clone(), None).unwrap();
+    #[cfg(unix)]
+    {
+        let linked = root.path().join("linked-cache");
+        std::fs::rename(&cache, &linked).unwrap();
+        std::os::unix::fs::symlink(&linked, &cache).unwrap();
+        for _ in 0..2 {
+            assert!(crate::get_model_report_from_snapshot(&first, options.clone(), None).is_err());
+        }
+        std::fs::remove_file(&cache).unwrap();
+        std::fs::rename(&linked, &cache).unwrap();
+        crate::get_model_report_from_snapshot(&first, options.clone(), None).unwrap();
+    }
+    let database = query(&cache);
+    database
+        .connection()
+        .execute(
+            "UPDATE sq_meta SET value=randomblob(16) WHERE key='store_epoch'",
+            [],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert!(crate::get_model_report_from_snapshot(&first, options.clone(), None).is_err());
+    }
+    drop(database);
+    let second = publish_historical_fixture(&cache, &context, 10, None);
+    crate::get_model_report_from_snapshot(&second, options.clone(), None).unwrap();
+    std::fs::rename(&cache, root.path().join("retired-cache")).unwrap();
+    let replacement = publish_historical_fixture(&cache, &context, 10, None);
+    for _ in 0..2 {
+        assert!(crate::get_model_report_from_snapshot(&second, options.clone(), None).is_err());
+    }
+    crate::get_model_report_from_snapshot(&replacement, options, None).unwrap();
+}
+
+#[test]
 fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads() {
     if std::env::var_os("SYRTIS_REPORT_CHECKPOINT_CHILD").is_none() {
         let home = TempDir::new().unwrap();
@@ -1722,6 +1788,20 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     let pricing = price(0.013);
     let kinds = ["graph-best-effort", "models", "hourly", "agents"];
     let first = publish_historical_fixture(root.path(), &context, 2305, None);
+    let clone = first.clone();
+    assert_eq!(first, clone);
+    for year in [None, Some("2025".to_string()), Some("2026".to_string())] {
+        let scoped = crate::ReportOptions {
+            year,
+            ..options.clone()
+        };
+        for kind in kinds {
+            assert_eq!(
+                historical_payload(&clone, &scoped, Some(&pricing), kind, true),
+                historical_payload(&clone, &scoped, Some(&pricing), kind, false),
+            );
+        }
+    }
     for kind in kinds {
         assert_eq!(
             historical_payload(&first, &options, Some(&pricing), kind, true),
@@ -1731,9 +1811,12 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     let second = publish_historical_fixture(root.path(), &context, 2330, None);
     assert_ne!(first.generation, second.generation);
     assert!(query(root.path()).pin(&first).is_err());
+    assert!(
+        crate::get_model_report_from_snapshot(&first, options.clone(), Some(&pricing)).is_err()
+    );
     for kind in kinds {
-        // All connections from the producing fold were dropped. Reopening the
-        // disk state is sufficient; no process registry holds these folds.
+        // Snapshot preparation is disposable; durable checkpoints also survive
+        // reopening a producer independently of its retained scratch.
         let cached =
             crate::HistoricalReportFold::new(&second, &options, Some(&pricing), kind).unwrap();
         assert_eq!(cached.checkpoint.resume_rows, 2305, "{kind}");
@@ -1803,11 +1886,6 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
                 year: Some(year.into()),
                 ..options.clone()
             };
-            let cached =
-                crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind)
-                    .unwrap();
-            assert!(!cached.checkpoint.has_restored(), "year identity: {kind}");
-            drop(cached);
             assert_eq!(
                 historical_payload(&corrected, &options, Some(&pricing), kind, true),
                 historical_payload(&corrected, &options, Some(&pricing), kind, false),
@@ -2015,11 +2093,16 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     .is_err());
     assert!(crate::lean_local_graph_from_snapshot(
         &other_root_scope,
-        options,
+        options.clone(),
         Some(&pricing),
         crate::GraphPricingMode::BestEffort,
     )
     .is_err());
+    assert!(
+        crate::get_model_report_from_snapshot(&other_root_scope, options.clone(), Some(&pricing))
+            .is_err(),
+        "failed preparation must not make a repeated query succeed"
+    );
     assert_eq!(
         revision,
         database

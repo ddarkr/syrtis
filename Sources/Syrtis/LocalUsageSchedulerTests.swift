@@ -1477,6 +1477,70 @@ extension LocalUsageScheduler {
                "failed replacement recovers the reopened header on the next synchronization")
         reopenedModel.releaseLocalDemand()
         replacementScheduler.stop()
+        // In-flight hints get a fresh, fixed window after capture completes,
+        // not the expired deadline of the batch that capture already consumed.
+        let inflightClock = Clock()
+        let inflightSource = SchedulerFixtureSource()
+        let inflightScheduler = LocalUsageScheduler(
+            source: inflightSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { inflightClock.monotonic }, wallNow: { inflightClock.wall })
+        let inflightSession = inflightScheduler.openSession()
+        let inflightRate = Query(kind: "rate")
+        inflightScheduler.update(inflightSession, queries: [inflightRate], active: true) { _, _ in }
+        await inflightScheduler.runDueWork()
+        await inflightSource.pauseNextSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///captured"])
+        inflightClock.advance(0.11)
+        let inflightWork = Task { await inflightScheduler.runDueWork() }
+        await inflightSource.waitForPausedSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///during"])
+        inflightClock.advance(0.3)
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///late"])
+        await inflightSource.resumeSync()
+        await inflightWork.value
+        await inflightScheduler.runDueWork()
+        expect(inflightScheduler.syncCount == 2,
+               "blocked capture does not immediately drain hints against its consumed deadline")
+        let inflightQueries = inflightScheduler.queryCount
+        inflightScheduler.clockChanged()
+        await inflightScheduler.runClockWork()
+        expect(inflightScheduler.queryCount > inflightQueries && inflightScheduler.syncCount == 2,
+               "dirty cooldown does not hold the independent recent query lane")
+        for path in ["file:///after-one", "file:///after-two"] {
+            inflightClock.advance(0.04)
+            inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: [path])
+            await inflightScheduler.runDueWork()
+        }
+        expect(inflightScheduler.syncCount == 2, "post-capture burst keeps one bounded debounce window")
+        inflightClock.advance(0.03)
+        await inflightScheduler.runDueWork()
+        let inflightDrainedRequest = (await inflightSource.history()).0.last
+        expect(inflightScheduler.syncCount == 3
+               && inflightDrainedRequest?.changedFileURLs
+                    == ["file:///after-one", "file:///after-two", "file:///during", "file:///late"],
+               "continuous post-capture hints cannot postpone the fixed deadline and none are lost")
+        await inflightSource.pauseNextSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///next"])
+        inflightClock.advance(0.11)
+        let forceInflightWork = Task { await inflightScheduler.runDueWork() }
+        await inflightSource.waitForPausedSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///remaining"])
+        inflightClock.advance(0.2)
+        await inflightSource.resumeSync()
+        await forceInflightWork.value
+        let forcedInflight = Task {
+            try await inflightScheduler.acquire(inflightRate, session: inflightSession, force: true)
+        }
+        while inflightScheduler.pendingAcquisitions == 0 { await Task.yield() }
+        await inflightScheduler.runDueWork()
+        let forcedInflightValue = try? await forcedInflight.value
+        let inflightForcedRequest = (await inflightSource.history()).0.last
+        expect(inflightScheduler.syncCount == 5 && forcedInflightValue != nil
+               && inflightForcedRequest?.force == true,
+               "manual force bypasses post-capture cooldown with a post-request verification")
+        await inflightScheduler.runDueWork()
+        expect(inflightScheduler.syncCount == 5, "authoritative force also consumes pending dirty evidence")
+        inflightScheduler.stop()
         // A burst keeps its first deadline; named syncs cannot reset periodic verification.
         let burstClock = Clock()
         let burstSource = SchedulerFixtureSource()
