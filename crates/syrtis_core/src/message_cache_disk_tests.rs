@@ -2278,6 +2278,108 @@ fn codex_append_stream_reuses_payload_and_turn_rows_across_repeated_appends() {
 }
 
 #[test]
+fn gc_seeks_shared_prefix_bounds_and_repairs_unregistered_streams_transactionally() {
+    let sources = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let path = source(sources.path(), "codex.jsonl");
+    let other_path = source(sources.path(), "unrelated.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Codex);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let initial = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                writer.push(&message("prefix", 11), false, false)?;
+                writer.insert_codex_turn_id("prefix-turn")
+            },
+        )
+        .unwrap();
+    fs::write(&path, b"source\nappend\n").unwrap();
+    let appended = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            None,
+            Some(&initial),
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                writer.push(&message("suffix", 22), false, false)?;
+                writer.insert_codex_turn_id("suffix-turn")
+            },
+        )
+        .unwrap();
+    let other = publish(&cache, identity, &other_path, &[message("unrelated", 33)]);
+    let initial_rows = encode_fact(&rows(&cache, &initial)).unwrap();
+    let other_rows = encode_fact(&rows(&cache, &other)).unwrap();
+    cache.with_database(None, |db| {
+        let shared: i64 = db.query_row(
+            "SELECT row_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+            params![appended.source_id, appended.generation], |row| row.get(0),
+        ).map_err(sql_error)?;
+        assert_eq!(shared, initial.generation);
+        // A missing logical version leaves both a stale mapping and physical
+        // suffix. Also inject facts with no mapping at all, as old GC allowed.
+        db.execute("DELETE FROM mc_versions WHERE source_id=?1 AND generation=?2",
+            params![appended.source_id, appended.generation]).map_err(sql_error)?;
+        db.execute(
+            "INSERT INTO mc_rows SELECT source_id,?2,ordinal,dedup_key,retained,fallback,timestamp,message,digest,
+             session_id,model_id,client,provider_id,workspace,workspace_label
+             FROM mc_rows WHERE source_id=?1 AND generation=?3 AND ordinal=0",
+            params![initial.source_id, appended.generation + 1000, initial.generation],
+        ).map_err(sql_error)?;
+        db.execute(
+            "INSERT INTO mc_codex_turn_ids VALUES(?1,?2,'orphan-turn',0)",
+            params![initial.source_id, appended.generation + 1000],
+        ).map_err(sql_error)?;
+        let before: (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM mc_rows),(SELECT count(*) FROM mc_codex_turn_ids)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(sql_error)?;
+        {
+            let transaction = db.unchecked_transaction().map_err(sql_error)?;
+            collect_unreferenced_versions_on(&transaction)?;
+            transaction.rollback().map_err(sql_error)?;
+        }
+        let after: (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM mc_rows),(SELECT count(*) FROM mc_codex_turn_ids)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(sql_error)?;
+        assert_eq!(after, before, "repair and index creation share publication rollback");
+        Ok(())
+    }).unwrap();
+    cache.collect_unreferenced_versions().unwrap();
+    assert_eq!(encode_fact(&rows(&cache, &initial)).unwrap(), initial_rows);
+    assert_eq!(encode_fact(&rows(&cache, &other)).unwrap(), other_rows);
+    cache
+        .with_database(None, |db| {
+            let stored = read_version(db, initial.source_id, initial.generation)?;
+            let mut turns = Vec::new();
+            visit_codex_ids(db, &stored, &mut |id| {
+                turns.push(id.to_owned());
+                Ok(())
+            })?;
+            assert_eq!(turns, vec!["prefix-turn"]);
+            let physical: (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM mc_rows),(SELECT count(*) FROM mc_codex_turn_ids)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(sql_error)?;
+            assert_eq!(physical, (2, 1));
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn codex_append_corrections_and_truncation_keep_inherited_keyless_multiplicity_and_gc() {
     let sources = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
@@ -2905,4 +3007,529 @@ fn codex_staging_looks_up_historical_turns_and_publishes_only_membership_deltas(
         })
         .unwrap();
     assert_eq!(ids, 0, "parser reset chooses a new empty membership stream");
+}
+
+#[test]
+fn shared_current_and_observed_history_still_fail_before_production_on_corruption() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "session.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    publish(
+        &cache,
+        identity,
+        &path,
+        &[message("first:req", 10), message("second:req", 20)],
+    );
+    fs::write(&path, b"compacted source\n").unwrap();
+    let current = publish(&cache, identity, &path, &[message("first:req", 10)]);
+    let observed = cache.retention_metadata(identity, &path).unwrap().unwrap();
+    assert_eq!(current.generation, observed.generation);
+    let recovery = root.path().join("source-message-cache.recovery.sqlite3");
+    let previous_recovery = fs::read(&recovery).unwrap();
+    cache
+        .with_database(None, |db| {
+            db.execute(
+                "DELETE FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal=0",
+                params![current.source_id, current.generation],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    let mut produced = false;
+    let result = cache.write_source(
+        identity,
+        &path,
+        SourceFingerprint::from_path(&path).unwrap(),
+        Some(&observed),
+        None,
+        None,
+        &mut |_| {},
+        &mut |_, _| Ok(()),
+        |_| {
+            produced = true;
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(!produced);
+    assert_eq!(
+        cache.metadata(identity, &path).unwrap().unwrap().generation,
+        current.generation
+    );
+    assert_eq!(fs::read(recovery).unwrap(), previous_recovery);
+}
+
+#[test]
+fn unchanged_claude_reconciliation_does_not_rewrite_facts_but_changed_merge_does() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "session.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    // The generic fixture starts with provider=openrouter. Real Claude
+    // production has already resolved its model/provider/workspace context.
+    let mut stable = message("shared:req", 100);
+    crate::sessions::claudecode::refresh_retained_message_context(&mut stable, &path, None, None);
+    let first = publish(&cache, identity, &path, std::slice::from_ref(&stable));
+    cache
+        .with_database(None, |db| {
+            db.execute_batch(
+                "CREATE TABLE merge_updates(n INTEGER); INSERT INTO merge_updates VALUES(0);
+            CREATE TRIGGER count_merge AFTER UPDATE OF message,retained ON mc_rows
+            BEGIN UPDATE merge_updates SET n=n+1; END;",
+            )
+            .map_err(sql_error)
+        })
+        .unwrap();
+    let same = publish(&cache, identity, &path, std::slice::from_ref(&stable));
+    let updates = || {
+        cache
+            .with_database(None, |db| {
+                db.query_row("SELECT n FROM merge_updates", [], |r| r.get::<_, i64>(0))
+                    .map_err(sql_error)
+            })
+            .unwrap()
+    };
+    assert_eq!(updates(), 0);
+    assert_eq!(rows(&cache, &first), rows(&cache, &same));
+    let mut changed = stable;
+    changed.tokens.input = 10;
+    let merged = publish(&cache, identity, &path, &[changed]);
+    assert_eq!(updates(), 1);
+    assert_eq!(rows(&cache, &merged)[0].0.tokens.input, 100);
+    assert_eq!(rows(&cache, &first)[0].0.tokens.input, 100);
+}
+
+fn publish_full_stream(
+    cache: &SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+    messages: &[UnifiedMessage],
+    fallback: bool,
+) -> CachedSourceMetadata {
+    let observed = cache.retention_metadata(identity, path).unwrap();
+    cache
+        .write_source(
+            identity,
+            path,
+            SourceFingerprint::from_path(path).unwrap(),
+            observed.as_ref(),
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                for message in messages {
+                    writer.push(message, false, fallback)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn omp_full_stream_dense_appends_write_only_delta_and_keep_exact_old_snapshots() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "omp.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Omp);
+    let mut facts: Vec<_> = (0..512)
+        .map(|n| {
+            let mut value = message(&format!("omp-{n}"), n + 1);
+            value.client = "omp".into();
+            value
+        })
+        .collect();
+    let first = publish_full_stream(&cache, identity, &path, &facts, false);
+    let original = rows(&cache, &first);
+    cache.with_database(None, |db| db.execute_batch(
+        "CREATE TABLE fact_writes(inserts INTEGER,updates INTEGER); INSERT INTO fact_writes VALUES(0,0);
+         CREATE TRIGGER count_fact_insert AFTER INSERT ON mc_rows BEGIN UPDATE fact_writes SET inserts=inserts+1; END;
+         CREATE TRIGGER count_fact_update AFTER UPDATE ON mc_rows BEGIN UPDATE fact_writes SET updates=updates+1; END;"
+    ).map_err(sql_error)).unwrap();
+    for n in 0..8 {
+        let mut next = message(&format!("new-{n}"), 1000 + n);
+        next.client = "omp".into();
+        facts.push(next);
+        fs::write(&path, format!("append-{n}\n")).unwrap();
+        let newest = publish_full_stream(&cache, identity, &path, &facts, false);
+        assert_eq!(
+            rows(&cache, &newest)
+                .into_iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            facts
+        );
+        assert_eq!(rows(&cache, &first), original);
+        cache.with_database(None, |db| {
+            let writes: (i64,i64) = db.query_row("SELECT inserts,updates FROM fact_writes", [], |r| Ok((r.get(0)?,r.get(1)?))).map_err(sql_error)?;
+            assert_eq!(writes, (n+1,0));
+            let physical: i64 = db.query_row("SELECT count(DISTINCT row_generation) FROM mc_generation_storage WHERE source_id=?1",
+                [first.source_id], |r| r.get(0)).map_err(sql_error)?;
+            assert_eq!(physical, 1);
+            Ok(())
+        }).unwrap();
+    }
+    let final_metadata = publish_full_stream(&cache, identity, &path, &facts, false);
+    cache
+        .with_database(None, |db| {
+            assert_eq!(
+                db.query_row("SELECT inserts FROM fact_writes", [], |r| r
+                    .get::<_, i64>(0))
+                    .map_err(sql_error)?,
+                8
+            );
+            Ok(())
+        })
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    drop(cache);
+    let reopened = SourceMessageCache::open_from_root(Some(root.path()));
+    assert_eq!(rows(&reopened, &first), original);
+    assert_eq!(
+        rows(&reopened, &final_metadata)
+            .into_iter()
+            .map(|r| r.0)
+            .collect::<Vec<_>>(),
+        facts
+    );
+}
+
+#[test]
+fn full_stream_prefix_corrections_truncation_and_failure_never_mutate_older_rows() {
+    for namespace in [ClientId::Omp, ClientId::Claude] {
+        for changed in [0usize, 2usize] {
+            let root = TempDir::new().unwrap();
+            let path = source(root.path(), "source.jsonl");
+            let cache = SourceMessageCache::open_from_root(Some(root.path()));
+            let identity = CacheIdentity::for_client(namespace);
+            let original: Vec<_> = (0..5)
+                .map(|n| message(&format!("key-{n}:req"), 100 + n))
+                .collect();
+            let first = publish_full_stream(&cache, identity, &path, &original, false);
+            let frozen = rows(&cache, &first);
+            let mut correction = original.clone();
+            correction[changed].tokens.input += 100;
+            fs::write(&path, b"corrected\n").unwrap();
+            let corrected = publish_full_stream(&cache, identity, &path, &correction, false);
+            assert_eq!(
+                rows(&cache, &corrected)
+                    .into_iter()
+                    .map(|r| r.0)
+                    .collect::<Vec<_>>(),
+                correction
+            );
+            assert_eq!(rows(&cache, &first), frozen);
+            let before = rows(&cache, &corrected);
+            fs::write(&path, b"truncated\n").unwrap();
+            let shorter = publish_full_stream(&cache, identity, &path, &correction[..2], false);
+            let short_rows = rows(&cache, &shorter);
+            assert_eq!(short_rows.len(), 5);
+            assert!(short_rows[..2].iter().all(|r| !r.1));
+            assert!(short_rows[2..].iter().all(|r| r.1));
+            assert_eq!(rows(&cache, &corrected), before);
+            let observed = cache.retention_metadata(identity, &path).unwrap();
+            let result = cache.write_source(
+                identity,
+                &path,
+                SourceFingerprint::from_path(&path).unwrap(),
+                observed.as_ref(),
+                None,
+                None,
+                &mut |_| {},
+                &mut |_, _| Err("rejected publication".into()),
+                |writer| {
+                    for fact in &correction {
+                        writer.push(fact, false, false)?;
+                    }
+                    writer.push(&message("extra:req", 500), false, false)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(rows(&cache, &shorter), short_rows);
+            assert_eq!(rows(&cache, &first), frozen);
+        }
+    }
+}
+
+#[test]
+fn full_stream_keyless_multiplicity_and_fallback_timestamps_remain_generation_owned() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "source.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Omp);
+    let mut repeated = message("ignored", 10);
+    repeated.dedup_key = None;
+    let first = publish_full_stream(
+        &cache,
+        identity,
+        &path,
+        &[repeated.clone(), repeated.clone()],
+        false,
+    );
+    let three = publish_full_stream(
+        &cache,
+        identity,
+        &path,
+        &[repeated.clone(), repeated.clone(), repeated.clone()],
+        false,
+    );
+    assert_eq!(rows(&cache, &first).len(), 2);
+    assert_eq!(rows(&cache, &three).len(), 3);
+    let shorter = publish_full_stream(&cache, identity, &path, &[repeated.clone()], false);
+    let short_rows = rows(&cache, &shorter);
+    assert_eq!(short_rows.len(), 3);
+    assert!(!short_rows[0].1);
+    assert!(short_rows[1..].iter().all(|r| r.1));
+    assert_eq!(rows(&cache, &three).len(), 3);
+
+    let fallback_path = source(root.path(), "fallback.jsonl");
+    let file = fs::File::open(&fallback_path).unwrap();
+    file.set_times(
+        fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100_000)),
+    )
+    .unwrap();
+    let old = publish_full_stream(
+        &cache,
+        identity,
+        &fallback_path,
+        &[message("fallback", 1)],
+        true,
+    );
+    let frozen = rows(&cache, &old);
+    file.set_times(
+        fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(200_000)),
+    )
+    .unwrap();
+    let new = publish_full_stream(
+        &cache,
+        identity,
+        &fallback_path,
+        &[message("fallback", 1)],
+        true,
+    );
+    assert_eq!(rows(&cache, &old), frozen);
+    assert_eq!(frozen[0].0.timestamp, 100_000_000);
+    assert_eq!(rows(&cache, &new)[0].0.timestamp, 200_000_000);
+}
+
+#[test]
+fn shared_full_prefix_claude_context_update_forks_before_mutation() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "source.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let facts = vec![message("first:req", 10), message("second:req", 20)];
+    let old = publish_full_stream(&cache, identity, &path, &facts, false);
+    let frozen = rows(&cache, &old);
+    let current = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            Some(&old),
+            None,
+            None,
+            &mut |value| value.agent = Some("refreshed".into()),
+            &mut |_, _| Ok(()),
+            |writer| {
+                for value in &facts {
+                    writer.push(value, false, false)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(rows(&cache, &old), frozen);
+    assert!(rows(&cache, &current)
+        .iter()
+        .all(|r| r.0.agent.as_deref() == Some("refreshed")));
+    cache.with_database(None, |db| {
+        let distinct: i64 = db.query_row("SELECT count(DISTINCT row_generation) FROM mc_generation_storage WHERE source_id=?1",
+            [old.source_id], |r| r.get(0)).map_err(sql_error)?;
+        assert_eq!(distinct,2);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn full_stream_forks_around_existing_suffix_and_unions_concurrent_history() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "source.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Omp);
+    let base_fact = message("base", 10);
+    let base = publish_full_stream(
+        &cache,
+        identity,
+        &path,
+        std::slice::from_ref(&base_fact),
+        false,
+    );
+    let sibling = publish_full_stream(
+        &cache,
+        identity,
+        &path,
+        &[base_fact.clone(), message("sibling", 20)],
+        false,
+    );
+    let sibling_rows = rows(&cache, &sibling);
+    // Model an older current pointer while a later immutable logical stream
+    // still pins the shared physical suffix. Every version remains valid.
+    cache
+        .with_database(None, |db| {
+            db.execute(
+                "UPDATE mc_sources SET generation=?2 WHERE id=?1",
+                params![base.source_id, base.generation],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    let branch = cache
+        .write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            Some(&sibling),
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                writer.push(&base_fact, false, false)?;
+                writer.push(&message("branch", 30), false, false)
+            },
+        )
+        .unwrap();
+    assert_eq!(rows(&cache, &base).len(), 1);
+    assert_eq!(rows(&cache, &sibling), sibling_rows);
+    let branch_rows = rows(&cache, &branch);
+    assert_eq!(
+        branch_rows
+            .iter()
+            .map(|r| r.0.dedup_key.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["base", "branch", "sibling"]
+    );
+    assert!(!branch_rows[0].1 && !branch_rows[1].1 && branch_rows[2].1);
+}
+
+#[test]
+fn full_stream_shared_prefix_rejects_corruption_and_rolls_back_sqlite_full() {
+    for corrupt in [false, true] {
+        let root = TempDir::new().unwrap();
+        let path = source(root.path(), "source.jsonl");
+        let cache = SourceMessageCache::open_from_root(Some(root.path()));
+        let identity = CacheIdentity::for_client(ClientId::Omp);
+        let facts: Vec<_> = (0..8)
+            .map(|n| message(&format!("key-{n}"), n + 1))
+            .collect();
+        let base = publish_full_stream(&cache, identity, &path, &facts, false);
+        let frozen = rows(&cache, &base);
+        cache
+            .with_database(None, |db| {
+                if corrupt {
+                    db.execute(
+                        "UPDATE mc_rows SET message=x'00' WHERE source_id=?1 AND ordinal=3",
+                        [base.source_id],
+                    )
+                    .map_err(sql_error)?;
+                } else {
+                    db.execute_batch(
+                        "CREATE TABLE fill(payload BLOB);
+                    CREATE TRIGGER fail_prefix BEFORE INSERT ON mc_rows WHEN new.ordinal=8
+                    BEGIN INSERT INTO fill VALUES(zeroblob(1048576)); END;",
+                    )
+                    .map_err(sql_error)?;
+                    let pages: i64 = db
+                        .pragma_query_value(None, "page_count", |r| r.get(0))
+                        .map_err(sql_error)?;
+                    db.pragma_update(None, "max_page_count", pages)
+                        .map_err(sql_error)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let observed = if corrupt {
+            Some(base.clone())
+        } else {
+            cache.retention_metadata(identity, &path).unwrap()
+        };
+        let result = cache.write_source(
+            identity,
+            &path,
+            SourceFingerprint::from_path(&path).unwrap(),
+            observed.as_ref(),
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                for value in &facts {
+                    writer.push(value, false, false)?;
+                }
+                writer.push(&message("extra", 90), false, false)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            cache.metadata(identity, &path).unwrap().unwrap().generation,
+            base.generation
+        );
+        if !corrupt {
+            assert_eq!(rows(&cache, &base), frozen);
+        }
+        cache
+            .with_database(None, |db| {
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM mc_versions", [], |r| r
+                        .get::<_, i64>(0))
+                        .map_err(sql_error)?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn full_stream_prefix_match_includes_indexed_metadata_not_only_payload_digest() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "source.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Omp);
+    let facts = [message("first", 10), message("second", 20)];
+    let base = publish_full_stream(&cache, identity, &path, &facts, false);
+    cache
+        .with_database(None, |db| {
+            db.execute(
+                "UPDATE mc_rows SET model_id='wrong-projection' WHERE source_id=?1 AND ordinal=1",
+                [base.source_id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .unwrap();
+    let new = publish_full_stream(&cache, identity, &path, &facts, false);
+    assert_eq!(
+        rows(&cache, &new)
+            .into_iter()
+            .map(|r| r.0)
+            .collect::<Vec<_>>(),
+        facts
+    );
+    cache.with_database(None,|db| {
+        let model: String = db.query_row(
+            "SELECT r.model_id FROM mc_generation_storage s JOIN mc_rows r ON r.source_id=s.source_id AND r.generation=s.row_generation
+             WHERE s.source_id=?1 AND s.generation=?2 AND r.ordinal=1",
+            params![new.source_id,new.generation],|r|r.get(0)).map_err(sql_error)?;
+        assert_eq!(model,facts[1].model_id);
+        Ok(())
+    }).unwrap();
 }

@@ -19,6 +19,14 @@ pub struct TraceBucket {
     pub tokens_per_min: f32,
 }
 
+#[derive(Serialize)]
+pub(crate) struct TraceRate {
+    trace: Vec<TraceBucket>,
+    rate: f32,
+}
+
+type TraceGroups = HashMap<(String, String, String), (i64, u32)>;
+
 struct TailSnapshot {
     snapshot: syrtis_core::LocalUsageSnapshot,
     registry_generation: u64,
@@ -162,20 +170,62 @@ pub(crate) fn trace_from_snapshot(
     if window_secs <= 0 {
         return Ok(Vec::new());
     }
-    let mut groups: HashMap<(String, String, String), (i64, u32)> = HashMap::new();
+    let mut groups = TraceGroups::new();
     visit_snapshot(snapshot, cutoff, window_secs, now, &mut |message| {
-        let key = (
-            message.client.clone(),
-            message
-                .agent
-                .clone()
-                .unwrap_or_else(|| message.client.clone()),
-            message.model_id.clone(),
-        );
-        let slot = groups.entry(key).or_insert((0, 0));
-        slot.0 = slot.0.saturating_add(event_total(message));
-        slot.1 = slot.1.saturating_add(message.message_count.max(0) as u32);
+        add_trace(&mut groups, message, event_total(message));
     })?;
+    Ok(finish_trace(groups, window_secs))
+}
+
+pub(crate) fn trace_rate_from_snapshot(
+    snapshot: &syrtis_core::LocalUsageSnapshot,
+    cutoff: i64,
+    window_secs: i64,
+    now: i64,
+) -> Result<TraceRate, String> {
+    if window_secs <= 0 {
+        return Ok(TraceRate {
+            trace: Vec::new(),
+            rate: 0.0,
+        });
+    }
+    let mut total = 0_i64;
+    let mut groups = TraceGroups::new();
+    visit_snapshot(snapshot, cutoff, window_secs, now, &mut |message| {
+        add_trace_rate(&mut total, &mut groups, message);
+    })?;
+    Ok(TraceRate {
+        trace: finish_trace(groups, window_secs),
+        rate: total as f32 / (window_secs as f32 / 60.0),
+    })
+}
+
+fn add_trace_rate(
+    total: &mut i64,
+    groups: &mut TraceGroups,
+    message: &syrtis_core::UnifiedMessage,
+) {
+    let tokens = event_total(message);
+    // Keep the chronological scalar fold independent of per-key saturation.
+    *total = total.saturating_add(tokens);
+    add_trace(groups, message, tokens);
+}
+
+fn add_trace(groups: &mut TraceGroups, message: &syrtis_core::UnifiedMessage, tokens: i64) {
+    let key = (
+        message.client.clone(),
+        message
+            .agent
+            .clone()
+            .unwrap_or_else(|| message.client.clone()),
+        message.model_id.clone(),
+    );
+    let slot = groups.entry(key).or_insert((0, 0));
+    slot.0 = slot.0.saturating_add(tokens);
+    slot.1 = slot.1.saturating_add(message.message_count.max(0) as u32);
+}
+
+fn finish_trace(groups: TraceGroups, window_secs: i64) -> Vec<TraceBucket> {
     let window_min = (window_secs as f32 / 60.0).max(1.0 / 60.0);
     let mut out: Vec<_> = groups
         .into_iter()
@@ -189,7 +239,7 @@ pub(crate) fn trace_from_snapshot(
         })
         .collect();
     out.sort_by_key(|bucket| std::cmp::Reverse(bucket.tokens));
-    Ok(out)
+    out
 }
 
 fn event_total(message: &syrtis_core::UnifiedMessage) -> i64 {
@@ -212,6 +262,52 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_fold_preserves_signed_chronological_and_per_key_saturation() {
+        let mut total = 0_i64;
+        let mut groups = TraceGroups::new();
+        let mut legacy_total = 0_i64;
+        let mut legacy_groups = TraceGroups::new();
+        for (model, input, output, messages) in [
+            ("shared", i64::MAX, 1, i32::MAX),
+            ("other", 17, 0, -1),
+            ("shared", i64::MIN, 0, i32::MAX),
+            ("shared", 0, 0, i32::MAX),
+        ] {
+            let mut message = syrtis_core::UnifiedMessage::new(
+                "opencode",
+                model,
+                "openai",
+                "session",
+                0,
+                syrtis_core::TokenBreakdown {
+                    input,
+                    output,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            message.message_count = messages;
+            add_trace_rate(&mut total, &mut groups, &message);
+            legacy_total = legacy_total.saturating_add(event_total(&message));
+            add_trace(&mut legacy_groups, &message, event_total(&message));
+        }
+        assert_eq!(total, -1);
+        assert_eq!(total, legacy_total);
+        assert_eq!(groups, legacy_groups);
+        assert_eq!(groups.values().map(|group| group.0).sum::<i64>(), 16);
+        let trace = finish_trace(groups, 1);
+        assert_eq!(trace[0].tokens, 17);
+        assert_eq!(trace[0].messages, 0);
+        assert_eq!(trace[1].tokens, -1);
+        assert_eq!(trace[1].messages, u32::MAX);
+        let legacy_window_min = (1.0_f32 / 60.0).max(1.0 / 60.0);
+        assert_eq!(
+            trace[1].tokens_per_min.to_bits(),
+            (-1.0_f32 / legacy_window_min).to_bits()
+        );
+    }
 
     #[test]
     fn disk_tail_expires_without_source_reads_and_preserves_overflow_and_last_good() {

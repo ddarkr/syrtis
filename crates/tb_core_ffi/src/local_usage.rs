@@ -1,5 +1,5 @@
 //! Scheduler source lane and exact-scope report queries.
-//! Leases retain metadata, pinned disk handles and shared pricing, never rows.
+//! Leases retain metadata, bounded file-backed preparation and shared pricing.
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -696,11 +696,11 @@ pub(crate) fn query(json: &str) -> Result<String, String> {
         ..Default::default()
     };
     let pricing = lease.pricing.as_deref();
-    // Ordinary reports use the engine's bounded, disk-backed sequential
-    // checkpoints. Their identity is the exact producer + query semantics +
-    // immutable pricing content, not this lease token or source generation.
-    // Selected-prefix admission precedes decoding/pricing/folding; no raw
-    // history or report checkpoints are retained in the native lease registry.
+    // Ordinary reports use bounded, disk-backed sequential checkpoints and
+    // share verified file-backed preparation within the exact source snapshot.
+    // Checkpoint identity covers producer + query semantics + immutable pricing;
+    // preparation reuse still revalidates store epoch, generation and writes.
+    // Neither decoded history nor report payloads enter the lease registry.
     let payload = match (scope.spec.kind, request.kind.as_str()) {
         (ScopeKind::Report, "graph") => {
             crate::usage_graph::run_from_snapshot(&scope.source.snapshot, options, pricing)
@@ -728,6 +728,13 @@ pub(crate) fn query(json: &str) -> Result<String, String> {
             request.now_ms.unwrap_or_else(now_ms),
         )
         .and_then(|trace| crate::encode_local_response(&trace)),
+        (ScopeKind::Recent, "traceRate") => crate::usage_tail::trace_rate_from_snapshot(
+            &scope.source.snapshot,
+            scope.source.cutoff,
+            request.window_secs.unwrap_or(600),
+            request.now_ms.unwrap_or_else(now_ms),
+        )
+        .and_then(|combined| crate::encode_local_response(&combined)),
         _ => Err("local usage query kind does not match its producing scope".into()),
     }?;
     if lease.root_generation != crate::root_generation() {
@@ -738,8 +745,8 @@ pub(crate) fn query(json: &str) -> Result<String, String> {
     Ok(payload)
 }
 
-// Metadata is conservatively counted per owning lease; shared price catalogs
-// are counted once. No historical source facts or JSON trees enter this registry.
+// Metadata and prepared-query pager allowances are counted per owning lease;
+// shared price catalogs are counted once. No decoded history or JSON trees.
 fn retained_bytes(leases: &VecDeque<LeaseEntry>) -> usize {
     let mut bytes = 0usize;
     for (index, (token, lease)) in leases.iter().enumerate() {

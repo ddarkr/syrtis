@@ -210,6 +210,7 @@ private final class TimedSource: UsageDataSource, @unchecked Sendable {
         case .agents: kind = "agents"
         case .rate: kind = "rate"
         case .trace: kind = "trace"; note("trace")
+        case .traceRate: kind = "traceRate"; note("trace")
         }
         return value
     }

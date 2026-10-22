@@ -34,6 +34,9 @@ private actor SchedulerFixtureSource: UsageDataSource {
     private var lastPrice: String?
     private var lastSyncResult: LocalUsageSyncResult?
     private var reportDay = Format.todayKey()
+    private var combinedRate: Double?
+
+    func setCombinedRate(_ value: Double?) { combinedRate = value }
 
     func setReportDay(_ day: String) { reportDay = day; generation += 1 }
 
@@ -142,16 +145,18 @@ private actor SchedulerFixtureSource: UsageDataSource {
         if shouldFail { throw Failure.sourceUnavailable }
         guard let capturedEvent = capturedRecentEvents[request.leaseToken] else { throw Failure.sourceUnavailable }
         switch request.kind {
-        case "rate", "trace":
+        case "rate", "trace", "traceRate":
             let window = request.windowSecs ?? (request.kind == "rate" ? 60 : 600)
             let now = request.nowMs ?? 0
             let live = capturedEvent > 0 && capturedEvent <= now && now - capturedEvent <= window * 1000
             let rate = live ? 120 / (Double(window) / 60) : 0
             if request.kind == "rate" { return .rate(rate) }
-            return .trace(live ? [
+            let rows = live ? [
                 TraceBucket(client: "omp", agent: "omp", model: "test-model",
                             tokens: 120, messages: 1, tokensPerMin: rate)
-            ] : [])
+            ] : []
+            if request.kind == "traceRate" { return .traceRate(rows, combinedRate ?? rate) }
+            return .trace(rows)
         case "graph":
             let payload = DemoData.payload(for: request.year, today: reportDay)
             guard distinctGraphs else { return .graph(payload) }
@@ -294,6 +299,227 @@ extension LocalUsageScheduler {
         otherRoot.releaseLocalDemand()
         displayScheduler.release(background)
         displayScheduler.stop()
+        let traceQuestion = Query(kind: "trace", windowSecs: 600)
+        let scalarQuestion = Query(kind: "rate", windowSecs: 600)
+        let mixedTrace = [
+            TraceBucket(client: "claude", agent: "claude", model: "m", tokens: 10, messages: 1, tokensPerMin: 1),
+            TraceBucket(client: "dynamic-fixture", agent: "a", model: "m", tokens: 2, messages: 1, tokensPerMin: 0.2),
+        ]
+        expect(LiveRate.rate(from: .traceRate(mixedTrace, 1.2000000476837158), hidden: []) == 1.2000000476837158
+               && LiveRate.rate(from: .traceRate(mixedTrace, 1.2000000476837158), hidden: ["claude"]) == 0.2
+               && LiveRate.rate(from: .traceRate(mixedTrace, 1.2000000476837158), hidden: ["dynamic-fixture"]) == 1,
+               "combined native scalar stays exact while hidden filtering preserves dynamic-client trace policy")
+        for failureCount in 0...2 {
+            let fails = failureCount > 0
+            let pairClock = Clock()
+            let pairSource = SchedulerFixtureSource()
+            let pairScheduler = LocalUsageScheduler(
+                source: pairSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { pairClock.monotonic }, wallNow: { pairClock.wall })
+            let pairOwner = pairScheduler.openSession()
+            var rates: [Double] = [], traces: [[TraceBucket]] = []
+            var traceErrors = 0, rateErrors = 0
+            await pairSource.appendRecentEvent(at: Int64(pairClock.wall.timeIntervalSince1970 * 1000))
+            // Deliberately unlike the bucket sum: the scheduler must use the
+            // native scalar field, not perform a second rounded fold.
+            await pairSource.setCombinedRate(fails ? nil : 12.000000953674316)
+            if fails { await pairSource.failNextQuery(kind: "traceRate") }
+            if failureCount == 2 { await pairSource.failNextQuery(kind: "rate") }
+            pairScheduler.update(pairOwner, queries: [traceQuestion, scalarQuestion], active: true) { query, result in
+                switch result {
+                case .success(.rate(let value)): rates.append(value)
+                case .success(.trace(let rows)): traces.append(rows)
+                case .failure:
+                    if query == traceQuestion { traceErrors += 1 } else { rateErrors += 1 }
+                default: break
+                }
+            }
+            await pairScheduler.runDueWork()
+            let requests = (await pairSource.history()).1
+            expect(requests.map(\.kind) == (fails ? ["traceRate", "rate"] : ["traceRate"]),
+                   "same-window trace and rate use one traversal, with independent scalar fallback on trace failure")
+            let expectedRates: [Double] = failureCount == 2 ? [] : [fails ? 12 : 12.000000953674316]
+            expect(rates == expectedRates && rateErrors == (failureCount == 2 ? 1 : 0)
+                   && traceErrors == (fails ? 1 : 0)
+                   && (fails ? traces.isEmpty : traces.first?.first?.tokens == 120),
+                   "combined publication preserves native scalar arithmetic and distinguishes trace failure from zero")
+            if !fails {
+                await pairSource.setCombinedRate(nil)
+                pairClock.advance(601)
+                await pairScheduler.runDueWork()
+                expect(rates.last == 0 && traces.last?.isEmpty == true,
+                       "combined ten-minute window publishes successful zero and empty trace after expiry")
+                pairScheduler.update(pairOwner, queries: [scalarQuestion], active: true) { _, result in
+                    if case .success(.rate(let value)) = result { rates.append(value) }
+                }
+                pairClock.advance(5)
+                await pairScheduler.runClockWork()
+                expect((await pairSource.history()).1.last?.kind == "rate" && rates.last == 0,
+                       "trace absence retains the independent scalar-only path")
+            }
+            pairScheduler.stop()
+        }
+        // A similar but different window or client selection is never shared.
+        for other in [Query(kind: "rate", windowSecs: 60),
+                      Query(kind: "rate", clients: ["codex"], windowSecs: 600)] {
+            for traceFails in [false, true] {
+                let exactClock = Clock()
+                let exactSource = SchedulerFixtureSource()
+                let exactScheduler = LocalUsageScheduler(
+                    source: exactSource, observesSources: false, automaticallySchedules: false,
+                    monotonicNow: { exactClock.monotonic }, wallNow: { exactClock.wall })
+                let exactOwner = exactScheduler.openSession()
+                var exactRates: [Double] = []
+                var traceFailures = 0, scalarFailures = 0
+                await exactSource.appendRecentEvent(at: Int64(exactClock.wall.timeIntervalSince1970 * 1000))
+                if traceFails { await exactSource.failNextQuery(kind: "trace") }
+                exactScheduler.update(exactOwner, queries: [traceQuestion, other], active: true) { query, result in
+                    if case .success(.rate(let value)) = result { exactRates.append(value) }
+                    if case .failure = result {
+                        if query == traceQuestion { traceFailures += 1 } else { scalarFailures += 1 }
+                    }
+                }
+                await exactScheduler.runDueWork()
+                expect((await exactSource.history()).1.map(\.kind) == ["rate", "trace"]
+                       && exactRates == [other.windowSecs == 60 ? 120 : 12]
+                       && traceFailures == (traceFails ? 1 : 0) && scalarFailures == 0,
+                       "different-window or different-client scalar publishes before an unrelated trace succeeds or fails")
+                exactScheduler.stop()
+            }
+        }
+        // A lease is an ownership handle, not the per-query source identity.
+        // Scope expansion rotates it without changing existing source generations.
+        for sourceChanges in [false, true] {
+            let rotationClock = Clock()
+            let rotationSource = SchedulerFixtureSource()
+            let rotationScheduler = LocalUsageScheduler(
+                source: rotationSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { rotationClock.monotonic }, wallNow: { rotationClock.wall })
+            let rotationOwner = rotationScheduler.openSession()
+            var rotationRates: [Double] = []
+            await rotationSource.appendRecentEvent(at: Int64(rotationClock.wall.timeIntervalSince1970 * 1000))
+            rotationScheduler.update(rotationOwner, queries: [traceQuestion, scalarQuestion], active: true) { _, result in
+                if case .success(.rate(let value)) = result { rotationRates.append(value) }
+            }
+            await rotationScheduler.runDueWork()
+            rotationClock.advance(5)
+            await rotationSource.pauseNextQuery(kind: "traceRate")
+            let oldTurn = Task { await rotationScheduler.runClockWork() }
+            await rotationSource.waitForPausedQuery()
+            let oldToken = (await rotationSource.history()).1.last!.leaseToken
+            if sourceChanges {
+                await rotationSource.appendRecentEvent(at: Int64(rotationClock.wall.timeIntervalSince1970 * 1000))
+            }
+            let addedQuota = quotaScope(clientId: "claude", accountKey: "rotation")
+            rotationScheduler.setQuotaScopes(rotationOwner, [addedQuota])
+            let replacement = Task { await rotationScheduler.runDueWork() }
+            while true {
+                if let token = await rotationSource.capturedQuotaToken(for: addedQuota),
+                   rotationScheduler.isCurrentQuotaSnapshot(token, session: rotationOwner) { break }
+                await Task.yield()
+            }
+            expect(!(await rotationSource.history()).2.contains(oldToken),
+                   "combined query pins its retired lease until blocking native work returns")
+            await rotationSource.resumeQuery()
+            await oldTurn.value
+            await replacement.value
+            expect(rotationRates == (sourceChanges ? [12] : [12, 12]),
+                   "unchanged source identity admits old-lease success; changed generation rejects it")
+            await rotationScheduler.runClockWork()
+            let rotationRequests = (await rotationSource.history()).1
+            expect(rotationRates == [12, 12]
+                   && rotationRequests.filter { $0.kind == "traceRate" }.count
+                       == (sourceChanges ? 3 : 2),
+                   "only changed source generations need a replacement combined query")
+            rotationScheduler.stop()
+        }
+        for replaceOwner in [false, true] {
+            let ownershipClock = Clock()
+            let ownershipSource = SchedulerFixtureSource()
+            let ownershipScheduler = LocalUsageScheduler(
+                source: ownershipSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { ownershipClock.monotonic }, wallNow: { ownershipClock.wall })
+            let traceOwner = ownershipScheduler.openSession()
+            var rateOwner = ownershipScheduler.openSession()
+            var ownershipRates: [Double] = [], traceTokens: [Int64] = []
+            let receiveRate: @MainActor @Sendable (Query, Result<LocalUsageValue, Error>) -> Void = { _, result in
+                if case .success(.rate(let value)) = result { ownershipRates.append(value) }
+            }
+            await ownershipSource.appendRecentEvent(at: Int64(ownershipClock.wall.timeIntervalSince1970 * 1000))
+            ownershipScheduler.update(traceOwner, queries: [traceQuestion], active: true) { _, result in
+                if case .success(.trace(let rows)) = result { traceTokens.append(rows.reduce(0) { $0 + $1.tokens }) }
+            }
+            ownershipScheduler.update(rateOwner, queries: [scalarQuestion], active: true, onValue: receiveRate)
+            await ownershipScheduler.runDueWork()
+            ownershipClock.advance(5)
+            await ownershipSource.pauseNextQuery(kind: "traceRate")
+            let ownershipTurn = Task { await ownershipScheduler.runClockWork() }
+            await ownershipSource.waitForPausedQuery()
+            if replaceOwner {
+                ownershipScheduler.release(rateOwner)
+                rateOwner = ownershipScheduler.openSession()
+            }
+            ownershipScheduler.update(rateOwner, queries: [scalarQuestion], active: false, onValue: receiveRate)
+            await ownershipSource.resumeQuery()
+            await ownershipTurn.value
+            expect(ownershipRates == [12] && traceTokens == [120, 120],
+                   "combined success independently admits unchanged trace but rejects replaced rate owner or clock")
+            await ownershipScheduler.runClockWork()
+            let replacementKind = (await ownershipSource.history()).1.last?.kind
+            expect(ownershipRates == [12, 12] && replacementKind == "rate",
+                   "replacement rate owner or clock immediately receives its own scalar result")
+            ownershipClock.advance(5)
+            await ownershipScheduler.runClockWork()
+            let activeOnlyRequest = (await ownershipSource.history()).1.last?.kind
+            expect(ownershipRates == [12, 12] && activeOnlyRequest == "trace",
+                   "active trace never accelerates the independently inactive scalar cadence")
+            ownershipScheduler.stop()
+        }
+        // Questions later in a lane must keep their issuing owners and clock,
+        // rather than starting obsolete historical work after an earlier await.
+        for replaceOwner in [false, true] {
+            let obsoleteClock = Clock()
+            let obsoleteSource = SchedulerFixtureSource()
+            let obsoleteScheduler = LocalUsageScheduler(
+                source: obsoleteSource, observesSources: false, automaticallySchedules: false,
+                monotonicNow: { obsoleteClock.monotonic }, wallNow: { obsoleteClock.wall })
+            let hourlyOwner = obsoleteScheduler.openSession()
+            var modelsOwner = obsoleteScheduler.openSession()
+            let obsoleteHourly = Query(kind: "hourly", year: "2026")
+            let obsoleteModels = Query(kind: "models", year: "2026")
+            var modelTotals: [Int64] = []
+            let receiveModels: @MainActor @Sendable (Query, Result<LocalUsageValue, Error>) -> Void = { _, result in
+                if case .success(.models(let report)) = result {
+                    modelTotals.append(report.totalInput)
+                }
+            }
+            obsoleteScheduler.update(hourlyOwner, queries: [obsoleteHourly], active: true) { _, _ in }
+            obsoleteScheduler.update(modelsOwner, queries: [obsoleteModels], active: true, onValue: receiveModels)
+            await obsoleteScheduler.runDueWork()
+            let originalModels = (await obsoleteSource.history()).1.filter { $0.kind == "models" }.count
+            obsoleteClock.wall.addTimeInterval(86_400)
+            obsoleteScheduler.clockChanged()
+            await obsoleteSource.pauseNextQuery(kind: "hourly")
+            let obsoleteTurn = Task { await obsoleteScheduler.runClockWork() }
+            await obsoleteSource.waitForPausedQuery()
+            if replaceOwner {
+                obsoleteScheduler.release(modelsOwner)
+                modelsOwner = obsoleteScheduler.openSession()
+                obsoleteScheduler.update(modelsOwner, queries: [obsoleteModels], active: true, onValue: receiveModels)
+            } else {
+                obsoleteClock.wall.addTimeInterval(86_400)
+                obsoleteScheduler.clockChanged()
+            }
+            await obsoleteSource.resumeQuery()
+            await obsoleteTurn.value
+            expect((await obsoleteSource.history()).1.filter { $0.kind == "models" }.count == originalModels
+                   && modelTotals == [DemoData.modelReport(for: "2026", today: Format.todayKey()).totalInput],
+                   "historical batch skips not-yet-started work after clock or owner replacement")
+            await obsoleteScheduler.runClockWork()
+            expect(modelTotals == Array(repeating: DemoData.modelReport(for: "2026", today: Format.todayKey()).totalInput, count: 2),
+                   "current historical owner receives the real replacement report without delayed cadence")
+            obsoleteScheduler.stop()
+        }
         // Cadence belongs to the exact recent question, not to global activity.
         for mode in 0..<4 {
             let cadenceClock = Clock()
@@ -1477,6 +1703,70 @@ extension LocalUsageScheduler {
                "failed replacement recovers the reopened header on the next synchronization")
         reopenedModel.releaseLocalDemand()
         replacementScheduler.stop()
+        // In-flight hints get a fresh, fixed window after capture completes,
+        // not the expired deadline of the batch that capture already consumed.
+        let inflightClock = Clock()
+        let inflightSource = SchedulerFixtureSource()
+        let inflightScheduler = LocalUsageScheduler(
+            source: inflightSource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { inflightClock.monotonic }, wallNow: { inflightClock.wall })
+        let inflightSession = inflightScheduler.openSession()
+        let inflightRate = Query(kind: "rate")
+        inflightScheduler.update(inflightSession, queries: [inflightRate], active: true) { _, _ in }
+        await inflightScheduler.runDueWork()
+        await inflightSource.pauseNextSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///captured"])
+        inflightClock.advance(0.11)
+        let inflightWork = Task { await inflightScheduler.runDueWork() }
+        await inflightSource.waitForPausedSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///during"])
+        inflightClock.advance(0.3)
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///late"])
+        await inflightSource.resumeSync()
+        await inflightWork.value
+        await inflightScheduler.runDueWork()
+        expect(inflightScheduler.syncCount == 2,
+               "blocked capture does not immediately drain hints against its consumed deadline")
+        let inflightQueries = inflightScheduler.queryCount
+        inflightScheduler.clockChanged()
+        await inflightScheduler.runClockWork()
+        expect(inflightScheduler.queryCount > inflightQueries && inflightScheduler.syncCount == 2,
+               "dirty cooldown does not hold the independent recent query lane")
+        for path in ["file:///after-one", "file:///after-two"] {
+            inflightClock.advance(0.04)
+            inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: [path])
+            await inflightScheduler.runDueWork()
+        }
+        expect(inflightScheduler.syncCount == 2, "post-capture burst keeps one bounded debounce window")
+        inflightClock.advance(0.03)
+        await inflightScheduler.runDueWork()
+        let inflightDrainedRequest = (await inflightSource.history()).0.last
+        expect(inflightScheduler.syncCount == 3
+               && inflightDrainedRequest?.changedFileURLs
+                    == ["file:///after-one", "file:///after-two", "file:///during", "file:///late"],
+               "continuous post-capture hints cannot postpone the fixed deadline and none are lost")
+        await inflightSource.pauseNextSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///next"])
+        inflightClock.advance(0.11)
+        let forceInflightWork = Task { await inflightScheduler.runDueWork() }
+        await inflightSource.waitForPausedSync()
+        inflightScheduler.sourcesChanged(requiresTopology: false, changedFileURLs: ["file:///remaining"])
+        inflightClock.advance(0.2)
+        await inflightSource.resumeSync()
+        await forceInflightWork.value
+        let forcedInflight = Task {
+            try await inflightScheduler.acquire(inflightRate, session: inflightSession, force: true)
+        }
+        while inflightScheduler.pendingAcquisitions == 0 { await Task.yield() }
+        await inflightScheduler.runDueWork()
+        let forcedInflightValue = try? await forcedInflight.value
+        let inflightForcedRequest = (await inflightSource.history()).0.last
+        expect(inflightScheduler.syncCount == 5 && forcedInflightValue != nil
+               && inflightForcedRequest?.force == true,
+               "manual force bypasses post-capture cooldown with a post-request verification")
+        await inflightScheduler.runDueWork()
+        expect(inflightScheduler.syncCount == 5, "authoritative force also consumes pending dirty evidence")
+        inflightScheduler.stop()
         // A burst keeps its first deadline; named syncs cannot reset periodic verification.
         let burstClock = Clock()
         let burstSource = SchedulerFixtureSource()

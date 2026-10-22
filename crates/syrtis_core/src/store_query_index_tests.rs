@@ -1,3 +1,374 @@
+#[cfg(not(unix))]
+#[test]
+fn recent_queries_without_inode_admission_remain_fresh_and_disposable() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let mut snapshot = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    publisher.publish(&mut snapshot).unwrap();
+    for _ in 0..2 {
+        let reader = snapshot.recent_query().unwrap();
+        assert!(!reader.prepared.as_ref().unwrap().retained);
+        reader
+            .prepare_query(&snapshot, UsageQuery::default())
+            .unwrap();
+        reader.unpin().unwrap();
+        drop(reader);
+        assert!(snapshot.preparation.0.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn seeded_cache_descriptors_pin_reuse_prune_and_preserve_registration_semantics() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let mut original = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let paths = [home.join("a"), home.join("b")];
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::write(path, b"fixture").unwrap();
+        cache
+            .write_source(
+                CacheIdentity::for_client(ClientId::Amp),
+                path,
+                SourceFingerprint::from_path_samples_only(path).unwrap(),
+                None,
+                None,
+                None,
+                &mut |_| {},
+                &mut |db, metadata| {
+                    publisher.register_cache_on(db, path, metadata, "amp", index, 0, false, false)
+                },
+                |writer| {
+                    writer.push(
+                        &message(
+                            "amp",
+                            "session",
+                            100,
+                            Some(&format!("id-{index}")),
+                            index as i64 + 1,
+                        ),
+                        false,
+                        false,
+                    )
+                },
+            )
+            .unwrap();
+    }
+    publisher.publish(&mut original).unwrap();
+    let warm = query(root.path());
+    let mut unchanged = warm
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    warm.seed_cache_descriptors().unwrap();
+    let observer = query(root.path());
+    let version = observer.data_version().unwrap();
+    for (index, path) in paths.iter().enumerate() {
+        let metadata = cache
+            .metadata(CacheIdentity::for_client(ClientId::Amp), path)
+            .unwrap()
+            .unwrap();
+        warm.register_cache(path, &metadata, "amp", index, 0, false, false)
+            .unwrap();
+    }
+    assert_eq!(
+        observer.data_version().unwrap(),
+        version,
+        "warm registrations must not commit canonical writes"
+    );
+    warm.publish(&mut unchanged).unwrap();
+    assert_eq!(unchanged.generation, original.generation);
+
+    let changed = query(root.path());
+    let mut reordered = changed
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    changed.seed_cache_descriptors().unwrap();
+    for (index, path) in paths.iter().rev().enumerate() {
+        let metadata = cache
+            .metadata(CacheIdentity::for_client(ClientId::Amp), path)
+            .unwrap()
+            .unwrap();
+        changed
+            .register_cache(path, &metadata, "amp", index, 1, true, true)
+            .unwrap();
+    }
+    changed
+        .set_workspace_reference("amp", 0, &Some("override".into()), &Some("Override".into()))
+        .unwrap();
+    changed.publish(&mut reordered).unwrap();
+    assert_ne!(reordered.generation, unchanged.generation);
+    assert_eq!(changed.db.query_row(
+        "SELECT COUNT(*) FROM sq_scope_sources WHERE scope_generation=?1 AND phase=1 AND tag=1 AND headless=1",
+        [reordered.generation], |row| row.get::<_, i64>(0),
+    ).unwrap(), 2);
+
+    let partial = query(root.path());
+    let mut reduced = partial
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    partial.seed_cache_descriptors().unwrap();
+    // An observed cohort cannot be mistaken for an unchanged live descriptor.
+    partial.db.execute(
+        "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+         SELECT scope_generation,'observed',lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase
+         FROM sq_scope_sources WHERE scope_generation=?1 AND source_order=0",
+        [reduced.generation],
+    ).unwrap();
+    partial.db.execute(
+        "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+         SELECT scope_generation,'observed-legacy',lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase
+         FROM sq_scope_sources WHERE scope_generation=?1 AND kind='cache' AND source_order=0",
+        [reduced.generation],
+    ).unwrap();
+    let metadata = cache
+        .metadata(CacheIdentity::for_client(ClientId::Amp), &paths[1])
+        .unwrap()
+        .unwrap();
+    partial
+        .register_cache(&paths[1], &metadata, "amp", 0, 0, false, false)
+        .unwrap();
+    partial.finish_seeded_cache_descriptors().unwrap();
+    assert_eq!(
+        partial
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_scope_sources WHERE scope_generation=?1",
+                [reduced.generation],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "unvisited cache and replaced observed/legacy descriptors must disappear"
+    );
+    assert_eq!(
+        partial
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_scope_sources WHERE scope_generation=?1
+         AND source_order=0 AND phase=0 AND tag=0 AND headless=0
+         AND workspace IS NULL AND workspace_label IS NULL AND cache_source_id=?2",
+                params![reduced.generation, metadata.source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "warm registration must normalize parsed phase and prior overrides"
+    );
+    partial.publish(&mut reduced).unwrap();
+    assert_ne!(reduced.generation, reordered.generation);
+
+    let abandoned = query(root.path());
+    let abandoned_snapshot = abandoned
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    abandoned.seed_cache_descriptors().unwrap();
+    drop(abandoned);
+    assert_eq!(
+        observer
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_scope_sources WHERE scope_generation=?1",
+                [abandoned_snapshot.generation],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "failed/dropped staging must release inherited generation pins"
+    );
+}
+
+#[test]
+fn local_discovery_keeps_explicit_claude_authority() {
+    let root = TempDir::new().unwrap();
+    let projects = root.path().join(".claude/projects/project");
+    std::fs::create_dir_all(&projects).unwrap();
+    let transcript = projects.join("session.jsonl");
+    std::fs::write(&transcript, b"{}\n").unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(root.path().to_path_buf()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    for clients in [
+        vec![],
+        vec!["claude".to_string()],
+        vec!["synthetic".to_string()],
+        vec!["synthetic".to_string(), "claude".to_string()],
+        vec!["amp".to_string()],
+    ] {
+        let scan = crate::scan_usage_sources(&context, &clients, None, SelectionMode::LocalClients)
+            .unwrap();
+        let allowed = clients.is_empty() || clients.iter().any(|client| client == "claude");
+        assert_eq!(scan.get(ClientId::Claude).contains(&transcript), allowed);
+        let report =
+            crate::scan_usage_sources(&context, &clients, None, SelectionMode::Report).unwrap();
+        assert_eq!(
+            report.get(ClientId::Claude).contains(&transcript),
+            allowed || clients.iter().any(|client| client == "synthetic"),
+        );
+    }
+}
+
+#[test]
+fn recent_completeness_witness_rechecks_external_and_own_missing_history() {
+    for own_connection in [false, true] {
+        for removed in [0, 2] {
+            let root = TempDir::new().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let context = ResolvedLocalSourceContext::capture(
+                Some(home.clone()),
+                false,
+                crate::scanner::ScannerSettings::default(),
+            )
+            .unwrap();
+            let publisher = query(root.path());
+            let mut snapshot = publisher
+                .begin_scope(
+                    root.path(),
+                    &context,
+                    &["amp".into()],
+                    None,
+                    SelectionMode::LocalClients,
+                )
+                .unwrap();
+            let path = home.join("source");
+            std::fs::write(&path, b"fixture").unwrap();
+            let cache = SourceMessageCache::open_from_root(Some(root.path()));
+            cache
+                .write_source(
+                    CacheIdentity::for_client(ClientId::Amp),
+                    &path,
+                    SourceFingerprint::from_path_samples_only(&path).unwrap(),
+                    None,
+                    None,
+                    None,
+                    &mut |_| {},
+                    &mut |db, metadata| {
+                        publisher.register_cache_on(db, &path, metadata, "amp", 0, 0, false, false)
+                    },
+                    |writer| {
+                        for ordinal in 0..5 {
+                            writer.push(
+                                &message(
+                                    "amp",
+                                    "session",
+                                    ordinal * 100,
+                                    Some(&format!("id-{ordinal}")),
+                                    1,
+                                ),
+                                false,
+                                false,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            publisher.publish(&mut snapshot).unwrap();
+            let reader = QueryState::open(root.path()).unwrap();
+            let range = UsageQuery {
+                from_ms: Some(400),
+                until_ms: Some(500),
+                ..UsageQuery::default()
+            };
+            for _ in 0..3 {
+                reader.pin(&snapshot).unwrap();
+                reader.prepare_query(&snapshot, range).unwrap();
+                reader.unpin().unwrap();
+            }
+            assert_eq!(
+                reader.completeness_checks.get(),
+                1,
+                "unchanged ranges must not recount history"
+            );
+            // Even an unrelated external commit invalidates the witness.
+            publisher.db.execute_batch(
+                "CREATE TABLE witness_unrelated(value INTEGER); INSERT INTO witness_unrelated VALUES(1);",
+            ).unwrap();
+            reader.pin(&snapshot).unwrap();
+            reader.prepare_query(&snapshot, range).unwrap();
+            reader.unpin().unwrap();
+            assert_eq!(reader.completeness_checks.get(), 2);
+            let corruptor = if own_connection {
+                &reader.db
+            } else {
+                &publisher.db
+            };
+            assert_eq!(
+                corruptor
+                    .execute("DELETE FROM mc_rows WHERE ordinal=?1", [removed])
+                    .unwrap(),
+                1
+            );
+            reader.pin(&snapshot).unwrap();
+            assert!(reader
+                .prepare_query(&snapshot, range)
+                .unwrap_err()
+                .contains("incomplete"));
+            reader.unpin().unwrap();
+            assert_eq!(reader.completeness_checks.get(), 3);
+        }
+    }
+}
+
 #[test]
 fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
     let root = TempDir::new().unwrap();
@@ -69,7 +440,7 @@ fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
                             false,
                         )?;
                         writer.push(
-                            &message("amp", "session", 200, Some("duplicate"), 99),
+                            &message("amp", "mirror-session", 200, Some("duplicate"), 99),
                             false,
                             false,
                         )?;
@@ -122,6 +493,46 @@ fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
     )
     .unwrap();
     publisher.publish(&mut snapshot).unwrap();
+    // Origin publication is one transaction, not one durable commit per path.
+    publisher
+        .record_completed_origins(&snapshot, &context)
+        .unwrap();
+    publisher
+        .db
+        .execute_batch(
+            "DELETE FROM sq_durable_origins;
+         CREATE TEMP TRIGGER reject_partial_origins BEFORE INSERT ON main.sq_durable_origins
+         WHEN (SELECT COUNT(*) FROM sq_durable_origins)>0
+         BEGIN SELECT RAISE(ABORT,'injected origin failure'); END;",
+        )
+        .unwrap();
+    assert!(publisher
+        .record_completed_origins(&snapshot, &context)
+        .is_err());
+    assert_eq!(
+        publisher
+            .db
+            .query_row("SELECT COUNT(*) FROM sq_durable_origins", [], |row| row
+                .get::<_, i64>(0),)
+            .unwrap(),
+        0,
+        "a later origin failure must roll back the whole batch"
+    );
+    publisher
+        .db
+        .execute_batch("DROP TRIGGER reject_partial_origins;")
+        .unwrap();
+    publisher
+        .record_completed_origins(&snapshot, &context)
+        .unwrap();
+    assert_eq!(
+        publisher
+            .db
+            .query_row("SELECT COUNT(*) FROM sq_durable_origins", [], |row| row
+                .get::<_, i64>(0),)
+            .unwrap(),
+        3
+    );
     let generation = snapshot.generation;
     let probe = query(root.path());
     let revision: i64 = probe
@@ -143,20 +554,6 @@ fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
             )
             .unwrap();
         reader.unpin().unwrap();
-        assert_eq!(
-            reader
-                .db
-                .query_row("SELECT COUNT(*) FROM sq_rows", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            reader
-                .db
-                .query_row("SELECT COUNT(*) FROM ocq_rows", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
         let mut events = Vec::new();
         crate::fold_prepared_usage_snapshot(
             &snapshot,
@@ -477,6 +874,97 @@ fn unchanged_opencode_reuses_decisions_while_other_lane_moves() {
     );
     assert_eq!(consumer_totals(&second), (16, 2, 2));
     assert_eq!(consumer_inputs(&second), vec![5, 11]);
+    assert!(query(root.path()).pin(&first).is_err());
+}
+
+#[test]
+fn integer_opencode_references_reuse_and_survive_pinned_retirement() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["opencode".to_string()];
+    let db_path = home.join("opencode.db");
+    local_fixture(&db_path, &[("row-a", 5)]);
+    let first = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        None,
+        Some((&db_path, 0)),
+    );
+    let reference: i64 = publisher
+        .db
+        .query_row(
+            "SELECT generation FROM sq_scope_sources WHERE scope_generation=?1 AND lane='opencode'",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(reference > 0);
+    let indexed: (i64, i64) = publisher.db.query_row(
+        "SELECT COUNT(*),COUNT(CASE WHEN typeof(d.oc_source)='integer' AND d.oc_source=?2 AND g.generation IS NOT NULL AND typeof(g.descriptor)='blob' THEN 1 END)
+         FROM sq_decisions d LEFT JOIN oc_generations g ON g.generation=d.oc_source
+         WHERE d.scope_generation=?1 AND d.lane='opencode'",
+        params![first.generation, reference], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(indexed, (1, 1));
+    for _ in 0..3 {
+        let same = publish_local(
+            &publisher,
+            root.path(),
+            &context,
+            &clients,
+            None,
+            Some((&db_path, 0)),
+        );
+        assert_eq!(same.generation, first.generation);
+        let counts: (i64, i64) = publisher
+            .db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sq_decisions),(SELECT COUNT(*) FROM oc_generations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+    let reader = query(root.path());
+    reader.pin(&first).unwrap();
+    let replacement = publish_local(&publisher, root.path(), &context, &clients, None, None);
+    assert_ne!(replacement.generation, first.generation);
+    reader.prepare_query(&first, UsageQuery::compact()).unwrap();
+    reader.unpin().unwrap();
+    let mut inputs = Vec::new();
+    crate::fold_prepared_usage_snapshot(
+        &first,
+        &reader,
+        None,
+        UsageQuery::compact(),
+        &|_| true,
+        &mut |message| inputs.push(message.tokens.input),
+        true,
+    )
+    .unwrap();
+    assert_eq!(inputs, vec![5]);
+    assert!(query(root.path()).pin(&first).is_err());
+    assert_eq!(consumer_totals(&replacement), (0, 0, 0));
+    let retired: i64 = publisher
+        .db
+        .query_row(
+            "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retired, 0);
 }
 
 #[test]
@@ -1229,6 +1717,20 @@ fn filtered_opencode_json_fallback_still_arbitrates_fresh_per_report() {
     // With no predicate the JSON twin wins (provider-reported cost): the
     // sqlite fallback only surfaces when the predicate rejects the twin.
     assert!(all.contains(&"filtered-model".to_string()));
+    for year in [None, Some("2023"), Some("2024"), Some("2023"), None] {
+        let options = crate::ReportOptions {
+            clients: Some(clients.clone()),
+            year: year.map(str::to_string),
+            ..Default::default()
+        };
+        for kind in ["models", "hourly", "agents", "graph-best-effort"] {
+            assert_eq!(
+                historical_payload(&snapshot, &options, None, kind, true),
+                historical_payload(&snapshot, &options, None, kind, false),
+                "{kind}, year={year:?}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -1550,6 +2052,145 @@ fn publish_historical_fixture(
 }
 
 #[test]
+fn historical_reader_preserves_issued_rows_across_publication_and_releases_on_drop() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let cache = root.path().join("cache");
+    let first = publish_historical_fixture(&cache, &context, 12, None);
+    let rows = |reader: &QueryState| {
+        let mut values = Vec::new();
+        reader
+            .visit_report_suffix(0, &mut |position, lane, simple, guarded, message| {
+                values.push((
+                    position,
+                    lane.to_string(),
+                    simple,
+                    guarded,
+                    serde_json::to_value(message).unwrap(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        values
+    };
+    let expected = {
+        let warm = first.historical_query().unwrap();
+        rows(&warm)
+    };
+    assert_eq!(expected.len(), 12);
+    let issued = first.historical_query().unwrap();
+    // This helper opens an independent producer connection. Its publication
+    // replaces the same scope and retires the issued query's canonical rows.
+    let replacement = publish_historical_fixture(&cache, &context, 13, Some(2));
+    assert_eq!(rows(&issued), expected);
+    issued.release_reader().unwrap();
+    let mut after_release = Vec::new();
+    assert!(issued
+        .visit_report_suffix(0, &mut |_, _, _, _, message| {
+            after_release.push(message);
+            Ok(())
+        })
+        .is_err());
+    assert!(after_release.is_empty());
+    drop(issued);
+
+    let current = replacement.historical_query().unwrap();
+    let changed = rows(&current);
+    assert_eq!(changed.len(), 13);
+    assert!(changed
+        .iter()
+        .any(|(_, _, _, _, message)| { message["tokens"]["input"] == serde_json::json!(1000) }));
+    drop(current);
+    let failed = replacement.historical_query().unwrap();
+    let mut callbacks = 0;
+    assert_eq!(
+        failed
+            .visit_report_suffix(0, &mut |_, _, _, _, _| {
+                callbacks += 1;
+                Err("stop historical visitor".into())
+            })
+            .unwrap_err(),
+        "stop historical visitor"
+    );
+    assert_eq!(callbacks, 1);
+    drop(failed);
+
+    // A leaked reader can allow WAL writes yet indefinitely prevent their
+    // reclamation. Check both publication and the actual checkpoint boundary.
+    let final_snapshot = publish_historical_fixture(&cache, &context, 14, Some(3));
+    let writer = query(&cache);
+    let (busy, _, _): (i64, i64, i64) = writer
+        .connection()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(busy, 0, "dropped historical readers must not pin the WAL");
+    let final_reader = final_snapshot.historical_query().unwrap();
+    let final_rows = rows(&final_reader);
+    assert_eq!(final_rows.len(), 14);
+}
+
+#[test]
+fn historical_preparation_rejects_reset_and_replaced_databases() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let cache = root.path().join("cache");
+    let options = crate::ReportOptions {
+        clients: Some(vec!["amp".into()]),
+        ..Default::default()
+    };
+    let first = publish_historical_fixture(&cache, &context, 10, None);
+    crate::get_model_report_from_snapshot(&first, options.clone(), None).unwrap();
+    #[cfg(unix)]
+    {
+        let linked = root.path().join("linked-cache");
+        std::fs::rename(&cache, &linked).unwrap();
+        std::os::unix::fs::symlink(&linked, &cache).unwrap();
+        for _ in 0..2 {
+            assert!(crate::get_model_report_from_snapshot(&first, options.clone(), None).is_err());
+        }
+        std::fs::remove_file(&cache).unwrap();
+        std::fs::rename(&linked, &cache).unwrap();
+        crate::get_model_report_from_snapshot(&first, options.clone(), None).unwrap();
+    }
+    let database = query(&cache);
+    database
+        .connection()
+        .execute(
+            "UPDATE sq_meta SET value=randomblob(16) WHERE key='store_epoch'",
+            [],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert!(crate::get_model_report_from_snapshot(&first, options.clone(), None).is_err());
+    }
+    drop(database);
+    let second = publish_historical_fixture(&cache, &context, 10, None);
+    crate::get_model_report_from_snapshot(&second, options.clone(), None).unwrap();
+    std::fs::rename(&cache, root.path().join("retired-cache")).unwrap();
+    let replacement = publish_historical_fixture(&cache, &context, 10, None);
+    for _ in 0..2 {
+        assert!(crate::get_model_report_from_snapshot(&second, options.clone(), None).is_err());
+    }
+    crate::get_model_report_from_snapshot(&replacement, options, None).unwrap();
+}
+
+#[test]
 fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads() {
     if std::env::var_os("SYRTIS_REPORT_CHECKPOINT_CHILD").is_none() {
         let home = TempDir::new().unwrap();
@@ -1600,6 +2241,20 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     let pricing = price(0.013);
     let kinds = ["graph-best-effort", "models", "hourly", "agents"];
     let first = publish_historical_fixture(root.path(), &context, 2305, None);
+    let clone = first.clone();
+    assert_eq!(first, clone);
+    for year in [None, Some("2025".to_string()), Some("2026".to_string())] {
+        let scoped = crate::ReportOptions {
+            year,
+            ..options.clone()
+        };
+        for kind in kinds {
+            assert_eq!(
+                historical_payload(&clone, &scoped, Some(&pricing), kind, true),
+                historical_payload(&clone, &scoped, Some(&pricing), kind, false),
+            );
+        }
+    }
     for kind in kinds {
         assert_eq!(
             historical_payload(&first, &options, Some(&pricing), kind, true),
@@ -1609,9 +2264,12 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     let second = publish_historical_fixture(root.path(), &context, 2330, None);
     assert_ne!(first.generation, second.generation);
     assert!(query(root.path()).pin(&first).is_err());
+    assert!(
+        crate::get_model_report_from_snapshot(&first, options.clone(), Some(&pricing)).is_err()
+    );
     for kind in kinds {
-        // All connections from the producing fold were dropped. Reopening the
-        // disk state is sufficient; no process registry holds these folds.
+        // Snapshot preparation is disposable; durable checkpoints also survive
+        // reopening a producer independently of its retained scratch.
         let cached =
             crate::HistoricalReportFold::new(&second, &options, Some(&pricing), kind).unwrap();
         assert_eq!(cached.checkpoint.resume_rows, 2305, "{kind}");
@@ -1681,11 +2339,6 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
                 year: Some(year.into()),
                 ..options.clone()
             };
-            let cached =
-                crate::HistoricalReportFold::new(&corrected, &options, Some(&pricing), kind)
-                    .unwrap();
-            assert!(!cached.checkpoint.has_restored(), "year identity: {kind}");
-            drop(cached);
             assert_eq!(
                 historical_payload(&corrected, &options, Some(&pricing), kind, true),
                 historical_payload(&corrected, &options, Some(&pricing), kind, false),
@@ -1859,6 +2512,16 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let expected_models =
+        historical_payload(&other_root_scope, &options, Some(&pricing), "models", true);
+    let original_payload: Vec<u8> = database
+        .db
+        .query_row(
+            "SELECT message FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
+            params![source, generation, ordinal],
+            |row| row.get(0),
+        )
+        .unwrap();
     // Alter the actual bytes underneath a previously saved checkpoint while
     // leaving the producer's digest untouched. Metadata-only admission would
     // return a successful stale aggregate; every ordinary report must fail.
@@ -1893,11 +2556,16 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     .is_err());
     assert!(crate::lean_local_graph_from_snapshot(
         &other_root_scope,
-        options,
+        options.clone(),
         Some(&pricing),
         crate::GraphPricingMode::BestEffort,
     )
     .is_err());
+    assert!(
+        crate::get_model_report_from_snapshot(&other_root_scope, options.clone(), Some(&pricing))
+            .is_err(),
+        "failed preparation must not make a repeated query succeed"
+    );
     assert_eq!(
         revision,
         database
@@ -1906,6 +2574,23 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
             .unwrap(),
         "failed checkpoint admission must not publish cache replacements"
     );
+    database
+        .db
+        .execute(
+            "UPDATE mc_rows SET message=?4 WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
+            params![source, generation, ordinal, original_payload],
+        )
+        .unwrap();
+    assert_eq!(
+        historical_payload(&other_root_scope, &options, Some(&pricing), "models", true),
+        expected_models,
+        "failed warm admission must release its reader and permit exact checkpoint recovery"
+    );
+    let busy: i64 = database
+        .db
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 0, "failed historical admission must not pin the WAL");
 }
 
 #[test]
@@ -2035,6 +2720,7 @@ fn checkpoint_membership_owns_opencode_aliases_after_scope_gc() {
     let second_count = fold_count(&second);
     assert_eq!(first_count, 2);
     assert_eq!(second_count, 1);
+    crate::usage_store::ReportCheckpoint::initialize(first.connection()).unwrap();
     let saved = crate::usage_store::ReportCheckpoint::open(first.connection(), [66; 32]).unwrap();
     saved.save(first.connection(), 0, &first_count).unwrap();
     saved.finish(first.connection()).unwrap();
@@ -2272,4 +2958,359 @@ fn checkpoint_timezone_rules_drive_immediate_same_thread_calendar_changes() {
         entries_before,
         "unresolved/custom rules must not retain uncertain checkpoints"
     );
+}
+
+#[test]
+fn decision_metadata_compaction_preserves_overrides_and_physical_references() {
+    for mapped in [false, true] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE mc_versions(source_id INTEGER,generation INTEGER);
+             CREATE TABLE mc_rows(source_id INTEGER,generation INTEGER,ordinal INTEGER,workspace BLOB NOT NULL,workspace_label BLOB NOT NULL,model_id TEXT NOT NULL,PRIMARY KEY(source_id,generation,ordinal));
+             CREATE TABLE sq_decisions(scope_generation INTEGER,rank INTEGER,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,workspace BLOB,workspace_label BLOB,model TEXT,PRIMARY KEY(scope_generation,rank));
+             INSERT INTO mc_versions VALUES(1,7);",
+        ).unwrap();
+        let physical = if mapped {
+            db.execute_batch(
+                "CREATE TABLE mc_generation_storage(source_id INTEGER,generation INTEGER,row_generation INTEGER,row_count INTEGER,PRIMARY KEY(source_id,generation));
+                 INSERT INTO mc_generation_storage VALUES(1,7,3,1);",
+            ).unwrap();
+            3
+        } else {
+            7
+        };
+        let workspace = bincode::serialize(&Some("/project".to_string())).unwrap();
+        let label = bincode::serialize(&Some("project".to_string())).unwrap();
+        let none = bincode::serialize(&Option::<String>::None).unwrap();
+        let different = bincode::serialize(&Some("different".to_string())).unwrap();
+        db.execute(
+            "INSERT INTO mc_rows VALUES(1,?1,0,?2,?3,'canonical')",
+            params![physical, workspace, label],
+        )
+        .unwrap();
+        for (rank, key, name, model) in [
+            (1, &workspace, &label, "canonical"),
+            (2, &different, &label, "override"),
+            (3, &none, &different, "canonical"),
+        ] {
+            db.execute(
+                "INSERT INTO sq_decisions VALUES(10,?1,1,7,0,?2,?3,?4)",
+                params![rank, key, name, model],
+            )
+            .unwrap();
+        }
+        // OpenCode has no MC reference and its SQL NULL retains its old meaning.
+        db.execute_batch("INSERT INTO sq_decisions VALUES(10,4,NULL,NULL,NULL,NULL,NULL,NULL); PRAGMA user_version=1;").unwrap();
+        let projection = |db: &Connection| {
+            let generation = if mapped { 3 } else { 7 };
+            let mut statement = db.prepare(
+                "SELECT d.rank,COALESCE(d.workspace,r.workspace),COALESCE(d.workspace_label,r.workspace_label),COALESCE(d.model,r.model_id)
+                 FROM sq_decisions d LEFT JOIN mc_rows r ON r.source_id=d.cache_source_id AND r.generation=?1 AND r.ordinal=d.cache_ordinal ORDER BY d.rank",
+            ).unwrap();
+            statement
+                .query_map([generation], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = projection(&db);
+        super::compact_decision_metadata(&db).unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        assert_eq!(projection(&db), before);
+        let stored: (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) = db
+            .query_row(
+                "SELECT workspace,workspace_label,model FROM sq_decisions WHERE rank=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None, None));
+        assert_eq!(
+            db.query_row("SELECT workspace FROM sq_decisions WHERE rank=3", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            none
+        );
+        let changes = db.total_changes();
+        super::compact_decision_metadata(&db).unwrap();
+        assert_eq!(db.total_changes(), changes);
+        assert_eq!(projection(&db), before);
+        db.execute_batch("INSERT INTO sq_decisions VALUES(10,5,99,7,0,x'00',x'00','unknown');")
+            .unwrap();
+        assert!(super::compact_decision_metadata(&db).is_err());
+        assert_eq!(
+            db.query_row("SELECT model FROM sq_decisions WHERE rank=5", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "unknown"
+        );
+    }
+    let empty = Connection::open_in_memory().unwrap();
+    super::compact_decision_metadata(&empty).unwrap();
+}
+
+#[test]
+fn legacy_null_decision_metadata_is_not_reinterpreted() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA user_version=1;
+         CREATE TABLE sq_decisions(cache_source_id INTEGER,workspace BLOB,workspace_label BLOB,model TEXT);
+         INSERT INTO sq_decisions VALUES(1,NULL,x'00','model');",
+    ).unwrap();
+    let changes = db.total_changes();
+    assert!(super::compact_decision_metadata(&db)
+        .unwrap_err()
+        .contains("legacy"));
+    assert_eq!(db.total_changes(), changes);
+}
+
+#[test]
+fn unchanged_report_publication_keeps_compact_decision_storage_bounded() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let source = home.join(".claude/projects/-home-lazy/session.jsonl");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    write_report_claude(&source, &[("first", 11), ("second", 13)]);
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["claude".to_string()];
+    let mut first_generation = None;
+    let mut counts = None;
+    let mut last_snapshot = None;
+    for _ in 0..3 {
+        let snapshot = report_snapshot(&publisher, root.path(), &context, &clients);
+        let current: (i64, i64) = publisher
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(CASE WHEN model IS NULL THEN 1 ELSE 0 END) FROM sq_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(current.0 > 0);
+        assert_eq!(current.0, current.1);
+        assert_eq!(
+            *first_generation.get_or_insert(snapshot.generation),
+            snapshot.generation
+        );
+        assert_eq!(*counts.get_or_insert(current), current);
+        assert_eq!(report_inputs(&snapshot), vec![11, 13]);
+        last_snapshot = Some(snapshot);
+    }
+    std::fs::remove_dir_all(home).unwrap();
+    assert_eq!(report_inputs(&last_snapshot.unwrap()), vec![11, 13]);
+}
+
+#[test]
+fn local_metadata_publication_hydrates_changed_facts_and_rejects_corrupt_winners() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["amp".to_string()];
+    let first = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        Some((100, 7)),
+        None,
+    );
+    assert_eq!(consumer_totals(&first), (7, 0, 1));
+    let second = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        Some((200, 11)),
+        None,
+    );
+    assert_eq!(consumer_totals(&second), (11, 0, 1));
+    // A prepared publication must replace metadata scratch with full facts.
+    let mut prepared = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &clients,
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    publisher.replay_snapshot(&second).unwrap();
+    // Reuse the exact canonical source descriptors, not a fresh live parse.
+    publisher.db.execute(
+        "INSERT INTO sq_scope_sources SELECT ?1,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase FROM sq_scope_sources WHERE scope_generation=?2",
+        params![prepared.generation, second.generation],
+    ).unwrap();
+    publisher.publish_prepared(&mut prepared).unwrap();
+    let mut hydrated = Vec::new();
+    publisher
+        .visit("amp", &mut |message, _, _| {
+            hydrated.push(message.tokens.input);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(hydrated, vec![11]);
+    publisher.db.execute(
+        "UPDATE mc_rows SET message=x'00' WHERE (source_id,generation) IN (SELECT st.source_id,st.row_generation FROM sq_scope_sources s JOIN mc_logical_storage st ON st.source_id=s.cache_source_id AND st.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.lane='amp')",
+        [second.generation],
+    ).unwrap();
+    let mut emitted = 0;
+    assert!(crate::visit_local_usage_snapshot(
+        &second,
+        UsageQuery::default(),
+        &|_| true,
+        &mut |_| emitted += 1,
+    )
+    .is_err());
+    assert_eq!(emitted, 0);
+}
+
+#[test]
+fn publication_gc_preserves_other_current_and_incomplete_index_generations() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["amp".to_string()];
+    let old = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        Some((100, 7)),
+        None,
+    );
+    let other = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &["amp".into(), "copilot".into()],
+        Some((100, 7)),
+        None,
+    );
+    let staging = query(root.path());
+    let pending = staging
+        .begin_scope(
+            root.path(),
+            &context,
+            &["staged".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    staging
+        .db
+        .execute(
+            "INSERT INTO sq_decisions(scope_generation,rank,lane,timestamp) VALUES(?1,1,'amp',100)",
+            [pending.generation],
+        )
+        .unwrap();
+    // No ready marker: interrupted index construction still owns its rows.
+    let current = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        Some((200, 11)),
+        None,
+    );
+    assert_eq!(consumer_totals(&current), (11, 0, 1));
+    assert_eq!(consumer_totals(&other), (7, 0, 1));
+    assert!(query(root.path()).pin(&old).is_err());
+    for (generation, expected) in [(old.generation, 0), (pending.generation, 1)] {
+        let count: i64 = staging
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1",
+                [generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected);
+    }
+    assert_eq!(staging.pending_generation().unwrap(), pending.generation);
+}
+
+#[test]
+fn range_queries_preserve_legacy_and_rank_only_scope_facts() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let snapshot = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &["amp".into()],
+        Some((100, 7)),
+        None,
+    );
+    for version in [3, 4] {
+        publisher
+            .db
+            .execute(
+                "UPDATE sq_meta SET value=?1 WHERE key='schema_version'",
+                [version],
+            )
+            .unwrap();
+        publisher
+            .db
+            .execute_batch(if version == 3 {
+                "CREATE INDEX IF NOT EXISTS sq_decision_time ON sq_decisions(scope_generation,timestamp,rank)"
+            } else {
+                "DROP INDEX IF EXISTS sq_decision_time"
+            })
+            .unwrap();
+        let reader = query(root.path());
+        reader.pin(&snapshot).unwrap();
+        reader.unpin().unwrap();
+        assert_eq!(consumer_totals(&snapshot), (7, 0, 1));
+        for (from, until, expected) in [(99, 100, vec![]), (100, 101, vec![7])] {
+            let mut input = Vec::new();
+            crate::visit_local_usage_snapshot(
+                &snapshot,
+                UsageQuery {
+                    from_ms: Some(from),
+                    until_ms: Some(until),
+                    ..UsageQuery::compact()
+                },
+                &|_| true,
+                &mut |message| input.push(message.tokens.input),
+            )
+            .unwrap();
+            assert_eq!(input, expected);
+        }
+    }
 }

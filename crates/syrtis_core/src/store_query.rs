@@ -11,6 +11,76 @@ use std::path::{Path, PathBuf};
 /// version and never borrow LocalClients ownership.
 const REPORT_INDEX_VERSION: i64 = 2;
 
+/// NULL inherits immutable canonical metadata. Explicit absent workspaces remain
+/// encoded Option::None blobs; legacy SQL NULL was never decodable metadata.
+pub(crate) fn compact_decision_metadata(db: &Connection) -> Result<(), String> {
+    let present: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sq_decisions')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        return Ok(());
+    }
+    let referenced: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_decisions WHERE cache_source_id IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !referenced {
+        return Ok(());
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == 1 {
+        let invalid: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_decisions WHERE cache_source_id IS NOT NULL AND (workspace IS NULL OR workspace_label IS NULL OR model IS NULL))",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if invalid {
+            return Err("legacy usage decision metadata is NULL; previous values retained".into());
+        }
+    }
+    let mapped: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mc_generation_storage')",
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let storage = if mapped {
+        "mc_generation_storage"
+    } else {
+        "(SELECT source_id,generation,generation AS row_generation,9223372036854775807 AS row_count FROM mc_versions)"
+    };
+    let canonical = format!(
+        "{storage} st JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation"
+    );
+    let missing: bool = db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM sq_decisions d WHERE d.cache_source_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM {canonical} WHERE st.source_id=d.cache_source_id AND st.generation=d.cache_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count))"),
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if missing {
+        return Err(
+            "usage decision canonical metadata unavailable; previous values retained".into(),
+        );
+    }
+    db.execute(
+        &format!("UPDATE sq_decisions AS d SET
+            workspace=NULLIF(d.workspace,r.workspace),
+            workspace_label=NULLIF(d.workspace_label,r.workspace_label),
+            model=NULLIF(d.model,r.model_id)
+            FROM {canonical}
+            WHERE st.source_id=d.cache_source_id AND st.generation=d.cache_generation
+              AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count
+              AND (d.workspace=r.workspace OR d.workspace_label=r.workspace_label OR d.model=r.model_id)"),
+        [],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionMode {
     Report,
@@ -28,15 +98,276 @@ pub struct UsageSnapshot {
     pub(crate) mode: SelectionMode,
     pub(crate) selection_ignores_filter: bool,
     pub(crate) modified_after: Option<u64>,
+    preparation: ReportPreparationSlot,
 }
 
+// Equality describes producer identity, never disposable connection-local work.
+#[derive(Clone, Default)]
+struct ReportPreparationSlot(std::sync::Arc<std::sync::Mutex<Option<PreparedHistory>>>);
+
+impl PartialEq for ReportPreparationSlot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ReportPreparationSlot {}
+
+static RETAINED_HISTORY_PREPARATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const MAX_RETAINED_HISTORY_PREPARATIONS: usize = 2;
+
+struct PreparationIdentity {
+    root: PathBuf,
+    scope: Vec<u8>,
+    generation: i64,
+    store_epoch: [u8; 16],
+    clients: Vec<String>,
+    mode: SelectionMode,
+    selection_ignores_filter: bool,
+    modified_after: Option<u64>,
+}
+
+impl PreparationIdentity {
+    fn matches(&self, snapshot: &UsageSnapshot) -> bool {
+        self.root == snapshot.root
+            && self.scope == snapshot.scope
+            && self.generation == snapshot.generation
+            && self.store_epoch == snapshot.store_epoch
+            && self.clients == snapshot.clients
+            && self.mode == snapshot.mode
+            && self.selection_ignores_filter == snapshot.selection_ignores_filter
+            && self.modified_after == snapshot.modified_after
+    }
+}
+
+struct PreparedHistory {
+    query: QueryState,
+    identity: PreparationIdentity,
+    data_version: i64,
+    retained: bool,
+    report_ready: bool,
+}
+
+impl Drop for PreparedHistory {
+    fn drop(&mut self) {
+        if self.retained {
+            RETAINED_HISTORY_PREPARATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Exclusively borrow a preparation without holding a mutex during a fold.
+/// Concurrent/reentrant consumers use independent scratch, never shared TEMP state.
+pub(crate) struct HistoricalQuery<'a> {
+    prepared: Option<PreparedHistory>,
+    slot: &'a ReportPreparationSlot,
+}
+
+impl std::ops::Deref for HistoricalQuery<'_> {
+    type Target = QueryState;
+    fn deref(&self) -> &QueryState {
+        &self
+            .prepared
+            .as_ref()
+            .expect("historical query is live")
+            .query
+    }
+}
+
+impl HistoricalQuery<'_> {
+    pub(crate) fn admit_reader(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
+        if self.read_pinned.get() || !self.canonical_payloads.get() {
+            return Ok(());
+        }
+        self.pin(snapshot)?;
+        let admitted = (|| {
+            let prepared = self.prepared.as_ref().expect("historical query is live");
+            if !crate::usage_store::admit_retained_database(self.connection(), &snapshot.root)?
+                || self.data_version()? != prepared.data_version
+            {
+                return Err("historical preparation changed; synchronize and reissue".into());
+            }
+            Ok(())
+        })();
+        if admitted.is_err() {
+            let released = self.unpin();
+            return admitted.and(released);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_reader(&self) -> Result<(), String> {
+        if self.read_pinned.get() {
+            self.unpin()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HistoricalQuery<'_> {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        let released = !prepared.query.read_pinned.get() || prepared.query.unpin().is_ok();
+        if released && prepared.retained && !std::thread::panicking() {
+            let mut slot = self
+                .slot
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.is_none() {
+                *slot = Some(prepared);
+            }
+        }
+    }
+}
 impl UsageSnapshot {
+    /// Reuse only connection-local work. The same global retention cap covers
+    /// recent and historical readers; reentrant calls still open private state.
+    pub(crate) fn recent_query(&self) -> Result<HistoricalQuery<'_>, String> {
+        use std::sync::atomic::Ordering;
+        // Platforms without retained-inode admission keep the original fresh,
+        // disposable query path rather than retaining an unverifiable handle.
+        let local = cfg!(unix) && self.mode == SelectionMode::LocalClients;
+        let cached = if local {
+            self.preparation
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        } else {
+            None
+        };
+        let prepared =
+            match cached.filter(|cached| !cached.report_ready && cached.identity.matches(self)) {
+                Some(cached) => cached,
+                None => {
+                    let query = QueryState::open(&self.root)?;
+                    let retained = local
+                        && RETAINED_HISTORY_PREPARATIONS
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                                (count < MAX_RETAINED_HISTORY_PREPARATIONS).then_some(count + 1)
+                            })
+                            .is_ok();
+                    PreparedHistory {
+                        query,
+                        identity: PreparationIdentity {
+                            root: self.root.clone(),
+                            scope: self.scope.clone(),
+                            generation: self.generation,
+                            store_epoch: self.store_epoch,
+                            clients: self.clients.clone(),
+                            mode: self.mode,
+                            selection_ignores_filter: self.selection_ignores_filter,
+                            modified_after: self.modified_after,
+                        },
+                        data_version: 0,
+                        retained,
+                        report_ready: false,
+                    }
+                }
+            };
+        prepared.query.pin(self)?;
+        // Unix fresh and retained readers both keep full inode admission.
+        // Non-Unix readers are always fresh, admitted by open_database + pin.
+        #[cfg(unix)]
+        if !crate::usage_store::admit_retained_database(prepared.query.connection(), &self.root)? {
+            return Err("usage database changed; synchronize and reissue".into());
+        }
+        Ok(HistoricalQuery {
+            prepared: Some(prepared),
+            slot: &self.preparation,
+        })
+    }
+    pub(crate) fn historical_query(&self) -> Result<HistoricalQuery<'_>, String> {
+        use std::sync::atomic::Ordering;
+        let cached = self
+            .preparation
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let mut prepared =
+            cached.filter(|cached| cached.report_ready && cached.identity.matches(self));
+        if let Some(cached) = &prepared {
+            cached.query.pin(self)?;
+            let admission = (|| {
+                Ok::<_, String>((
+                    crate::usage_store::admit_retained_database(
+                        cached.query.connection(),
+                        &self.root,
+                    )?,
+                    cached.query.data_version()?,
+                ))
+            })();
+            let (identity_available, version) = admission?;
+            if !identity_available || version != cached.data_version {
+                cached.query.unpin()?;
+                prepared = None;
+            }
+        }
+        if prepared.is_none() {
+            let query = QueryState::open(&self.root)?;
+            crate::usage_store::ReportCheckpoint::initialize(query.connection())?;
+            query.pin(self)?;
+            // Capture while pinned: external writes invalidate the next
+            // checkout, while this fold keeps its admitted canonical snapshot.
+            let result = (|| {
+                let version = query.data_version()?;
+                query.prepare_trusted_query(self, UsageQuery::compact())?;
+                query.prepare_report_fold(self)?;
+                Ok::<_, String>(version)
+            })();
+            let data_version = result?;
+            let identity = PreparationIdentity {
+                root: self.root.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation,
+                store_epoch: self.store_epoch,
+                clients: self.clients.clone(),
+                mode: self.mode,
+                selection_ignores_filter: self.selection_ignores_filter,
+                modified_after: self.modified_after,
+            };
+            let retained = RETAINED_HISTORY_PREPARATIONS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    (count < MAX_RETAINED_HISTORY_PREPARATIONS).then_some(count + 1)
+                })
+                .is_ok();
+            prepared = Some(PreparedHistory {
+                query,
+                identity,
+                data_version,
+                retained,
+                report_ready: true,
+            });
+        }
+        // Immutable rows/membership survive. OpenCode's visitor resets its own
+        // arbitration; only checkpoint staging needs a per-report reset here.
+        // Reset before the return-to-slot guard so errors discard preparation.
+        prepared
+            .as_ref()
+            .expect("historical preparation is ready")
+            .query
+            .connection()
+            .execute_batch("DROP TABLE IF EXISTS temp.report_checkpoint_staged;")
+            .map_err(|error| error.to_string())?;
+        let result = HistoricalQuery {
+            prepared,
+            slot: &self.preparation,
+        };
+        Ok(result)
+    }
     pub fn generation(&self) -> u64 {
         self.generation as u64
     }
-    /// Retained native snapshot metadata, excluding shared store/pricing state.
+    /// Retained native metadata plus conservative historical pager allowance.
     pub fn metadata_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            // Conservative per-handle pager allowance, including an in-flight
+            // preparation removed from the slot. At most two are retained globally.
+            + 320 * 1024
             + self.root.capacity()
             + self.scope.capacity()
             + self.clients.capacity() * std::mem::size_of::<String>()
@@ -101,16 +432,21 @@ impl UsageQuery {
     }
 }
 
-/// Scope-wide LocalClients decisions persist as references, never payloads.
-/// Callback-facing facts belong to connection-local, file-backed range tables.
+/// Published ownership decisions persist as references, never payloads.
+/// Public callbacks detach bytes; trusted reports keep an admitted read pin.
 pub(crate) struct QueryState {
     db: Connection,
     store_epoch: [u8; 16],
     pending_scope: std::cell::Cell<Option<i64>>,
     pending_mode: std::cell::Cell<SelectionMode>,
     read_pinned: std::cell::Cell<bool>,
+    canonical_payloads: std::cell::Cell<bool>,
     indexed: std::cell::Cell<bool>,
     report_reused: std::cell::Cell<bool>,
+    complete_sources: std::cell::Cell<Option<(i64, i64, u64)>>,
+    seeded_cache_descriptors: std::cell::Cell<bool>,
+    #[cfg(test)]
+    completeness_checks: std::cell::Cell<u64>,
 }
 
 pub(crate) struct IncrementalSource {
@@ -121,6 +457,12 @@ pub(crate) struct IncrementalSource {
 }
 
 impl QueryState {
+    fn data_version(&self) -> Result<i64, String> {
+        self.db
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         let db = crate::usage_store::open_database(root)?;
         let existing:i64=db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sq_meta','sq_scopes','sq_scope_generations','sq_scope_sources')",[],|row|row.get(0)).map_err(|error|error.to_string())?;
@@ -132,11 +474,11 @@ impl QueryState {
                 rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
             transaction.execute_batch("CREATE TABLE IF NOT EXISTS sq_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
-            INSERT OR IGNORE INTO sq_meta VALUES('schema_version',2);
+            INSERT OR IGNORE INTO sq_meta VALUES('schema_version',5);
             INSERT OR IGNORE INTO sq_meta VALUES('store_epoch',randomblob(16));
             CREATE TABLE IF NOT EXISTS sq_scopes(id INTEGER PRIMARY KEY,scope_key BLOB NOT NULL UNIQUE,current_generation INTEGER);
             CREATE TABLE IF NOT EXISTS sq_scope_generations(id INTEGER PRIMARY KEY,scope_id INTEGER NOT NULL,complete INTEGER NOT NULL DEFAULT 0,selection INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,generation BLOB,tag INTEGER NOT NULL,headless INTEGER NOT NULL,workspace BLOB,workspace_label BLOB,phase INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,kind,lane,source_order)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,generation INTEGER,tag INTEGER NOT NULL,headless INTEGER NOT NULL,workspace BLOB,workspace_label BLOB,phase INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,kind,lane,source_order)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS sq_scope_cache_versions ON sq_scope_sources(cache_source_id,cache_generation);
             CREATE INDEX IF NOT EXISTS sq_scope_opencode_versions ON sq_scope_sources(kind,path,generation);").map_err(|error|error.to_string())?;
             transaction.commit().map_err(|error| error.to_string())?;
@@ -148,7 +490,7 @@ impl QueryState {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if version != 2 {
+        if !matches!(version, 3..=5) {
             return Err("usage scope schema is unsupported; previous generations retained".into());
         }
         db.prepare("SELECT g.id,g.scope_id,g.complete,g.selection,s.id,s.scope_key,s.current_generation,x.scope_generation,x.kind,x.lane,x.source_order,x.path,x.cache_source_id,x.cache_generation,x.generation,x.tag,x.headless,x.workspace,x.workspace_label,x.phase FROM sq_scope_generations g LEFT JOIN sq_scopes s ON s.id=g.scope_id LEFT JOIN sq_scope_sources x ON x.scope_generation=g.id LIMIT 0").map_err(|error|error.to_string())?;
@@ -175,12 +517,21 @@ impl QueryState {
             let transaction =
                 rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| e.to_string())?;
-            transaction.execute_batch("CREATE TABLE IF NOT EXISTS sq_indexes(scope_generation INTEGER PRIMARY KEY,version INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS sq_decisions(scope_generation INTEGER NOT NULL,rank INTEGER NOT NULL,lane TEXT NOT NULL,timestamp INTEGER NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER,oc_source BLOB,oc_ordinal INTEGER,retained INTEGER NOT NULL DEFAULT 0,global_storage INTEGER NOT NULL DEFAULT 0,workspace BLOB,workspace_label BLOB,model TEXT,headless INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,rank)) WITHOUT ROWID;
-                CREATE INDEX IF NOT EXISTS sq_decision_time ON sq_decisions(scope_generation,timestamp,rank);").map_err(|e| e.to_string())?;
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS sq_indexes(scope_generation INTEGER PRIMARY KEY,version INTEGER NOT NULL,decision_generation INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS sq_decisions(scope_generation INTEGER NOT NULL,rank INTEGER NOT NULL,lane TEXT NOT NULL,timestamp INTEGER NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER,oc_source INTEGER,oc_ordinal INTEGER,retained INTEGER NOT NULL DEFAULT 0,global_storage INTEGER NOT NULL DEFAULT 0,workspace BLOB,workspace_label BLOB,model TEXT,headless INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,rank)) WITHOUT ROWID;").map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         } else if indexed_tables != 2 {
             return Err("usage decision index is incomplete; previous generations retained".into());
+        }
+        let integer_references: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sq_scope_sources') WHERE name='generation' AND upper(type)='INTEGER')
+             AND EXISTS(SELECT 1 FROM pragma_table_info('sq_decisions') WHERE name='oc_source' AND upper(type)='INTEGER')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !integer_references {
+            return Err(
+                "usage scope reference layout is unsupported; previous generations retained".into(),
+            );
         }
         let needs_format: bool = db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('sq_decisions') WHERE name='cache_format')",
@@ -208,16 +559,66 @@ impl QueryState {
             }
             transaction.commit().map_err(|error| error.to_string())?;
         }
+        if version != 5 {
+            let transaction =
+                rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
+            let current: i64 = transaction
+                .query_row(
+                    "SELECT value FROM sq_meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            match current {
+                3 | 4 => {
+                    transaction
+                        .execute_batch("DROP INDEX IF EXISTS sq_decision_time;")
+                        .map_err(|error| error.to_string())?;
+                    let missing_owner: bool = transaction.query_row(
+                        "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('sq_indexes') WHERE name='decision_generation')",
+                        [], |row| row.get(0),
+                    ).map_err(|error| error.to_string())?;
+                    if missing_owner {
+                        transaction
+                            .execute_batch(
+                                "ALTER TABLE sq_indexes ADD COLUMN decision_generation INTEGER;
+                             UPDATE sq_indexes SET decision_generation=scope_generation;",
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    transaction.execute_batch(
+                        "DELETE FROM sq_decisions WHERE oc_source IS NULL
+                           AND scope_generation IN (SELECT decision_generation FROM sq_indexes WHERE version=1);
+                         UPDATE sq_indexes SET version=3 WHERE version=1;
+                         UPDATE sq_meta SET value=5 WHERE key='schema_version';",
+                    ).map_err(|error| error.to_string())?;
+                }
+                5 => {}
+                _ => {
+                    return Err(
+                        "usage scope schema is unsupported; previous generations retained".into(),
+                    )
+                }
+            }
+            transaction.commit().map_err(|error| error.to_string())?;
+        }
+        db.prepare("SELECT decision_generation FROM sq_indexes LIMIT 0")
+            .map_err(|error| error.to_string())?;
+        // ponytail: scan rank-clustered reference metadata for recent bounds;
+        // bulk-build a time lookup only if measured read CPU requires it.
         // 64 KiB TEMP budget, aligned with the durable-store TEMP budget; RAM over sort latency.
         db.execute_batch("PRAGMA temp.cache_size=-64;
             CREATE TEMP TABLE sq_rows(id INTEGER PRIMARY KEY,lane TEXT NOT NULL,source_order INTEGER NOT NULL,phase INTEGER NOT NULL,retained INTEGER NOT NULL,global_storage INTEGER NOT NULL,session TEXT NOT NULL,workspace BLOB NOT NULL,dedup TEXT,model TEXT NOT NULL,workspace_label BLOB NOT NULL,timestamp INTEGER NOT NULL,payload BLOB,client TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',headless INTEGER NOT NULL DEFAULT 0,payload_digest BLOB,eligible INTEGER NOT NULL DEFAULT 1,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER);
+            CREATE TEMP VIEW sq_payload_rows AS SELECT * FROM sq_rows;
             CREATE INDEX sq_lane_order ON sq_rows(lane,phase,source_order,id);
             CREATE INDEX sq_session ON sq_rows(lane,session);
-            CREATE INDEX sq_time ON sq_rows(timestamp,id);
             CREATE TEMP TABLE sq_selected(rank INTEGER PRIMARY KEY,id INTEGER NOT NULL UNIQUE);
             CREATE TEMP TABLE sq_output(rank INTEGER PRIMARY KEY,timestamp INTEGER NOT NULL,payload BLOB NOT NULL);
             CREATE INDEX sq_output_time ON sq_output(timestamp,rank);
-            CREATE TEMP TABLE sq_sources(lane TEXT NOT NULL,source_order INTEGER NOT NULL,miss INTEGER NOT NULL,PRIMARY KEY(lane,source_order)) WITHOUT ROWID;")
+            CREATE TEMP TABLE sq_recent_rows(kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(kind,lane,source_order,ordinal)) WITHOUT ROWID;
+            CREATE TEMP TABLE sq_recent_keys(lane TEXT NOT NULL,dedup TEXT NOT NULL,PRIMARY KEY(lane,dedup)) WITHOUT ROWID;
+            CREATE TEMP TABLE sq_sources(lane TEXT NOT NULL,source_order INTEGER NOT NULL,miss INTEGER NOT NULL,seeded_seen INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(lane,source_order)) WITHOUT ROWID;")
             .map_err(|error| error.to_string())?;
         Ok(Self {
             db,
@@ -225,8 +626,13 @@ impl QueryState {
             pending_scope: std::cell::Cell::new(None),
             pending_mode: std::cell::Cell::new(SelectionMode::Report),
             read_pinned: std::cell::Cell::new(false),
+            canonical_payloads: std::cell::Cell::new(false),
             indexed: std::cell::Cell::new(false),
             report_reused: std::cell::Cell::new(false),
+            complete_sources: std::cell::Cell::new(None),
+            seeded_cache_descriptors: std::cell::Cell::new(false),
+            #[cfg(test)]
+            completeness_checks: std::cell::Cell::new(0),
         })
     }
     fn read_store_epoch(db: &Connection) -> Result<Option<[u8; 16]>, String> {
@@ -329,6 +735,7 @@ impl QueryState {
             mode,
             selection_ignores_filter: context.selection_ignores_report_filter(),
             modified_after,
+            preparation: ReportPreparationSlot::default(),
         })
     }
     /// Resolve supported primary sources without changing the published scope.
@@ -467,6 +874,74 @@ impl QueryState {
         Ok(true)
     }
 
+    /// Pin prior cache descriptors in one commit before reading any sources.
+    /// This is opt-in for full discovery, never the incremental-copy path.
+    pub(crate) fn seed_cache_descriptors(&self) -> Result<(), String> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| error.to_string())?;
+        let generation = self.admit_staging(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE temp.sq_sources SET seeded_seen=0 WHERE seeded_seen!=0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
+            "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase)
+             SELECT ?1,s.kind,s.lane,s.source_order,s.path,s.cache_source_id,s.cache_generation,s.generation,s.tag,s.headless,s.workspace,s.workspace_label,s.phase
+             FROM sq_scope_sources s
+             JOIN sq_scopes owner ON owner.current_generation=s.scope_generation
+             JOIN sq_scope_generations staged ON staged.scope_id=owner.id
+             WHERE staged.id=?1 AND s.kind='cache'",
+            [generation],
+        ).map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.seeded_cache_descriptors.set(true);
+        Ok(())
+    }
+
+    fn mark_cache_seen(&self, lane: &str, index: usize) -> Result<(), String> {
+        if self.seeded_cache_descriptors.get() {
+            self.db
+                .prepare_cached(
+                    "INSERT INTO sq_sources(lane,source_order,miss,seeded_seen) VALUES(?1,?2,0,1)
+                 ON CONFLICT(lane,source_order) DO UPDATE SET seeded_seen=1",
+                )
+                .map_err(|error| error.to_string())?
+                .execute(params![lane, index as i64])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Unvisited inherited descriptors are not evidence of present sources.
+    /// Remove them before absent-source recovery applies its authority policy.
+    pub(crate) fn finish_seeded_cache_descriptors(&self) -> Result<(), String> {
+        if !self.seeded_cache_descriptors.get() {
+            return Ok(());
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| error.to_string())?;
+        let generation = self.admit_staging(&transaction)?;
+        transaction
+            .execute(
+                "DELETE FROM sq_scope_sources AS s WHERE s.scope_generation=?1 AND s.kind='cache'
+             AND NOT EXISTS(SELECT 1 FROM sq_sources seen WHERE seen.lane=s.lane
+                            AND seen.source_order=s.source_order AND seen.seeded_seen=1)",
+                [generation],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        self.seeded_cache_descriptors.set(false);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_cache(
         &self,
@@ -478,6 +953,47 @@ impl QueryState {
         tag: bool,
         headless: bool,
     ) -> Result<(), String> {
+        let admission =
+            rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| error.to_string())?;
+        let generation = self.admit_staging(&admission)?;
+        let encoded = bincode::options()
+            .serialize(&crate::message_cache::CachedPath::from_path(path))
+            .map_err(|error| error.to_string())?;
+        let identical: bool = admission
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM sq_scope_sources s
+             JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation
+             WHERE s.scope_generation=?1 AND s.kind='cache' AND s.lane=?2 AND s.source_order=?3
+               AND s.path=?4 AND s.cache_source_id=?5 AND s.cache_generation=?6
+               AND s.phase=?7 AND s.tag=?8 AND s.headless=?9
+               AND s.generation IS NULL AND s.workspace IS NULL AND s.workspace_label IS NULL
+               AND NOT EXISTS(SELECT 1 FROM sq_scope_sources observed
+                   WHERE observed.scope_generation=s.scope_generation AND observed.lane=s.lane
+                     AND observed.source_order=s.source_order
+                     AND observed.kind IN ('observed','observed-legacy')))",
+            )
+            .map_err(|error| error.to_string())?
+            .query_row(
+                params![
+                    generation,
+                    lane,
+                    index as i64,
+                    encoded,
+                    metadata.source_id,
+                    metadata.generation,
+                    phase,
+                    tag,
+                    headless
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if identical {
+            admission.commit().map_err(|error| error.to_string())?;
+            return self.mark_cache_seen(lane, index);
+        }
+        drop(admission);
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -508,19 +1024,41 @@ impl QueryState {
         tag: bool,
         headless: bool,
     ) -> Result<(), String> {
+        if db.is_autocommit() {
+            return Err("cache registration requires a transaction".into());
+        }
         let generation = self.admit_staging(db)?;
         let path = bincode::options()
             .serialize(&crate::message_cache::CachedPath::from_path(path))
             .map_err(|error| error.to_string())?;
-        let changed=db.execute("INSERT OR REPLACE INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
-            SELECT ?1,'cache',?2,?3,?4,?5,?6,?7,?8,?9 FROM mc_versions WHERE source_id=?5 AND generation=?6",params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,tag,headless,phase]).map_err(|error|error.to_string())?;
-        if changed == 0 {
+        let available: bool = db
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM mc_versions WHERE source_id=?1 AND generation=?2)",
+            )
+            .map_err(|error| error.to_string())?
+            .query_row(params![metadata.source_id, metadata.generation], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        if !available {
             return Err(
                 "cache generation changed before scope registration; synchronize and reissue"
                     .into(),
             );
         }
+        db.prepare_cached(
+            "DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind='cache' AND lane=?2 AND source_order=?3",
+        ).map_err(|error| error.to_string())?
+            .execute(params![generation,lane,index as i64])
+            .map_err(|error| error.to_string())?;
+        db.prepare_cached(
+            "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+             VALUES(?1,'cache',?2,?3,?4,?5,?6,?7,?8,?9)",
+        ).map_err(|error| error.to_string())?
+            .execute(params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,tag,headless,phase])
+            .map_err(|error| error.to_string())?;
         db.execute("DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind IN ('observed','observed-legacy') AND lane=?2 AND source_order=?3",params![generation,lane,index as i64]).map_err(|error|error.to_string())?;
+        self.mark_cache_seen(lane, index)?;
         Ok(())
     }
 
@@ -537,7 +1075,23 @@ impl QueryState {
             rusqlite::TransactionBehavior::Immediate,
         )
         .map_err(|error| error.to_string())?;
-        let generation = self.admit_staging(&transaction)?;
+        self.observe_cache_on(&transaction, path, metadata, lane, index, tag)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn observe_cache_on(
+        &self,
+        db: &Connection,
+        path: &Path,
+        metadata: &CachedSourceMetadata,
+        lane: &str,
+        index: usize,
+        tag: bool,
+    ) -> Result<(), String> {
+        if db.is_autocommit() {
+            return Err("retained cache registration requires a transaction".into());
+        }
+        let generation = self.admit_staging(db)?;
         let path = bincode::options()
             .serialize(&crate::message_cache::CachedPath::from_path(path))
             .map_err(|error| error.to_string())?;
@@ -545,15 +1099,38 @@ impl QueryState {
             .chain(metadata.legacy_history.as_deref())
             .enumerate()
         {
-            let changed=transaction.execute("INSERT OR REPLACE INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless)
-                SELECT ?1,?7,?2,?3,?4,?5,?6,?8,0 FROM mc_versions WHERE source_id=?5 AND generation=?6",params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,if index_kind==0 {"observed"}else{"observed-legacy"},tag]).map_err(|error|error.to_string())?;
-            if changed == 0 {
+            let available: bool = db
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM mc_versions WHERE source_id=?1 AND generation=?2)",
+                )
+                .map_err(|error| error.to_string())?
+                .query_row(params![metadata.source_id, metadata.generation], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if !available {
                 return Err(
                     "observed retained generation unavailable; synchronize and reissue".into(),
                 );
             }
+            let kind = if index_kind == 0 {
+                "observed"
+            } else {
+                "observed-legacy"
+            };
+            db.prepare_cached(
+                "DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind=?2 AND lane=?3 AND source_order=?4",
+            ).map_err(|error| error.to_string())?
+                .execute(params![generation,kind,lane,index as i64])
+                .map_err(|error| error.to_string())?;
+            db.prepare_cached(
+                "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless)
+                 VALUES(?1,?7,?2,?3,?4,?5,?6,?8,0)",
+            ).map_err(|error| error.to_string())?
+                .execute(params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,kind,tag])
+                .map_err(|error| error.to_string())?;
         }
-        transaction.commit().map_err(|error| error.to_string())
+        Ok(())
     }
 
     fn collect_abandoned_scope_headers(&self) {
@@ -566,7 +1143,7 @@ impl QueryState {
         path: &Path,
         sqlite: bool,
         index: usize,
-        key: &[u8],
+        key: i64,
     ) -> Result<(), String> {
         let generation = self.admit_staging(db)?;
         let path = bincode::options()
@@ -597,6 +1174,7 @@ impl QueryState {
     }
 
     fn publish_inner(&self, snapshot: &mut UsageSnapshot, prepare: bool) -> Result<(), String> {
+        self.finish_seeded_cache_descriptors()?;
         self.db
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| error.to_string())?;
@@ -675,11 +1253,59 @@ impl QueryState {
             }
             // Dynamic origins are recorded by the ingest owner before publish
             // (staged rows visible); completion itself is this COMMIT.
-            self.db.execute_batch("DELETE FROM sq_scopes WHERE current_generation IS NOT NULL AND id NOT IN (SELECT id FROM sq_scopes WHERE current_generation IS NOT NULL ORDER BY current_generation DESC,id DESC LIMIT 32);
-                DELETE FROM sq_scope_sources WHERE scope_generation IN (SELECT g.id FROM sq_scope_generations g WHERE g.complete=1 AND NOT EXISTS(SELECT 1 FROM sq_scopes s WHERE s.current_generation=g.id));
-                DELETE FROM sq_scope_generations WHERE complete=1 AND NOT EXISTS(SELECT 1 FROM sq_scopes s WHERE s.current_generation=sq_scope_generations.id);").map_err(|error|error.to_string())?;
-            self.db.execute_batch("DELETE FROM sq_decisions WHERE NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.id=sq_decisions.scope_generation);
-                DELETE FROM sq_indexes WHERE NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.id=sq_indexes.scope_generation);").map_err(|e| e.to_string())?;
+            self.db.execute_batch("DELETE FROM sq_scopes WHERE current_generation IS NOT NULL AND id NOT IN (SELECT id FROM sq_scopes WHERE current_generation IS NOT NULL ORDER BY current_generation DESC,id DESC LIMIT 32);").map_err(|error|error.to_string())?;
+            // Discover victims from generation headers before removing them.
+            // Incomplete generations (including partially built indexes) belong
+            // to their staging owner and must survive another scope's publish.
+            let stale = self.db.prepare(
+                "SELECT g.id FROM sq_scope_generations g WHERE g.complete=1 AND NOT EXISTS(SELECT 1 FROM sq_scopes s WHERE s.current_generation=g.id)
+                 UNION SELECT i.scope_generation FROM sq_indexes i WHERE NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.id=i.scope_generation)",
+            ).map_err(|error| error.to_string())?
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            for generation in stale {
+                let owner: Option<i64> = self
+                    .db
+                    .query_row(
+                        "SELECT decision_generation FROM sq_indexes WHERE scope_generation=?1",
+                        [generation],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                for sql in [
+                    "DELETE FROM sq_indexes WHERE scope_generation=?1",
+                    "DELETE FROM sq_scope_sources WHERE scope_generation=?1",
+                    "DELETE FROM sq_scope_generations WHERE id=?1",
+                ] {
+                    self.db
+                        .execute(sql, [generation])
+                        .map_err(|error| error.to_string())?;
+                }
+                for candidate in [Some(generation), owner.filter(|&id| id != generation)]
+                    .into_iter()
+                    .flatten()
+                {
+                    let retained: bool = self
+                        .db
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE decision_generation=?1)",
+                            [candidate],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if !retained {
+                        self.db
+                            .execute(
+                                "DELETE FROM sq_decisions WHERE scope_generation=?1",
+                                [candidate],
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
             crate::usage_store::discard_unreferenced_opencode_generations(&self.db)?;
             crate::message_cache::collect_unreferenced_versions_on(&self.db)?;
             if prepare {
@@ -746,31 +1372,146 @@ impl QueryState {
             AND (SELECT COUNT(DISTINCT l.model) FROM sq_rows l WHERE l.lane='grok' AND l.session=u.session AND (l.dedup IS NULL OR l.dedup NOT LIKE 'grok-unified:%') AND l.model!='grok-unknown')=1;").map_err(|error|error.to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_snapshot(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
+        self.replay_cache_rows(snapshot, true, None)
+    }
+    fn check_sources_complete(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
         crate::message_cache::install_logical_views_on(&self.db)?;
+        let version = self.data_version()?;
+        let witness = (snapshot.generation, version, self.db.total_changes());
+        if self.complete_sources.get() == Some(witness) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.completeness_checks
+            .set(self.completeness_checks.get() + 1);
         crate::message_cache::validate_scope_metadata_on(&self.db, snapshot.generation)?;
-        let missing:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM sq_scope_sources s LEFT JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (v.source_id IS NULL OR v.message_count!=(SELECT COUNT(*) FROM mc_logical_storage st JOIN mc_rows r INDEXED BY mc_rows_time ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal<st.row_count WHERE st.source_id=s.cache_source_id AND st.generation=s.cache_generation)))",[snapshot.generation],|row|row.get(0)).map_err(|error|error.to_string())?;
+        let missing: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_scope_sources s LEFT JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (v.source_id IS NULL OR v.message_count!=(SELECT COUNT(*) FROM mc_logical_storage st JOIN mc_rows r INDEXED BY mc_rows_time ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal<st.row_count WHERE st.source_id=s.cache_source_id AND st.generation=s.cache_generation)))",
+            [snapshot.generation], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
         if missing {
+            self.complete_sources.set(None);
             return Err("usage snapshot source generation unavailable or incomplete".into());
         }
-        self.db.execute("INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
-            SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,r.message,r.digest,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version
-            FROM sq_scope_sources s JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') ORDER BY s.lane,s.phase,s.source_order,r.ordinal",[snapshot.generation]).map(|_|()).map_err(|error|error.to_string())
+        self.complete_sources.set(Some(witness));
+        Ok(())
     }
-    fn prepare_cache_snapshot(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
+    /// Called only after the private output driver has finished its TEMP writes.
+    pub(crate) fn finish_query_output(&self) {
+        if let Some((generation, version, _)) = self.complete_sources.get() {
+            self.complete_sources
+                .set(Some((generation, version, self.db.total_changes())));
+        }
+    }
+
+    fn replay_cache_rows(
+        &self,
+        snapshot: &UsageSnapshot,
+        hydrate: bool,
+        range: Option<UsageQuery>,
+    ) -> Result<(), String> {
+        crate::message_cache::install_logical_views_on(&self.db)?;
+        self.check_sources_complete(snapshot)?;
+        let recent_join = if let Some(range) = range {
+            self.prepare_recent_rows(snapshot, range)?;
+            " JOIN sq_recent_rows wanted ON wanted.kind=s.kind AND wanted.lane=s.lane AND wanted.source_order=s.source_order AND wanted.ordinal=r.ordinal"
+        } else {
+            ""
+        };
+        self.db.execute(&format!("INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
+            SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 THEN r.message ELSE NULL END,CASE WHEN ?2 THEN r.digest ELSE NULL END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version
+            FROM sq_scope_sources s JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation {recent_join} WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') ORDER BY s.lane,s.phase,s.source_order,r.ordinal"),params![snapshot.generation, hydrate]).map(|_|()).map_err(|error|error.to_string())
+    }
+
+    fn prepare_recent_rows(
+        &self,
+        snapshot: &UsageSnapshot,
+        query: UsageQuery,
+    ) -> Result<(), String> {
+        self.db
+            .execute_batch("DELETE FROM sq_recent_rows; DELETE FROM sq_recent_keys;")
+            .map_err(|error| error.to_string())?;
+        let mut gate = String::from(
+            "s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy')",
+        );
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&snapshot.generation];
+        if let Some(from) = query.from_ms.as_ref() {
+            gate.push_str(" AND r.timestamp>=?");
+            values.push(from);
+        }
+        if let Some(until) = query.until_ms.as_ref() {
+            gate.push_str(" AND r.timestamp<?");
+            values.push(until);
+        }
+        self.db.execute(&format!(
+            "INSERT OR IGNORE INTO sq_recent_rows
+             SELECT s.kind,s.lane,s.source_order,r.ordinal FROM sq_scope_sources s
+             JOIN mc_logical_storage st ON st.source_id=s.cache_source_id AND st.generation=s.cache_generation
+             JOIN mc_rows r INDEXED BY mc_rows_time ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal<st.row_count
+             WHERE {gate} AND COALESCE(r.fallback,0)=0"),
+            values.as_slice(),
+        ).map_err(|error| error.to_string())?;
+        self.db.execute(&format!(
+            "INSERT OR IGNORE INTO sq_recent_rows
+             SELECT s.kind,s.lane,s.source_order,r.ordinal FROM sq_scope_sources s
+             JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation
+             WHERE {gate} AND r.fallback!=0"),
+            values.as_slice(),
+        ).map_err(|error| error.to_string())?;
+        // Global dedup keys can cross sessions and can lose to an older row.
+        self.db.execute(
+            "INSERT OR IGNORE INTO sq_recent_keys
+             SELECT s.lane,r.dedup_key FROM sq_recent_rows wanted
+             JOIN sq_scope_sources s ON s.scope_generation=?1 AND s.kind=wanted.kind AND s.lane=wanted.lane AND s.source_order=wanted.source_order
+             JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation AND r.ordinal=wanted.ordinal
+             WHERE r.dedup_key IS NOT NULL AND s.lane NOT IN ('copilot','grok','trae','kiro')
+               AND (s.tag!=0 OR s.lane IN ('claude','codex','hermes','gjc'))",
+            [snapshot.generation],
+        ).map_err(|error| error.to_string())?;
+        self.db.execute(
+            "INSERT OR IGNORE INTO sq_recent_rows
+             SELECT s.kind,s.lane,s.source_order,r.ordinal
+             FROM sq_recent_keys k CROSS JOIN mc_rows r CROSS JOIN sq_scope_sources s CROSS JOIN mc_logical_storage st
+             WHERE r.dedup_key=k.dedup AND s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy')
+               AND s.lane=k.lane AND s.cache_source_id=r.source_id
+               AND st.source_id=s.cache_source_id AND st.generation=s.cache_generation
+               AND r.generation=st.row_generation AND r.ordinal<st.row_count",
+            [snapshot.generation],
+        ).map_err(|error| error.to_string())?;
+        // ponytail: rare cross-row authority lanes replay whole only when
+        // active in this range; refine cohorts if their measured cost warrants it.
+        self.db.execute(
+            "WITH lanes AS MATERIALIZED (
+                 SELECT DISTINCT lane FROM sq_recent_rows WHERE lane IN ('copilot','grok','trae','kiro'))
+             INSERT OR IGNORE INTO sq_recent_rows
+             SELECT s.kind,s.lane,s.source_order,r.ordinal FROM lanes
+             CROSS JOIN sq_scope_sources s CROSS JOIN mc_logical_rows r
+             WHERE s.scope_generation=?1 AND s.lane=lanes.lane
+               AND r.source_id=s.cache_source_id AND r.generation=s.cache_generation
+               AND s.kind IN ('cache','observed','observed-legacy')",
+            [snapshot.generation],
+        ).map(|_| ()).map_err(|error| error.to_string())
+    }
+    fn prepare_cache_snapshot(
+        &self,
+        snapshot: &UsageSnapshot,
+        hydrate: bool,
+    ) -> Result<(), String> {
         self.indexed.set(false);
         self.report_reused.set(false);
         self.db
             .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
             .map_err(|e| e.to_string())?;
-        self.replay_snapshot(snapshot)
+        self.replay_cache_rows(snapshot, hydrate, None)
     }
     pub(crate) fn prepare_snapshot(
         &self,
         snapshot: &UsageSnapshot,
         hydrate_aliases: bool,
     ) -> Result<(), String> {
-        self.prepare_cache_snapshot(snapshot)?;
+        self.prepare_cache_snapshot(snapshot, !self.canonical_payloads.get())?;
         // Compact queries skip only hydration aliases; authority aliases stay.
         crate::usage_store::prepare_opencode_snapshot_on(
             &self.db,
@@ -790,6 +1531,76 @@ impl QueryState {
 
     pub(crate) fn take_report_reused(&self) -> bool {
         self.report_reused.replace(false)
+    }
+
+    fn decision_generation(&self, generation: i64) -> Result<i64, String> {
+        self.db.query_row(
+            "SELECT decision_generation FROM sq_indexes WHERE scope_generation=?1 AND decision_generation>0",
+            [generation], |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
+    fn reuse_decision_index(
+        &self,
+        snapshot: &UsageSnapshot,
+        version: i64,
+        opencode: bool,
+    ) -> Result<bool, String> {
+        let gate = if opencode {
+            "kind IN ('opencode-sqlite','opencode-json')"
+        } else {
+            "kind IN ('cache','observed','observed-legacy') AND lane IN ('claude','codex')"
+        };
+        let columns = "kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase";
+        let exact_sql = format!(
+            "SELECT NOT EXISTS(SELECT {columns} FROM sq_scope_sources WHERE scope_generation=?1 AND {gate}
+               EXCEPT SELECT {columns} FROM sq_scope_sources WHERE scope_generation=?2 AND {gate})
+             AND NOT EXISTS(SELECT {columns} FROM sq_scope_sources WHERE scope_generation=?2 AND {gate}
+               EXCEPT SELECT {columns} FROM sq_scope_sources WHERE scope_generation=?1 AND {gate})"
+        );
+        let mut statement = self
+            .db
+            .prepare_cached(
+                "SELECT g.id,i.decision_generation FROM sq_scope_generations g
+             JOIN sq_indexes i ON i.scope_generation=g.id
+             WHERE g.scope_id=(SELECT scope_id FROM sq_scope_generations WHERE id=?1)
+               AND g.id!=?1 AND g.complete=1 AND i.version=?2 ORDER BY g.id DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![snapshot.generation, version])
+            .map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let previous: i64 = row.get(0).map_err(|error| error.to_string())?;
+            let owner: i64 = row.get(1).map_err(|error| error.to_string())?;
+            let exact: bool = self
+                .db
+                .query_row(&exact_sql, params![snapshot.generation, previous], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if !exact {
+                continue;
+            }
+            let dangling_sql = if opencode {
+                "SELECT EXISTS(SELECT 1 FROM sq_decisions d LEFT JOIN oc_messages m ON m.source=d.oc_source AND m.ordinal=d.oc_ordinal WHERE d.scope_generation=?1 AND d.oc_source IS NOT NULL AND m.source IS NULL)"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM sq_decisions d LEFT JOIN mc_logical_storage st ON st.source_id=d.cache_source_id AND st.generation=d.cache_generation LEFT JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count WHERE d.scope_generation=?1 AND d.cache_source_id IS NOT NULL AND r.ordinal IS NULL)"
+            };
+            let dangling: bool = self
+                .db
+                .query_row(dangling_sql, [owner], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if dangling {
+                continue;
+            }
+            self.db.execute(
+                "INSERT INTO sq_indexes(scope_generation,version,decision_generation) VALUES(?1,?2,?3)",
+                params![snapshot.generation, version, owner],
+            ).map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Exact-generation Report index readiness, including empty winner sets.
@@ -843,6 +1654,10 @@ impl QueryState {
         if built {
             return Ok(());
         }
+        self.check_report_side_complete(snapshot, true)?;
+        if self.reuse_decision_index(snapshot, REPORT_INDEX_VERSION, false)? {
+            return Ok(());
+        }
         self.db
             .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
             .map_err(|error| error.to_string())?;
@@ -855,13 +1670,18 @@ impl QueryState {
         self.select_lane("codex", snapshot.mode, false)?;
         self.db
             .execute(
-                "INSERT OR IGNORE INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless) SELECT ?1,ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,r.workspace,r.workspace_label,r.model,r.headless FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
+                "INSERT OR IGNORE INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless)
+                 SELECT ?1,ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,NULLIF(r.workspace,c.workspace),NULLIF(r.workspace_label,c.workspace_label),NULLIF(r.model,c.model_id),r.headless
+                 FROM sq_rows r JOIN sq_selected s ON s.id=r.id
+                 LEFT JOIN mc_logical_storage st ON st.source_id=r.cache_source_id AND st.generation=r.cache_generation
+                 LEFT JOIN mc_rows c ON c.source_id=st.source_id AND c.generation=st.row_generation AND c.ordinal=r.cache_ordinal AND c.ordinal<st.row_count
+                 WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
                 [snapshot.generation],
             )
             .map_err(|error| error.to_string())?;
         self.db
             .execute(
-                "INSERT OR IGNORE INTO sq_indexes VALUES(?1,?2)",
+                "INSERT OR IGNORE INTO sq_indexes(scope_generation,version,decision_generation) VALUES(?1,?2,?1)",
                 rusqlite::params![snapshot.generation, REPORT_INDEX_VERSION],
             )
             .map_err(|error| error.to_string())?;
@@ -898,9 +1718,8 @@ impl QueryState {
         Ok(())
     }
 
-    /// Publish-time Claude/Codex arbitration needs metadata only. Final visitors
-    /// reload validated payloads through the persisted cache references.
-    /// Other lanes are folded directly during preparation and still need bytes.
+    /// Arbitration needs metadata only. Trusted reports resolve cached payloads
+    /// under their admitted read pin; detached public visitors still copy bytes.
     fn replay_report_other_lanes(
         &self,
         snapshot: &UsageSnapshot,
@@ -910,31 +1729,32 @@ impl QueryState {
         self.db
             .execute(
                 "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
-                SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 THEN NULL ELSE r.message END,CASE WHEN ?2 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version
+                SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.message END,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version
                 FROM sq_scope_sources s JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal",
-                params![snapshot.generation, only_cc],
+                params![snapshot.generation, only_cc, self.canonical_payloads.get()],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
-    /// Copy only this generation's indexed winners into scratch. Completeness
+    /// Copy this snapshot's owned winner group using current captured sources. Completeness
     /// reuses the same C/C gate as publication (losers and zero-winner
     /// sources included) without replaying their payloads; the winner-count
     /// match is additional, and a short copy falls back to full preparation,
     /// which errors whole on corruption. SQL only; no history-sized Vec.
     fn replay_report_winners(&self, snapshot: &UsageSnapshot) -> Result<bool, String> {
         self.check_report_side_complete(snapshot, true)?;
+        let owner = self.decision_generation(snapshot.generation)?;
         let expected: i64 = self
             .db
             .query_row(
                 "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1 AND lane IN ('claude','codex') AND oc_source IS NULL",
-                [snapshot.generation],
+                [owner],
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
         self.db
-            .execute("INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format) SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,r.message,r.digest,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version FROM sq_decisions d JOIN mc_logical_rows r ON r.source_id=d.cache_source_id AND r.generation=d.cache_generation AND r.ordinal=d.cache_ordinal JOIN sq_scope_sources s ON s.scope_generation=d.scope_generation AND s.kind IN ('cache','observed','observed-legacy') AND s.lane=d.lane AND s.cache_source_id=r.source_id AND s.cache_generation=r.generation WHERE d.scope_generation=?1 AND d.lane IN ('claude','codex') AND d.oc_source IS NULL ORDER BY d.rank", [snapshot.generation])
+            .execute("INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format) SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?3 THEN NULL ELSE r.message END,CASE WHEN ?3 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version FROM sq_decisions d JOIN mc_logical_rows r ON r.source_id=d.cache_source_id AND r.generation=d.cache_generation AND r.ordinal=d.cache_ordinal JOIN sq_scope_sources s ON s.scope_generation=?2 AND s.kind IN ('cache','observed','observed-legacy') AND s.lane=d.lane AND s.cache_source_id=r.source_id AND s.cache_generation=r.generation WHERE d.scope_generation=?1 AND d.lane IN ('claude','codex') AND d.oc_source IS NULL ORDER BY d.rank", params![owner, snapshot.generation, self.canonical_payloads.get()])
             .map_err(|error| error.to_string())?;
         let copied: i64 = self
             .db
@@ -951,71 +1771,116 @@ impl QueryState {
         let ready: bool = self
             .db
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=1)",
+                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=3)",
                 [snapshot.generation],
-                |r| r.get(0),
+                |row| row.get(0),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         if ready {
             return Ok(());
         }
-        let reused =
-            crate::usage_store::reuse_local_opencode_decisions(&self.db, snapshot.generation)?;
-        if reused {
-            self.prepare_cache_snapshot(snapshot)?;
-        } else {
-            self.prepare_snapshot(snapshot, false)?;
+        crate::message_cache::install_logical_views_on(&self.db)?;
+        crate::message_cache::validate_scope_metadata_on(&self.db, snapshot.generation)?;
+        self.check_report_side_complete(snapshot, true)?;
+        self.check_report_side_complete(snapshot, false)?;
+        if self.reuse_decision_index(snapshot, 3, true)? {
+            return Ok(());
         }
+        crate::usage_store::prepare_opencode_snapshot_on(&self.db, snapshot.generation, false)?;
+        crate::usage_store::persist_local_opencode_decisions(&self.db, snapshot.generation)?;
+        self.db.execute(
+            "INSERT INTO sq_indexes(scope_generation,version,decision_generation) VALUES(?1,3,?1)",
+            [snapshot.generation],
+        ).map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    fn prepare_local_grok_metadata(&self) -> Result<(), String> {
         self.enrich_grok_metadata()?;
-        let none = bincode::serialize(&Option::<String>::None).map_err(|e| e.to_string())?;
-        // Grok's uniquely-known legacy workspace is a cohort decision too.
+        let none =
+            bincode::serialize(&Option::<String>::None).map_err(|error| error.to_string())?;
         self.db.execute("UPDATE sq_rows AS u SET
             workspace=(SELECT l.workspace FROM sq_rows l WHERE l.lane='grok' AND l.session=u.session AND (l.dedup IS NULL OR l.dedup NOT LIKE 'grok-unified:%') AND (l.workspace!=?1 OR l.workspace_label!=?1) LIMIT 1),
             workspace_label=(SELECT l.workspace_label FROM sq_rows l WHERE l.lane='grok' AND l.session=u.session AND (l.dedup IS NULL OR l.dedup NOT LIKE 'grok-unified:%') AND (l.workspace!=?1 OR l.workspace_label!=?1) LIMIT 1)
             WHERE u.lane='grok' AND u.dedup LIKE 'grok-unified:%' AND u.workspace=?1 AND u.workspace_label=?1
-            AND (SELECT COUNT(*) FROM (SELECT DISTINCT l.workspace,l.workspace_label FROM sq_rows l WHERE l.lane='grok' AND l.session=u.session AND (l.dedup IS NULL OR l.dedup NOT LIKE 'grok-unified:%') AND (l.workspace!=?1 OR l.workspace_label!=?1)))=1", [&none]).map_err(|e| e.to_string())?;
-        if !reused {
-            crate::usage_store::persist_local_opencode_decisions(&self.db, snapshot.generation)?;
-        }
-        crate::for_each_usage_lane(snapshot.mode, &mut |lane, _, simple, _| {
-            self.select_lane(lane, snapshot.mode, simple)?;
-            let base: i64 = self
-                .db
-                .query_row(
-                    "SELECT COALESCE(MAX(rank),0) FROM sq_decisions WHERE scope_generation=?1",
-                    [snapshot.generation],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            self.db.execute("INSERT INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless)
-                SELECT ?1,?3+ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,r.workspace,r.workspace_label,r.model,r.headless
-                FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane=?2 ORDER BY s.rank", params![snapshot.generation,lane,base]).map_err(|e| e.to_string())?;
-            Ok(())
-        })?;
-        self.db
-            .execute("INSERT INTO sq_indexes VALUES(?1,1)", [snapshot.generation])
-            .map_err(|e| e.to_string())?;
-        Ok(())
+            AND (SELECT COUNT(*) FROM (SELECT DISTINCT l.workspace,l.workspace_label FROM sq_rows l WHERE l.lane='grok' AND l.session=u.session AND (l.dedup IS NULL OR l.dedup NOT LIKE 'grok-unified:%') AND (l.workspace!=?1 OR l.workspace_label!=?1)))=1", [&none])
+            .map(|_| ()).map_err(|error| error.to_string())
     }
 
     pub(crate) fn is_indexed(&self) -> bool {
         self.indexed.get()
     }
 
-    /// Copy only the indexed range before releasing the reader. Public callbacks
-    /// never keep canonical facts pinned against a publishing/GC transaction.
+    pub(crate) fn prepare_trusted_query(
+        &self,
+        snapshot: &UsageSnapshot,
+        query: UsageQuery,
+    ) -> Result<(), String> {
+        if !self.read_pinned.get() {
+            return Err("trusted usage preparation requires a pinned reader".into());
+        }
+        if snapshot.mode == SelectionMode::Report && !self.canonical_payloads.get() {
+            crate::message_cache::install_logical_views_on(&self.db)?;
+            self.db
+                .execute_batch(
+                    "DROP VIEW temp.sq_payload_rows;
+                 CREATE TEMP VIEW sq_payload_rows AS
+                 SELECT r.id,r.lane,r.source_order,r.phase,r.retained,r.global_storage,
+                        r.session,r.workspace,r.dedup,r.model,r.workspace_label,r.timestamp,
+                        COALESCE(r.payload,c.message) AS payload,r.client,r.provider,r.headless,
+                        COALESCE(r.payload_digest,c.digest) AS payload_digest,r.eligible,
+                        r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format
+                 FROM sq_rows r LEFT JOIN mc_logical_storage st
+                   ON r.payload IS NULL AND st.source_id=r.cache_source_id
+                  AND st.generation=r.cache_generation
+                 LEFT JOIN main.mc_rows c
+                   ON c.source_id=st.source_id AND c.generation=st.row_generation
+                  AND c.ordinal=r.cache_ordinal AND c.ordinal<st.row_count;",
+                )
+                .map_err(|error| error.to_string())?;
+            self.canonical_payloads.set(true);
+        }
+        self.prepare_query(snapshot, query)
+    }
+
+    fn admit_payload_reader(&self) -> Result<(), String> {
+        if self.canonical_payloads.get() && !self.read_pinned.get() {
+            return Err("canonical usage payloads require their admitted reader".into());
+        }
+        Ok(())
+    }
+
+    /// Prepare a range and its complete arbitration cohorts before releasing
+    /// the reader. Public callbacks never pin canonical facts against publication.
     pub(crate) fn prepare_query(
         &self,
         snapshot: &UsageSnapshot,
         query: UsageQuery,
     ) -> Result<(), String> {
-        crate::message_cache::install_logical_views_on(&self.db)?;
-        crate::message_cache::validate_scope_metadata_on(&self.db, snapshot.generation)?;
+        let result = self.prepare_query_inner(snapshot, query);
+        // Only successful private TEMP work may advance our own-write witness.
+        // An external commit always changes the same connection's data_version.
+        if result.is_ok() {
+            if let Some((generation, version, _)) = self.complete_sources.get() {
+                self.complete_sources
+                    .set(Some((generation, version, self.db.total_changes())));
+            }
+        } else {
+            self.complete_sources.set(None);
+        }
+        result
+    }
+
+    fn prepare_query_inner(
+        &self,
+        snapshot: &UsageSnapshot,
+        query: UsageQuery,
+    ) -> Result<(), String> {
         self.report_reused.set(false);
         if snapshot.mode != SelectionMode::LocalClients {
-            // Indexed Claude/Codex winners SQL-copy from this generation's
-            // own index; every other lane (including OpenCode) replays and
-            // arbitrates fresh, so the filter-dependent fallback is unchanged.
+            crate::message_cache::install_logical_views_on(&self.db)?;
+            crate::message_cache::validate_scope_metadata_on(&self.db, snapshot.generation)?;
+            // Published C/C groups replay against this snapshot's descriptors.
+            // Every other lane still arbitrates fresh before report filtering.
             if self.report_index_ready(snapshot)? {
                 self.db
                     .execute_batch(
@@ -1042,52 +1907,36 @@ impl QueryState {
             }
             return self.prepare_snapshot(snapshot, query.hydrate_opencode_aliases);
         }
-        self.check_report_side_complete(snapshot, true)?;
-        self.check_report_side_complete(snapshot, false)?;
         let ready: bool = self
             .db
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=1)",
+                "SELECT EXISTS(SELECT 1 FROM sq_indexes WHERE scope_generation=?1 AND version=3)",
                 [snapshot.generation],
-                |r| r.get(0),
+                |row| row.get(0),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         if !ready {
             return Err(
                 "usage snapshot has no complete decision index; synchronize and reissue".into(),
             );
         }
+        self.indexed.set(false);
+        self.check_sources_complete(snapshot)?;
         self.db
             .execute_batch("DELETE FROM sq_rows; DELETE FROM sq_selected; DELETE FROM sq_output;")
-            .map_err(|e| e.to_string())?;
-        // Range predicates are deliberately generated without nullable OR gates:
-        // SQLite can seek directly into (generation,timestamp,rank).
-        let mut gate = String::from("d.scope_generation=?1 AND d.oc_source IS NULL");
-        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&snapshot.generation];
-        if let Some(from) = query.from_ms.as_ref() {
-            gate.push_str(" AND d.timestamp>=?");
-            values.push(from);
+            .map_err(|error| error.to_string())?;
+        if let Some((generation, version, _)) = self.complete_sources.get() {
+            self.complete_sources
+                .set(Some((generation, version, self.db.total_changes())));
         }
-        if let Some(until) = query.until_ms.as_ref() {
-            gate.push_str(" AND d.timestamp<?");
-            values.push(until);
-        }
-        // LEFT JOINing the multi-table logical-row view materializes every
-        // payload before applying this range. Resolve its single-table storage
-        // projection first, then point-read only the selected immutable facts.
-        let sql = format!("INSERT INTO sq_rows(id,lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_format)
-            SELECT d.rank,d.lane,0,0,d.retained,d.global_storage,r.session_id,d.workspace,r.dedup_key,d.model,d.workspace_label,d.timestamp,r.message,r.digest,r.client,r.provider_id,d.headless,d.cache_format
-            FROM sq_decisions d INDEXED BY sq_decision_time
-            LEFT JOIN mc_logical_storage st ON st.source_id=d.cache_source_id AND st.generation=d.cache_generation
-            LEFT JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count
-            WHERE {gate} ORDER BY d.rank");
-        self.db
-            .execute(&sql, values.as_slice())
-            .map_err(|e| e.to_string())?;
-        self.db
-            .execute_batch("INSERT INTO sq_selected SELECT id,id FROM sq_rows ORDER BY id;")
-            .map_err(|e| e.to_string())?;
-        crate::usage_store::prepare_indexed_opencode_on(&self.db, snapshot.generation, query)?;
+        let range = (query.from_ms.is_some() || query.until_ms.is_some()).then_some(query);
+        self.replay_cache_rows(snapshot, true, range)?;
+        self.prepare_local_grok_metadata()?;
+        crate::for_each_usage_lane(snapshot.mode, &mut |lane, _, simple, _| {
+            self.select_lane(lane, snapshot.mode, simple)
+        })?;
+        let owner = self.decision_generation(snapshot.generation)?;
+        crate::usage_store::prepare_indexed_opencode_on(&self.db, owner, query)?;
         self.indexed.set(true);
         Ok(())
     }
@@ -1114,7 +1963,7 @@ impl QueryState {
 
     pub(crate) fn classify(&self, lane: &str, index: usize, miss: bool) -> Result<(), String> {
         self.db
-            .prepare_cached("INSERT INTO sq_sources VALUES(?1,?2,?3)")
+            .prepare_cached("INSERT INTO sq_sources(lane,source_order,miss) VALUES(?1,?2,?3) ON CONFLICT(lane,source_order) DO UPDATE SET miss=excluded.miss")
             .map_err(|error| error.to_string())?
             .execute(params![lane, index as i64, miss])
             .map(|_| ())
@@ -1146,7 +1995,7 @@ impl QueryState {
         lane: &str,
         sink: &mut impl FnMut(UnifiedMessage, bool, bool) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.visit_sql("SELECT r.payload,r.retained,r.global_storage,r.timestamp,r.workspace,r.workspace_label,r.headless,r.payload_digest,r.model,r.cache_format FROM sq_rows r WHERE r.lane=?1 ORDER BY r.phase,r.source_order,r.id", &[&lane],sink)
+        self.visit_sql("SELECT r.payload,r.retained,r.global_storage,r.timestamp,r.workspace,r.workspace_label,r.headless,r.payload_digest,r.model,r.cache_format FROM sq_payload_rows r WHERE r.lane=?1 ORDER BY r.phase,r.source_order,r.id", &[&lane],sink)
     }
 
     fn visit_sql(
@@ -1155,6 +2004,7 @@ impl QueryState {
         values: &[&dyn rusqlite::ToSql],
         sink: &mut impl FnMut(UnifiedMessage, bool, bool) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.admit_payload_reader()?;
         let mut statement = self
             .db
             .prepare_cached(sql)
@@ -1179,22 +2029,28 @@ impl QueryState {
             clients.iter().map(String::as_str).collect();
         let mut statement = self
             .db
-            .prepare_cached("SELECT id,client,model,provider FROM sq_rows")
+            .prepare_cached("SELECT id,client,model,provider,eligible FROM sq_rows")
             .map_err(|error| error.to_string())?;
         let mut rows = statement.query([]).map_err(|error| error.to_string())?;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let id: i64 = row.get(0).map_err(|error| error.to_string())?;
-            let client: String = row.get(1).map_err(|error| error.to_string())?;
-            let model: String = row.get(2).map_err(|error| error.to_string())?;
-            let provider: String = row.get(3).map_err(|error| error.to_string())?;
-            let eligible =
-                crate::retain_for_requested_clients(&client, &model, &provider, &requested);
-            self.db
-                .prepare_cached("UPDATE sq_rows SET eligible=?2 WHERE id=?1")
-                .map_err(|error| error.to_string())?
-                .execute(params![id, eligible])
-                .map(|_| ())
-                .map_err(|error| error.to_string())?;
+            let client = row.get_ref(1).map_err(|error| error.to_string())?;
+            let model = row.get_ref(2).map_err(|error| error.to_string())?;
+            let provider = row.get_ref(3).map_err(|error| error.to_string())?;
+            let eligible = crate::retain_for_requested_clients(
+                client.as_str().map_err(|error| error.to_string())?,
+                model.as_str().map_err(|error| error.to_string())?,
+                provider.as_str().map_err(|error| error.to_string())?,
+                &requested,
+            );
+            let current: i64 = row.get(4).map_err(|error| error.to_string())?;
+            if current != i64::from(eligible) {
+                self.db
+                    .prepare_cached("UPDATE sq_rows SET eligible=?2 WHERE id=?1")
+                    .map_err(|error| error.to_string())?
+                    .execute(params![id, eligible])
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Ok(())
     }
@@ -1212,27 +2068,7 @@ impl QueryState {
                 .map_err(|error| error.to_string())?;
             return Ok(());
         }
-        let requested = clients.iter().map(String::as_str).collect();
-        let mut statement = self
-            .db
-            .prepare_cached("SELECT id,client,model,provider FROM sq_rows")
-            .map_err(|error| error.to_string())?;
-        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            let id: i64 = row.get(0).map_err(|error| error.to_string())?;
-            let client: String = row.get(1).map_err(|error| error.to_string())?;
-            let model: String = row.get(2).map_err(|error| error.to_string())?;
-            let provider: String = row.get(3).map_err(|error| error.to_string())?;
-            let eligible =
-                crate::retain_for_requested_clients(&client, &model, &provider, &requested);
-            self.db
-                .prepare_cached("UPDATE sq_rows SET eligible=?2 WHERE id=?1")
-                .map_err(|error| error.to_string())?
-                .execute(params![id, eligible])
-                .map(|_| ())
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
+        self.set_client_eligibility_without_grok(clients)
     }
 
     pub(crate) fn select_lane(
@@ -1314,7 +2150,7 @@ impl QueryState {
         query: UsageQuery,
         sink: &mut impl FnMut(UnifiedMessage, bool, bool) -> Result<(), String>,
     ) -> Result<(), String> {
-        let mut sql=String::from("SELECT r.payload,r.retained,r.global_storage,r.timestamp,r.workspace,r.workspace_label,r.headless,r.payload_digest,r.model,r.cache_format FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane=?1");
+        let mut sql=String::from("SELECT r.payload,r.retained,r.global_storage,r.timestamp,r.workspace,r.workspace_label,r.headless,r.payload_digest,r.model,r.cache_format FROM sq_payload_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane=?1");
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&lane];
         if let Some(from) = query.from_ms.as_ref() {
             sql.push_str(" AND r.timestamp>=?");
@@ -1462,6 +2298,7 @@ pub(crate) fn carry_absent_durable_sources(
     home: &Path,
     clients: &[String],
 ) -> Result<(), String> {
+    query.finish_seeded_cache_descriptors()?;
     use crate::message_cache::CacheIdentity;
     use std::collections::{HashMap, HashSet};
     let include_all = clients.is_empty();
@@ -1594,6 +2431,12 @@ pub(crate) fn carry_absent_durable_sources(
     }
     let mut lanes: Vec<String> = grouped.keys().cloned().collect();
     lanes.sort();
+    if lanes.is_empty() {
+        return Ok(());
+    }
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&query.db, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
     for lane in lanes {
         let cohorts = grouped.remove(&lane).unwrap_or_default();
         if cohorts.is_empty() {
@@ -1614,10 +2457,10 @@ pub(crate) fn carry_absent_durable_sources(
             // raw-source tag the Kiro suppression gate reads.
             let tag = lane == ClientId::Kiro.as_str()
                 && sessions::kiro::is_kiro_global_storage_source(&decoded);
-            query.observe_cache(&decoded, &history, &lane, order, tag)?;
+            query.observe_cache_on(&transaction, &decoded, &history, &lane, order, tag)?;
         }
     }
-    Ok(())
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 impl QueryState {
@@ -1633,8 +2476,12 @@ impl QueryState {
         // One origin per owning configuration, not per rotating query scope.
         // Claims outlive scope GC, but only a successfully published scope
         // can establish them. Cache rows use the canonical mc path encoding.
-        let mut statement = self
-            .db
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut statement = transaction
             .prepare(
                 "SELECT DISTINCT m.namespace,m.path FROM sq_scope_sources s
              JOIN mc_sources m ON m.id=s.cache_source_id
@@ -1654,14 +2501,15 @@ impl QueryState {
                     source_ownership_digest(context, &namespace)?,
                 );
             }
-            self.db
-                .execute(
-                    "INSERT OR IGNORE INTO sq_durable_origins VALUES(?1,?2,?3,?4)",
-                    params![snapshot.scope, namespace, path, owners[&namespace]],
-                )
+            transaction
+                .prepare_cached("INSERT OR IGNORE INTO sq_durable_origins VALUES(?1,?2,?3,?4)")
+                .map_err(|error| error.to_string())?
+                .execute(params![snapshot.scope, namespace, path, owners[&namespace]])
                 .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        drop(rows);
+        drop(statement);
+        transaction.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -1881,13 +2729,20 @@ pub(crate) fn stage_streamed_source(
         )
         .map(|_| ())
         .map_err(|error| error.to_string())?;
-    // Parse outside the cache write transaction; flatten the nested
-    // read-scope observation so I/O failures abort with nothing published.
-    let streamed = sessions::utils::source_read_scope(path, || {
-        visit(&mut |message| query.push(&scratch, 0, phase, false, false, &message))
-    });
+    // Only TEMP rows are written while parsing. Commit this deferred scratch
+    // transaction before the cache writer takes the canonical write lock.
+    let streamed = (|| {
+        let transaction = query
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        sessions::utils::source_read_scope(path, || {
+            visit(&mut |message| query.push(&scratch, 0, phase, false, false, &message))
+        })??;
+        transaction.commit().map_err(|error| error.to_string())
+    })();
     let result = (|| {
-        streamed??;
+        streamed?;
         if refingerprint(path) != before {
             return Err(format!(
                 "{lane} source changed during ingestion; previous generation retained"
@@ -2531,6 +3386,7 @@ impl QueryState {
     /// stream without deserializing or pricing historical messages.
     pub(crate) fn prepare_report_fold(&self, snapshot: &UsageSnapshot) -> Result<(), String> {
         use sha2::{Digest, Sha256};
+        self.admit_payload_reader()?;
         self.set_client_eligibility(&snapshot.clients)?;
         let reused = self.take_report_reused();
         self.db.execute_batch(
@@ -2584,7 +3440,7 @@ impl QueryState {
             ("SELECT source,source_order,kind FROM ocq_scope ORDER BY kind DESC,source_order,source", 3),
             ("SELECT id,source,kind,source_order,ordinal,provider,timestamp,primary_key,message,payload FROM ocq_rows ORDER BY kind DESC,source_order,ordinal,id", 10),
             ("SELECT id,key,timestamp,position FROM ocq_aliases ORDER BY id,key,position", 4),
-            ("SELECT model,workspace,workspace_label,session,payload FROM sq_rows WHERE lane='grok' ORDER BY phase,source_order,id", 5),
+            ("SELECT model,workspace,workspace_label,session,payload FROM sq_payload_rows WHERE lane='grok' ORDER BY phase,source_order,id", 5),
         ] {
             let mut statement = self.db.prepare(sql).map_err(|error| error.to_string())?;
             let mut rows = statement.query([]).map_err(|error| error.to_string())?;
@@ -2598,7 +3454,7 @@ impl QueryState {
             .prepare(
                 "SELECT f.position,r.payload,r.payload_digest,r.timestamp,r.workspace,
                  r.workspace_label,r.headless,r.model,r.cache_format,f.lane,f.simple,f.guarded
-             FROM sq_fold_rows f JOIN sq_rows r ON r.id=f.id ORDER BY f.position",
+             FROM sq_fold_rows f JOIN sq_payload_rows r ON r.id=f.id ORDER BY f.position",
             )
             .map_err(|error| error.to_string())?;
         let mut rows = statement.query([]).map_err(|error| error.to_string())?;
@@ -2645,13 +3501,14 @@ impl QueryState {
         after: i64,
         sink: &mut impl FnMut(i64, &str, bool, bool, UnifiedMessage) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.admit_payload_reader()?;
         let mut statement = self
             .db
             .prepare(
                 "SELECT r.payload,r.retained,r.global_storage,r.timestamp,r.workspace,
                  r.workspace_label,r.headless,r.payload_digest,r.model,r.cache_format,
                  f.position,f.lane,f.simple,f.guarded
-             FROM sq_fold_rows f JOIN sq_rows r ON r.id=f.id
+             FROM sq_fold_rows f JOIN sq_payload_rows r ON r.id=f.id
              WHERE f.position>?1 ORDER BY f.position",
             )
             .map_err(|error| error.to_string())?;

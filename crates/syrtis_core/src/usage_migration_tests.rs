@@ -558,3 +558,101 @@ fn invalid_shard_only_source_fails_closed() {
     assert!(prepare_captured(&context, &target_dir).is_err());
     assert!(!target_dir.join("source-message-cache.sqlite3").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn explicit_stage_reclaim_requires_exact_admitted_source_free_copy() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("usage");
+    seed_legacy_store(&root, 17, 29);
+    assert!(!root.join("native-session.jsonl").exists());
+    drop(crate::store_query::QueryState::open(&root).unwrap());
+    let db = crate::usage_store::open_database(&root).unwrap();
+    let _management = crate::usage_store::management_lock(&root, true).unwrap();
+    let copy = |name: &str| {
+        let path = root.join(name);
+        let mut target = Connection::open(&path).unwrap();
+        let backup = rusqlite::backup::Backup::new(&db, &mut target).unwrap();
+        backup
+            .run_to_completion(128, std::time::Duration::ZERO, None)
+            .unwrap();
+        drop(backup);
+        target
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        drop(target);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    };
+    let good = copy("usage_migration_tmp_1-1.sqlite3");
+    let unknown = copy("usage_migration_tmp_1-x.sqlite3");
+    let journal = copy("usage_migration_tmp_1-2.sqlite3");
+    fs::write(
+        root.join("usage_migration_tmp_1-2.sqlite3-journal"),
+        b"unproven journal",
+    )
+    .unwrap();
+    let older = copy("usage_migration_tmp_1-3.sqlite3");
+    Connection::open(&older)
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    let uncovered = copy("usage_migration_tmp_1-4.sqlite3");
+    Connection::open(&uncovered)
+        .unwrap()
+        .execute(
+            "INSERT INTO mc_meta(key,value) VALUES('uncovered_fact',x'12')",
+            [],
+        )
+        .unwrap();
+    let locked = copy("usage_migration_tmp_1-5.sqlite3");
+    let writer = Connection::open(&locked).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let alias = root.join("usage_migration_tmp_1-6.sqlite3");
+    symlink(&unknown, &alias).unwrap();
+    let wrong_owner = copy("usage_migration_tmp_1-7.sqlite3");
+    // A deterministic synthetic owner mismatch exercises the same predicate
+    // without privileged chown or touching another user's filesystem.
+    assert!(!admitted_stage_owner(
+        &fs::symlink_metadata(&wrong_owner).unwrap(),
+        unsafe { libc::geteuid() }.wrapping_add(1),
+    ));
+    let old_epoch = copy("usage_migration_tmp_1-10.sqlite3");
+    Connection::open(&old_epoch)
+        .unwrap()
+        .execute(
+            "UPDATE sq_meta SET value=randomblob(16) WHERE key='store_epoch'",
+            [],
+        )
+        .unwrap();
+    let wrong_mode = copy("usage_migration_tmp_1-8.sqlite3");
+    fs::set_permissions(&wrong_mode, fs::Permissions::from_mode(0o644)).unwrap();
+    reclaim_abandoned_stages(&db, &root).unwrap();
+    assert!(!good.exists());
+    for path in [
+        &unknown,
+        &journal,
+        &older,
+        &uncovered,
+        &locked,
+        &alias,
+        &wrong_mode,
+        &old_epoch,
+    ] {
+        assert!(fs::symlink_metadata(path).is_ok(), "{path:?} must remain");
+    }
+    assert_eq!(
+        fs::read(root.join("usage_migration_tmp_1-2.sqlite3-journal")).unwrap(),
+        b"unproven journal"
+    );
+    assert!(!wrong_owner.exists());
+    writer.execute_batch("ROLLBACK").unwrap();
+    let incomplete = copy("usage_migration_tmp_1-9.sqlite3");
+    db.execute("DELETE FROM mc_rows", []).unwrap();
+    reclaim_abandoned_stages(&db, &root).unwrap();
+    assert!(
+        incomplete.exists(),
+        "incomplete canonical must not authorize removal"
+    );
+}

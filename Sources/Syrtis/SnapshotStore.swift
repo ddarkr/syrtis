@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import TokenBarCore
 
@@ -400,12 +401,10 @@ actor SnapshotWriter {
 
     private struct State {
         var highestCompletedSequence = 0
-        /// The complete encoded bytes of the last ACCEPTED write, with
-        /// `savedAt` held at a fixed canonical value so only a real content
-        /// change counts. Updated only after a successful rename — a skip or
-        /// a failed write must never poison the next real change into being
-        /// silently dropped.
-        var lastWrittenCanonicalBytes: Data?
+        /// Digest of the accepted wire bytes, not another retained payload.
+        /// Comparing with the accepted timestamp keeps savedAt out of content
+        /// identity and lets the first capture use its one encoding directly.
+        var lastWrittenDigest: SHA256.Digest?
         /// When the file on disk was last stamped. Content dedup alone lets an
         /// idle machine keep a byte-identical payload until `maxAge` rejects
         /// it, restoring the blank startup this slice exists to remove — even
@@ -416,7 +415,6 @@ actor SnapshotWriter {
 
     private var states: [String: State] = [:]
 
-    private static let canonicalDate = Date(timeIntervalSince1970: 0)
     /// Re-stamp an unchanged snapshot no less often than this. Well inside
     /// `SnapshotStore.maxAge`, and at roughly 117 KB it costs one write a week
     /// on a machine with no new usage at all.
@@ -453,12 +451,13 @@ actor SnapshotWriter {
             bundleIdentifier: envelope.bundleIdentifier,
             shortVersion: envelope.shortVersion,
             buildNumber: envelope.buildNumber,
-            savedAt: Self.canonicalDate,
+            savedAt: state.lastWrittenAt ?? envelope.savedAt,
             selectedYear: envelope.selectedYear,
             payload: envelope.payload,
             knownYears: envelope.knownYears,
             scanRoots: envelope.scanRoots)
         guard let canonicalBytes = try? Self.encoder.encode(canonical) else { return }
+        let digest = SHA256.hash(data: canonicalBytes)
         // Skip only when the content is unchanged AND the stamp is still fresh.
         // Dedup on content alone would let an idle machine keep the same bytes
         // past `maxAge`, at which point restore rejects a snapshot whose live
@@ -466,10 +465,17 @@ actor SnapshotWriter {
         let stale = state.lastWrittenAt.map {
             envelope.savedAt.timeIntervalSince($0) >= Self.renewalInterval
         } ?? true
-        guard canonicalBytes != state.lastWrittenCanonicalBytes || stale else { return }
-        guard let bytes = try? Self.encoder.encode(envelope) else { return }
+        guard digest != state.lastWrittenDigest || stale else { return }
+        let bytes: Data
+        if canonical.savedAt == envelope.savedAt {
+            bytes = canonicalBytes
+        } else {
+            guard let stamped = try? Self.encoder.encode(envelope) else { return }
+            bytes = stamped
+        }
         guard SnapshotStore.write(bytes, in: directory) else { return }
-        state.lastWrittenCanonicalBytes = canonicalBytes
+        state.lastWrittenDigest = canonical.savedAt == envelope.savedAt
+            ? digest : SHA256.hash(data: bytes)
         state.lastWrittenAt = envelope.savedAt
     }
 }

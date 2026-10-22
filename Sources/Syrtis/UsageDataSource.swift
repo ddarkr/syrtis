@@ -8,6 +8,12 @@ enum LocalUsageValue: Sendable {
     case agents(AgentsReport)
     case rate(Double)
     case trace([TraceBucket])
+    case traceRate([TraceBucket], Double)
+}
+
+private struct RecentUsage: Decodable {
+    let trace: [TraceBucket]
+    let rate: Double
 }
 
 /// App-level source of usage data. Every usage consumer depends on this
@@ -79,6 +85,9 @@ extension UsageDataSource {
         case "agents": return .agents(try await agentsReport(year: request.year, clients: request.clients, priority: .userInitiated))
         case "rate": return .rate(try await tokensPerMin())
         case "trace": return .trace(try await usageTrace(windowSecs: request.windowSecs ?? 600))
+        case "traceRate":
+            let trace = try await usageTrace(windowSecs: request.windowSecs ?? 600)
+            return .traceRate(trace, try await tokensPerMin())
         default: throw NSError(domain: "LocalUsageQuery", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown local query kind"])
         }
     }
@@ -221,6 +230,9 @@ struct LiveUsageDataSource: UsageDataSource {
         case "agents": return .agents(try await TBCore.localUsageQuery(request, as: AgentsReport.self))
         case "rate": return .rate(try await TBCore.localUsageQuery(request, as: Double.self))
         case "trace": return .trace(try await TBCore.localUsageQuery(request, as: [TraceBucket].self))
+        case "traceRate":
+            let value = try await TBCore.localUsageQuery(request, as: RecentUsage.self)
+            return .traceRate(value.trace, value.rate)
         default: throw NSError(domain: "LocalUsageQuery", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown local query kind"])
         }
     }

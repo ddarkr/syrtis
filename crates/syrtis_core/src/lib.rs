@@ -1751,7 +1751,7 @@ impl CapturedReportTimezone {
 /// A changed source generation does not enter its key: selected membership
 /// establishes the longest reusable prefix before any payload is decoded.
 struct HistoricalReportFold<'a> {
-    query: store_query::QueryState,
+    query: store_query::HistoricalQuery<'a>,
     checkpoint: usage_store::ReportCheckpoint,
     snapshot: &'a LocalUsageSnapshot,
     pricing: Option<&'a pricing::PricingService>,
@@ -1796,12 +1796,7 @@ impl<'a> HistoricalReportFold<'a> {
         if let Some(timezone) = &timezone {
             hash.update(timezone.digest);
         }
-        let query = store_query::QueryState::open(&snapshot.root)?;
-        query.pin(snapshot)?;
-        let prepared = query.prepare_query(snapshot, LocalUsageQuery::compact());
-        let released = query.unpin();
-        prepared.and(released)?;
-        query.prepare_report_fold(snapshot)?;
+        let query = snapshot.historical_query()?;
         let outside_timezone_range: bool = query
             .connection()
             .query_row(
@@ -1842,8 +1837,9 @@ impl<'a> HistoricalReportFold<'a> {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
+        self.query.admit_reader(self.snapshot)?;
         let Some(timezone) = &self.timezone else {
-            return fold_prepared_usage_snapshot(
+            let result = fold_prepared_usage_snapshot(
                 self.snapshot,
                 &self.query,
                 self.pricing,
@@ -1853,6 +1849,8 @@ impl<'a> HistoricalReportFold<'a> {
                 false,
             )
             .map(|_| ());
+            let released = self.query.release_reader();
+            return result.and(released);
         };
         let requested: HashSet<&str> = self.snapshot.clients.iter().map(String::as_str).collect();
         let passes = |message: &UnifiedMessage| {
@@ -1864,8 +1862,8 @@ impl<'a> HistoricalReportFold<'a> {
                     &requested,
                 )
         };
-        // Restoring consumes the encoded blob. If this private fold object is
-        // used again, replay from zero rather than skipping a consumed prefix.
+        // The encoded state is consumed on restoration. Without a saved
+        // accumulator this fold must start at the first selected row.
         let resume_rows = if self.checkpoint.has_restored() {
             self.checkpoint.resume_rows
         } else {
@@ -1926,6 +1924,7 @@ impl<'a> HistoricalReportFold<'a> {
         if last > resume_rows && last % 1024 != 0 {
             self.checkpoint.save(self.query.connection(), last, state)?;
         }
+        self.query.release_reader()?;
         self.checkpoint.finish(self.query.connection())
     }
 }
@@ -3020,6 +3019,8 @@ fn scan_usage_sources(
         return Err(error.clone());
     }
     if selection == LocalUsageSelection::LocalClients {
+        // Scanner root deduplication spans clients. Claude needs its own
+        // discovery so another client's aliased root cannot claim its files.
         let claude_files = if clients.is_empty() || clients.iter().any(|client| client == "claude")
         {
             let mut claude =
@@ -3083,6 +3084,7 @@ fn ingest_local_usage_inner(
     cache.ensure_open()?;
     let query = QueryState::open(&root)?;
     let mut snapshot = query.begin_scope(&root, source_context, clients, modified_after, mode)?;
+    query.seed_cache_descriptors()?;
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|client| client == "synthetic");
     usage_store::synchronize_opencode_sources(
@@ -3607,14 +3609,16 @@ where
     F: Fn(&UnifiedMessage) -> bool,
     S: FnMut(&UnifiedMessage) + ?Sized,
 {
-    let query = store_query::QueryState::open(&snapshot.root)?;
-    query.pin(snapshot)?;
+    let query = snapshot.recent_query()?;
     let prepared = query.prepare_query(snapshot, options);
     let released = query.unpin();
     prepared.and(released)?;
     // `buffer: true` keeps the serialized `sq_output` flush so public
     // `visit_*` retains buffered failure/chronological/reentrant semantics.
-    fold_prepared_usage_snapshot(snapshot, &query, pricing, options, filter, sink, true)
+    let result =
+        fold_prepared_usage_snapshot(snapshot, &query, pricing, options, filter, sink, true);
+    query.finish_query_output();
+    result
 }
 /// Shared trusted-fold driver: one arbitration, no serialize roundtrip.
 ///
@@ -3647,13 +3651,16 @@ fn fold_usage_snapshot_direct<F>(
 where
     F: Fn(&UnifiedMessage) -> bool,
 {
-    let query = store_query::QueryState::open(&snapshot.root)?;
-    query.pin(snapshot)?;
+    let query = snapshot.recent_query()?;
     let options = LocalUsageQuery::compact();
-    let prepared = query.prepare_query(snapshot, options);
+    let folded = query
+        .prepare_trusted_query(snapshot, options)
+        .and_then(|_| {
+            fold_prepared_usage_snapshot(snapshot, &query, pricing, options, filter, sink, false)
+        });
+    query.finish_query_output();
     let released = query.unpin();
-    prepared.and(released)?;
-    fold_prepared_usage_snapshot(snapshot, &query, pricing, options, filter, sink, false)
+    folded.and_then(|counts| released.map(|_| counts))
 }
 
 fn fold_prepared_usage_snapshot<F, S>(

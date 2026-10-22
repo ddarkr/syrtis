@@ -415,6 +415,10 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                 t.turn_id,t.born_generation FROM mc_sources s LEFT JOIN mc_versions v ON v.source_id=s.id
                 LEFT JOIN mc_rows r ON r.source_id=s.id LEFT JOIN mc_codex_turn_ids t ON t.source_id=s.id LIMIT 0",
     ).map_err(sql_error)?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS mc_rows_fallback ON mc_rows(source_id,generation,ordinal) WHERE fallback!=0;
+         CREATE INDEX IF NOT EXISTS mc_rows_global_key ON mc_rows(dedup_key,source_id,generation,ordinal) WHERE dedup_key IS NOT NULL;",
+    ).map_err(sql_error)?;
     transaction.commit().map_err(sql_error)?;
     install_logical_views_on(connection)
 }
@@ -449,11 +453,12 @@ fn read_version(
     id: i64,
     generation: i64,
 ) -> Result<StoredMetadata, String> {
-    let (namespace,scope,parser_version,format_version,fingerprint,resume,message_count,retained_count,fallback_count,retained_digest,cacheable,codex_turn_count,codex_turn_digest) = connection.query_row(
+    let (namespace,scope,parser_version,format_version,fingerprint,resume,message_count,retained_count,fallback_count,retained_digest,cacheable,codex_turn_count,codex_turn_digest) = connection.prepare_cached(
         "SELECT s.namespace,s.scope,v.parser_version,v.format_version,v.fingerprint,v.resume,
                 v.message_count,v.retained_count,v.fallback_count,v.retained_digest,v.cacheable,v.codex_turn_count,v.codex_turn_digest
          FROM mc_sources s JOIN mc_versions v ON v.source_id=s.id
          WHERE s.id=?1 AND v.generation=?2",
+    ).map_err(sql_error)?.query_row(
         params![id,generation],
         |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,u32>(2)?,row.get::<_,u32>(3)?,
             row.get::<_,Vec<u8>>(4)?,row.get::<_,Option<Vec<u8>>>(5)?,row.get::<_,u64>(6)?,row.get::<_,u64>(7)?,
@@ -473,17 +478,16 @@ fn read_version(
         return Err("source message cache metadata is invalid".to_string());
     }
     let schema: i64 = connection
-        .query_row(
-            "SELECT value FROM mc_meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT value FROM mc_meta WHERE key='schema_version'")
+        .map_err(sql_error)?
+        .query_row([], |row| row.get(0))
         .map_err(sql_error)?;
     if schema == SCHEMA_VERSION {
         let (row_generation,row_count,fallback_timestamp,recorded_format,turn_generation,digest): (i64,u64,Option<i64>,u32,i64,Vec<u8>) =
-            connection.query_row(
+            connection.prepare_cached(
                 "SELECT row_generation,row_count,fallback_timestamp,format_version,turn_generation,reference_digest
                  FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+            ).map_err(sql_error)?.query_row(
                 params![id,generation], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             ).map_err(sql_error)?;
         let expected = encode_fact(&(
@@ -918,14 +922,26 @@ impl SourceMessageCache {
             let legacy = if identity.scope != [0;32] && retained_history_key_filter(identity.namespace).is_some() {
                 read_metadata(&transaction,CacheIdentity { scope: [0;32],..identity },path)?
             } else { None };
-            if let Some(old) = old.as_ref() {validate_stored_generation(&transaction,old)?;}
-            if let Some(legacy) = legacy.as_ref() {validate_stored_generation(&transaction,legacy)?;}
             let observed = observed_from.map(|expected| read_observed_history(&transaction,identity,path,expected)).transpose()?;
             let observed_legacy = observed_from.and_then(|expected| expected.legacy_history.as_deref())
                 .map(|expected| read_observed_history(&transaction,identity,path,expected)).transpose()?;
+            // All identities share this write-locked snapshot. The observed
+            // generation is commonly the current generation; verify each exact
+            // immutable stream once, not again through every history role.
+            let histories = [old.as_ref(),legacy.as_ref(),observed.as_ref(),observed_legacy.as_ref()];
+            for (index, history) in histories.iter().enumerate() {
+                let Some(history) = *history else {continue;};
+                if histories[..index].iter().flatten().any(|known|
+                    known.id == history.id && known.metadata.generation == history.metadata.generation) {
+                    continue;
+                }
+                validate_stored_generation(&transaction,history)?;
+            }
             let (id,generation) = allocate_generation(&transaction,identity,path,identity.parser_version,&fingerprint,old.as_ref())?;
             let mut writer = SourceRowWriter {
                 connection: &transaction,source_id: id,generation,next_ordinal: 0,
+                row_generation: generation,
+                prefix: None,
                 codex_incremental,
                 cacheable: true,
                 fallback_timestamp: (fingerprint.modified_ns / 1_000_000) as i64,
@@ -935,14 +951,32 @@ impl SourceMessageCache {
                     && old.format_version == CACHE_FORMAT_VERSION && old.parser_version == identity.parser_version && old.metadata.cacheable
                     && old.id == expected.source_id && old.metadata.generation == expected.generation && old.metadata.fingerprint == expected.fingerprint)
                     .ok_or_else(|| "source message cache append generation changed".to_string())?;
-                transaction.execute(
+                writer.row_generation = transaction.query_row(
                     "UPDATE mc_generation_storage SET
                        row_generation=(SELECT row_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?3),
                        turn_generation=(SELECT turn_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?3)
-                     WHERE source_id=?1 AND generation=?2",
+                     WHERE source_id=?1 AND generation=?2 RETURNING row_generation",
                     params![id,generation,old.metadata.generation],
+                    |row| row.get(0),
                 ).map_err(sql_error)?;
                 writer.next_ordinal = old.metadata.message_count;
+            }
+            if append_from.is_none() {
+                if let Some(base) = old.as_ref().filter(|base|
+                    base.format_version == CACHE_FORMAT_VERSION
+                        && base.parser_version == identity.parser_version
+                        && base.metadata.cacheable) {
+                    let (physical, fallback): (i64, Option<i64>) = transaction.query_row(
+                        "SELECT row_generation,fallback_timestamp FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+                        params![id,base.metadata.generation], |row| Ok((row.get(0)?,row.get(1)?)),
+                    ).map_err(sql_error)?;
+                    writer.row_generation = physical;
+                    writer.prefix = Some((base.metadata.message_count, fallback));
+                    transaction.execute(
+                        "UPDATE mc_generation_storage SET row_generation=?3,row_count=0 WHERE source_id=?1 AND generation=?2",
+                        params![id,generation,physical],
+                    ).map_err(sql_error)?;
+                }
             }
             if let Some(mut resume) = writer.codex_incremental.take() {
                 for turn_id in resume.state.forked_child_task_started_turn_ids.drain() {
@@ -951,6 +985,7 @@ impl SourceMessageCache {
                 writer.codex_incremental = Some(resume);
             }
             producer(&mut writer)?;
+            writer.finish_producer()?;
             // Durable carry runs for every namespace: Claude reconciles
             // same-key observations unit-aware; other lanes carry missing
             // keyed rows verbatim; keyless rows carry by source-local
@@ -1329,6 +1364,9 @@ pub(crate) struct SourceRowWriter<'a> {
     connection: &'a Connection,
     source_id: i64,
     generation: i64,
+    row_generation: i64,
+    // Validated ordinary full-stream prefix; legacy/import writers never share.
+    prefix: Option<(u64, Option<i64>)>,
     next_ordinal: u64,
     codex_incremental: Option<CodexIncrementalCache>,
     cacheable: bool,
@@ -1336,6 +1374,67 @@ pub(crate) struct SourceRowWriter<'a> {
 }
 
 impl SourceRowWriter<'_> {
+    fn ensure_owned_rows(&mut self) -> Result<(), String> {
+        if self.row_generation == self.generation {
+            self.prefix = None;
+            return Ok(());
+        }
+        if self.row_generation != self.generation {
+            self.connection
+                .execute(
+                    "INSERT INTO mc_rows SELECT source_id,?3,ordinal,dedup_key,retained,fallback,
+                    CASE WHEN fallback THEN ?5 ELSE timestamp END,message,digest,
+                    session_id,model_id,client,provider_id,workspace,workspace_label
+                 FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal<?4",
+                    params![
+                        self.source_id,
+                        self.row_generation,
+                        self.generation,
+                        self.next_ordinal,
+                        self.fallback_timestamp
+                    ],
+                )
+                .map_err(sql_error)?;
+            self.row_generation = self.generation;
+        }
+        self.prefix = None;
+        self.connection.execute(
+            "UPDATE mc_generation_storage SET row_generation=?3,row_count=9223372036854775807 WHERE source_id=?1 AND generation=?2",
+            params![self.source_id,self.generation,self.row_generation],
+        ).map_err(sql_error)?;
+        Ok(())
+    }
+
+    fn finish_producer(&mut self) -> Result<(), String> {
+        if self
+            .prefix
+            .is_some_and(|(bound, _)| self.next_ordinal < bound)
+        {
+            // Do not expose unproduced suffix rows as fresh live observations.
+            return self.ensure_owned_rows();
+        }
+        if self.row_generation == self.generation {
+            self.prefix = None;
+            return Ok(());
+        }
+        if self.row_generation != self.generation {
+            let suffix: bool = self.connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal>=?3)",
+            ).map_err(sql_error)?.query_row(
+                params![self.source_id,self.row_generation,self.next_ordinal], |row| row.get(0),
+            ).map_err(sql_error)?;
+            if suffix {
+                return self.ensure_owned_rows();
+            }
+        }
+        self.prefix = None;
+        self.connection.execute(
+            "UPDATE mc_generation_storage SET row_count=9223372036854775807 WHERE source_id=?1 AND generation=?2 AND row_count!=9223372036854775807",
+            params![self.source_id,self.generation],
+        ).map_err(sql_error)?;
+        Ok(())
+    }
+
     pub(crate) fn set_cacheable(&mut self, value: bool) -> Result<(), String> {
         self.cacheable = value;
         Ok(())
@@ -1377,14 +1476,55 @@ impl SourceRowWriter<'_> {
         }
         let bytes = encode_fact(message)?;
         let digest = Sha256::digest(&bytes);
+        let workspace = encode_fact(&message.workspace_key)?;
+        let workspace_label = encode_fact(&message.workspace_label)?;
+        if let Some((bound, base_fallback)) = self.prefix {
+            if self.next_ordinal < bound {
+                let matches: bool = self.connection.prepare_cached(
+                    "SELECT message=?4 AND digest=?5 AND retained=?6 AND fallback=?7
+                        AND (CASE WHEN fallback THEN coalesce(?8,timestamp) ELSE timestamp END)=?9
+                        AND dedup_key IS ?10 AND session_id IS ?11 AND model_id IS ?12
+                        AND client IS ?13 AND provider_id IS ?14 AND workspace IS ?15 AND workspace_label IS ?16
+                     FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal=?3",
+                ).map_err(sql_error)?.query_row(
+                    params![self.source_id,self.row_generation,ordinal,bytes,digest.as_slice(),retained,fallback,
+                        base_fallback,if fallback {self.fallback_timestamp} else {message.timestamp},
+                        message.dedup_key,message.session_id,message.model_id,message.client,message.provider_id,
+                        workspace,workspace_label],
+                    |row| row.get(0),
+                ).map_err(sql_error)?;
+                if matches {
+                    self.next_ordinal += 1;
+                    return Ok(());
+                }
+                self.ensure_owned_rows()?;
+            } else {
+                let suffix: bool = self.connection.prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal>=?3)",
+                ).map_err(sql_error)?.query_row(params![self.source_id,self.row_generation,ordinal], |row| row.get(0)).map_err(sql_error)?;
+                if suffix {
+                    self.ensure_owned_rows()?;
+                } else {
+                    self.prefix = None;
+                }
+            }
+        } else if self.row_generation != self.generation {
+            // Carry can append after a full matching producer. Another retained
+            // logical generation may already own the next physical ordinal.
+            let suffix: bool = self.connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal>=?3)",
+            ).map_err(sql_error)?.query_row(params![self.source_id,self.row_generation,ordinal], |row| row.get(0)).map_err(sql_error)?;
+            if suffix {
+                self.ensure_owned_rows()?;
+            }
+        }
         self.connection.prepare_cached(
             "INSERT INTO mc_rows(source_id,generation,ordinal,dedup_key,retained,fallback,timestamp,message,digest,
                  session_id,model_id,client,provider_id,workspace,workspace_label)
-             SELECT ?1,row_generation,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15
-             FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
-        ).map_err(sql_error)?.execute(params![self.source_id,self.generation,ordinal,message.dedup_key,retained,fallback,
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+        ).map_err(sql_error)?.execute(params![self.source_id,self.row_generation,ordinal,message.dedup_key,retained,fallback,
             if fallback {self.fallback_timestamp} else {message.timestamp},bytes,digest.as_slice(),
-            message.session_id,message.model_id,message.client,message.provider_id,encode_fact(&message.workspace_key)?,encode_fact(&message.workspace_label)?],
+            message.session_id,message.model_id,message.client,message.provider_id,workspace,workspace_label],
         ).map_err(sql_error)?;
         self.next_ordinal += 1;
         Ok(())
@@ -1497,7 +1637,7 @@ fn merge_history(
             })
             .optional()
             .map_err(sql_error)?;
-        if let Some((ordinal, retained, bytes, digest)) = current {
+        if let Some((ordinal, current_retained, current_bytes, digest)) = current {
             // Same-key reconciliation is Claude-only (unit-aware observation
             // merge). Other lanes keep the fresh parse's row untouched: the
             // producer already supplied this identity in the new generation.
@@ -1509,15 +1649,19 @@ fn merge_history(
             if old.parser_version != identity.parser_version {
                 continue;
             }
-            verify_digest(&bytes, &digest)?;
-            let mut current = decode_message(&bytes)?;
+            verify_digest(&current_bytes, &digest)?;
+            let mut current = decode_message(&current_bytes)?;
             merge_message(&mut current, &stored);
             refresh(&mut current);
             // Only producer-supplied rows can inherit a matching live observation.
             // Rows carried by this reconciliation stay retained in every history order.
-            let retained = retained
+            let retained = current_retained
                 && !((ordinal as u64) < produced_rows && same_fingerprint && !stored_retained);
             let bytes = encode_fact(&current)?;
+            if retained == current_retained && bytes == current_bytes {
+                continue;
+            }
+            writer.ensure_owned_rows()?;
             writer.connection.prepare_cached(
                 "UPDATE mc_rows SET retained=?1,message=?2,digest=?3,session_id=?7,model_id=?8,client=?9,provider_id=?10,
                      workspace=?11,workspace_label=?12 WHERE source_id=?4 AND generation=?5 AND ordinal=?6",
@@ -2465,6 +2609,8 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
             connection: self.connection,
             source_id: id,
             generation,
+            row_generation: generation,
+            prefix: None,
             next_ordinal: 0,
             codex_incremental: None,
             cacheable: true,
@@ -2606,6 +2752,8 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
                 connection: self.connection,
                 source_id: id,
                 generation: current_generation,
+                row_generation: current_generation,
+                prefix: None,
                 next_ordinal: old.metadata.message_count,
                 codex_incremental: old.metadata.codex_incremental.clone(),
                 cacheable: old.metadata.cacheable,
@@ -2901,7 +3049,6 @@ fn read_observed_history(
         return Err("source message cache observed history belongs to another source".to_string());
     }
     let stored = read_version(connection, expected.source_id, expected.generation)?;
-    validate_stored_generation(connection, &stored)?;
     Ok(stored)
 }
 
@@ -2940,14 +3087,88 @@ pub(crate) fn collect_unreferenced_versions_on(connection: &Connection) -> Resul
          AND NOT EXISTS(SELECT 1 FROM mc_migration_versions m WHERE m.source_id=v.source_id AND m.generation=v.generation)"
     };
     connection.execute(candidates, []).map_err(sql_error)?;
-    // Empty source shells with no surviving version are removed below.
+    // Retire metadata by primary-key ranges, not by scanning each registry for
+    // every candidate. Version-less mappings are compact metadata, not facts.
+    let mut retired = connection
+        .prepare("SELECT source_id,generation FROM mc_gc")
+        .map_err(sql_error)?;
+    let mut retired_rows = retired.query([]).map_err(sql_error)?;
+    while let Some(row) = retired_rows.next().map_err(sql_error)? {
+        let source_id: i64 = row.get(0).map_err(sql_error)?;
+        let generation: i64 = row.get(1).map_err(sql_error)?;
+        connection
+            .execute(
+                "DELETE FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+                params![source_id, generation],
+            )
+            .map_err(sql_error)?;
+        connection
+            .execute(
+                "DELETE FROM mc_versions WHERE source_id=?1 AND generation=?2",
+                params![source_id, generation],
+            )
+            .map_err(sql_error)?;
+    }
     connection.execute_batch(
-        "DELETE FROM mc_generation_storage WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_generation_storage.source_id AND g.generation=mc_generation_storage.generation);
-         DELETE FROM mc_versions WHERE EXISTS(SELECT 1 FROM mc_gc g WHERE g.source_id=mc_versions.source_id AND g.generation=mc_versions.generation);
-         DELETE FROM mc_generation_storage WHERE NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_generation_storage.source_id AND v.generation=mc_generation_storage.generation);
-         DELETE FROM mc_rows WHERE NOT EXISTS(SELECT 1 FROM mc_generation_storage s WHERE s.source_id=mc_rows.source_id AND s.row_generation=mc_rows.generation AND s.row_count>mc_rows.ordinal);
-         DELETE FROM mc_codex_turn_ids WHERE NOT EXISTS(SELECT 1 FROM mc_generation_storage s WHERE s.source_id=mc_codex_turn_ids.source_id AND s.turn_generation=mc_codex_turn_ids.generation AND s.generation>=mc_codex_turn_ids.born_generation);
-         DELETE FROM mc_sources WHERE active=0 AND NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_sources.id);
+        "DELETE FROM mc_generation_storage WHERE NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_generation_storage.source_id AND v.generation=mc_generation_storage.generation);
+         CREATE INDEX IF NOT EXISTS mc_turn_birth ON mc_codex_turn_ids(source_id,generation,born_generation);",
+    ).map_err(sql_error)?;
+    // Seek by each prefix separately. A tuple ">(source,generation)" can
+    // report SEARCH yet step through every row with the equal prefix.
+    // Include physical streams without registry entries, then delete only
+    // their unreferenced suffix. The turn birth index is built once.
+    for (first_sql, next_generation_sql, next_source_sql, bound_sql, suffix_sql, stream_sql) in [
+        (
+            "SELECT source_id,generation FROM mc_rows ORDER BY source_id,generation LIMIT 1",
+            "SELECT generation FROM mc_rows WHERE source_id=?1 AND generation>?2 ORDER BY generation LIMIT 1",
+            "SELECT source_id,generation FROM mc_rows WHERE source_id>?1 ORDER BY source_id,generation LIMIT 1",
+            "SELECT max(row_count) FROM mc_generation_storage WHERE source_id=?1 AND row_generation=?2",
+            "DELETE FROM mc_rows WHERE source_id=?1 AND generation=?2 AND ordinal>=?3",
+            "DELETE FROM mc_rows WHERE source_id=?1 AND generation=?2",
+        ),
+        (
+            "SELECT source_id,generation FROM mc_codex_turn_ids ORDER BY source_id,generation LIMIT 1",
+            "SELECT generation FROM mc_codex_turn_ids WHERE source_id=?1 AND generation>?2 ORDER BY generation LIMIT 1",
+            "SELECT source_id,generation FROM mc_codex_turn_ids WHERE source_id>?1 ORDER BY source_id,generation LIMIT 1",
+            "SELECT max(generation) FROM mc_generation_storage WHERE source_id=?1 AND turn_generation=?2",
+            "DELETE FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2 AND born_generation>?3",
+            "DELETE FROM mc_codex_turn_ids WHERE source_id=?1 AND generation=?2",
+        ),
+    ] {
+        let mut first = connection.prepare(first_sql).map_err(sql_error)?;
+        let mut next_generation = connection.prepare(next_generation_sql).map_err(sql_error)?;
+        let mut next_source = connection.prepare(next_source_sql).map_err(sql_error)?;
+        let mut surviving_bound = connection.prepare(bound_sql).map_err(sql_error)?;
+        let mut delete_suffix = connection.prepare(suffix_sql).map_err(sql_error)?;
+        let mut delete_stream = connection.prepare(stream_sql).map_err(sql_error)?;
+        let read_stream = |row: &rusqlite::Row<'_>| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        };
+        let mut stream = first.query_row([], read_stream).optional().map_err(sql_error)?;
+        while let Some((source_id, generation)) = stream {
+            let bound: Option<i64> = surviving_bound
+                .query_row(params![source_id, generation], |row| row.get(0))
+                .map_err(sql_error)?;
+            if let Some(bound) = bound {
+                delete_suffix.execute(params![source_id, generation, bound]).map_err(sql_error)?;
+            } else {
+                delete_stream.execute(params![source_id, generation]).map_err(sql_error)?;
+            }
+            let generation = next_generation
+                .query_row(params![source_id, generation], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(sql_error)?;
+            stream = match generation {
+                Some(generation) => Some((source_id, generation)),
+                None => next_source
+                    .query_row([source_id], read_stream)
+                    .optional()
+                    .map_err(sql_error)?,
+            };
+        }
+    }
+    connection.execute_batch(
+        "DELETE FROM mc_sources WHERE active=0 AND NOT EXISTS(SELECT 1 FROM mc_versions v WHERE v.source_id=mc_sources.id);
          DELETE FROM mc_gc;",
     ).map_err(sql_error)
 }
@@ -3182,8 +3403,7 @@ pub(crate) fn validate_scope_metadata_on(
         .prepare(
             "SELECT s.path,q.path,q.cache_source_id,q.cache_generation
          FROM sq_scope_sources q LEFT JOIN mc_sources s ON s.id=q.cache_source_id
-         WHERE q.scope_generation=?1 AND q.kind IN ('cache','observed','observed-legacy')
-         ORDER BY q.lane,q.source_order",
+         WHERE q.scope_generation=?1 AND q.kind IN ('cache','observed','observed-legacy')",
         )
         .map_err(sql_error)?;
     let mut rows = statement.query([scope_generation]).map_err(sql_error)?;

@@ -55,6 +55,149 @@ mod tests {
     }
 
     #[test]
+    fn recent_trace_rate_matches_independent_folds_and_lease_admission() {
+        if std::env::var_os("SYRTIS_TRACE_RATE_CHILD").is_none() {
+            let root = tempfile::TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "local_usage::tests::recent_trace_rate_matches_independent_folds_and_lease_admission", "--nocapture"])
+                .env_clear()
+                .env("SYRTIS_TRACE_RATE_CHILD", "1")
+                .env("HOME", root.path())
+                .env("TOKSCALE_CONFIG_DIR", root.path().join("config"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("opencode/storage/message/session");
+        std::fs::create_dir_all(&directory).unwrap();
+        let now = now_ms();
+        for (id, timestamp, model, input) in [
+            ("ordinary", now - 120_000, "ordinary", 41),
+            ("lower", now - 60_001, "boundary", 97),
+            ("first", now - 60_000, "shared", i64::MAX),
+            ("second", now - 30_000, "other", 17),
+            ("third", now, "shared", i64::MIN),
+            ("future", now + 1, "future", 101),
+        ] {
+            std::fs::write(
+                directory.join(format!("{id}.json")),
+                json!({
+                    "id":id, "sessionID":"session", "role":"assistant", "modelID":model,
+                    "providerID":"openai", "mode":"build", "time":{"created":timestamp},
+                    "tokens":{"input":input,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let synced = data(ffi(
+            &json!({"scopes":[
+                {"id":"live","kind":"recent","clients":["opencode"]},
+                {"id":"report","kind":"report","clients":["opencode"]}
+            ]}),
+            crate::tb_local_usage_sync,
+        ));
+        let token = synced["leaseToken"].as_str().unwrap();
+        let query = |scope: &str, kind: &str, window: i64, clock: i64| {
+            ffi(
+                &json!({"leaseToken":token,"scopeId":scope,"kind":kind,
+                "windowSecs":window,"nowMs":clock}),
+                crate::tb_local_usage_query,
+            )
+        };
+        let normalized_trace = |value: &Value| {
+            let mut rows = value.as_array().unwrap().clone();
+            rows.sort_by_key(|row| {
+                (
+                    row["client"].as_str().unwrap().to_owned(),
+                    row["agent"].as_str().unwrap().to_owned(),
+                    row["model"].as_str().unwrap().to_owned(),
+                )
+            });
+            rows
+        };
+        for (window, clock) in [
+            (60, now),
+            (60, now - 1),
+            (60, now + 1),
+            (1, now - 120_000),
+            (600, now),
+            (0, now),
+            (-1, now),
+            (i64::MAX, i64::MAX),
+            (60, i64::MIN),
+        ] {
+            let combined_response = query("live", "traceRate", window, clock);
+            let rate_response = query("live", "rate", window, clock);
+            let trace_response = query("live", "trace", window, clock);
+            assert_eq!(
+                combined_response["ok"], rate_response["ok"],
+                "{window}/{clock}"
+            );
+            assert_eq!(
+                combined_response["ok"], trace_response["ok"],
+                "{window}/{clock}"
+            );
+            if combined_response["ok"] == false {
+                assert_eq!(combined_response, rate_response, "{window}/{clock}");
+                assert_eq!(combined_response, trace_response, "{window}/{clock}");
+                continue;
+            }
+            let combined = data(combined_response);
+            let rate = data(rate_response);
+            let trace = data(trace_response);
+            assert_eq!(
+                (combined["rate"].as_f64().unwrap() as f32).to_bits(),
+                (rate.as_f64().unwrap() as f32).to_bits(),
+                "{window}/{clock}"
+            );
+            assert_eq!(
+                normalized_trace(&combined["trace"]),
+                normalized_trace(&trace),
+                "{window}/{clock}"
+            );
+            let rows = combined["trace"].as_array().unwrap();
+            assert!(rows
+                .windows(2)
+                .all(|pair| pair[0]["tokens"].as_i64().unwrap()
+                    >= pair[1]["tokens"].as_i64().unwrap()));
+        }
+        // OpenCode clamps negative source token lanes before publication.
+        let combined = data(query("live", "traceRate", 60, now));
+        assert_eq!(
+            (combined["rate"].as_f64().unwrap() as f32).to_bits(),
+            (i64::MAX as f32).to_bits()
+        );
+        assert_eq!(
+            combined["trace"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["model"] == "shared")
+                .unwrap()["tokens"],
+            i64::MAX
+        );
+        assert_eq!(query("report", "traceRate", 60, now)["ok"], false);
+        assert_eq!(query("missing", "traceRate", 60, now)["ok"], false);
+        let mismatch = ffi(
+            &json!({"leaseToken":token,"scopeId":"live","kind":"traceRate","clients":["claude"]}),
+            crate::tb_local_usage_query,
+        );
+        assert_eq!(mismatch["ok"], false);
+        assert!(release(token)["released"].as_bool().unwrap());
+        assert_eq!(query("live", "traceRate", 60, now)["ok"], false);
+    }
+
+    #[test]
     fn scheduler_pinned_queries_preserve_scopes_clocks_and_independent_owners() {
         if std::env::var_os("SYRTIS_LOCAL_SCHEDULER_CHILD").is_none() {
             let root = tempfile::TempDir::new().unwrap();

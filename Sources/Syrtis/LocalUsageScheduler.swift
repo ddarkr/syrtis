@@ -765,7 +765,12 @@ final class LocalUsageScheduler {
             if topology { lastTopology = completedAt; topologyRequired = false }
             if pricing { lastPricing = completedAt }
             forceVerified = max(forceVerified, forceBarrier)
+            // Events received during capture belong to the next batch. Give
+            // that batch one debounce window after ingestion releases rather
+            // than inheriting the already-due timestamp of the consumed batch.
+            // Later hints keep this deadline, so continuous writes cannot defer it.
             if checkedSequence == dirtySequence { dirtyAt = nil }
+            else if dirtyAt != nil { dirtyAt = completedAt }
             lastError = nil; retryAt = 0
             if observesSources {
                 let manifest = LocalSourceWatchManifest(
@@ -942,6 +947,25 @@ final class LocalUsageScheduler {
         default: return (3, kind)
         }
     }
+    private func publishQuery(
+        _ value: LocalUsageValue, for query: Query, key: String,
+        epoch: UInt64, scanRoots: String, issuingOwners: Set<Session>
+    ) {
+        refreshDemand()
+        guard epoch == rootEpoch, !stopped, demandedQueries.contains(query),
+              syncedScopes.contains(query.scope), scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
+              !issuingOwners.isDisjoint(with: demanders(of: query)) else { return }
+        guard key == identity(query) else {
+            results[query]?.requiresRefresh = true
+            return
+        }
+        results[query] = DisplaySnapshot(
+            value: value, identity: key, capturedAt: wallNow(), scanRoots: scanRoots)
+        for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
+            owner.callback?(query, .success(value))
+        }
+        resumeReadyWaiters()
+    }
 
     private func runQueries(recentOnly: Bool) async {
         guard !stopped, !diskMaintenance, let snapshot = sync else { return }
@@ -953,50 +977,138 @@ final class LocalUsageScheduler {
         // Graph paints first, then the visible hourly/agents lenses, then
         // models: lexical order would run agents before the graph it annotates.
         var ordered = Array(demandedQueries.lazy.filter { $0.isRecent == recentOnly })
-        ordered.sort {
-            if $0.kind != $1.kind { return Self.historyPriority($0.kind) < Self.historyPriority($1.kind) }
-            if $0.scope.id != $1.scope.id { return $0.scope.id < $1.scope.id }
-            if $0.year != $1.year { return ($0.year ?? "") < ($1.year ?? "") }
-            return ($0.windowSecs ?? -1) < ($1.windowSecs ?? -1)
+        if !recentOnly {
+            ordered.sort {
+                if $0.kind != $1.kind { return Self.historyPriority($0.kind) < Self.historyPriority($1.kind) }
+                if $0.scope.id != $1.scope.id { return $0.scope.id < $1.scope.id }
+                if $0.year != $1.year { return ($0.year ?? "") < ($1.year ?? "") }
+                return ($0.windowSecs ?? -1) < ($1.windowSecs ?? -1)
+            }
+        }
+        // Freeze every question's clock and owners before the first await.
+        // A later query must not adopt a replacement owner or a newer clock
+        // while still reading the old batch's snapshot.
+        var issued: [Query: (key: String, owners: Set<Session>)] = [:]
+        for query in ordered {
+            let key = identity(query)
+            if cachedIdentity(query) != key {
+                issued[query] = (key, demanders(of: query))
+            }
+        }
+        if recentOnly {
+            var pairedTraces: Set<Query> = [], pairedRates: Set<Query> = []
+            for trace in issued.keys where trace.kind == "trace" {
+                let rate = Query(kind: "rate", year: trace.year, clients: trace.clients,
+                                 windowSecs: trace.windowSecs ?? 600)
+                if issued[rate] != nil {
+                    pairedTraces.insert(trace); pairedRates.insert(rate)
+                }
+            }
+            // Independent scalars retain first service even if an unrelated
+            // trace fails. Exact pairs start at trace and publish both values.
+            func priority(_ query: Query) -> Int {
+                if pairedTraces.contains(query) { return 1 }
+                if pairedRates.contains(query) { return 2 }
+                return query.kind == "rate" ? 0 : 3
+            }
+            ordered.sort {
+                if priority($0) != priority($1) { return priority($0) < priority($1) }
+                if $0.scope.id != $1.scope.id { return $0.scope.id < $1.scope.id }
+                if $0.year != $1.year { return ($0.year ?? "") < ($1.year ?? "") }
+                return ($0.windowSecs ?? -1) < ($1.windowSecs ?? -1)
+            }
         }
         for query in ordered {
+            refreshDemand()
             guard epoch == rootEpoch, !stopped, sync?.leaseToken == snapshot.leaseToken else { return }
-            guard demandedQueries.contains(query), syncedScopes.contains(query.scope) else { continue }
-            let issueDemanderIDs = demanders(of: query)
-            guard !issueDemanderIDs.isEmpty else { continue }
-            // Request-time bucket: a stale completion is dropped and re-issued
-            // under the current bucket instead of publishing old data. Recent
-            // buckets use this query's demand cadence, history uses day/timezone: the lane
-            // split only unblocks recent, it never weakens admission.
-            let key = identity(query)
+            guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
+                  let issue = issued[query], issue.key == identity(query),
+                  !issue.owners.isDisjoint(with: demanders(of: query)) else { continue }
+            let issueDemanderIDs = issue.owners
+            let key = issue.key
             if cachedIdentity(query) == key { continue }
+            let rateQuery = Query(kind: "rate", year: query.year, clients: query.clients,
+                                  windowSecs: query.windowSecs ?? 600)
+            let pairedRate: Bool
+            if query.kind == "trace", demandedQueries.contains(rateQuery), let rateIssue = issued[rateQuery] {
+                pairedRate = rateIssue.key == identity(rateQuery) && cachedIdentity(rateQuery) != rateIssue.key
+                    && !rateIssue.owners.isDisjoint(with: demanders(of: rateQuery))
+            } else {
+                pairedRate = false
+            }
             let token = snapshot.leaseToken
+            var fallbackFailed = false
+            defer {
+                if fallbackFailed, sync?.leaseToken == token { syncedScopes.removeAll() }
+            }
             pinLease(token)
             let scanRoots = ClaudeExtraRoots.appliedPayloadJSON
             do {
                 defer { unpinLease(token) }
                 queryCount += 1
-                let value = try await source.localUsageQuery(LocalUsageQueryRequest(
-                    leaseToken: token, scopeId: query.scope.id, kind: query.kind,
+                let nowMs = Int64(wallNow().timeIntervalSince1970 * 1000)
+                let request = LocalUsageQueryRequest(
+                    leaseToken: token, scopeId: query.scope.id,
+                    kind: pairedRate ? "traceRate" : query.kind,
                     year: query.year, clients: query.clients, windowSecs: query.windowSecs,
-                    nowMs: Int64(wallNow().timeIntervalSince1970 * 1000)))
+                    nowMs: nowMs)
+                let value: LocalUsageValue
+                do {
+                    value = try await source.localUsageQuery(request)
+                } catch {
+                    // A trace failure must not remove the independent scalar
+                    // path. Run it before ordinary error handling retires scope
+                    // coverage, and admit it only for its original clock/owner.
+                    if pairedRate, let rateIssue = issued[rateQuery],
+                       epoch == rootEpoch, !stopped, sync?.leaseToken == token,
+                       scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
+                       rateIssue.key == identity(rateQuery),
+                       !rateIssue.owners.isDisjoint(with: demanders(of: rateQuery)) {
+                        queryCount += 1
+                        do {
+                            let fallback = try await source.localUsageQuery(LocalUsageQueryRequest(
+                                leaseToken: token, scopeId: rateQuery.scope.id, kind: "rate",
+                                year: rateQuery.year, clients: rateQuery.clients,
+                                windowSecs: rateQuery.windowSecs, nowMs: nowMs))
+                            publishQuery(fallback, for: rateQuery, key: rateIssue.key,
+                                         epoch: epoch, scanRoots: scanRoots, issuingOwners: rateIssue.owners)
+                        } catch {
+                            refreshDemand()
+                            if epoch == rootEpoch, !stopped, sync?.leaseToken == token,
+                               scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
+                               syncedScopes.contains(rateQuery.scope), !capturingScopes.contains(rateQuery.scope),
+                               rateIssue.key == identity(rateQuery),
+                               !rateIssue.owners.isDisjoint(with: demanders(of: rateQuery)) {
+                                fallbackFailed = true
+                                lastError = String(describing: error); retryAt = monotonicNow() + 10
+                                previousLeaseUsable = false
+                                for (session, owner) in owners
+                                where contains(session) && owner.queries.contains(rateQuery) {
+                                    owner.callback?(rateQuery, .failure(error))
+                                }
+                                for entry in waiting.values.filter({ $0.query == rateQuery }) {
+                                    waiting.removeValue(forKey: entry.id)?.continuation.resume(throwing: error)
+                                }
+                            }
+                        }
+                    }
+                    throw error
+                }
+                if case let .traceRate(trace, rate) = value, pairedRate,
+                   let rateIssue = issued[rateQuery] {
+                    publishQuery(.trace(trace), for: query, key: key, epoch: epoch,
+                                 scanRoots: scanRoots, issuingOwners: issueDemanderIDs)
+                    publishQuery(.rate(rate), for: rateQuery, key: rateIssue.key, epoch: epoch,
+                                 scanRoots: scanRoots, issuingOwners: rateIssue.owners)
+                } else {
+                    publishQuery(value, for: query, key: key, epoch: epoch,
+                                 scanRoots: scanRoots, issuingOwners: issueDemanderIDs)
+                }
+            } catch {
+                refreshDemand()
                 guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
                 guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
                       scanRoots == ClaudeExtraRoots.appliedPayloadJSON,
-                      !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
-                if key != identity(query) {
-                    results[query]?.requiresRefresh = true
-                    continue
-                }
-                results[query] = DisplaySnapshot(
-                    value: value, identity: key, capturedAt: wallNow(), scanRoots: scanRoots)
-                for (session, owner) in owners where contains(session) && owner.queries.contains(query) {
-                    owner.callback?(query, .success(value))
-                }
-                resumeReadyWaiters()
-            } catch {
-                guard epoch == rootEpoch, !stopped, sync?.leaseToken == token else { return }
-                guard demandedQueries.contains(query), syncedScopes.contains(query.scope),
                       !issueDemanderIDs.isDisjoint(with: demanders(of: query)) else { continue }
                 guard key == identity(query) else { continue }
                 // Native ingestion can evict this generation before its new

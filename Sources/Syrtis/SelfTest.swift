@@ -9432,6 +9432,9 @@ enum SelfTest {
         if let parrot = parrotArt {
             let raster = StatusItemAnimationSurface.rasterizedFrameMetricsForTesting(parrot, scale: 2)
             expect(
+                StatusItemAnimationSurface.frameLifecycleForTesting(parrot),
+                "animation frames preserve source metadata, reuse unchanged tint/scale, retint, rescale and release contents")
+            expect(
                 raster?.pixelSize == CGSize(width: 36, height: 36),
                 "the animation raster is still a square 18pt box at 2x, unaffected by the logical size")
         }
@@ -11934,6 +11937,11 @@ enum SelfTest {
             lp3Envelope(year: "2046", savedAt: Date(timeIntervalSince1970: 6_000))
         let lp3WEnvelopeAfterFail =
             lp3Envelope(year: "2047", savedAt: Date(timeIntervalSince1970: 7_000))
+        let renewed = lp3Envelope(
+            year: "2044",
+            savedAt: lp3WEnvelopeC.savedAt.addingTimeInterval(SnapshotWriter.renewalInterval))
+        let afterRenewal = lp3Envelope(
+            year: "2044", savedAt: renewed.savedAt.addingTimeInterval(1))
         let lp3WriterChecks = awaitValue { () async -> [String: Bool] in
             var results: [String: Bool] = [:]
             func bytesNow() -> Data? { SnapshotStore.readBytes(in: lp3WriterDir) }
@@ -11982,6 +11990,13 @@ enum SelfTest {
             await SnapshotWriter.shared.submit(
                 sequence: 4, envelope: lp3WEnvelopeAfterFail, directory: lp3WriterDir)
             results["staleAfterFailedWriteRejected"] = bytesNow() == afterC
+            await SnapshotWriter.shared.submit(
+                sequence: 6, envelope: lp3WEnvelopeFailAttempt, directory: lp3WriterDir)
+            let retried = bytesNow().flatMap {
+                try? JSONDecoder().decode(SnapshotEnvelope.self, from: $0)
+            }
+            results["failedContentRetried"] = retried?.selectedYear == "2046"
+                && retried?.savedAt == lp3WEnvelopeFailAttempt.savedAt
             do {
                 try await SnapshotWriter.shared.discard(sequence: 6, directory: lp3WriterDir)
                 results["resetRemovedSnapshot"] = bytesNow() == nil
@@ -11991,6 +12006,19 @@ enum SelfTest {
                 await SnapshotWriter.shared.submit(
                     sequence: 7, envelope: lp3WEnvelopeC, directory: lp3WriterDir)
                 results["postResetCaptureAccepted"] = bytesNow() != nil
+                await SnapshotWriter.shared.submit(
+                    sequence: 8, envelope: renewed, directory: lp3WriterDir)
+                let renewedBytes = bytesNow()
+                let restored = renewedBytes.flatMap {
+                    try? JSONDecoder().decode(SnapshotEnvelope.self, from: $0)
+                }
+                results["weeklyRenewal"] = restored?.savedAt == renewed.savedAt
+                    && restored?.selectedYear == "2044"
+                await SnapshotWriter.shared.submit(
+                    sequence: 9,
+                    envelope: afterRenewal,
+                    directory: lp3WriterDir)
+                results["renewalDedup"] = bytesNow() == renewedBytes
             } catch {
                 results["resetRemovedSnapshot"] = false
             }
@@ -12027,6 +12055,13 @@ enum SelfTest {
                 && lp3WriterChecks["resetRejectedDelayedCapture"] == true
                 && lp3WriterChecks["postResetCaptureAccepted"] == true,
             "Usage reset removes the disk snapshot, rejects delayed old captures, and accepts new usage")
+        expect(
+            lp3WriterChecks["weeklyRenewal"] == true
+                && lp3WriterChecks["renewalDedup"] == true,
+            "LP3 writer renews unchanged content at the weekly boundary and deduplicates against the renewed stamp")
+        expect(
+            lp3WriterChecks["failedContentRetried"] == true,
+            "LP3 writer retries failed content at a newer sequence with its actual capture timestamp")
 
         // --- Isolation: the production directory must never be RESOLVED off ---
         // --- a shipping identity. Every `swift run` invocation — which is    ---

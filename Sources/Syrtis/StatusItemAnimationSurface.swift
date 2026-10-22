@@ -69,6 +69,29 @@ final class StatusItemAnimationSurface {
             alphaBounds
         )
     }
+    static func frameLifecycleForTesting(_ source: NSImage) -> Bool {
+        let layer = StatusItemRunnerLayer()
+        defer { layer.stop() }
+        let originalTemplate = source.isTemplate
+        let originalSize = source.size
+        layer.setColor(NSColor.white.cgColor)
+        layer.setFrames([source], speed: 2, scale: 2)
+        guard let first = layer.contents.map({ $0 as! CGImage }),
+              first.width == 36, first.height == 36 else { return false }
+        layer.setColor(NSColor.white.cgColor)
+        layer.update(frame: CGRect(x: 0, y: 0, width: 18, height: 18), contentsScale: 2)
+        guard let unchanged = layer.contents.map({ $0 as! CGImage }),
+              first === unchanged else { return false }
+        layer.setColor(NSColor.black.cgColor)
+        guard let retinted = layer.contents.map({ $0 as! CGImage }),
+              retinted !== first, retinted.width == 36 else { return false }
+        layer.update(frame: CGRect(x: 0, y: 0, width: 18, height: 18), contentsScale: 1)
+        guard let rescaled = layer.contents.map({ $0 as! CGImage }),
+              rescaled.width == 18, rescaled.height == 18 else { return false }
+        layer.stop()
+        return layer.contents == nil
+            && source.isTemplate == originalTemplate && source.size == originalSize
+    }
 #endif
 
     init(button: NSStatusBarButton) {
@@ -104,14 +127,10 @@ final class StatusItemAnimationSurface {
         button.image = staticImage
         button.layoutSubtreeIfNeeded()
 
-        let animationFrames = frames.map { frame -> NSImage in
-            let image = frame.copy() as? NSImage ?? frame
-            image.size = frame.size
-            image.isTemplate = false
-            return image
-        }
-        runnerLayer.setFrames(animationFrames, speed: speed)
         updateAppearance(button.effectiveAppearance)
+        let scale = button.window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor ?? 2
+        runnerLayer.setFrames(frames, speed: speed, scale: scale)
         isAnimated = true
         scheduleLayout()
     }
@@ -390,11 +409,11 @@ private final class StatusItemRunnerLayer: CALayer {
         CATransaction.commit()
     }
 
-    func setFrames(_ images: [NSImage], speed: Float) {
+    func setFrames(_ images: [NSImage], speed: Float, scale: CGFloat) {
         guard !images.isEmpty else { return }
         sourceImages = images
         frameIndex = 0
-        rebuildFrames(scale: rasterScale)
+        rebuildFrames(scale: scale)
         setSpeed(speed)
     }
 
@@ -422,6 +441,7 @@ private final class StatusItemRunnerLayer: CALayer {
     }
 
     func setColor(_ color: CGColor) {
+        guard tintColor != color else { return }
         tintColor = color
         applyTint()
     }

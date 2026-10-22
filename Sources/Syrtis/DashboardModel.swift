@@ -459,7 +459,7 @@ private struct DashboardSnapshot {
                     self.agents = report; self.agentsClients = Set(query.clients ?? [])
                     self.agentsYear = Self.identityYear(requestedYear)
                     if self.modelSliceIsCommitted { self.cacheSnapshot() }
-                case .trace(let buckets):
+                case .trace(let buckets), .traceRate(let buckets, _):
                     if query.windowSecs == 600 {
                         self.trace = buckets
                         self.refreshSnapshotLiveData()

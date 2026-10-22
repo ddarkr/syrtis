@@ -20,6 +20,8 @@ enum LiveRate {
         switch value {
         case let .rate(rate): return hidden.isEmpty ? rate : nil
         case let .trace(rows): return TraceBucket.totalRate(rows, hidden: hidden)
+        case let .traceRate(rows, rate):
+            return hidden.isEmpty ? rate : TraceBucket.totalRate(rows, hidden: hidden)
         default: return nil
         }
     }
