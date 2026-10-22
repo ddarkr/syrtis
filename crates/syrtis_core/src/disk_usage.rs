@@ -248,14 +248,11 @@ fn disk_usage_paths(
         let db = crate::usage_store::open_database(root)?;
         reset(&db, root)?;
     } else if action == DiskUsageAction::Optimize && present {
+        // Cleanup independently admits the existing canonical read-only before
+        // any writable opener can migrate it or authorize deleting history.
+        crate::usage_migration::cleanup_owned_staging(root)?;
         let db = crate::usage_store::open_database(root)?;
-        db.execute_batch("PRAGMA optimize; VACUUM;")
-            .map_err(error)?;
-        let _: (i64, i64, i64) = db
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .map_err(error)?;
+        compact(&db, root, fs2::available_space(root).map_err(error)?)?;
     }
     let mut report = DiskUsageReport {
         usage_directory: root.to_string_lossy().into_owned(),
@@ -302,6 +299,44 @@ fn managed(name: &str, base: &str) -> bool {
         || ["-wal", "-shm", "-journal"]
             .iter()
             .any(|s| name.strip_prefix(base) == Some(*s))
+}
+
+fn checkpoint(db: &Connection) -> Result<(), String> {
+    let (busy, log, done): (i64, i64, i64) = db
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(error)?;
+    if busy != 0 || log != done {
+        return Err(format!("Disk usage: checkpoint incomplete (busy={busy}, log={log}, checkpointed={done}); maintenance not completed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn compact(db: &Connection, root: &Path, available: u64) -> Result<(), String> {
+    let pages: u64 = db
+        .pragma_query_value(None, "page_count", |r| r.get(0))
+        .map_err(error)?;
+    let page_size: u64 = db
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .map_err(error)?;
+    // VACUUM's temporary copy and rewritten WAL may coexist with a fresh
+    // recovery snapshot. Existing recovery remains intact until publication.
+    let required = pages
+        .saturating_mul(page_size)
+        .saturating_mul(3)
+        .saturating_add(16 * 1024 * 1024);
+    if available < required {
+        return Err(format!("Disk usage: insufficient free space for compaction (need {required}, available {available}); maintenance not completed"));
+    }
+    checkpoint(db)?;
+    crate::store_query::compact_decision_metadata(db)
+        .map_err(|e| format!("{e}; compaction maintenance not completed"))?;
+    db.execute_batch("PRAGMA optimize; VACUUM;")
+        .map_err(|e| format!("{}; compaction maintenance not completed", error(e)))?;
+    checkpoint(db).map_err(|e| format!("{e}; database compacted but recovery not refreshed"))?;
+    crate::usage_store::refresh_retained_recovery(db, root)
+        .map_err(|e| format!("Disk usage: database compacted but recovery refresh failed: {e}"))
 }
 fn reset(db: &Connection, root: &Path) -> Result<(), String> {
     // Persist a fail-closed recovery barrier before committing deletion. If a
@@ -364,6 +399,75 @@ fn reset(db: &Connection, root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn compaction_preserves_epoch_and_facts_and_refreshes_smaller_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("usage");
+        let db = crate::usage_store::open_database(&root).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sq_meta(key TEXT PRIMARY KEY,value);
+            INSERT INTO sq_meta VALUES('store_epoch',x'010203');
+            CREATE TABLE retained_fact(value BLOB);
+            INSERT INTO retained_fact VALUES(x'1234');
+            CREATE TABLE disposable_padding(value BLOB);
+            INSERT INTO disposable_padding VALUES(zeroblob(4194304));",
+        )
+        .unwrap();
+        checkpoint(&db).unwrap();
+        crate::usage_store::refresh_retained_recovery(&db, &root).unwrap();
+        let old_recovery = fs::metadata(root.join(RECOVERY)).unwrap().len();
+        db.execute_batch("DROP TABLE disposable_padding").unwrap();
+        let before = fs::metadata(root.join(DATABASE)).unwrap().len();
+        let recovery_bytes = fs::read(root.join(RECOVERY)).unwrap();
+        assert!(compact(&db, &root, 0)
+            .unwrap_err()
+            .contains("insufficient free space"));
+        assert_eq!(fs::read(root.join(RECOVERY)).unwrap(), recovery_bytes);
+        compact(&db, &root, u64::MAX).unwrap();
+        assert!(fs::metadata(root.join(DATABASE)).unwrap().len() < before);
+        assert!(fs::metadata(root.join(RECOVERY)).unwrap().len() < old_recovery);
+        let recovery = Connection::open(root.join(RECOVERY)).unwrap();
+        for connection in [&db, &recovery] {
+            assert_eq!(
+                connection
+                    .query_row("SELECT value FROM retained_fact", [], |r| r
+                        .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                [0x12, 0x34]
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT value FROM sq_meta WHERE key='store_epoch'",
+                        [],
+                        |r| r.get::<_, Vec<u8>>(0)
+                    )
+                    .unwrap(),
+                [1, 2, 3]
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_reports_busy_reader_without_unlinking_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("usage");
+        let db = crate::usage_store::open_database(&root).unwrap();
+        db.execute_batch("CREATE TABLE fact(value); INSERT INTO fact VALUES(1)")
+            .unwrap();
+        checkpoint(&db).unwrap();
+        let reader = Connection::open(root.join(DATABASE)).unwrap();
+        reader.execute_batch("BEGIN; SELECT * FROM fact;").unwrap();
+        db.execute_batch("INSERT INTO fact VALUES(2)").unwrap();
+        db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert!(checkpoint(&db)
+            .unwrap_err()
+            .contains("checkpoint incomplete"));
+        assert!(root.join(format!("{DATABASE}-wal")).exists());
+        reader.execute_batch("ROLLBACK").unwrap();
+        checkpoint(&db).unwrap();
+    }
+
+    #[test]
     fn allocated_bytes_and_symlink_boundary() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a");
@@ -381,6 +485,30 @@ mod tests {
         }
         assert!(!root_exists(&tmp.path().join("absent")).unwrap());
         assert!(!tmp.path().join("absent").exists());
+    }
+
+    #[test]
+    fn inspect_and_optimize_preserve_stage_when_canonical_is_unavailable() {
+        for corrupt in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("usage");
+            let cache = tmp.path().join("cache");
+            drop(crate::usage_store::open_database(&root).unwrap());
+            let canonical = root.join(DATABASE);
+            let stage = root.join("usage_migration_tmp_123-456.sqlite3");
+            fs::rename(&canonical, &stage).unwrap();
+            let original = fs::read(&stage).unwrap();
+            if corrupt {
+                fs::write(&canonical, b"corrupt").unwrap();
+            }
+            let before = fs::read(&canonical).ok();
+            for action in [DiskUsageAction::Inspect, DiskUsageAction::Optimize] {
+                let result = disk_usage_paths(&root, &cache, action);
+                assert_eq!(result.is_err(), corrupt);
+                assert_eq!(fs::read(&stage).unwrap(), original);
+                assert_eq!(fs::read(&canonical).ok(), before);
+            }
+        }
     }
 
     #[test]

@@ -11,6 +11,76 @@ use std::path::{Path, PathBuf};
 /// version and never borrow LocalClients ownership.
 const REPORT_INDEX_VERSION: i64 = 2;
 
+/// NULL inherits immutable canonical metadata. Explicit absent workspaces remain
+/// encoded Option::None blobs; legacy SQL NULL was never decodable metadata.
+pub(crate) fn compact_decision_metadata(db: &Connection) -> Result<(), String> {
+    let present: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sq_decisions')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !present {
+        return Ok(());
+    }
+    let referenced: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_decisions WHERE cache_source_id IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !referenced {
+        return Ok(());
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == 1 {
+        let invalid: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_decisions WHERE cache_source_id IS NOT NULL AND (workspace IS NULL OR workspace_label IS NULL OR model IS NULL))",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if invalid {
+            return Err("legacy usage decision metadata is NULL; previous values retained".into());
+        }
+    }
+    let mapped: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mc_generation_storage')",
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let storage = if mapped {
+        "mc_generation_storage"
+    } else {
+        "(SELECT source_id,generation,generation AS row_generation,9223372036854775807 AS row_count FROM mc_versions)"
+    };
+    let canonical = format!(
+        "{storage} st JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation"
+    );
+    let missing: bool = db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM sq_decisions d WHERE d.cache_source_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM {canonical} WHERE st.source_id=d.cache_source_id AND st.generation=d.cache_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count))"),
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if missing {
+        return Err(
+            "usage decision canonical metadata unavailable; previous values retained".into(),
+        );
+    }
+    db.execute(
+        &format!("UPDATE sq_decisions AS d SET
+            workspace=NULLIF(d.workspace,r.workspace),
+            workspace_label=NULLIF(d.workspace_label,r.workspace_label),
+            model=NULLIF(d.model,r.model_id)
+            FROM {canonical}
+            WHERE st.source_id=d.cache_source_id AND st.generation=d.cache_generation
+              AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count
+              AND (d.workspace=r.workspace OR d.workspace_label=r.workspace_label OR d.model=r.model_id)"),
+        [],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectionMode {
     Report,
@@ -132,11 +202,11 @@ impl QueryState {
                 rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
             transaction.execute_batch("CREATE TABLE IF NOT EXISTS sq_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
-            INSERT OR IGNORE INTO sq_meta VALUES('schema_version',2);
+            INSERT OR IGNORE INTO sq_meta VALUES('schema_version',3);
             INSERT OR IGNORE INTO sq_meta VALUES('store_epoch',randomblob(16));
             CREATE TABLE IF NOT EXISTS sq_scopes(id INTEGER PRIMARY KEY,scope_key BLOB NOT NULL UNIQUE,current_generation INTEGER);
             CREATE TABLE IF NOT EXISTS sq_scope_generations(id INTEGER PRIMARY KEY,scope_id INTEGER NOT NULL,complete INTEGER NOT NULL DEFAULT 0,selection INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,generation BLOB,tag INTEGER NOT NULL,headless INTEGER NOT NULL,workspace BLOB,workspace_label BLOB,phase INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,kind,lane,source_order)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,generation INTEGER,tag INTEGER NOT NULL,headless INTEGER NOT NULL,workspace BLOB,workspace_label BLOB,phase INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,kind,lane,source_order)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS sq_scope_cache_versions ON sq_scope_sources(cache_source_id,cache_generation);
             CREATE INDEX IF NOT EXISTS sq_scope_opencode_versions ON sq_scope_sources(kind,path,generation);").map_err(|error|error.to_string())?;
             transaction.commit().map_err(|error| error.to_string())?;
@@ -148,7 +218,7 @@ impl QueryState {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if version != 2 {
+        if version != 3 {
             return Err("usage scope schema is unsupported; previous generations retained".into());
         }
         db.prepare("SELECT g.id,g.scope_id,g.complete,g.selection,s.id,s.scope_key,s.current_generation,x.scope_generation,x.kind,x.lane,x.source_order,x.path,x.cache_source_id,x.cache_generation,x.generation,x.tag,x.headless,x.workspace,x.workspace_label,x.phase FROM sq_scope_generations g LEFT JOIN sq_scopes s ON s.id=g.scope_id LEFT JOIN sq_scope_sources x ON x.scope_generation=g.id LIMIT 0").map_err(|error|error.to_string())?;
@@ -176,11 +246,21 @@ impl QueryState {
                 rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| e.to_string())?;
             transaction.execute_batch("CREATE TABLE IF NOT EXISTS sq_indexes(scope_generation INTEGER PRIMARY KEY,version INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS sq_decisions(scope_generation INTEGER NOT NULL,rank INTEGER NOT NULL,lane TEXT NOT NULL,timestamp INTEGER NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER,oc_source BLOB,oc_ordinal INTEGER,retained INTEGER NOT NULL DEFAULT 0,global_storage INTEGER NOT NULL DEFAULT 0,workspace BLOB,workspace_label BLOB,model TEXT,headless INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,rank)) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS sq_decisions(scope_generation INTEGER NOT NULL,rank INTEGER NOT NULL,lane TEXT NOT NULL,timestamp INTEGER NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,cache_format INTEGER,oc_source INTEGER,oc_ordinal INTEGER,retained INTEGER NOT NULL DEFAULT 0,global_storage INTEGER NOT NULL DEFAULT 0,workspace BLOB,workspace_label BLOB,model TEXT,headless INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,rank)) WITHOUT ROWID;
                 CREATE INDEX IF NOT EXISTS sq_decision_time ON sq_decisions(scope_generation,timestamp,rank);").map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         } else if indexed_tables != 2 {
             return Err("usage decision index is incomplete; previous generations retained".into());
+        }
+        let integer_references: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sq_scope_sources') WHERE name='generation' AND upper(type)='INTEGER')
+             AND EXISTS(SELECT 1 FROM pragma_table_info('sq_decisions') WHERE name='oc_source' AND upper(type)='INTEGER')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !integer_references {
+            return Err(
+                "usage scope reference layout is unsupported; previous generations retained".into(),
+            );
         }
         let needs_format: bool = db.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('sq_decisions') WHERE name='cache_format')",
@@ -566,7 +646,7 @@ impl QueryState {
         path: &Path,
         sqlite: bool,
         index: usize,
-        key: &[u8],
+        key: i64,
     ) -> Result<(), String> {
         let generation = self.admit_staging(db)?;
         let path = bincode::options()
@@ -855,7 +935,12 @@ impl QueryState {
         self.select_lane("codex", snapshot.mode, false)?;
         self.db
             .execute(
-                "INSERT OR IGNORE INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless) SELECT ?1,ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,r.workspace,r.workspace_label,r.model,r.headless FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
+                "INSERT OR IGNORE INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless)
+                 SELECT ?1,ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,NULLIF(r.workspace,c.workspace),NULLIF(r.workspace_label,c.workspace_label),NULLIF(r.model,c.model_id),r.headless
+                 FROM sq_rows r JOIN sq_selected s ON s.id=r.id
+                 LEFT JOIN mc_logical_storage st ON st.source_id=r.cache_source_id AND st.generation=r.cache_generation
+                 LEFT JOIN mc_rows c ON c.source_id=st.source_id AND c.generation=st.row_generation AND c.ordinal=r.cache_ordinal AND c.ordinal<st.row_count
+                 WHERE r.lane IN ('claude','codex') AND r.cache_source_id IS NOT NULL ORDER BY s.rank",
                 [snapshot.generation],
             )
             .map_err(|error| error.to_string())?;
@@ -988,8 +1073,11 @@ impl QueryState {
                 )
                 .map_err(|e| e.to_string())?;
             self.db.execute("INSERT INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,retained,global_storage,workspace,workspace_label,model,headless)
-                SELECT ?1,?3+ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,r.workspace,r.workspace_label,r.model,r.headless
-                FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane=?2 ORDER BY s.rank", params![snapshot.generation,lane,base]).map_err(|e| e.to_string())?;
+                SELECT ?1,?3+ROW_NUMBER() OVER(ORDER BY s.rank),r.lane,r.timestamp,r.cache_source_id,r.cache_generation,r.cache_ordinal,r.cache_format,r.retained,r.global_storage,NULLIF(r.workspace,c.workspace),NULLIF(r.workspace_label,c.workspace_label),NULLIF(r.model,c.model_id),r.headless
+                FROM sq_rows r JOIN sq_selected s ON s.id=r.id
+                LEFT JOIN mc_logical_storage st ON st.source_id=r.cache_source_id AND st.generation=r.cache_generation
+                LEFT JOIN mc_rows c ON c.source_id=st.source_id AND c.generation=st.row_generation AND c.ordinal=r.cache_ordinal AND c.ordinal<st.row_count
+                WHERE r.lane=?2 ORDER BY s.rank", params![snapshot.generation,lane,base]).map_err(|e| e.to_string())?;
             Ok(())
         })?;
         self.db
@@ -1076,7 +1164,7 @@ impl QueryState {
         // payload before applying this range. Resolve its single-table storage
         // projection first, then point-read only the selected immutable facts.
         let sql = format!("INSERT INTO sq_rows(id,lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_format)
-            SELECT d.rank,d.lane,0,0,d.retained,d.global_storage,r.session_id,d.workspace,r.dedup_key,d.model,d.workspace_label,d.timestamp,r.message,r.digest,r.client,r.provider_id,d.headless,d.cache_format
+            SELECT d.rank,d.lane,0,0,d.retained,d.global_storage,r.session_id,COALESCE(d.workspace,r.workspace),r.dedup_key,COALESCE(d.model,r.model_id),COALESCE(d.workspace_label,r.workspace_label),d.timestamp,r.message,r.digest,r.client,r.provider_id,d.headless,d.cache_format
             FROM sq_decisions d INDEXED BY sq_decision_time
             LEFT JOIN mc_logical_storage st ON st.source_id=d.cache_source_id AND st.generation=d.cache_generation
             LEFT JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count

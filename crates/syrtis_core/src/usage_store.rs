@@ -17,9 +17,15 @@ use std::time::Duration;
 const DATABASE: &str = "source-message-cache.sqlite3";
 const RECOVERY: &str = "source-message-cache.recovery.sqlite3";
 const APPLICATION_ID: i64 = 0x54534b55;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BATCH_ROWS: usize = 1024;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+#[path = "usage_store_schema.rs"]
+mod usage_store_schema;
+#[cfg(test)]
+#[path = "usage_store_schema_tests.rs"]
+mod usage_store_schema_tests;
 
 fn sql<T>(result: rusqlite::Result<T>) -> Result<T, String> {
     result.map_err(|error| match error {
@@ -221,7 +227,7 @@ fn sqlite_status(code: i32) -> Result<(), String> {
     }
 }
 
-fn admit_open_database(
+pub(crate) fn admit_open_database(
     connection: &Connection,
     path: &Path,
     expected: Option<&fs::Metadata>,
@@ -329,33 +335,12 @@ pub(crate) fn configure_connection(conn: &Connection) -> Result<(), String> {
 }
 
 pub(crate) fn admit_schema(conn: &Connection) -> Result<(), String> {
-    let application: i64 = sql(conn.pragma_query_value(None, "application_id", |r| r.get(0)))?;
-    let version: i64 = sql(conn.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    if application == APPLICATION_ID && version == SCHEMA_VERSION {
-        return Ok(());
-    }
-    let transaction = sql(rusqlite::Transaction::new_unchecked(
-        conn,
-        TransactionBehavior::Immediate,
-    ))?;
-    // Another opener may have initialized the database after our warm probe.
-    let application: i64 =
-        sql(transaction.pragma_query_value(None, "application_id", |r| r.get(0)))?;
-    let version: i64 = sql(transaction.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    if application == APPLICATION_ID && version == SCHEMA_VERSION {
-        return sql(transaction.commit());
-    }
-    let count: i64 = sql(transaction.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |r| r.get(0),
-    ))?;
-    if application != 0 || version != 0 || count != 0 {
-        return Err("usage store schema is unsupported; existing data preserved".into());
-    }
-    sql(transaction.pragma_update(None, "application_id", APPLICATION_ID))?;
-    sql(transaction.pragma_update(None, "user_version", SCHEMA_VERSION))?;
-    sql(transaction.commit())
+    usage_store_schema::admit(conn)
+}
+
+/// Structural maintenance admission only; the caller owns the read snapshot.
+pub(crate) fn validate_managed_schema_readonly(conn: &Connection) -> Result<(), String> {
+    usage_store_schema::validate_readonly(conn)
 }
 
 fn lock_file(path: &Path) -> Result<fs::File, String> {
@@ -444,7 +429,7 @@ pub(crate) fn open_existing_database(root: &Path) -> Result<Connection, String> 
     configure_connection(&conn)?;
     let application: i64 = sql(conn.pragma_query_value(None, "application_id", |r| r.get(0)))?;
     let version: i64 = sql(conn.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    if application != APPLICATION_ID || version != SCHEMA_VERSION {
+    if application != APPLICATION_ID || !matches!(version, 1 | SCHEMA_VERSION) {
         return Err("usage store schema is unsupported; existing data preserved".into());
     }
     Ok(conn)
@@ -601,7 +586,7 @@ pub(crate) fn recover_database(cache_root: &Path) -> Result<(), String> {
     }
     let app: i64 = sql(source.pragma_query_value(None, "application_id", |r| r.get(0)))?;
     let version: i64 = sql(source.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    if app != APPLICATION_ID || version != SCHEMA_VERSION {
+    if app != APPLICATION_ID || !matches!(version, 1 | SCHEMA_VERSION) {
         return Err("usage store recovery schema is unsupported".into());
     }
     // Restore off to the side. No failed backup may leave an empty canonical
@@ -639,6 +624,11 @@ pub(crate) fn recover_database(cache_root: &Path) -> Result<(), String> {
         let backup = sql(rusqlite::backup::Backup::new(&source, &mut destination))?;
         finish_backup(&backup)?;
         drop(backup);
+        admit_schema(&destination)?;
+        let integrity: String = sql(destination.query_row("PRAGMA quick_check", [], |r| r.get(0)))?;
+        if integrity != "ok" {
+            return Err("usage store restored snapshot is invalid".into());
+        }
         sync_database(&destination)?;
         admit_open_database(&destination, &staging, admitted.as_ref())?;
         drop(destination);
@@ -669,35 +659,12 @@ fn finish_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<(), String
 }
 
 fn schema(conn: &Connection) -> Result<(), String> {
-    let exists: bool = sql(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='oc_meta')",
-        [],
-        |r| r.get(0),
-    ))?;
-    if !exists {
-        sql(conn.execute_batch("BEGIN IMMEDIATE;
-        CREATE TABLE IF NOT EXISTS oc_meta(version INTEGER NOT NULL);
-        INSERT INTO oc_meta SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM oc_meta);
-        CREATE TABLE IF NOT EXISTS oc_sources(path BLOB PRIMARY KEY, fingerprint BLOB NOT NULL, kind INTEGER NOT NULL, generation BLOB NOT NULL);
-        CREATE TABLE IF NOT EXISTS oc_generations(generation BLOB PRIMARY KEY, path BLOB NOT NULL, fingerprint BLOB NOT NULL, kind INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS oc_rows(source BLOB NOT NULL, ordinal INTEGER NOT NULL, candidate BLOB NOT NULL, PRIMARY KEY(source,ordinal)) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS oc_messages(source BLOB NOT NULL, ordinal INTEGER NOT NULL, fingerprint BLOB NOT NULL, embedded_id TEXT, v1_fallback INTEGER NOT NULL, workspace_conflict INTEGER NOT NULL, message BLOB NOT NULL, payload BLOB NOT NULL, timestamp INTEGER NOT NULL, provider INTEGER NOT NULL, primary_key TEXT, PRIMARY KEY(source,ordinal)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS oc_fingerprint ON oc_messages(source,fingerprint,ordinal);
-        CREATE INDEX IF NOT EXISTS oc_fingerprint_id ON oc_messages(source,fingerprint,embedded_id,ordinal);
-        CREATE TABLE IF NOT EXISTS oc_aliases(source BLOB NOT NULL, ordinal INTEGER NOT NULL, position INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY(source,ordinal,key)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS oc_alias_order ON oc_aliases(source,ordinal,position);
-        COMMIT;"))?;
-    }
-    let version: i64 = sql(conn.query_row("SELECT version FROM oc_meta", [], |r| r.get(0)))?;
-    if version != 1 {
-        return Err("OpenCode usage store schema unsupported".into());
-    }
-    Ok(())
+    usage_store_schema::ensure_opencode(conn)
 }
 
 fn source_key(path: &Path) -> Result<Vec<u8>, String> {
     // Native source descriptors match the cache/registry path codec. Compact
-    // usage rows and opaque generation keys retain fixed-int encoding.
+    // usage rows and exact generation descriptors retain fixed-int encoding.
     bincode::options()
         .serialize(&CachedPath::from_path(path))
         .map_err(|_| "usage store path encoding failed".into())
@@ -726,7 +693,7 @@ fn readonly_source(path: &Path) -> Result<Connection, String> {
 // delimit bounded write batches without publishing a partial source generation.
 struct SourceWriter<'a> {
     conn: &'a Connection,
-    source: &'a [u8],
+    source: &'a i64,
     ordinal: i64,
     rows: usize,
     bytes: usize,
@@ -763,8 +730,8 @@ impl SourceWriter<'_> {
 /// in bounded ordinal pages; carried rows never rejoin the membership set.
 fn carry_missing_opencode_candidates(
     conn: &Connection,
-    key: &[u8],
-    previous: &[u8],
+    key: &i64,
+    previous: &i64,
 ) -> Result<(), String> {
     // Guard before any decode: same-generation syncs carry nothing.
     if previous == key {
@@ -879,7 +846,7 @@ fn carry_missing_opencode_candidates(
     sql(conn.execute_batch("DROP TABLE IF EXISTS temp.oc_carry_live"))
 }
 
-fn transfer_source(conn: &Connection, path: &Path, key: &[u8], sqlite: bool) -> Result<(), String> {
+fn transfer_source(conn: &Connection, path: &Path, key: &i64, sqlite: bool) -> Result<(), String> {
     sql(conn.execute("DELETE FROM oc_rows WHERE source=?1", [key]))?;
     sql(conn.execute_batch("SAVEPOINT oc_batch"))?;
     let mut writer = SourceWriter {
@@ -913,7 +880,7 @@ fn transfer_source(conn: &Connection, path: &Path, key: &[u8], sqlite: bool) -> 
     sql(conn.execute_batch("RELEASE oc_batch"))
 }
 
-fn add_alias(conn: &Connection, key: &[u8], ordinal: i64, alias: &str) -> Result<(), String> {
+fn add_alias(conn: &Connection, key: &i64, ordinal: i64, alias: &str) -> Result<(), String> {
     sql(conn.execute("INSERT OR IGNORE INTO oc_aliases SELECT ?1,?2,coalesce(max(position)+1,0),?3 FROM oc_aliases WHERE source=?1 AND ordinal=?2", params![key,ordinal,alias]))?;
     Ok(())
 }
@@ -926,7 +893,7 @@ struct CollapsedMessage {
     message: UnifiedMessage,
 }
 
-fn collapse_source(conn: &Connection, key: &[u8], sqlite: bool) -> Result<(), String> {
+fn collapse_source(conn: &Connection, key: &i64, sqlite: bool) -> Result<(), String> {
     sql(conn.execute("DELETE FROM oc_messages WHERE source=?1", [key]))?;
     sql(conn.execute("DELETE FROM oc_aliases WHERE source=?1", [key]))?;
     let mut statement = sql(
@@ -1032,8 +999,8 @@ fn sync_source(
     conn: &mut Connection,
     path: &Path,
     sqlite: bool,
-    register: &mut impl FnMut(&Connection, &[u8]) -> Result<(), String>,
-) -> Result<Vec<u8>, String> {
+    register: &mut impl FnMut(&Connection, i64) -> Result<(), String>,
+) -> Result<i64, String> {
     // Absent sources keep durable facts: re-register the last-known
     // generation so the scope still references its canonical rows. A
     // present-but-unfingerprintable source still fails closed below.
@@ -1042,7 +1009,7 @@ fn sync_source(
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     {
         let transaction = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current: Option<Vec<u8>> = sql(transaction
+        let current: Option<i64> = sql(transaction
             .query_row(
                 "SELECT generation FROM oc_sources WHERE path=?1",
                 [&source_key(path)?],
@@ -1050,7 +1017,7 @@ fn sync_source(
             )
             .optional())?;
         if let Some(generation) = current {
-            register(&transaction, &generation)?;
+            register(&transaction, generation)?;
             sql(transaction.commit())?;
             return Ok(generation);
         }
@@ -1060,8 +1027,15 @@ fn sync_source(
     for _ in 0..2 {
         let fingerprint = source_fingerprint(path, sqlite)?;
         let fingerprint_bytes = encode(&fingerprint)?;
-        let generation = encode(&(&path_key, &fingerprint_bytes, sqlite))?;
+        let descriptor = encode(&(&path_key, &fingerprint_bytes, sqlite))?;
         let transaction = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let existing: Option<i64> = sql(transaction
+            .query_row(
+                "SELECT generation FROM oc_generations WHERE descriptor=?1",
+                [&descriptor],
+                |r| r.get(0),
+            )
+            .optional())?;
         let current: Option<(Vec<u8>, bool)> = sql(transaction
             .query_row(
                 "SELECT fingerprint,kind FROM oc_sources WHERE path=?1",
@@ -1073,7 +1047,8 @@ fn sync_source(
             .as_ref()
             .is_some_and(|(stored, kind)| stored == &fingerprint_bytes && *kind == sqlite)
         {
-            register(&transaction, &generation)?;
+            let generation = existing.ok_or("OpenCode current generation is unavailable")?;
+            register(&transaction, generation)?;
             sql(transaction.commit())?;
             return Ok(generation);
         }
@@ -1084,13 +1059,17 @@ fn sync_source(
         // information: retry the transfer once against the prior generation
         // and keep canonical history when the retry also yields nothing.
         // Genuinely new empty sources (no prior generation) publish empty.
-        let exists: bool = sql(transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM oc_generations WHERE generation=?1)",
-            [&generation],
-            |r| r.get(0),
-        ))?;
-        if !exists {
-            let previous: Option<Vec<u8>> = sql(transaction
+        let generation = if let Some(generation) = existing {
+            generation
+        } else {
+            sql(transaction.execute(
+                "INSERT INTO oc_generations(descriptor,path,fingerprint,kind) VALUES(?1,?2,?3,?4)",
+                params![descriptor, path_key, fingerprint_bytes, sqlite],
+            ))?;
+            transaction.last_insert_rowid()
+        };
+        if existing.is_none() {
+            let previous: Option<i64> = sql(transaction
                 .query_row(
                     "SELECT generation FROM oc_sources WHERE path=?1",
                     [&path_key],
@@ -1114,23 +1093,23 @@ fn sync_source(
                 |r| r.get(0),
             ))?;
             if transferred == 0 {
-                if let Some(previous) = previous.as_deref() {
+                if let Some(previous) = previous.as_ref() {
                     sql(transaction.execute("DELETE FROM oc_rows WHERE source=?1", [&generation]))?;
-                    register(&transaction, previous)?;
+                    sql(transaction.execute(
+                        "DELETE FROM oc_generations WHERE generation=?1",
+                        [generation],
+                    ))?;
+                    register(&transaction, *previous)?;
                     sql(transaction.commit())?;
-                    return Ok(previous.to_vec());
+                    return Ok(*previous);
                 }
-            } else if let Some(previous) = previous.as_deref() {
+            } else if let Some(previous) = previous.as_ref() {
                 carry_missing_opencode_candidates(&transaction, &generation, previous)?;
             }
             collapse_source(&transaction, &generation, sqlite)?;
-            sql(transaction.execute(
-                "INSERT INTO oc_generations VALUES(?1,?2,?3,?4)",
-                params![generation, path_key, fingerprint_bytes, sqlite],
-            ))?;
         }
         sql(transaction.execute("INSERT INTO oc_sources VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint,kind=excluded.kind,generation=excluded.generation", params![path_key,fingerprint_bytes,sqlite,generation]))?;
-        register(&transaction, &generation)?;
+        register(&transaction, generation)?;
         sql(transaction.commit())?;
         return Ok(generation);
     }
@@ -1170,7 +1149,7 @@ fn materialization_database() -> Result<Connection, String> {
 // disk and selection never uses this native output vector as historical state.
 fn hydrate_source_aliases(
     conn: &Connection,
-    key: &[u8],
+    key: &i64,
     ordinal: i64,
     message: &mut UnifiedMessage,
 ) -> Result<(), String> {
@@ -1219,8 +1198,8 @@ fn query_schema(conn: &Connection) -> Result<(), String> {
         DROP TABLE IF EXISTS temp.ocq_deferred;
         DROP TABLE IF EXISTS temp.ocq_deferred_aliases;
         DROP TABLE IF EXISTS temp.ocq_connected;
-        CREATE TEMP TABLE ocq_scope(source BLOB PRIMARY KEY,source_order INTEGER,kind INTEGER) WITHOUT ROWID;
-        CREATE TEMP TABLE ocq_rows(id INTEGER PRIMARY KEY,source BLOB,ordinal INTEGER,source_order INTEGER,kind INTEGER,message BLOB,payload BLOB,provider INTEGER,timestamp INTEGER,primary_key TEXT);
+        CREATE TEMP TABLE ocq_scope(source INTEGER PRIMARY KEY,source_order INTEGER,kind INTEGER) WITHOUT ROWID;
+        CREATE TEMP TABLE ocq_rows(id INTEGER PRIMARY KEY,source INTEGER,ordinal INTEGER,source_order INTEGER,kind INTEGER,message BLOB,payload BLOB,provider INTEGER,timestamp INTEGER,primary_key TEXT);
         CREATE INDEX ocq_traversal ON ocq_rows(kind DESC,source_order,ordinal);
         CREATE TEMP TABLE ocq_aliases(id INTEGER,key TEXT,timestamp INTEGER,position INTEGER,PRIMARY KEY(id,key)) WITHOUT ROWID;
         CREATE INDEX ocq_alias_identity ON ocq_aliases(key,timestamp,id);
@@ -1404,7 +1383,7 @@ pub(crate) fn synchronize_opencode_sources(
     db_paths: &[PathBuf],
     json_paths: &[PathBuf],
     cache_root: &Path,
-    register: &mut impl FnMut(&Connection, &Path, bool, usize, &[u8]) -> Result<(), String>,
+    register: &mut impl FnMut(&Connection, &Path, bool, usize, i64) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut conn = open_database(cache_root)?;
     schema(&conn)?;
@@ -1430,7 +1409,7 @@ pub(crate) fn carry_absent_opencode_sources(
     json_paths: &[PathBuf],
     cache_root: &Path,
     scope_generation: i64,
-    register: &mut impl FnMut(&Connection, &Path, bool, usize, &[u8]) -> Result<(), String>,
+    register: &mut impl FnMut(&Connection, &Path, bool, usize, i64) -> Result<(), String>,
 ) -> Result<(), String> {
     use std::collections::HashSet;
     let mut live: HashSet<(Vec<u8>, bool)> = HashSet::new();
@@ -1445,11 +1424,11 @@ pub(crate) fn carry_absent_opencode_sources(
     let mut statement =
         sql(conn.prepare("SELECT path,kind,generation FROM oc_sources ORDER BY kind DESC,path"))?;
     let mut rows = sql(statement.query([]))?;
-    let mut carried: Vec<(Vec<u8>, bool, Vec<u8>)> = Vec::new();
+    let mut carried: Vec<(Vec<u8>, bool, i64)> = Vec::new();
     while let Some(row) = sql(rows.next())? {
         let path: Vec<u8> = sql(row.get(0))?;
         let kind: bool = sql(row.get(1))?;
-        let generation: Vec<u8> = sql(row.get(2))?;
+        let generation: i64 = sql(row.get(2))?;
         if live.contains(&(path.clone(), kind)) {
             continue;
         }
@@ -1458,7 +1437,7 @@ pub(crate) fn carry_absent_opencode_sources(
     drop(rows);
     drop(statement);
     // Admit + decode first; orders come from the staged scope afterwards.
-    let mut admitted: Vec<(PathBuf, bool, Vec<u8>)> = Vec::new();
+    let mut admitted: Vec<(PathBuf, bool, i64)> = Vec::new();
     for (path, kind, generation) in carried {
         let decoded: CachedPath = bincode::options()
             .deserialize(&path)
@@ -1491,7 +1470,7 @@ pub(crate) fn carry_absent_opencode_sources(
             json_next += 1;
             order
         };
-        register(&conn, &decoded, kind, order, &generation)?;
+        register(&conn, &decoded, kind, order, generation)?;
     }
     Ok(())
 }
@@ -1541,7 +1520,7 @@ pub(crate) fn validate_opencode_scope_sources_on(
         return Err("OpenCode staged scope is unavailable".into());
     }
     let mut statement=sql(conn.prepare(
-        "SELECT s.path,s.kind='opencode-sqlite',g.path,g.kind,g.fingerprint,s.generation FROM sq_scope_sources s LEFT JOIN oc_generations g ON g.generation=s.generation
+        "SELECT s.path,s.kind='opencode-sqlite',g.path,g.kind,g.fingerprint,g.descriptor FROM sq_scope_sources s LEFT JOIN oc_generations g ON g.generation=s.generation
          WHERE s.scope_generation=?1 AND s.kind IN ('opencode-sqlite','opencode-json') ORDER BY s.kind DESC,s.source_order",
     ))?;
     let mut rows = sql(statement.query([scope_generation]))?;
@@ -1628,10 +1607,10 @@ pub(crate) fn reconcile_missing_opencode_sources_on(
 /// intermediates are dropped while the newest generation per identity and
 /// every scope-pinned generation stay queryable.
 pub(crate) fn discard_unreferenced_opencode_generations(conn: &Connection) -> Result<(), String> {
-    sql(conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS oc_gc(generation BLOB PRIMARY KEY) WITHOUT ROWID;
+    sql(conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS oc_gc(generation INTEGER PRIMARY KEY) WITHOUT ROWID;
         DELETE FROM oc_gc;
         INSERT INTO oc_gc SELECT g.generation FROM oc_generations g WHERE
-            g.generation NOT IN (SELECT max(g2.generation) FROM oc_generations g2 WHERE g2.path=g.path AND g2.kind=g.kind) AND
+            g.descriptor NOT IN (SELECT max(g2.descriptor) FROM oc_generations g2 WHERE g2.path=g.path AND g2.kind=g.kind) AND
             NOT EXISTS(SELECT 1 FROM oc_sources s WHERE s.generation=g.generation) AND
             NOT EXISTS(SELECT 1 FROM sq_scope_sources s WHERE s.generation=g.generation AND s.kind IN ('opencode-sqlite','opencode-json'));
         DELETE FROM oc_rows WHERE source IN (SELECT generation FROM oc_gc);
@@ -2606,19 +2585,19 @@ mod tests {
         let root = TempDir::new().unwrap();
         let mut conn = open_database(&root.path().join("cache")).unwrap();
         schema(&conn).unwrap();
-        let key = source_key(&root.path().join("source.db")).unwrap();
-        let json_key = source_key(&root.path().join("authority.json")).unwrap();
+        let key: i64 = 1;
+        let json_key: i64 = 2;
         let transaction = conn.transaction().unwrap();
         for (source, kind, messages) in [(&key, true, &sqlite[..]), (&json_key, false, &json[..])] {
             transaction
                 .execute(
-                    "INSERT INTO oc_sources VALUES(?1,x'00',?2,?1)",
+                    "INSERT INTO oc_sources VALUES(CAST(?1 AS BLOB),x'00',?2,?1)",
                     params![source, kind],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO oc_generations VALUES(?1,?1,x'00',?2)",
+                    "INSERT INTO oc_generations VALUES(?1,CAST(?1 AS BLOB),CAST(?1 AS BLOB),x'00',?2)",
                     params![source, kind],
                 )
                 .unwrap();
@@ -3147,14 +3126,14 @@ mod tests {
         );
         let mut store = open_database(&cache).unwrap();
         store.execute_batch("CREATE TABLE sq_scope_generations(id INTEGER PRIMARY KEY,complete INTEGER NOT NULL);
-            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation BLOB NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
+            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
             INSERT INTO sq_scope_generations VALUES(1,0);INSERT INTO sq_scope_generations VALUES(2,0);").unwrap();
         let register = |scope: i64,
                         conn: &Connection,
                         path: &Path,
                         sqlite: bool,
                         order: usize,
-                        generation: &[u8]| {
+                        generation: i64| {
             sql(conn.execute(
                 "INSERT INTO sq_scope_sources VALUES(?1,?2,?3,?4,?5)",
                 params![
@@ -3242,7 +3221,7 @@ mod tests {
             )
         )
         .is_err());
-        let new_a:Vec<u8>=store.query_row("SELECT generation FROM sq_scope_sources WHERE scope_generation=2 AND source_order=0",[],|row|row.get(0)).unwrap();
+        let new_a:i64=store.query_row("SELECT generation FROM sq_scope_sources WHERE scope_generation=2 AND source_order=0",[],|row|row.get(0)).unwrap();
         let mut incomplete_emitted = 0;
         assert!(visit_opencode_snapshot(
             &cache,
@@ -3284,7 +3263,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(actual, expected);
-        let old_b: Vec<u8> = store
+        let old_b: i64 = store
             .query_row(
                 "SELECT generation FROM sq_scope_sources
              WHERE scope_generation=1 AND source_order=1",
@@ -3305,8 +3284,8 @@ mod tests {
         store
             .execute("INSERT INTO sq_scope_generations VALUES(3,1)", [])
             .unwrap();
-        register(3, &store, &a, true, 0, &new_a).unwrap();
-        register(3, &store, &b, true, 1, &old_b).unwrap();
+        register(3, &store, &a, true, 0, new_a).unwrap();
+        register(3, &store, &b, true, 1, old_b).unwrap();
         let mut recovered = Vec::new();
         visit_opencode_snapshot(
             &cache,
@@ -3659,14 +3638,14 @@ mod tests {
         );
         let mut store = open_database(&cache).unwrap();
         store.execute_batch("CREATE TABLE sq_scope_generations(id INTEGER PRIMARY KEY,scope_id INTEGER NOT NULL,complete INTEGER NOT NULL);
-            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation BLOB NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
+            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
             INSERT INTO sq_scope_generations VALUES(1,10,0),(2,10,0),(3,10,0),(4,10,0),(5,20,0);").unwrap();
         let register = |scope: i64,
                         conn: &Connection,
                         path: &Path,
                         sqlite: bool,
                         order: usize,
-                        generation: &[u8]| {
+                        generation: i64| {
             sql(conn.execute(
                 "INSERT INTO sq_scope_sources VALUES(?1,?2,?3,?4,?5)",
                 params![
@@ -3707,7 +3686,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let original_generation: Vec<u8> = store
+        let original_generation: i64 = store
             .query_row(
                 "SELECT generation FROM oc_sources WHERE path=?1",
                 [source_key(&a).unwrap()],
@@ -3724,7 +3703,7 @@ mod tests {
             .unwrap();
         discard_unreferenced_opencode_generations(&transaction).unwrap();
         transaction.commit().unwrap();
-        let evicted_generation: Vec<u8> = store
+        let evicted_generation: i64 = store
             .query_row(
                 "SELECT generation FROM oc_sources WHERE path=?1",
                 [source_key(&a).unwrap()],
@@ -3741,7 +3720,7 @@ mod tests {
             },
         )
         .unwrap();
-        let warm_generation: Vec<u8> = store
+        let warm_generation: i64 = store
             .query_row(
                 "SELECT generation FROM sq_scope_sources WHERE scope_generation=3",
                 [],
@@ -3762,7 +3741,7 @@ mod tests {
             drop(transaction);
             fs::set_permissions(&source_dir, permissions).unwrap();
             assert!(result.is_err());
-            let current: Vec<u8> = store
+            let current: i64 = store
                 .query_row(
                     "SELECT generation FROM oc_sources WHERE path=?1",
                     [source_key(&a).unwrap()],
@@ -3825,7 +3804,7 @@ mod tests {
         fs::write(&json, &original_json).unwrap();
         let store = open_database(&cache).unwrap();
         store.execute_batch("CREATE TABLE sq_scope_generations(id INTEGER PRIMARY KEY,complete INTEGER NOT NULL);
-            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation BLOB NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
+            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(scope_generation,kind,source_order));
             INSERT INTO sq_scope_generations VALUES(1,0),(2,0),(3,0);").unwrap();
         let stage = |scope: i64| {
             synchronize_opencode_sources(
@@ -3929,11 +3908,11 @@ mod tests {
         // Staged-scope shape the real register_opencode writes: one lane,
         // per-kind source_order.
         store.execute_batch("CREATE TABLE sq_scope_generations(id INTEGER PRIMARY KEY,complete INTEGER NOT NULL);
-            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL DEFAULT 'opencode',source_order INTEGER NOT NULL,path BLOB NOT NULL,generation BLOB NOT NULL,PRIMARY KEY(scope_generation,kind,lane,source_order));
+            CREATE TABLE sq_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL DEFAULT 'opencode',source_order INTEGER NOT NULL,path BLOB NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(scope_generation,kind,lane,source_order));
             INSERT INTO sq_scope_generations VALUES(1,0);").unwrap();
         let scope = std::cell::Cell::new(1);
         let mut register =
-            |conn: &Connection, path: &Path, sqlite: bool, order: usize, generation: &[u8]| {
+            |conn: &Connection, path: &Path, sqlite: bool, order: usize, generation: i64| {
                 sql(conn.execute(
                     "INSERT INTO sq_scope_sources VALUES(?1,?2,'opencode',?3,?4,?5)",
                     params![
@@ -3997,8 +3976,8 @@ mod tests {
         let scratch = Connection::open("").unwrap();
         configure_connection(&scratch).unwrap();
         schema(&scratch).unwrap();
-        let fresh: Vec<u8> = vec![7; 32];
-        let previous: Vec<u8> = vec![9; 32];
+        let fresh: i64 = 7;
+        let previous: i64 = 9;
         let seed = opencode::parse_opencode_candidate(
             (
                 "seed".into(),
@@ -4136,7 +4115,7 @@ mod tests {
         assert_eq!(positions[1] - positions[0], 1);
         // Empty fresh carries the whole prior generation; the
         // same-generation guard decodes nothing and writes nothing.
-        let empty: Vec<u8> = vec![11; 32];
+        let empty: i64 = 11;
         carry_missing_opencode_candidates(&scratch, &empty, &previous).unwrap();
         let empty_count: i64 = scratch
             .query_row(

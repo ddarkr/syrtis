@@ -157,6 +157,16 @@ fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
                 .unwrap(),
             1
         );
+        let integer_sources: bool = reader
+            .db
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM ocq_rows WHERE typeof(source)!='integer')
+             AND NOT EXISTS(SELECT 1 FROM ocq_scope WHERE typeof(source)!='integer')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(integer_sources);
         let mut events = Vec::new();
         crate::fold_prepared_usage_snapshot(
             &snapshot,
@@ -467,6 +477,14 @@ fn unchanged_opencode_reuses_decisions_while_other_lane_moves() {
     );
     assert_eq!(consumer_totals(&first), (12, 2, 2));
     assert_eq!(consumer_inputs(&first), vec![5, 7]);
+    let first_reference: i64 = publisher
+        .db
+        .query_row(
+            "SELECT oc_source FROM sq_decisions WHERE scope_generation=?1 AND lane='opencode'",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
     let second = publish_local(
         &publisher,
         root.path(),
@@ -477,6 +495,110 @@ fn unchanged_opencode_reuses_decisions_while_other_lane_moves() {
     );
     assert_eq!(consumer_totals(&second), (16, 2, 2));
     assert_eq!(consumer_inputs(&second), vec![5, 11]);
+    let copied_reference: i64 = publisher.db.query_row(
+        "SELECT d.oc_source FROM sq_decisions d JOIN oc_rows r ON r.source=d.oc_source AND r.ordinal=d.oc_ordinal WHERE d.scope_generation=?1 AND d.lane='opencode'",
+        [second.generation], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(copied_reference, first_reference);
+    let old_decisions: i64 = publisher
+        .db
+        .query_row(
+            "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_decisions, 0);
+}
+
+#[test]
+fn integer_opencode_references_reuse_and_survive_pinned_retirement() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["opencode".to_string()];
+    let db_path = home.join("opencode.db");
+    local_fixture(&db_path, &[("row-a", 5)]);
+    let first = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &clients,
+        None,
+        Some((&db_path, 0)),
+    );
+    let reference: i64 = publisher
+        .db
+        .query_row(
+            "SELECT generation FROM sq_scope_sources WHERE scope_generation=?1 AND lane='opencode'",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(reference > 0);
+    let indexed: (i64, i64) = publisher.db.query_row(
+        "SELECT COUNT(*),COUNT(CASE WHEN typeof(d.oc_source)='integer' AND d.oc_source=?2 AND g.generation IS NOT NULL AND typeof(g.descriptor)='blob' THEN 1 END)
+         FROM sq_decisions d LEFT JOIN oc_generations g ON g.generation=d.oc_source
+         WHERE d.scope_generation=?1 AND d.lane='opencode'",
+        params![first.generation, reference], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(indexed, (1, 1));
+    for _ in 0..3 {
+        let same = publish_local(
+            &publisher,
+            root.path(),
+            &context,
+            &clients,
+            None,
+            Some((&db_path, 0)),
+        );
+        assert_eq!(same.generation, first.generation);
+        let counts: (i64, i64) = publisher
+            .db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM sq_decisions),(SELECT COUNT(*) FROM oc_generations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+    let reader = query(root.path());
+    reader.pin(&first).unwrap();
+    let replacement = publish_local(&publisher, root.path(), &context, &clients, None, None);
+    assert_ne!(replacement.generation, first.generation);
+    reader.prepare_query(&first, UsageQuery::compact()).unwrap();
+    reader.unpin().unwrap();
+    let mut inputs = Vec::new();
+    crate::fold_prepared_usage_snapshot(
+        &first,
+        &reader,
+        None,
+        UsageQuery::compact(),
+        &|_| true,
+        &mut |message| inputs.push(message.tokens.input),
+        true,
+    )
+    .unwrap();
+    assert_eq!(inputs, vec![5]);
+    assert!(query(root.path()).pin(&first).is_err());
+    assert_eq!(consumer_totals(&replacement), (0, 0, 0));
+    let retired: i64 = publisher
+        .db
+        .query_row(
+            "SELECT COUNT(*) FROM sq_decisions WHERE scope_generation=?1",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retired, 0);
 }
 
 #[test]
@@ -2272,4 +2394,216 @@ fn checkpoint_timezone_rules_drive_immediate_same_thread_calendar_changes() {
         entries_before,
         "unresolved/custom rules must not retain uncertain checkpoints"
     );
+}
+
+#[test]
+fn decision_metadata_compaction_preserves_overrides_and_physical_references() {
+    for mapped in [false, true] {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE mc_versions(source_id INTEGER,generation INTEGER);
+             CREATE TABLE mc_rows(source_id INTEGER,generation INTEGER,ordinal INTEGER,workspace BLOB NOT NULL,workspace_label BLOB NOT NULL,model_id TEXT NOT NULL,PRIMARY KEY(source_id,generation,ordinal));
+             CREATE TABLE sq_decisions(scope_generation INTEGER,rank INTEGER,cache_source_id INTEGER,cache_generation INTEGER,cache_ordinal INTEGER,workspace BLOB,workspace_label BLOB,model TEXT,PRIMARY KEY(scope_generation,rank));
+             INSERT INTO mc_versions VALUES(1,7);",
+        ).unwrap();
+        let physical = if mapped {
+            db.execute_batch(
+                "CREATE TABLE mc_generation_storage(source_id INTEGER,generation INTEGER,row_generation INTEGER,row_count INTEGER,PRIMARY KEY(source_id,generation));
+                 INSERT INTO mc_generation_storage VALUES(1,7,3,1);",
+            ).unwrap();
+            3
+        } else {
+            7
+        };
+        let workspace = bincode::serialize(&Some("/project".to_string())).unwrap();
+        let label = bincode::serialize(&Some("project".to_string())).unwrap();
+        let none = bincode::serialize(&Option::<String>::None).unwrap();
+        let different = bincode::serialize(&Some("different".to_string())).unwrap();
+        db.execute(
+            "INSERT INTO mc_rows VALUES(1,?1,0,?2,?3,'canonical')",
+            params![physical, workspace, label],
+        )
+        .unwrap();
+        for (rank, key, name, model) in [
+            (1, &workspace, &label, "canonical"),
+            (2, &different, &label, "override"),
+            (3, &none, &different, "canonical"),
+        ] {
+            db.execute(
+                "INSERT INTO sq_decisions VALUES(10,?1,1,7,0,?2,?3,?4)",
+                params![rank, key, name, model],
+            )
+            .unwrap();
+        }
+        // OpenCode has no MC reference and its SQL NULL retains its old meaning.
+        db.execute_batch("INSERT INTO sq_decisions VALUES(10,4,NULL,NULL,NULL,NULL,NULL,NULL); PRAGMA user_version=1;").unwrap();
+        let projection = |db: &Connection| {
+            let generation = if mapped { 3 } else { 7 };
+            let mut statement = db.prepare(
+                "SELECT d.rank,COALESCE(d.workspace,r.workspace),COALESCE(d.workspace_label,r.workspace_label),COALESCE(d.model,r.model_id)
+                 FROM sq_decisions d LEFT JOIN mc_rows r ON r.source_id=d.cache_source_id AND r.generation=?1 AND r.ordinal=d.cache_ordinal ORDER BY d.rank",
+            ).unwrap();
+            statement
+                .query_map([generation], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = projection(&db);
+        super::compact_decision_metadata(&db).unwrap();
+        db.pragma_update(None, "user_version", 2).unwrap();
+        assert_eq!(projection(&db), before);
+        let stored: (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) = db
+            .query_row(
+                "SELECT workspace,workspace_label,model FROM sq_decisions WHERE rank=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None, None));
+        assert_eq!(
+            db.query_row("SELECT workspace FROM sq_decisions WHERE rank=3", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            none
+        );
+        let changes = db.total_changes();
+        super::compact_decision_metadata(&db).unwrap();
+        assert_eq!(db.total_changes(), changes);
+        assert_eq!(projection(&db), before);
+        db.execute_batch("INSERT INTO sq_decisions VALUES(10,5,99,7,0,x'00',x'00','unknown');")
+            .unwrap();
+        assert!(super::compact_decision_metadata(&db).is_err());
+        assert_eq!(
+            db.query_row("SELECT model FROM sq_decisions WHERE rank=5", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "unknown"
+        );
+    }
+    let empty = Connection::open_in_memory().unwrap();
+    super::compact_decision_metadata(&empty).unwrap();
+}
+
+#[test]
+fn compact_and_legacy_indexed_metadata_match_without_sources() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let snapshot = publish_local(
+        &publisher,
+        root.path(),
+        &context,
+        &["amp".into()],
+        Some((200, 11)),
+        None,
+    );
+    assert!(publisher.db.query_row(
+        "SELECT workspace IS NULL AND workspace_label IS NULL AND model IS NULL FROM sq_decisions WHERE scope_generation=?1",
+        [snapshot.generation], |row| row.get::<_,bool>(0),
+    ).unwrap());
+    std::fs::remove_dir_all(&home).unwrap();
+    let read = || {
+        let mut output = Vec::new();
+        crate::visit_local_usage_snapshot(
+            &snapshot,
+            UsageQuery {
+                from_ms: Some(200),
+                until_ms: Some(201),
+                ..UsageQuery::compact()
+            },
+            &|_| true,
+            &mut |row| output.push(bincode::serialize(row).unwrap()),
+        )
+        .unwrap();
+        output
+    };
+    let compact = read();
+    assert_eq!(compact.len(), 1);
+    // Simulate a pre-compaction index without touching immutable MC facts.
+    publisher.db.execute_batch(
+        "UPDATE sq_decisions AS d SET (workspace,workspace_label,model)=(
+             SELECT r.workspace,r.workspace_label,r.model_id
+             FROM mc_generation_storage st JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation
+             WHERE st.source_id=d.cache_source_id AND st.generation=d.cache_generation AND r.ordinal=d.cache_ordinal AND r.ordinal<st.row_count)
+         WHERE d.cache_source_id IS NOT NULL;",
+    ).unwrap();
+    assert_eq!(read(), compact);
+    super::compact_decision_metadata(&publisher.db).unwrap();
+    assert_eq!(read(), compact);
+    let changes = publisher.db.total_changes();
+    super::compact_decision_metadata(&publisher.db).unwrap();
+    assert_eq!(publisher.db.total_changes(), changes);
+}
+
+#[test]
+fn legacy_null_decision_metadata_is_not_reinterpreted() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "PRAGMA user_version=1;
+         CREATE TABLE sq_decisions(cache_source_id INTEGER,workspace BLOB,workspace_label BLOB,model TEXT);
+         INSERT INTO sq_decisions VALUES(1,NULL,x'00','model');",
+    ).unwrap();
+    let changes = db.total_changes();
+    assert!(super::compact_decision_metadata(&db)
+        .unwrap_err()
+        .contains("legacy"));
+    assert_eq!(db.total_changes(), changes);
+}
+
+#[test]
+fn unchanged_report_publication_keeps_compact_decision_storage_bounded() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    let source = home.join(".claude/projects/-home-lazy/session.jsonl");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    write_report_claude(&source, &[("first", 11), ("second", 13)]);
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let clients = vec!["claude".to_string()];
+    let mut first_generation = None;
+    let mut counts = None;
+    let mut last_snapshot = None;
+    for _ in 0..3 {
+        let snapshot = report_snapshot(&publisher, root.path(), &context, &clients);
+        let current: (i64, i64) = publisher
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(CASE WHEN model IS NULL THEN 1 ELSE 0 END) FROM sq_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(current.0 > 0);
+        assert_eq!(current.0, current.1);
+        assert_eq!(
+            *first_generation.get_or_insert(snapshot.generation),
+            snapshot.generation
+        );
+        assert_eq!(*counts.get_or_insert(current), current);
+        assert_eq!(report_inputs(&snapshot), vec![11, 13]);
+        last_snapshot = Some(snapshot);
+    }
+    std::fs::remove_dir_all(home).unwrap();
+    assert_eq!(report_inputs(&last_snapshot.unwrap()), vec![11, 13]);
 }

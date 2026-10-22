@@ -63,6 +63,9 @@ pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), Strin
     secure_directory(root)?;
     let _management = crate::usage_store::management_lock(root, false)?;
     let _guard = lock_file(&root.join(LOCK))?;
+    // Independent stages are reclaimed only by explicit Optimize, never by
+    // recurring ingestion. Publication-link recovery needs no history scan.
+    recover_interrupted_publication(root)?;
     // The target appears only through atomic publication below, so an
     // existing target is either a completed migration or a store the opener
     // created itself. Either way there is nothing to import: a later cache
@@ -70,11 +73,6 @@ pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), Strin
     // `open_database` admits the existing file itself (fail-closed on a
     // foreign schema). This also makes retry trivially safe.
     if target_exists(root)? {
-        // Recover a stranded same-inode staging link from an interrupted
-        // publication (see publish_staged): the canonical name already
-        // exists, so drop our own leftover temp name if it points at the
-        // same inode. Never touches unrelated temps.
-        recover_interrupted_publication(root)?;
         return Ok(());
     }
     match fs::symlink_metadata(root.join("usage-reset.barrier")) {
@@ -142,6 +140,8 @@ fn recover_interrupted_publication(root: &Path) -> Result<(), String> {
                         && a.ino() == b.ino()
                         && !a.file_type().is_symlink()
                         && a.is_file()
+                        && a.uid() == unsafe { libc::geteuid() }
+                        && b.uid() == unsafe { libc::geteuid() }
                 }
                 #[cfg(not(unix))]
                 {
@@ -154,6 +154,135 @@ fn recover_interrupted_publication(root: &Path) -> Result<(), String> {
         if same {
             fs::remove_file(&candidate)
                 .map_err(|_| "usage migration stranded publication cleanup failed")?;
+        }
+    }
+    Ok(())
+}
+
+fn staging_name(name: &str) -> bool {
+    name.strip_prefix(STAGING_PREFIX)
+        .and_then(|s| s.strip_suffix(".sqlite3"))
+        .and_then(|s| s.split_once('-'))
+        .is_some_and(|(pid, nonce)| {
+            !pid.is_empty()
+                && !nonce.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && nonce.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Caller holds exclusive maintenance admission; migration writers additionally
+/// serialize on the same persistent lock inode. Inspection never calls this.
+pub(crate) fn cleanup_owned_staging(root: &Path) -> Result<(), String> {
+    let _guard = lock_file(&root.join(LOCK))?;
+    cleanup_staging_locked(root)
+}
+
+fn cleanup_staging_locked(root: &Path) -> Result<(), String> {
+    recover_interrupted_publication(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = |path: &Path| -> Option<fs::Metadata> {
+            fs::symlink_metadata(path).ok().filter(|m| {
+                m.is_file()
+                    && !m.file_type().is_symlink()
+                    && m.nlink() == 1
+                    && m.uid() == unsafe { libc::geteuid() }
+            })
+        };
+        let mut canonical = None;
+        for entry in fs::read_dir(root).map_err(|_| "usage migration cleanup discovery failed")? {
+            let entry = entry.map_err(|_| "usage migration cleanup discovery failed")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|s| staging_name(s)) else {
+                continue;
+            };
+            let path = entry.path();
+            let Some(before) = identity(&path) else {
+                continue;
+            };
+            // Only a complete attributable store is reclaimable. Partial or
+            // foreign files lack evidence and are deliberately preserved.
+            let mut owned = vec![(path.clone(), before)];
+            let mut safe = true;
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = root.join(format!("{name}{suffix}"));
+                match fs::symlink_metadata(&sidecar) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => match identity(&sidecar) {
+                        Some(meta) => owned.push((sidecar, meta)),
+                        None => safe = false,
+                    },
+                    Err(_) => safe = false,
+                }
+            }
+            if !safe {
+                continue;
+            }
+            let readonly = match Connection::open_with_flags(
+                crate::usage_store::sqlite_open_path(&path)?,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(db) => db,
+                Err(_) => continue,
+            };
+            if crate::usage_store::admit_open_database(&readonly, &path, Some(&owned[0].1)).is_err()
+                || readonly.execute_batch("BEGIN").is_err()
+                || validate_legacy_identity(&readonly).is_err()
+                || crate::usage_store::validate_managed_schema_readonly(&readonly).is_err()
+                || crate::message_cache::validate_durable_store_on(&readonly).is_err()
+            {
+                continue;
+            }
+            drop(readonly);
+            // A separate inode may be the last durable history. Admit the
+            // canonical once, and only after finding a reclaimable stage, so
+            // ordinary warm prepare calls never scan historical payloads.
+            if canonical.is_none() {
+                if !target_exists(root)? {
+                    return Ok(());
+                }
+                let db = crate::usage_store::open_existing_database(root)?;
+                db.execute_batch("BEGIN")
+                    .map_err(|_| "usage migration canonical snapshot failed")?;
+                validate_legacy_identity(&db)?;
+                crate::usage_store::validate_managed_schema_readonly(&db)?;
+                crate::message_cache::validate_durable_store_on(&db)?;
+                canonical = Some(db);
+            }
+            let db = match Connection::open_with_flags(
+                crate::usage_store::sqlite_open_path(&path)?,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(db) => db,
+                Err(_) => continue,
+            };
+            if db.busy_timeout(std::time::Duration::ZERO).is_err()
+                || crate::usage_store::admit_open_database(&db, &path, Some(&owned[0].1)).is_err()
+                || db.execute_batch("BEGIN EXCLUSIVE").is_err()
+                || validate_legacy_identity(&db).is_err()
+                || crate::usage_store::validate_managed_schema_readonly(&db).is_err()
+                || crate::message_cache::validate_durable_store_on(&db).is_err()
+            {
+                continue;
+            }
+            let _ = db.execute_batch("ROLLBACK");
+            drop(db);
+            // SQLite may remove its own sidecars on close. Never unlink a
+            // replacement inode, nor any hard-linked canonical/lock inode.
+            for (file, before) in owned.iter().rev() {
+                let Some(after) = identity(file) else {
+                    continue;
+                };
+                if before.dev() == after.dev() && before.ino() == after.ino() {
+                    fs::remove_file(file).map_err(|_| "usage migration orphan cleanup failed")?;
+                }
+            }
         }
     }
     Ok(())
@@ -281,8 +410,14 @@ fn validate_store(conn: &Connection) -> Result<(), String> {
 }
 
 fn sync_connection(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    let (busy, log, done): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .map_err(|_| "usage migration sync failed")?;
+    if busy != 0 || log != done {
+        return Err("usage migration checkpoint incomplete".into());
+    }
     // Borrow SQLite's own VFS file like usage_store does; never open an
     // unrelated descriptor for a lock-bearing inode.
     let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
@@ -470,6 +605,7 @@ fn transfer(source: &Source, root: &Path) -> Result<(), String> {
         )
         .map_err(|_| "usage migration staging reopen failed")?;
         configure(&staged)?;
+        crate::usage_store::admit_schema(&staged)?;
         // Import every supported legacy shard from the source root into the
         // staged copy BEFORE validation+activation, so no source log is
         // needed afterwards. Uses the shared importer (existing codecs,
@@ -651,8 +787,28 @@ fn validated_source_snapshot(conn: &Connection) -> Result<rusqlite::Transaction<
     let snapshot = conn
         .unchecked_transaction()
         .map_err(|_| "usage migration source snapshot failed")?;
+    validate_legacy_identity(&snapshot)?;
     crate::message_cache::validate_durable_store_on(&snapshot)?;
     Ok(snapshot)
+}
+
+fn validate_legacy_identity(conn: &Connection) -> Result<(), String> {
+    let application: i64 = conn
+        .pragma_query_value(None, "application_id", |r| r.get(0))
+        .map_err(|_| "usage migration source identity failed")?;
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(|_| "usage migration source identity failed")?;
+    if application != 0x54534b55 || !matches!(version, 1 | 2) {
+        return Err("usage migration source schema is unsupported".into());
+    }
+    let result: String = conn
+        .query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .map_err(|_| "usage migration source validation failed")?;
+    if result != "ok" {
+        return Err("usage migration source validation failed".into());
+    }
+    Ok(())
 }
 
 fn step_backup(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<(), String> {

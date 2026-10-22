@@ -7,6 +7,240 @@ use std::env;
 use std::ffi::OsString;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[test]
+fn cleanup_preserves_active_stage_and_unsafe_sidecar() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("usage");
+    seed_legacy_store(&root, 3, 4);
+    drop(crate::usage_store::open_database(&root).unwrap());
+    let active = root.join("usage_migration_tmp_10-11.sqlite3");
+    fs::copy(root.join(DATABASE), &active).unwrap();
+    let writer = Connection::open(&active).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let unsafe_stage = root.join("usage_migration_tmp_10-12.sqlite3");
+    fs::copy(root.join(DATABASE), &unsafe_stage).unwrap();
+    let sidecar = root.join("usage_migration_tmp_10-12.sqlite3-journal");
+    std::os::unix::fs::symlink(root.join(DATABASE), &sidecar).unwrap();
+    let _management = crate::usage_store::management_lock(&root, true).unwrap();
+    cleanup_owned_staging(&root).unwrap();
+    assert!(active.exists());
+    assert!(unsafe_stage.exists());
+    assert!(fs::symlink_metadata(sidecar)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+    cleanup_owned_staging(&root).unwrap();
+    assert!(!active.exists());
+}
+
+#[test]
+fn legacy_v1_copy_upgrades_without_changing_original_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let legacy = tmp.path().join("legacy");
+    let target = tmp.path().join("usage");
+    seed_legacy_store(&legacy, 11, 22);
+    let db = Connection::open(legacy.join(DATABASE)).unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(db);
+    let before = fs::read(legacy.join(DATABASE)).unwrap();
+    prepare(&target, std::slice::from_ref(&legacy)).unwrap();
+    assert_eq!(before, fs::read(legacy.join(DATABASE)).unwrap());
+    let migrated = Connection::open(target.join(DATABASE)).unwrap();
+    assert_eq!(
+        migrated
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    crate::message_cache::validate_durable_store_on(&migrated).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_cleanup_requires_exact_owned_regular_unlinked_valid_stage() {
+    use std::os::unix::fs::{symlink, MetadataExt};
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("usage");
+    seed_legacy_store(&root, 11, 22);
+    drop(crate::usage_store::open_database(&root).unwrap());
+    let canonical = root.join(DATABASE);
+    let original = fs::read(&canonical).unwrap();
+    let orphan = root.join("usage_migration_tmp_123-456.sqlite3");
+    fs::copy(&canonical, &orphan).unwrap();
+    let unknown = root.join("usage_migration_tmp_123-456-extra.sqlite3");
+    fs::copy(&canonical, &unknown).unwrap();
+    let linked = root.join("usage_migration_tmp_123-457.sqlite3");
+    fs::hard_link(&unknown, &linked).unwrap();
+    let symbolic = root.join("usage_migration_tmp_123-458.sqlite3");
+    symlink(&canonical, &symbolic).unwrap();
+    let invalid = root.join("usage_migration_tmp_123-459.sqlite3");
+    fs::write(&invalid, b"not a store").unwrap();
+    let stranded = root.join("usage_migration_tmp_123-460.sqlite3");
+    fs::hard_link(&canonical, &stranded).unwrap();
+    let recovery = root.join(RECOVERY);
+    fs::copy(&canonical, &recovery).unwrap();
+    let lock = lock_file(&root.join(LOCK)).unwrap();
+    let lock_inode = lock.metadata().unwrap().ino();
+    drop(lock);
+    let _management = crate::usage_store::management_lock(&root, true).unwrap();
+    cleanup_owned_staging(&root).unwrap();
+    assert!(!orphan.exists());
+    assert!(!stranded.exists());
+    assert!(
+        unknown.exists()
+            && linked.exists()
+            && symbolic
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+    );
+    assert_eq!(fs::read(invalid).unwrap(), b"not a store");
+    assert_eq!(fs::read(&canonical).unwrap(), original);
+    assert_eq!(fs::read(&recovery).unwrap(), original);
+    assert_eq!(fs::metadata(root.join(LOCK)).unwrap().ino(), lock_inode);
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_preserves_partial_managed_schema_canonical_and_stage() {
+    for partial_canonical in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("usage");
+        seed_legacy_store(&root, 11, 22);
+        drop(crate::usage_store::open_database(&root).unwrap());
+        let canonical = root.join(DATABASE);
+        let stage = root.join("usage_migration_tmp_123-456.sqlite3");
+        fs::copy(&canonical, &stage).unwrap();
+        let partial = if partial_canonical {
+            &canonical
+        } else {
+            &stage
+        };
+        let db = Connection::open(partial).unwrap();
+        db.execute_batch(
+            "CREATE TABLE oc_meta(version INTEGER NOT NULL);
+             INSERT INTO oc_meta VALUES(2);
+             CREATE TABLE user_notes(note TEXT);
+             INSERT INTO user_notes VALUES('preserve');",
+        )
+        .unwrap();
+        // Payload admission alone cannot establish managed-schema completeness.
+        validate_legacy_identity(&db).unwrap();
+        crate::message_cache::validate_durable_store_on(&db).unwrap();
+        drop(db);
+        let canonical_before = fs::read(&canonical).unwrap();
+        let stage_before = fs::read(&stage).unwrap();
+        let _management = crate::usage_store::management_lock(&root, true).unwrap();
+        assert_eq!(cleanup_owned_staging(&root).is_err(), partial_canonical);
+        assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
+        assert_eq!(fs::read(&stage).unwrap(), stage_before);
+    }
+}
+
+#[test]
+fn prepare_existing_target_without_owned_stages_defers_database_admission() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("usage");
+    seed_legacy_store(&root, 11, 22);
+    drop(crate::usage_store::open_database(&root).unwrap());
+    let canonical = root.join(DATABASE);
+    let db = Connection::open(&canonical).unwrap();
+    db.pragma_update(None, "user_version", 999).unwrap();
+    drop(db);
+    let original = fs::read(&canonical).unwrap();
+    let unrelated = root.join("usage_migration_tmp_not-owned.sqlite3");
+    fs::copy(&canonical, &unrelated).unwrap();
+    // Without a reclaimable owned stage, prepare must leave admission to its
+    // caller rather than opening or validating the existing target.
+    prepare(&root, &[]).unwrap();
+    assert!(crate::usage_store::open_existing_database(&root).is_err());
+    assert_eq!(fs::read(&canonical).unwrap(), original);
+    assert_eq!(fs::read(&unrelated).unwrap(), original);
+}
+
+#[test]
+fn repeated_prepare_preserves_locked_and_partial_owned_stages() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("usage");
+    seed_legacy_store(&root, 11, 22);
+    drop(crate::usage_store::open_database(&root).unwrap());
+    let canonical = root.join(DATABASE);
+    let stage = root.join("usage_migration_tmp_123-456.sqlite3");
+    fs::copy(&canonical, &stage).unwrap();
+    let partial = root.join("usage_migration_tmp_123-457.sqlite3");
+    fs::write(&partial, b"SQLite format 3\0partial").unwrap();
+    let writer = Connection::open(&stage).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
+        .unwrap();
+    let original = fs::read(&stage).unwrap();
+    // Canonical admission remains the caller's job, including when an owned
+    // stage becomes readable again. Maintenance would reject this target.
+    let db = Connection::open(&canonical).unwrap();
+    db.pragma_update(None, "user_version", 999).unwrap();
+    drop(db);
+    prepare(&root, &[]).unwrap();
+    writer.execute_batch("ROLLBACK").unwrap();
+    for _ in 0..3 {
+        prepare(&root, &[]).unwrap();
+    }
+    assert_eq!(fs::read(&stage).unwrap(), original);
+    assert_eq!(fs::read(&partial).unwrap(), b"SQLite format 3\0partial");
+    writer.execute_batch("BEGIN EXCLUSIVE; ROLLBACK").unwrap();
+    assert!(crate::usage_store::open_existing_database(&root).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_preserves_sole_stage_without_admitted_canonical() {
+    use std::os::unix::fs::MetadataExt;
+    for target in [
+        None,
+        Some(b"corrupt".as_slice()),
+        Some(b"unsupported".as_slice()),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("usage");
+        seed_legacy_store(&root, 11, 22);
+        drop(crate::usage_store::open_database(&root).unwrap());
+        let canonical = root.join(DATABASE);
+        let stage = root.join("usage_migration_tmp_123-456.sqlite3");
+        fs::rename(&canonical, &stage).unwrap();
+        let original = fs::read(&stage).unwrap();
+        if let Some(bytes) = target {
+            if bytes == b"unsupported" {
+                fs::copy(&stage, &canonical).unwrap();
+                let db = Connection::open(&canonical).unwrap();
+                db.pragma_update(None, "user_version", 999).unwrap();
+            } else {
+                fs::write(&canonical, bytes).unwrap();
+            }
+        }
+        let canonical_before = fs::read(&canonical).ok();
+        let lock = lock_file(&root.join(LOCK)).unwrap();
+        let lock_inode = lock.metadata().unwrap().ino();
+        drop(lock);
+        {
+            let _management = crate::usage_store::management_lock(&root, true).unwrap();
+            let result = cleanup_owned_staging(&root);
+            assert_eq!(result.is_ok(), target.is_none());
+        }
+        assert_eq!(fs::read(&stage).unwrap(), original);
+        assert_eq!(fs::read(&canonical).ok(), canonical_before);
+        prepare(&root, &[]).unwrap();
+        assert_eq!(fs::read(&stage).unwrap(), original);
+        assert_eq!(fs::read(&canonical).ok(), canonical_before);
+        assert_eq!(fs::metadata(root.join(LOCK)).unwrap().ino(), lock_inode);
+        let db = Connection::open(&stage).unwrap();
+        crate::message_cache::validate_durable_store_on(&db).unwrap();
+    }
+}
+
 struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
 
 impl EnvGuard {
