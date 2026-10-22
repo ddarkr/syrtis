@@ -554,6 +554,16 @@ fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
             )
             .unwrap();
         reader.unpin().unwrap();
+        let integer_sources: bool = reader
+            .db
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM ocq_rows WHERE typeof(source)!='integer')
+             AND NOT EXISTS(SELECT 1 FROM ocq_scope WHERE typeof(source)!='integer')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(integer_sources);
         let mut events = Vec::new();
         crate::fold_prepared_usage_snapshot(
             &snapshot,
@@ -864,6 +874,14 @@ fn unchanged_opencode_reuses_decisions_while_other_lane_moves() {
     );
     assert_eq!(consumer_totals(&first), (12, 2, 2));
     assert_eq!(consumer_inputs(&first), vec![5, 7]);
+    let first_reference: i64 = publisher
+        .db
+        .query_row(
+            "SELECT oc_source FROM sq_decisions WHERE scope_generation=?1 AND lane='opencode'",
+            [first.generation],
+            |row| row.get(0),
+        )
+        .unwrap();
     let second = publish_local(
         &publisher,
         root.path(),
@@ -874,6 +892,12 @@ fn unchanged_opencode_reuses_decisions_while_other_lane_moves() {
     );
     assert_eq!(consumer_totals(&second), (16, 2, 2));
     assert_eq!(consumer_inputs(&second), vec![5, 11]);
+    let owner = publisher.decision_generation(second.generation).unwrap();
+    let reused_reference: i64 = publisher.db.query_row(
+        "SELECT d.oc_source FROM sq_decisions d JOIN oc_rows r ON r.source=d.oc_source AND r.ordinal=d.oc_ordinal WHERE d.scope_generation=?1 AND d.lane='opencode'",
+        [owner], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(reused_reference, first_reference);
     assert!(query(root.path()).pin(&first).is_err());
 }
 
@@ -3055,6 +3079,79 @@ fn decision_metadata_compaction_preserves_overrides_and_physical_references() {
     }
     let empty = Connection::open_in_memory().unwrap();
     super::compact_decision_metadata(&empty).unwrap();
+}
+
+#[test]
+fn compact_and_legacy_indexed_metadata_match_without_sources() {
+    for compact in [false, true] {
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.clone()),
+            false,
+            crate::scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let publisher = query(root.path());
+        let snapshot = publish_local(
+            &publisher,
+            root.path(),
+            &context,
+            &["amp".into()],
+            Some((200, 11)),
+            None,
+        );
+        let read = || {
+            let mut output = Vec::new();
+            crate::visit_local_usage_snapshot(
+                &snapshot,
+                UsageQuery {
+                    from_ms: Some(200),
+                    until_ms: Some(201),
+                    ..UsageQuery::compact()
+                },
+                &|_| true,
+                &mut |row| output.push(bincode::serialize(row).unwrap()),
+            )
+            .unwrap();
+            output
+        };
+        let expected = read();
+        assert_eq!(consumer_inputs(&snapshot), vec![11]);
+        // Recreate the pre-metadata-only LocalClients index. Both expanded
+        // and compact legacy metadata must migrate without raw source access.
+        publisher.db.execute(
+            "INSERT INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,workspace,workspace_label,model)
+             SELECT s.scope_generation,1,s.lane,r.timestamp,s.cache_source_id,s.cache_generation,r.ordinal,v.format_version,r.workspace,r.workspace_label,r.model_id
+             FROM sq_scope_sources s JOIN mc_versions v ON v.source_id=s.cache_source_id AND v.generation=s.cache_generation
+             JOIN mc_logical_storage st ON st.source_id=s.cache_source_id AND st.generation=s.cache_generation
+             JOIN mc_rows r ON r.source_id=st.source_id AND r.generation=st.row_generation AND r.ordinal<st.row_count
+             WHERE s.scope_generation=?1 AND s.kind='cache'",
+            [snapshot.generation],
+        ).unwrap();
+        if compact {
+            super::compact_decision_metadata(&publisher.db).unwrap();
+        }
+        publisher
+            .db
+            .execute_batch(
+                "UPDATE sq_indexes SET version=1;
+             UPDATE sq_meta SET value=3 WHERE key='schema_version';",
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(read(), expected);
+        assert_eq!(read(), expected);
+        assert_eq!(
+            publisher
+                .db
+                .query_row("SELECT COUNT(*) FROM sq_decisions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[test]

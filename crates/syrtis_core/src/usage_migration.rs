@@ -63,6 +63,9 @@ pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), Strin
     secure_directory(root)?;
     let _management = crate::usage_store::management_lock(root, false)?;
     let _guard = lock_file(&root.join(LOCK))?;
+    // Independent stages are reclaimed only by explicit Optimize, never by
+    // recurring ingestion. Publication-link recovery needs no history scan.
+    recover_interrupted_publication(root)?;
     // The target appears only through atomic publication below, so an
     // existing target is either a completed migration or a store the opener
     // created itself. Either way there is nothing to import: a later cache
@@ -70,11 +73,6 @@ pub(crate) fn prepare(root: &Path, legacy_roots: &[PathBuf]) -> Result<(), Strin
     // `open_database` admits the existing file itself (fail-closed on a
     // foreign schema). This also makes retry trivially safe.
     if target_exists(root)? {
-        // Recover a stranded same-inode staging link from an interrupted
-        // publication (see publish_staged): the canonical name already
-        // exists, so drop our own leftover temp name if it points at the
-        // same inode. Never touches unrelated temps.
-        recover_interrupted_publication(root)?;
         return Ok(());
     }
     match fs::symlink_metadata(root.join("usage-reset.barrier")) {
@@ -142,6 +140,8 @@ fn recover_interrupted_publication(root: &Path) -> Result<(), String> {
                         && a.ino() == b.ino()
                         && !a.file_type().is_symlink()
                         && a.is_file()
+                        && a.uid() == unsafe { libc::geteuid() }
+                        && b.uid() == unsafe { libc::geteuid() }
                 }
                 #[cfg(not(unix))]
                 {
@@ -504,8 +504,14 @@ fn validate_store(conn: &Connection) -> Result<(), String> {
 }
 
 fn sync_connection(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    let (busy, log, done): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .map_err(|_| "usage migration sync failed")?;
+    if busy != 0 || log != done {
+        return Err("usage migration checkpoint incomplete".into());
+    }
     // Borrow SQLite's own VFS file like usage_store does; never open an
     // unrelated descriptor for a lock-bearing inode.
     let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();

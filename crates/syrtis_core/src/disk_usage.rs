@@ -488,6 +488,30 @@ mod tests {
     }
 
     #[test]
+    fn inspect_and_optimize_preserve_stage_when_canonical_is_unavailable() {
+        for corrupt in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("usage");
+            let cache = tmp.path().join("cache");
+            drop(crate::usage_store::open_database(&root).unwrap());
+            let canonical = root.join(DATABASE);
+            let stage = root.join("usage_migration_tmp_123-456.sqlite3");
+            fs::rename(&canonical, &stage).unwrap();
+            let original = fs::read(&stage).unwrap();
+            if corrupt {
+                fs::write(&canonical, b"corrupt").unwrap();
+            }
+            let before = fs::read(&canonical).ok();
+            for action in [DiskUsageAction::Inspect, DiskUsageAction::Optimize] {
+                let result = disk_usage_paths(&root, &cache, action);
+                assert_eq!(result.is_err(), corrupt);
+                assert_eq!(fs::read(&stage).unwrap(), original);
+                assert_eq!(fs::read(&canonical).ok(), before);
+            }
+        }
+    }
+
+    #[test]
     fn management_preserves_then_resets_facts_without_creating_on_inspect() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("usage");
