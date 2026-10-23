@@ -2132,8 +2132,16 @@ impl QueryState {
             } else {
                 bypass.into()
             };
+            // Only Trae's local ordering consumes these projections. Carrying
+            // every session string through report arbitration widens both
+            // file-backed window/sort streams for the entire history.
+            let ordering_columns = if lane == "trae" && mode != SelectionMode::Report {
+                ",r.session,r.timestamp"
+            } else {
+                ""
+            };
             format!("INSERT OR IGNORE INTO sq_selected(id) SELECT id FROM (
-                SELECT r.id,r.phase,r.source_order,r.session,r.timestamp,CASE WHEN {bypass} THEN 1 ELSE ROW_NUMBER() OVER(PARTITION BY CASE WHEN {bypass} THEN r.id ELSE NULL END,{partition} ORDER BY r.phase,r.source_order,r.id) END AS winner FROM sq_rows r WHERE {gate}
+                SELECT r.id,r.phase,r.source_order{ordering_columns},CASE WHEN {bypass} THEN 1 ELSE ROW_NUMBER() OVER(PARTITION BY CASE WHEN {bypass} THEN r.id ELSE NULL END,{partition} ORDER BY r.phase,r.source_order,r.id) END AS winner FROM sq_rows r WHERE {gate}
                 ) WHERE winner=1 ORDER BY {order}")
         } else {
             format!("INSERT OR IGNORE INTO sq_selected(id) SELECT r.id FROM sq_rows r WHERE {gate} ORDER BY r.phase,r.source_order,r.id")
@@ -2699,6 +2707,106 @@ pub(crate) fn stage_source(
         query, cache, identity, path, &metadata, lane, index, phase, tag, false,
     )
 }
+#[cfg(test)]
+type PiMessageHook = Box<dyn FnMut(&Path) -> Result<(), String>>;
+
+#[cfg(test)]
+thread_local! {
+    static PI_MESSAGE_HOOK: std::cell::RefCell<Option<PiMessageHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Pi-family sources share Codex's frozen-prefix storage, but keep their own
+/// parser state. Prefix admission hashes every prior byte; it is not an
+/// inode/size or sampled-fingerprint append guess.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_pi_source(
+    query: &QueryState,
+    cache: &mut SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+    before: Option<SourceFingerprint>,
+    index: usize,
+    phase: i32,
+    tag: bool,
+) -> Result<(), String> {
+    let fingerprint = before.ok_or_else(|| "Pi source fingerprint unavailable; previous scope retained".to_string())?;
+    let cached = cache.metadata(identity, path)?;
+    if let Some(metadata) = cached.as_ref().filter(|metadata| metadata.message_count != 0 && metadata.fingerprint == fingerprint) {
+        return stage_cached(query, cache, identity, path, metadata, identity.namespace, index, 0, tag, false);
+    }
+    let append = cached.as_ref().filter(|metadata| metadata.retained_count == 0
+        && metadata.fallback_count == 0
+        && metadata.pi_incremental.as_ref().is_some_and(|state| state.resumable
+            && state.session_id.is_some()
+            && state.consumed_offset == metadata.fingerprint.size
+            && state.prefix_hash == metadata.fingerprint.content_hash
+            && fingerprint.size > state.consumed_offset
+            && crate::message_cache::hash_prefix(path, state.consumed_offset) == Some(state.prefix_hash)));
+    let previous = append.and_then(|metadata| metadata.pi_incremental.clone());
+    let dedup = if identity.namespace == "kimchi" {
+        sessions::pi::PiDedup::SessionScoped
+    } else {
+        sessions::pi::PiDedup::CrossSession
+    };
+    // Parse inside the canonical write transaction: any read, sink or final
+    // full-fingerprint failure rolls back both facts and scope registration.
+    // No full-history TEMP serialization/replay is needed.
+    cache.write_source(
+        identity, path, fingerprint.clone(), None, append, None, &mut |_| {},
+        &mut |db, metadata| {
+            query.register_cache_on(db, path, metadata, identity.namespace, index, phase, tag, false)
+        },
+        |writer| {
+            let mut state = sessions::utils::source_read_scope(path, || {
+                sessions::pi::visit_pi_format_incremental(path, identity.namespace, dedup, previous,
+                    &mut |message| {
+                        writer.push(&message, false, false)?;
+                        #[cfg(test)]
+                        PI_MESSAGE_HOOK.with(|slot| {
+                            if let Some(hook) = slot.borrow_mut().as_mut() { hook(path) } else { Ok(()) }
+                        })?;
+                        Ok(())
+                    })
+            })??;
+            if SourceFingerprint::from_path(path).as_ref() != Some(&fingerprint) {
+                return Err("Pi source changed during ingestion; previous generation retained".into());
+            }
+            state.prefix_hash = fingerprint.content_hash;
+            writer.set_pi_incremental(state);
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+pub(crate) fn pi_source_fingerprint(
+    cache: &SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+) -> Result<Option<SourceFingerprint>, String> {
+    let cached = cache.metadata(identity, path)?.filter(|metadata| metadata.message_count != 0);
+    Ok(match SourceFingerprint::check_path(path, cached.as_ref().map(|metadata| &metadata.fingerprint)) {
+        Some(crate::message_cache::FingerprintStatus::Unchanged) => cached.map(|metadata| metadata.fingerprint),
+        Some(crate::message_cache::FingerprintStatus::Changed(fingerprint)) => Some(fingerprint),
+        None => None,
+    })
+}
+
+pub(crate) fn ingest_pi_sources(
+    query: &QueryState,
+    cache: &mut SourceMessageCache,
+    identity: CacheIdentity,
+    paths: &[std::path::PathBuf],
+    mode: SelectionMode,
+) -> Result<(), String> {
+    ingest_sources_inner(query, cache, identity, paths, identity.namespace, mode,
+        &|cache, path| pi_source_fingerprint(cache, identity, path), &|_| true, false,
+        |query, cache, path, before, index, phase, tag| {
+            stage_pi_source(query, cache, identity, path, before, index, phase, tag)
+        })
+}
+
 /// Stream one source into the cache without ever holding its messages in a
 /// `Vec`. Rows flow straight from the visitor into a query-scratch lane, the
 /// fingerprint is re-verified before the cache write commits, and the scratch
@@ -3141,7 +3249,7 @@ fn ingest_sources_inner<F, T, S>(
     mut stage_cold: S,
 ) -> Result<(), String>
 where
-    F: Fn(&Path) -> Option<SourceFingerprint>,
+    F: Fn(&SourceMessageCache, &Path) -> Result<Option<SourceFingerprint>, String>,
     T: Fn(&Path) -> bool,
     S: FnMut(
         &QueryState,
@@ -3170,7 +3278,7 @@ where
                 | "crush"
         );
     for (index, path) in paths.iter().enumerate() {
-        let before = fingerprint(path);
+        let before = fingerprint(cache, path)?;
         let hit = cache_hit(cache, identity, path, before.as_ref(), allow_empty)?;
         query.classify(lane, index, hit.is_none())?;
         if let Some(metadata) = hit {
@@ -3210,7 +3318,7 @@ where
             if !query.is_miss(lane, index)? {
                 continue;
             }
-            let before = fingerprint(path);
+            let before = fingerprint(cache, path)?;
             if carry_absent_source(
                 query,
                 cache,
@@ -3251,7 +3359,7 @@ pub(crate) fn ingest_sources(
         paths,
         lane,
         mode,
-        &fingerprint,
+        &|_, path| Ok(fingerprint(path)),
         &tag,
         allow_empty,
         |query, cache, path, before, index, phase, tag| {
@@ -3301,7 +3409,7 @@ pub(crate) fn ingest_sources_streamed(
         paths,
         lane,
         mode,
-        &fingerprint,
+        &|_, path| Ok(fingerprint(path)),
         &tag,
         allow_empty,
         |query, cache, path, before, index, phase, tag| {
@@ -3398,17 +3506,20 @@ impl QueryState {
             if !reused || !matches!(lane, "claude" | "codex") {
                 self.select_lane(lane, SelectionMode::Report, simple)?;
             }
+            // INTEGER PRIMARY KEY assigns the next position in selected-rank
+            // order, without a second ROW_NUMBER window and its TEMP stream.
             self.db
                 .execute(
-                    "INSERT INTO sq_fold_rows
-                 SELECT (SELECT COALESCE(MAX(position),0) FROM sq_fold_rows)+
-                     ROW_NUMBER() OVER (ORDER BY s.rank),r.id,?1,?2,?3
-                 FROM sq_rows r JOIN sq_selected s ON s.id=r.id WHERE r.lane=?1 ORDER BY s.rank",
+                    "INSERT INTO sq_fold_rows(id,lane,simple,guarded)
+                 SELECT r.id,?1,?2,?3
+                 FROM sq_rows r JOIN sq_selected s ON s.id=r.id
+                 WHERE r.lane=?1 ORDER BY s.rank",
                     params![lane, simple, guarded],
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         })?;
+        let stride = self.report_checkpoint_stride()?;
         let mut prior_boundaries = std::collections::BTreeSet::<i64>::new();
         let checkpoints_exist: bool = self
             .db
@@ -3478,11 +3589,22 @@ impl QueryState {
                 hash_membership_value(&mut hash, row, column)?;
             }
             last = position;
-            if position % 1024 == 0 || prior_boundaries.contains(&position) {
+            if position % stride == 0 || prior_boundaries.contains(&position) {
                 self.record_fold_membership(position, &hash)?;
             }
         }
         self.record_fold_membership(last, &hash)
+    }
+
+    pub(crate) fn report_checkpoint_stride(&self) -> Result<i64, String> {
+        self.db
+            .query_row(
+                "SELECT COALESCE(MAX(position),0) FROM sq_fold_rows",
+                [],
+                |row| row.get(0),
+            )
+            .map(crate::usage_store::report_checkpoint_stride)
+            .map_err(|error| error.to_string())
     }
 
     fn record_fold_membership(&self, position: i64, hash: &sha2::Sha256) -> Result<(), String> {
@@ -5105,6 +5227,190 @@ mod tests {
         replacement.unpin().unwrap();
     }
     #[test]
+    fn pi_cold_refresh_and_direct_producer_rollback() {
+        for mode in [SelectionMode::Report, SelectionMode::LocalClients] {
+            let root = TempDir::new().unwrap();
+            let cache_root = root.path().join("cache");
+            let context = ResolvedLocalSourceContext::capture(
+                Some(root.path().join("home")), false, crate::scanner::ScannerSettings::default(),
+            ).unwrap();
+            let content = |id, input| format!("{{\"type\":\"session\",\"id\":\"session\"}}\n{}\n",
+                serde_json::json!({"type":"message","id":id,"timestamp":"2026-01-01T00:00:01Z",
+                    "message":{"role":"assistant","model":"gpt-5","usage":{"input":input}}}));
+            let first = root.path().join("a.jsonl");
+            let second = root.path().join("b.jsonl");
+            std::fs::write(&first, content("one", 10)).unwrap();
+            std::fs::write(&second, content("two", 20)).unwrap();
+            let mut cache = SourceMessageCache::open_from_root(Some(&cache_root));
+            let identity = CacheIdentity::for_client(ClientId::Omp);
+            let staged = query(&cache_root);
+            let mut snapshot = staged.begin_scope(&cache_root, &context, &["omp".to_string()],
+                None, mode).unwrap();
+            let change_first = first.clone();
+            let change_second = second.clone();
+            let replacement = content("two", 30);
+            PI_MESSAGE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(move |path| {
+                if path == change_first { std::fs::write(&change_second, &replacement).unwrap(); }
+                Ok(())
+            })));
+            let result = ingest_pi_sources(&staged, &mut cache, identity,
+                &[first.clone(), second], mode);
+            PI_MESSAGE_HOOK.with(|slot| slot.borrow_mut().take());
+            result.unwrap();
+            staged.publish(&mut snapshot).unwrap();
+            staged.replay_snapshot(&snapshot).unwrap();
+            staged.select_lane("omp", mode, true).unwrap();
+            assert_eq!(inputs(&staged, "omp", None, None), vec![10, 30]);
+            let original = cache.metadata(identity, &first).unwrap().unwrap();
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(&first).unwrap()
+                .write_all(content("three", 40).split_once('\n').unwrap().1.as_bytes()).unwrap();
+            let rejected = query(&cache_root);
+            let _pending = rejected.begin_scope(&cache_root, &context, &["omp".to_string()], None, mode).unwrap();
+            let before = pi_source_fingerprint(&cache, identity, &first).unwrap();
+            PI_MESSAGE_HOOK.with(|slot| *slot.borrow_mut() =
+                Some(Box::new(|_| Err("injected Pi producer abort".into()))));
+            let result = stage_pi_source(&rejected, &mut cache, identity, &first, before, 0, 1, true);
+            PI_MESSAGE_HOOK.with(|slot| slot.borrow_mut().take());
+            assert_eq!(result.unwrap_err(), "injected Pi producer abort");
+            let after = cache.metadata(identity, &first).unwrap().unwrap();
+            assert_eq!(after.generation, original.generation);
+            assert_eq!(after.message_count, 1);
+            assert_eq!(after.pi_incremental.unwrap().consumed_offset, original.fingerprint.size);
+            let physical_count: u64 = rejected.db.query_row(
+                "SELECT count(*) FROM mc_rows WHERE source_id=?1", [original.source_id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(physical_count, 1);
+        }
+    }
+
+    #[test]
+    fn pi_family_resume_preserves_frozen_prefix_and_rejects_corruption() {
+        use std::io::Write;
+        for client in [ClientId::Pi, ClientId::Kimchi, ClientId::Senpi, ClientId::Omp] {
+            let root = TempDir::new().unwrap();
+            let cache_root = root.path().join("cache");
+            let source = root.path().join("session.jsonl");
+            let identity = CacheIdentity::for_client(client);
+            let lane = client.as_str();
+            let context = ResolvedLocalSourceContext::capture(
+                Some(root.path().join("home")), false, crate::scanner::ScannerSettings::default(),
+            ).unwrap();
+            let header = "{\"type\":\"session\",\"id\":\"session\",\"cwd\":\"/tmp\"}\n";
+            let record = |id: &str, input: i64| format!("{}\n", serde_json::json!({
+                "type":"message","id":id,"timestamp":"2026-01-01T00:00:01Z",
+                "message":{"role":"assistant","model":"gpt-5","provider":"openai",
+                    "responseId":id,"usage":{"input":input}}
+            }));
+            std::fs::write(&source, format!("{header}{}", record("one", 10))).unwrap();
+            let mut cache = SourceMessageCache::open_from_root(Some(&cache_root));
+            let capture = |cache: &mut SourceMessageCache, full: bool| {
+                let staged = query(&cache_root);
+                let mut snapshot = staged.begin_scope(&cache_root, &context, &[lane.to_string()],
+                    None, SelectionMode::Report).unwrap();
+                if full {
+                    ingest_pi_sources(&staged, cache, identity, std::slice::from_ref(&source),
+                        SelectionMode::Report).unwrap();
+                } else {
+                    let before = pi_source_fingerprint(cache, identity, &source).unwrap();
+                    stage_pi_source(&staged, cache, identity, &source, before, 0, 1, true).unwrap();
+                }
+                staged.publish(&mut snapshot).unwrap();
+                (staged, snapshot)
+            };
+            let (_, first) = capture(&mut cache, true);
+            let old_reader = query(&cache_root);
+            old_reader.pin(&first).unwrap();
+            old_reader.replay_snapshot(&first).unwrap();
+            old_reader.select_lane(lane, SelectionMode::Report, true).unwrap();
+            assert_eq!(inputs(&old_reader, lane, None, None), vec![10]);
+            let first_metadata = cache.metadata(identity, &source).unwrap().unwrap();
+            assert!(first_metadata.pi_incremental.is_some());
+            let first_physical: i64 = old_reader.db.query_row(
+                "SELECT row_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+                params![first_metadata.source_id,first_metadata.generation], |row| row.get(0),
+            ).unwrap();
+            // Reopening must recover parser state, not depend on a resident map.
+            drop(cache);
+            cache = SourceMessageCache::open_from_root(Some(&cache_root));
+            let append = |text: &str| {
+                std::fs::OpenOptions::new().append(true).open(&source).unwrap()
+                    .write_all(text.as_bytes()).unwrap();
+            };
+            append(&record("two", 20));
+            let (second_query, second) = capture(&mut cache, false);
+            second_query.replay_snapshot(&second).unwrap();
+            second_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            assert_eq!(inputs(&second_query, lane, None, None), vec![10, 20]);
+            assert_eq!(inputs(&old_reader, lane, None, None), vec![10]);
+            let metadata = cache.metadata(identity, &source).unwrap().unwrap();
+            let physical = |generation| second_query.db.query_row(
+                "SELECT row_generation FROM mc_generation_storage WHERE source_id=?1 AND generation=?2",
+                params![metadata.source_id,generation], |row| row.get::<_, i64>(0),
+            ).unwrap();
+            assert_eq!(first_physical, physical(metadata.generation));
+            assert_eq!(metadata.message_count, 2);
+            assert!(metadata.pi_incremental.is_some());
+            append(&record("one", 99));
+            let (duplicate_query, duplicate) = capture(&mut cache, true);
+            duplicate_query.replay_snapshot(&duplicate).unwrap();
+            duplicate_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            assert_eq!(inputs(&duplicate_query, lane, None, None), vec![10, 20]);
+            let admitted = cache.metadata(identity, &source).unwrap().unwrap();
+            let (bytes, digest): (Vec<u8>, Vec<u8>) = duplicate_query.db.query_row(
+                "SELECT message,digest FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 AND ordinal=0",
+                params![admitted.source_id,admitted.generation], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            let rejected = query(&cache_root);
+            let _pending = rejected.begin_scope(&cache_root, &context, &[lane.to_string()], None,
+                SelectionMode::Report).unwrap();
+            duplicate_query.db.execute("UPDATE mc_rows SET digest=zeroblob(32) WHERE source_id=?1 AND ordinal=0",
+                [admitted.source_id]).unwrap();
+            append(&record("three", 30));
+            let before = pi_source_fingerprint(&cache, identity, &source).unwrap();
+            assert!(stage_pi_source(&rejected, &mut cache, identity, &source, before, 0, 1, true).is_err());
+            assert_eq!(cache.metadata(identity, &source).unwrap().unwrap().generation, admitted.generation);
+            duplicate_query.db.execute("UPDATE mc_rows SET message=?2,digest=?3 WHERE source_id=?1 AND ordinal=0",
+                params![admitted.source_id,bytes,digest]).unwrap();
+            // Rewriting the old prefix while appending must fall back to a full
+            // observation; the stable duplicate identity still resolves first.
+            std::fs::write(&source, format!("{header}{}{}", record("one", 11), record("four", 40))).unwrap();
+            let (corrected_query, corrected) = capture(&mut cache, false);
+            corrected_query.replay_snapshot(&corrected).unwrap();
+            corrected_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            let mut corrected_inputs = inputs(&corrected_query, lane, None, None);
+            corrected_inputs.sort();
+            assert_eq!(corrected_inputs, vec![11, 20, 40]);
+            assert!(cache.metadata(identity, &source).unwrap().unwrap().pi_incremental.is_none());
+            std::fs::write(&source, header).unwrap();
+            let (truncated_query, truncated) = capture(&mut cache, true);
+            truncated_query.replay_snapshot(&truncated).unwrap();
+            truncated_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            let mut truncated_inputs = inputs(&truncated_query, lane, None, None);
+            truncated_inputs.sort();
+            assert_eq!(truncated_inputs, vec![11, 20, 40]);
+            let tail = record("five", 50);
+            let split = tail.len() / 2;
+            append(&tail[..split]);
+            let (partial_query, partial) = capture(&mut cache, false);
+            partial_query.replay_snapshot(&partial).unwrap();
+            partial_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            let mut partial_inputs = inputs(&partial_query, lane, None, None);
+            partial_inputs.sort();
+            assert_eq!(partial_inputs, vec![11, 20, 40]);
+            assert!(cache.metadata(identity, &source).unwrap().unwrap().pi_incremental.is_none());
+            append(&tail[split..]);
+            let (completed_query, completed) = capture(&mut cache, true);
+            completed_query.replay_snapshot(&completed).unwrap();
+            completed_query.select_lane(lane, SelectionMode::Report, true).unwrap();
+            let mut completed_inputs = inputs(&completed_query, lane, None, None);
+            completed_inputs.sort();
+            assert_eq!(completed_inputs, vec![11, 20, 40, 50]);
+            old_reader.unpin().unwrap();
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn streamed_sink_abort_publishes_nothing_partial() {
         // Pi sink abort: the visitor stops at the first sink Err, the cache
@@ -5149,7 +5455,7 @@ mod tests {
             before,
             SourceFingerprint::from_path_samples_only,
             |sink| {
-                sessions::pi::visit_pi_file(&source, &mut |message| {
+                sessions::pi::visit_pi_format_file(&source, "pi", sessions::pi::PiDedup::CrossSession, &mut |message| {
                     sink(message)?;
                     Err("injected sink abort".to_string())
                 })

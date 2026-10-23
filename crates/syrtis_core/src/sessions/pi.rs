@@ -10,8 +10,8 @@ use super::utils::file_modified_timestamp_ms;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
-use serde::Deserialize;
-use std::io::{BufRead, BufReader};
+use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 /// Pi session header (first line of JSONL)
@@ -132,6 +132,19 @@ pub fn parse_pi_file(path: &Path) -> Vec<UnifiedMessage> {
     parse_pi_format_file(path, "pi", PiDedup::CrossSession)
 }
 
+/// Optional parser state is stored separately from the legacy Codex resume
+/// slot. Only complete physical lines and explicit event timestamps may resume.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PiIncrementalCache {
+    pub consumed_offset: u64,
+    pub prefix_hash: [u8; 32],
+    pub session_id: Option<String>,
+    pub workspace_key: Option<String>,
+    pub workspace_label: Option<String>,
+    pub agent: Option<String>,
+    pub resumable: bool,
+}
+
 /// Stream one Pi-format session file to `sink` without retaining its messages.
 ///
 /// Observable output matches [`parse_pi_format_file`]: a missing header or a
@@ -143,57 +156,86 @@ pub(crate) fn visit_pi_format_file(
     dedup: PiDedup,
     sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
 ) -> Result<(), String> {
-    let file = super::utils::open_source_file(path).map_err(|error| error.to_string())?;
+    visit_pi_format_incremental(path, client, dedup, None, sink).map(|_| ())
+}
+
+pub(crate) fn visit_pi_format_incremental(
+    path: &Path,
+    client: &str,
+    dedup: PiDedup,
+    previous: Option<PiIncrementalCache>,
+    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
+) -> Result<PiIncrementalCache, String> {
+    let mut state = previous.unwrap_or_else(|| PiIncrementalCache {
+        resumable: true,
+        ..PiIncrementalCache::default()
+    });
+    let mut file = super::utils::open_source_file(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(state.consumed_offset)).map_err(|error| error.to_string())?;
     let fallback_timestamp = file_modified_timestamp_ms(path);
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut buffer = Vec::with_capacity(4096);
-    let mut session_id: Option<String> = None;
-    let mut workspace_key: Option<String> = None;
-    let mut workspace_label: Option<String> = None;
-    let mut agent: Option<String> = None;
-    for (line_index, line) in reader.lines().enumerate() {
-        // An invalid-UTF-8 line costs only itself: `Lines` has consumed its
-        // bytes, so the next call reads the following record (upstream #1095).
-        let line = match line {
-            Ok(l) => l,
+    let mut probe_buffer = Vec::new();
+    let mut session_id = state.session_id.take();
+    let mut workspace_key = state.workspace_key.take();
+    let mut workspace_label = state.workspace_label.take();
+    let mut agent = state.agent.take();
+    let mut line_index = state.consumed_offset;
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let first_line = line_index == 0;
+        line_index += 1;
+        state.consumed_offset += read as u64;
+        state.resumable &= buffer.last() == Some(&b'\n');
+        // Match Lines' invalid-UTF-8 admission, without allocating a second
+        // copy of every (potentially very large) JSON record.
+        let line = match std::str::from_utf8(&buffer) {
+            Ok(line) => line,
             Err(_) => continue,
         };
-
-        // A UTF-8 BOM decodes cleanly, so it survives as U+FEFF glued to the
-        // front of the first record, where `str::trim` leaves it (U+FEFF is not
-        // White_Space) and the header then fails to parse — which discards the
-        // whole transcript. Strip it on the file's first physical line only;
-        // anywhere else it stays an ordinary malformed record (upstream #1134).
-        let line = if line_index == 0 {
-            line.strip_prefix('\u{feff}').unwrap_or(&line)
+        let line = if first_line {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
         } else {
-            &line
+            line
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        let start = trimmed.as_ptr() as usize - buffer.as_ptr() as usize;
+        let end = start + trimmed.len();
 
         if session_id.is_none() {
-            buffer.clear();
-            buffer.extend_from_slice(trimmed.as_bytes());
-            let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut buffer) {
+            // SIMD decoding mutates strings. Pre-header records alone need a
+            // probe copy: decode the full header from the original line.
+            probe_buffer.clear();
+            probe_buffer.extend_from_slice(&buffer[start..end]);
+            let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut probe_buffer) {
                 Ok(probe) => probe.entry_type,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    state.resumable = false;
+                    return Ok(state);
+                }
             };
 
             if entry_type != "session" {
                 if PRE_SESSION_METADATA_TYPES.contains(&entry_type.as_str()) {
                     continue;
                 }
-                return Ok(());
+                state.resumable = false;
+                return Ok(state);
             }
 
-            buffer.clear();
-            buffer.extend_from_slice(trimmed.as_bytes());
-            let header = match simd_json::from_slice::<PiSessionHeader>(&mut buffer) {
+            let header = match simd_json::from_slice::<PiSessionHeader>(&mut buffer[start..end]) {
                 Ok(h) => h,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    state.resumable = false;
+                    return Ok(state);
+                }
             };
 
             session_id = Some(header.id);
@@ -202,9 +244,7 @@ pub(crate) fn visit_pi_format_file(
             continue;
         }
 
-        buffer.clear();
-        buffer.extend_from_slice(trimmed.as_bytes());
-        let entry = match simd_json::from_slice::<PiSessionEntry>(&mut buffer) {
+        let entry = match simd_json::from_slice::<PiSessionEntry>(&mut buffer[start..end]) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -254,6 +294,7 @@ pub(crate) fn visit_pi_format_file(
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
             .map(|dt| dt.timestamp_millis());
         let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
+        state.resumable &= recorded_timestamp.is_some();
 
         let mut unified = UnifiedMessage::new_with_agent(
             client,
@@ -320,7 +361,12 @@ pub(crate) fn visit_pi_format_file(
         unified.set_workspace(workspace_key.clone(), workspace_label.clone());
         sink(unified)?;
     }
-    Ok(())
+    state.session_id = session_id;
+    state.workspace_key = workspace_key;
+    state.workspace_label = workspace_label;
+    state.agent = agent;
+    state.resumable &= state.session_id.is_some();
+    Ok(state)
 }
 /// Parse a JSONL session file written in the Pi record format.
 ///
@@ -340,37 +386,6 @@ pub(crate) fn parse_pi_format_file(
     messages
 }
 
-/// Thin per-client streaming entry points over the shared Pi-format visitor.
-/// App ingestion routes through these; the `Vec` wrappers stay for tests and
-/// the non-ingestion callers listed in `lib.rs`.
-pub(crate) fn visit_pi_file(
-    path: &Path,
-    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
-) -> Result<(), String> {
-    visit_pi_format_file(path, "pi", PiDedup::CrossSession, sink)
-}
-
-pub(crate) fn visit_kimchi_file(
-    path: &Path,
-    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
-) -> Result<(), String> {
-    visit_pi_format_file(path, "kimchi", PiDedup::SessionScoped, sink)
-}
-
-pub(crate) fn visit_senpi_file(
-    path: &Path,
-    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
-) -> Result<(), String> {
-    visit_pi_format_file(path, "senpi", PiDedup::CrossSession, sink)
-}
-
-pub(crate) fn visit_omp_file(
-    path: &Path,
-    sink: &mut dyn FnMut(UnifiedMessage) -> Result<(), String>,
-) -> Result<(), String> {
-    visit_pi_format_file(path, "omp", PiDedup::CrossSession, sink)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +397,54 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    #[test]
+    fn incremental_bytes_preserve_header_agent_numeric_and_partial_tail_semantics() {
+        let mut file = create_test_file(concat!(
+            "\u{feff} {\"type\":\"title\",\"title\":\"before session\"}\r\n",
+            "{\"type\":\"session\",\"id\":\"session\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"session_info\",\"name\":\"subagent-review-12345678\"}\n",
+        ));
+        // Invalid UTF-8 consumes exactly its physical line.
+        file.write_all(b"\xff\n").unwrap();
+        file.flush().unwrap();
+        let mut first = Vec::new();
+        let state = visit_pi_format_incremental(file.path(), "omp", PiDedup::CrossSession, None,
+            &mut |message| { first.push(message); Ok(()) }).unwrap();
+        assert!(state.resumable);
+        assert!(first.is_empty());
+        let record = concat!(
+            "{\"type\":\"message\",\"id\":\"turn\",\"timestamp\":\"2026-01-01T00:00:01Z\",",
+            "\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5\",\"provider\":\"openai\",",
+            "\"usage\":{\"input\":9007199254740993,\"output\":7}}}"
+        );
+        file.write_all(format!("{record}\n").as_bytes()).unwrap();
+        file.flush().unwrap();
+        let mut delta = Vec::new();
+        let next = visit_pi_format_incremental(file.path(), "omp", PiDedup::CrossSession, Some(state),
+            &mut |message| { delta.push(message); Ok(()) }).unwrap();
+        assert!(next.resumable);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].tokens.input, 9007199254740993);
+        assert_eq!(delta[0].agent.as_deref(), Some("review"));
+        assert_eq!(delta[0].workspace_key.as_deref(), Some("/tmp"));
+        let mut full = Vec::new();
+        visit_pi_format_file(file.path(), "omp", PiDedup::CrossSession, &mut |message| { full.push(message); Ok(()) }).unwrap();
+        assert_eq!(serde_json::to_value(&delta).unwrap(), serde_json::to_value(&full).unwrap());
+        file.write_all(b"{\"type\":\"message\"").unwrap();
+        file.flush().unwrap();
+        let partial = visit_pi_format_incremental(file.path(), "omp", PiDedup::CrossSession, Some(next),
+            &mut |_| panic!("incomplete record must not emit")).unwrap();
+        assert!(!partial.resumable);
+        let missing_time = create_test_file(concat!(
+            "{\"type\":\"session\",\"id\":\"session\"}\n",
+            "{\"type\":\"message\",\"id\":\"turn\",\"message\":{\"role\":\"assistant\",",
+            "\"model\":\"gpt-5\",\"usage\":{\"input\":1}}}\n",
+        ));
+        let fallback = visit_pi_format_incremental(missing_time.path(), "omp", PiDedup::CrossSession, None,
+            &mut |_| Ok(())).unwrap();
+        assert!(!fallback.resumable);
     }
 
     #[test]

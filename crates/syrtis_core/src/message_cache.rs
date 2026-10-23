@@ -150,7 +150,6 @@ pub(crate) enum FingerprintStatus {
 }
 
 impl SourceFingerprint {
-    #[cfg(test)]
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         Self::from_path_with_related(path, std::iter::empty())
     }
@@ -423,7 +422,6 @@ impl SourceFingerprint {
         Self::from_path_with_related_mode(path, related_paths, mode).map(FingerprintStatus::Changed)
     }
 
-    #[cfg(test)]
     fn from_path_with_related<I>(path: &Path, related_paths: I) -> Option<Self>
     where
         I: IntoIterator<Item = (String, PathBuf)>,
@@ -727,7 +725,7 @@ fn legacy_shard_index(namespace: &str, path: &CachedPath) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CacheIdentity {
-    namespace: &'static str,
+    pub(crate) namespace: &'static str,
     parser_version: u32,
     scope: [u8; 32],
 }
@@ -1639,7 +1637,7 @@ pub(crate) fn jcode_journal_path(path: &Path) -> PathBuf {
     crate::sessions::jcode::jcode_journal_path(path)
 }
 
-fn hash_prefix(path: &Path, len: u64) -> Option<[u8; 32]> {
+pub(crate) fn hash_prefix(path: &Path, len: u64) -> Option<[u8; 32]> {
     #[cfg(test)]
     FULL_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
 

@@ -2008,6 +2008,16 @@ fn publish_historical_fixture(
     count: usize,
     correction: Option<usize>,
 ) -> UsageSnapshot {
+    publish_historical_fixture_with_hours(root, context, count, correction, false)
+}
+
+fn publish_historical_fixture_with_hours(
+    root: &std::path::Path,
+    context: &ResolvedLocalSourceContext,
+    count: usize,
+    correction: Option<usize>,
+    bounded_hours: bool,
+) -> UsageSnapshot {
     let publisher = query(root);
     let mut snapshot = publisher
         .begin_scope(root, context, &["amp".into()], None, SelectionMode::Report)
@@ -2031,6 +2041,14 @@ fn publish_historical_fixture(
                 for index in 0..count {
                     let timestamp = if index == 7 {
                         0
+                    } else if bounded_hours {
+                        // Two represented years, but bounded report state.
+                        let year_start = if index % 2 == 0 {
+                            1_735_689_600_000
+                        } else {
+                            1_767_225_600_000
+                        };
+                        year_start + (index % 24) as i64 * 3_600_000
                     } else {
                         1_735_689_600_000 + index as i64 * 3_600_000
                             - if correction == Some(index) {
@@ -2264,6 +2282,70 @@ fn historical_report_checkpoints_reuse_changed_generations_with_exact_payloads()
     };
     let pricing = price(0.013);
     let kinds = ["graph-best-effort", "models", "hourly", "agents"];
+    // Eight ordinary query identities must coexist under the unchanged global
+    // 128-state cap, even when one history exceeds 32 fixed-size boundaries.
+    // Cache-pressure eligibility requires each aggregate to fit the existing
+    // 1 MiB state cap: keep all rows and query identities, not one hour/event.
+    // Fixed-1024 checkpoints would still require 34*8=272 global entries.
+    let pressure_root = TempDir::new().unwrap();
+    let pressure = publish_historical_fixture_with_hours(
+        pressure_root.path(),
+        &context,
+        32769,
+        None,
+        true,
+    );
+    let mut expected = Vec::new();
+    for year in ["2025", "2026"] {
+        let scoped = crate::ReportOptions {
+            year: Some(year.into()),
+            ..options.clone()
+        };
+        for kind in kinds {
+            let cold = historical_payload(&pressure, &scoped, Some(&pricing), kind, false);
+            assert_eq!(
+                historical_payload(&pressure, &scoped, Some(&pricing), kind, true),
+                cold,
+            );
+            expected.push((scoped.clone(), kind, cold));
+        }
+    }
+    for (scoped, kind, cold) in expected {
+        REPORT_DECODED_ROWS.with(|count| count.set(0));
+        assert_eq!(
+            historical_payload(&pressure, &scoped, Some(&pricing), kind, true),
+            cold,
+            "warm query under multi-report pressure: {kind}",
+        );
+        assert_eq!(
+            REPORT_DECODED_ROWS.with(|count| count.get()),
+            0,
+            "warm query decoded historical rows: {kind}",
+        );
+    }
+    // An intentionally oversized hourly accumulator remains a correct cold
+    // suffix fallback; optional caching must never truncate the report.
+    let oversized_root = TempDir::new().unwrap();
+    let oversized = publish_historical_fixture(oversized_root.path(), &context, 32769, None);
+    let oversized_options = crate::ReportOptions {
+        year: Some("2025".into()),
+        ..options.clone()
+    };
+    let oversized_expected =
+        historical_payload(&oversized, &oversized_options, Some(&pricing), "hourly", false);
+    assert_eq!(
+        historical_payload(&oversized, &oversized_options, Some(&pricing), "hourly", true),
+        oversized_expected,
+    );
+    REPORT_DECODED_ROWS.with(|count| count.set(0));
+    assert_eq!(
+        historical_payload(&oversized, &oversized_options, Some(&pricing), "hourly", true),
+        oversized_expected,
+    );
+    assert!(
+        REPORT_DECODED_ROWS.with(|count| count.get()) > 0,
+        "oversized hourly state must use the exact uncached suffix",
+    );
     let first = publish_historical_fixture(root.path(), &context, 2305, None);
     let clone = first.clone();
     assert_eq!(first, clone);

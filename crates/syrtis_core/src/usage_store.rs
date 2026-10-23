@@ -2093,6 +2093,11 @@ where
 
 const REPORT_STATE_BYTE_LIMIT: usize = 1024 * 1024;
 
+/// Initial state, at most fourteen interior states, and the final state.
+pub(crate) fn report_checkpoint_stride(selected_rows: i64) -> i64 {
+    (selected_rows / 15 + i64::from(selected_rows % 15 != 0)).max(1024)
+}
+
 /// One serialization pass with a hard byte ceiling. Small aggregates do not
 /// reserve the full ceiling, and oversized states never allocate beyond it.
 #[derive(Default)]
@@ -2285,6 +2290,19 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use tempfile::TempDir;
+
+    #[test]
+    fn report_checkpoint_boundaries_fit_sixteen_states() {
+        for rows in [0, 1, 1023, 1024, 1025, 15360, 15361, 32769, 262144, i64::MAX] {
+            let stride = report_checkpoint_stride(rows);
+            assert!(stride >= 1024);
+            let interiors = if rows == 0 { 0 } else { (rows - 1) / stride };
+            let states = 1 + interiors + i64::from(rows != 0);
+            assert!(states <= 16, "{rows} rows produced {states} states");
+        }
+        assert_eq!(report_checkpoint_stride(15360), 1024);
+        assert_eq!(report_checkpoint_stride(15361), 1025);
+    }
 
     type TransferHook = Box<dyn FnOnce(&Path)>;
     thread_local! {

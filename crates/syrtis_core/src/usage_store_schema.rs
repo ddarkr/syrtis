@@ -190,7 +190,7 @@ pub(super) fn validate_readonly(conn: &Connection) -> Result<(), String> {
         for (table, spec) in [
             ("mc_meta", "key:TEXT value:INTEGER"),
             ("mc_sources", "id:INTEGER namespace:TEXT scope:BLOB path:BLOB active:INTEGER generation:INTEGER"),
-            ("mc_versions", "source_id:INTEGER generation:INTEGER parser_version:INTEGER format_version:INTEGER fingerprint:BLOB resume:BLOB message_count:INTEGER retained_count:INTEGER fallback_count:INTEGER retained_digest:BLOB cacheable:INTEGER codex_turn_count:INTEGER codex_turn_digest:BLOB"),
+            ("mc_versions", "source_id:INTEGER generation:INTEGER parser_version:INTEGER format_version:INTEGER fingerprint:BLOB resume:BLOB pi_resume?:BLOB message_count:INTEGER retained_count:INTEGER fallback_count:INTEGER retained_digest:BLOB cacheable:INTEGER codex_turn_count:INTEGER codex_turn_digest:BLOB"),
             ("mc_rows", "source_id:INTEGER generation:INTEGER ordinal:INTEGER dedup_key:TEXT retained:INTEGER fallback:INTEGER timestamp:INTEGER message:BLOB digest:BLOB session_id:TEXT model_id:TEXT client:TEXT provider_id:TEXT workspace:BLOB workspace_label:BLOB"),
             ("mc_codex_turn_ids", "source_id:INTEGER generation:INTEGER turn_id:TEXT"),
             ("mc_migrations", "path:BLOB digest:BLOB source_count:INTEGER"),

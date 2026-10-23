@@ -1090,6 +1090,22 @@ fn pi_family_targeted_step(
     let full = crate::synchronize_local_usage(&contexts[1], options(client), mode).unwrap();
     *snapshots = [targeted, full];
     assert_pi_family_parity(snapshots);
+    for context in contexts {
+        let db = Connection::open(context.usage_dir().join("source-message-cache.sqlite3")).unwrap();
+        let mut statement = db.prepare(
+            "SELECT v.resume FROM mc_sources s JOIN mc_versions v ON v.source_id=s.id
+             WHERE s.namespace IN ('pi','kimchi','senpi','omp')",
+        ).unwrap();
+        let resumes = statement.query_map(
+            [],
+            |row| row.get::<_,Option<Vec<u8>>>(0),
+        ).unwrap();
+        for resume in resumes {
+            // Baseline readers dispatch every non-NULL current-parser resume
+            // to the Codex decoder. Public Pi sync must keep that slot NULL.
+            assert!(resume.unwrap().is_none());
+        }
+    }
     assert_eq!(
         pi_family_phases(&contexts[0], &snapshots[0]),
         pi_family_phases(&contexts[1], &snapshots[1])

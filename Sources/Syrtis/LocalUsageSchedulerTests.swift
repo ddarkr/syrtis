@@ -206,6 +206,49 @@ extension LocalUsageScheduler {
             var wall = Date(timeIntervalSince1970: 1_800_000_000)
             func advance(_ seconds: TimeInterval) { monotonic += seconds; wall.addTimeInterval(seconds) }
         }
+        let trayClock = Clock()
+        let traySource = SchedulerFixtureSource()
+        await traySource.useDistinctGraphs()
+        let trayScheduler = LocalUsageScheduler(
+            source: traySource, observesSources: false, automaticallySchedules: false,
+            monotonicNow: { trayClock.monotonic }, wallNow: { trayClock.wall })
+        let app = AppDelegate(source: traySource, scheduler: trayScheduler)
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: true, discordNeedsGraph: false)
+        await trayScheduler.runDueWork()
+        let trayHistory = await traySource.history()
+        let goodTitle = TrayMode.totalTokens.title(graph: app.lastGraph, tokensPerMin: nil)
+        let goodGeneration = app.lastGraph?.meta.generatedAt
+        expect(app.lastGraph != nil && trayHistory.1.allSatisfy { $0.kind == "graph" && $0.year == nil },
+               "actual tray owner publishes a display without dormant year or model preparation")
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: false, discordNeedsGraph: false)
+        trayClock.advance(601)
+        await trayScheduler.runDueWork()
+        let dormantHistory = await traySource.history()
+        expect(dormantHistory.0.count == trayHistory.0.count
+               && dormantHistory.1.count == trayHistory.1.count
+               && TrayMode.totalTokens.title(graph: app.lastGraph, tokensPerMin: nil) == goodTitle,
+               "final graph consumer removal stops source work without losing the last-good title")
+        await traySource.appendRecentEvent(at: Int64(trayClock.wall.timeIntervalSince1970 * 1000))
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: false, discordNeedsGraph: true)
+        expect(app.lastGraph?.meta.generatedAt == goodGeneration,
+               "presence re-enable preserves last-good display before its fresh capture")
+        await trayScheduler.runDueWork()
+        expect(app.lastGraph?.meta.generatedAt != goodGeneration,
+               "presence-only owner receives a fresh graph after background suspension")
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: false, discordNeedsGraph: false)
+        let retainedGeneration = app.lastGraph?.meta.generatedAt
+        await traySource.appendRecentEvent(at: Int64(trayClock.wall.timeIntervalSince1970 * 1000))
+        await traySource.pauseNextSync()
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: true, discordNeedsGraph: false)
+        let closingRefresh = Task { await trayScheduler.runDueWork() }
+        await traySource.waitForPausedSync()
+        app.reconcileBackgroundUsageDemand(trayNeedsGraph: false, discordNeedsGraph: false)
+        await traySource.resumeSync()
+        await closingRefresh.value
+        expect(app.lastGraph?.meta.generatedAt == retainedGeneration,
+               "a background source completion after final consumer removal cannot replace the last-good display")
+        trayScheduler.stop()
+
         // An app-lifetime owner prepares display facts without a dashboard.
         DashboardModel.invalidateScanDerivedCaches()
         let displayClock = Clock()

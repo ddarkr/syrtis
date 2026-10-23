@@ -233,6 +233,9 @@ final class LocalUsageScheduler {
         owners[session]?.usageReset = callback
     }
 
+    // App-lifetime display state must reset even with no source demand owner.
+    var resetDisplay: (() -> Void)?
+
     /// Pause and drain the app's source/query lanes before native maintenance.
     /// Reset invalidates display writers before deletion, including on failure.
     func diskUsage(_ action: DiskUsageAction) async throws -> DiskUsageReport {
@@ -254,6 +257,7 @@ final class LocalUsageScheduler {
         if action == .resetUsage {
             rootsChanged()
             DashboardModel.invalidateScanDerivedCaches()
+            resetDisplay?()
             let directories = Set(owners.values.compactMap { $0.usageReset?() })
             try await DashboardModel.discardPersistedUsage(in: directories)
             for entry in Array(waiting.values) {

@@ -1890,6 +1890,7 @@ impl<'a> HistoricalReportFold<'a> {
             )?;
             self.checkpoint.save(self.query.connection(), 0, state)?;
         }
+        let stride = self.query.report_checkpoint_stride()?;
         let mut last = resume_rows;
         self.query.visit_report_suffix(
             last,
@@ -1914,14 +1915,14 @@ impl<'a> HistoricalReportFold<'a> {
                     }
                 }
                 last = position;
-                if position % 1024 == 0 {
+                if position % stride == 0 {
                     self.checkpoint
                         .save(self.query.connection(), position, state)?;
                 }
                 Ok(())
             },
         )?;
-        if last > resume_rows && last % 1024 != 0 {
+        if last > resume_rows && last % stride != 0 {
             self.checkpoint.save(self.query.connection(), last, state)?;
         }
         self.query.release_reader()?;
@@ -2958,41 +2959,14 @@ pub fn try_synchronize_local_usage_sources(
                 store_query::stage_codex(&query, &mut cache, path, source.index, source.headless)?
             }
             ClientId::Pi | ClientId::Kimchi | ClientId::Senpi | ClientId::Omp => {
-                let visit = match source.client {
-                    ClientId::Pi => sessions::pi::visit_pi_file,
-                    ClientId::Kimchi => sessions::pi::visit_kimchi_file,
-                    ClientId::Senpi => sessions::pi::visit_senpi_file,
-                    ClientId::Omp => sessions::pi::visit_omp_file,
-                    _ => unreachable!(),
-                };
                 let identity = message_cache::CacheIdentity::for_client(source.client);
-                let before = message_cache::SourceFingerprint::from_path_samples_only(path);
-                if let Some(metadata) =
-                    store_query::cache_hit(&cache, identity, path, before.as_ref(), false)?
-                {
-                    store_query::stage_cached(
-                        &query,
-                        &cache,
-                        identity,
-                        path,
-                        &metadata,
-                        source.client.as_str(),
-                        source.index,
-                        0,
-                        source.tag,
-                        false,
-                    )?;
-                    continue;
-                }
-                store_query::stage_streamed_source(
+                let before = store_query::pi_source_fingerprint(&cache, identity, path)?;
+                store_query::stage_pi_source(
                     &query,
                     &mut cache,
                     identity,
                     path,
                     before,
-                    message_cache::SourceFingerprint::from_path_samples_only,
-                    |sink| visit(path, sink),
-                    source.client.as_str(),
                     source.index,
                     i32::from(selection == LocalUsageSelection::Report),
                     source.tag,
@@ -3237,10 +3211,11 @@ fn ingest_local_usage_inner(
         ClientId::OpenClaw,
         sessions::openclaw::visit_openclaw_transcript
     );
-    ingest_streamed!(ClientId::Pi, sessions::pi::visit_pi_file);
-    ingest_streamed!(ClientId::Kimchi, sessions::pi::visit_kimchi_file);
-    ingest_streamed!(ClientId::Senpi, sessions::pi::visit_senpi_file);
-    ingest_streamed!(ClientId::Omp, sessions::pi::visit_omp_file);
+    for client in [ClientId::Pi, ClientId::Kimchi, ClientId::Senpi, ClientId::Omp] {
+        store_query::ingest_pi_sources(
+            &query, &mut cache, CacheIdentity::for_client(client), scan_result.get(client), mode,
+        )?;
+    }
     ingest!(
         ClientId::Kimi,
         parse_kimi_source,
