@@ -8,13 +8,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let intervalKey = "tokenbar.refresh.intervalMin"
 
     private let usageSource: any UsageDataSource
-    private lazy var localScheduler = LocalUsageScheduler(source: usageSource)
+    private let localScheduler: LocalUsageScheduler
     private var backgroundUsageSession: LocalUsageScheduler.Session?
     private var installedRootGeneration = UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey)
 
-    init(source: any UsageDataSource = UsageDataSources.current) {
+    init(source: any UsageDataSource = UsageDataSources.current, scheduler: LocalUsageScheduler? = nil) {
         usageSource = source
+        localScheduler = scheduler ?? LocalUsageScheduler(source: source)
         super.init()
+        localScheduler.resetDisplay = { [weak self] in self?.clearBackgroundDisplay() }
     }
     private var statusController: StatusItemController?
     private var trayAnimator: TrayAnimator?
@@ -22,7 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var defaultsObserver: NSObjectProtocol?
     private var defaultsApplyScheduled = false
     // Last good fetches — a failed refresh keeps showing these.
-    private var lastGraph: UsagePayload?
+    private(set) var lastGraph: UsagePayload?
     private var trayProjection: TrayDisplayProjection?
     private var discordProjection: TrayDisplayProjection?
     private var refreshIntervalMin = AppDelegate.readIntervalMin()
@@ -401,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let installed = UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey)
             if installed != self.installedRootGeneration {
                 self.installedRootGeneration = installed
+                self.clearBackgroundDisplay()
                 self.localScheduler.rootsChanged()
             }
             self.reconcileBackgroundUsageDemand()
@@ -537,11 +540,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             officialClients: enabledClients.isEmpty ? [] : AgentIconView.availableOfficialClientIDs()))
     }
 
-    /// Keep default display reports prepared even while every window is closed.
-    private func reconcileBackgroundUsageDemand() {
-        let trayNeedsGraph = TrayMode.current.needsGraph
-            || !ClientTray.enabled().subtracting(ClientRegistry.hiddenTabClients()).isEmpty
-        let discordNeedsGraph = DiscordPresence.mayConnect(
+    /// Only actual menu-bar or presence consumers own a historical report.
+    func reconcileBackgroundUsageDemand(trayNeedsGraph: Bool? = nil, discordNeedsGraph: Bool? = nil) {
+        let trayNeedsGraph = trayNeedsGraph ?? (TrayMode.current.needsGraph
+            || !ClientTray.enabled().subtracting(ClientRegistry.hiddenTabClients()).isEmpty)
+        let discordNeedsGraph = discordNeedsGraph ?? DiscordPresence.mayConnect(
             arguments: CommandLine.arguments, enabled: DiscordPresence.enabled())
         // lastGraph is last-good display state, not a native lease. Dropping it
         // here blanks resumed titles/client items until a refresh succeeds.
@@ -559,24 +562,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             discordProjection = nil
         }
+        guard trayNeedsGraph || discordNeedsGraph else {
+            if let session = backgroundUsageSession { localScheduler.release(session) }
+            backgroundUsageSession = nil
+            return
+        }
         let session = backgroundUsageSession ?? localScheduler.openSession()
         backgroundUsageSession = session
-        localScheduler.setUsageReset(session) { [weak self] in
-            guard let self else { return nil }
-            self.lastGraph = nil
-            self.trayProjection = nil
-            self.discordProjection = nil
-            self.applyMenuBarState()
-            self.applyDiscordPresence()
-            return nil
-        }
-        let year = DashboardModel.resolveYear()
-        let queries: Set<LocalUsageScheduler.Query> = [
-            .init(kind: "graph"),
-            .init(kind: "graph", year: year),
-            .init(kind: "models", year: year)
-        ]
-        localScheduler.update(session, queries: queries, active: false) { [weak self] query, result in
+        localScheduler.update(session, queries: [.init(kind: "graph")], active: false) { [weak self] query, result in
             guard let self, query.year == nil,
                   case .success(.graph(let graph)) = result else { return }
             self.lastGraph = graph
@@ -585,6 +578,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.applyMenuBarState()
             self.applyDiscordPresence()
         }
+    }
+
+    private func clearBackgroundDisplay() {
+        lastGraph = nil
+        trayProjection = nil
+        discordProjection = nil
+        applyMenuBarState()
+        applyDiscordPresence()
     }
 
     /// Stale quota rendering has its own cheap cadence, even when no local

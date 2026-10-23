@@ -66,6 +66,95 @@ fn publish(
         .unwrap()
 }
 
+#[test]
+fn pi_resume_metadata_is_source_free_and_checksums_parser_state() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "pi.jsonl");
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let identity = CacheIdentity::for_client(ClientId::Omp);
+    let fingerprint = SourceFingerprint::from_path(&path).unwrap();
+    let resume = sessions::pi::PiIncrementalCache {
+        consumed_offset: fingerprint.size,
+        prefix_hash: fingerprint.content_hash,
+        session_id: Some("session".to_string()),
+        resumable: true,
+        ..Default::default()
+    };
+    let value = UnifiedMessage::new_with_dedup(
+        "omp", "gpt-5", "openai", "session", 100,
+        TokenBreakdown { input: 11, ..Default::default() }, 0.0, Some("turn".to_string()),
+    );
+    let metadata = cache.write_source(identity, &path, fingerprint, None, None, None,
+        &mut |_| {}, &mut |_, _| Ok(()), |writer| {
+            writer.push(&value, false, false)?;
+            writer.set_pi_incremental(resume);
+            Ok(())
+        }).unwrap();
+    fs::remove_file(&path).unwrap();
+    drop(cache);
+    let reopened = SourceMessageCache::open_from_root(Some(root.path()));
+    let stored = reopened.metadata(identity, &path).unwrap().unwrap();
+    assert_eq!(stored.pi_incremental.unwrap().session_id.as_deref(), Some("session"));
+    assert_eq!(rows(&reopened, &metadata)[0].0.tokens.input, 11);
+    reopened.with_database(Some(identity), |connection| {
+        // Baseline current-parser dispatch decodes every non-NULL resume as
+        // Codex, including Pi-family rows. The extension must leave it NULL.
+        let resume: Option<Vec<u8>> = connection.query_row(
+            "SELECT resume FROM mc_versions WHERE source_id=?1 AND generation=?2",
+            params![metadata.source_id,metadata.generation], |row| row.get(0),
+        ).map_err(sql_error)?;
+        let old_reader_resume = resume.as_deref().map(decode::<CodexIncrementalCache>).transpose()?;
+        assert!(old_reader_resume.is_none());
+        Ok(())
+    }).unwrap();
+    reopened.with_database(Some(identity), |connection| {
+        connection.execute("UPDATE mc_versions SET pi_resume=?3 WHERE source_id=?1 AND generation=?2",
+            params![metadata.source_id,metadata.generation,encode(&(vec![1u8],vec![0u8;32]))?]).map_err(sql_error)?;
+        Ok(())
+    }).unwrap();
+    assert!(reopened.metadata(identity, &path).is_err());
+    // Parser upgrades do not decode the obsolete parser-owned resume layout;
+    // the shared durable fact row remains readable without its source.
+    reopened.with_database(Some(identity), |connection| {
+        connection.execute("UPDATE mc_versions SET parser_version=?3 WHERE source_id=?1 AND generation=?2",
+            params![metadata.source_id,metadata.generation,identity.parser_version-1]).map_err(sql_error)?;
+        let stored = read_version(connection, metadata.source_id, metadata.generation)?;
+        assert!(stored.metadata.pi_incremental.is_none());
+        validate_stored_generation(connection, &stored)
+    }).unwrap();
+}
+
+#[test]
+fn pi_resume_column_addition_preserves_old_source_free_stores() {
+    let root = TempDir::new().unwrap();
+    let path = source(root.path(), "old-pi.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Pi);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let mut value = message("turn", 12);
+    value.client = "pi".to_string();
+    let metadata = publish(&cache, identity, &path, &[value]);
+    drop(cache);
+    fs::remove_file(&path).unwrap();
+    let db = Connection::open(root.path().join("source-message-cache.sqlite3")).unwrap();
+    db.execute_batch("ALTER TABLE mc_versions DROP COLUMN pi_resume").unwrap();
+    let old = read_version(&db, metadata.source_id, metadata.generation).unwrap();
+    assert!(old.metadata.pi_incremental.is_none());
+    validate_stored_generation(&db, &old).unwrap();
+    drop(db);
+    let upgraded = SourceMessageCache::open_from_root(Some(root.path()));
+    let current = upgraded.metadata(identity, &path).unwrap().unwrap();
+    assert!(current.pi_incremental.is_none());
+    assert_eq!(rows(&upgraded, &current)[0].0.tokens.input, 12);
+    upgraded.with_database(Some(identity), |db| {
+        let null: bool = db.query_row(
+            "SELECT pi_resume IS NULL AND resume IS NULL FROM mc_versions WHERE source_id=?1 AND generation=?2",
+            params![current.source_id,current.generation], |row| row.get(0),
+        ).map_err(sql_error)?;
+        assert!(null);
+        Ok(())
+    }).unwrap();
+}
+
 fn rows(
     cache: &SourceMessageCache,
     metadata: &CachedSourceMetadata,

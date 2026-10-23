@@ -1,4 +1,5 @@
 use super::*;
+use crate::sessions;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use std::fmt;
@@ -17,6 +18,7 @@ pub(crate) struct CachedSourceMetadata {
     pub retained_count: u64,
     pub fallback_count: u64,
     pub codex_incremental: Option<CodexIncrementalCache>,
+    pub pi_incremental: Option<sessions::pi::PiIncrementalCache>,
     /// At most one additional pre-parse legacy snapshot; never message rows.
     pub legacy_history: Option<Box<CachedSourceMetadata>>,
 }
@@ -299,7 +301,11 @@ fn initialize(connection: &Connection) -> Result<(), String> {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(sql_error)?
-            == 1;
+            == 1
+        || !connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mc_versions') WHERE name='pi_resume')",
+            [], |row| row.get::<_,bool>(0),
+        ).map_err(sql_error)?;
     let transaction = rusqlite::Transaction::new_unchecked(
         connection,
         if upgrade {
@@ -379,6 +385,15 @@ fn initialize(connection: &Connection) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS mc_namespaces(namespace TEXT PRIMARY KEY,signature BLOB NOT NULL);",
     ).map_err(sql_error)?;
     }
+    // Optional derived parser state: old readers keep seeing NULL Codex
+    // `resume` values for Pi-family rows and ignore this additive column.
+    let pi_resume_column: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mc_versions') WHERE name='pi_resume')",
+        [], |row| row.get(0),
+    ).map_err(sql_error)?;
+    if !pi_resume_column {
+        transaction.execute_batch("ALTER TABLE mc_versions ADD COLUMN pi_resume BLOB").map_err(sql_error)?;
+    }
     if version == 1 {
         transaction.execute_batch(
             "CREATE TABLE mc_generation_storage(
@@ -448,6 +463,12 @@ fn read_metadata(
         .transpose()
 }
 
+fn decode_pi_resume(bytes: &[u8]) -> Result<sessions::pi::PiIncrementalCache, String> {
+    let (state, digest): (Vec<u8>, Vec<u8>) = decode(bytes)?;
+    verify_digest(&state, &digest)?;
+    decode(&state)
+}
+
 fn read_version(
     connection: &Connection,
     id: i64,
@@ -514,6 +535,17 @@ fn read_version(
     }
     let current = CacheIdentity::current_for_namespace(&namespace)
         .ok_or_else(|| "source message cache parser owner is unknown".to_string())?;
+    let pi_resume = if matches!(namespace.as_str(), "pi" | "kimchi" | "senpi" | "omp")
+        && parser_version == current.parser_version {
+        let present: bool = connection.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mc_versions') WHERE name='pi_resume')"
+        ).map_err(sql_error)?.query_row([], |row| row.get(0)).map_err(sql_error)?;
+        if present {
+            connection.prepare_cached("SELECT pi_resume FROM mc_versions WHERE source_id=?1 AND generation=?2")
+                .map_err(sql_error)?.query_row(params![id,generation], |row| row.get::<_,Option<Vec<u8>>>(0))
+                .map_err(sql_error)?.as_deref().map(decode_pi_resume).transpose()?
+        } else { None }
+    } else { None };
     if retained_history_key_filter(&namespace).is_some() && parser_version > current.parser_version
     {
         return Err("source message cache retained parser version is unsupported".to_string());
@@ -539,11 +571,12 @@ fn read_version(
             fallback_count,
             // Stale parser-owned resume state is never decoded against a newer
             // CodexParseState layout; only compact shared rows remain queryable.
-            codex_incremental: if parser_version == current.parser_version {
+            codex_incremental: if namespace == ClientId::Codex.as_str() && parser_version == current.parser_version {
                 resume.as_deref().map(decode).transpose()?
             } else {
                 None
             },
+            pi_incremental: pi_resume,
             legacy_history: None,
         },
     })
@@ -943,11 +976,12 @@ impl SourceMessageCache {
                 row_generation: generation,
                 prefix: None,
                 codex_incremental,
+                pi_incremental: None,
                 cacheable: true,
                 fallback_timestamp: (fingerprint.modified_ns / 1_000_000) as i64,
             };
             if let Some(expected) = append_from {
-                let old = old.as_ref().filter(|old| identity.namespace == ClientId::Codex.as_str()
+                let old = old.as_ref().filter(|old| matches!(identity.namespace, "codex" | "pi" | "kimchi" | "senpi" | "omp")
                     && old.format_version == CACHE_FORMAT_VERSION && old.parser_version == identity.parser_version && old.metadata.cacheable
                     && old.id == expected.source_id && old.metadata.generation == expected.generation && old.metadata.fingerprint == expected.fingerprint)
                     .ok_or_else(|| "source message cache append generation changed".to_string())?;
@@ -1018,10 +1052,33 @@ impl SourceMessageCache {
             }
             // Changed-source queries and subsequent warm reads share one
             // reconciled generation; never publish the pre-merge observation.
-            let metadata = publish_generation(&transaction,identity,id,generation,&fingerprint,
+            let mut metadata = publish_generation(&transaction,identity,id,generation,&fingerprint,
                 writer.codex_incremental.as_ref(),writer.cacheable,true,old.as_ref())?;
+            if let Some(resume) = writer.pi_incremental.as_ref().filter(|state| state.resumable
+                && state.consumed_offset == fingerprint.size
+                && state.prefix_hash == fingerprint.content_hash
+                && metadata.retained_count == 0) {
+                let bytes = encode(resume)?;
+                let payload = encode(&(bytes.clone(), Sha256::digest(&bytes).to_vec()))?;
+                transaction.execute("UPDATE mc_versions SET pi_resume=?3 WHERE source_id=?1 AND generation=?2",
+                    params![id,generation,payload]).map_err(sql_error)?;
+                metadata.pi_incremental = Some(resume.clone());
+            }
             let query_generation = read_version(&transaction,id,generation)?;
-            validate_stored_generation(&transaction,&query_generation)?;
+            if append_from.is_some() && writer.pi_incremental.is_some() {
+                // The write-locked old stream was fully admitted above. Pi's
+                // producer can only extend (or copy) that immutable prefix;
+                // validate the newly written suffix, not the same payload twice.
+                let base = &old.as_ref().expect("append requires current generation").metadata;
+                visit_stored_rows_after(&transaction, &query_generation, Some(base),
+                    &mut |_: &UnifiedMessage, _, _| Ok(()))?;
+                if retained_digest(&transaction,id,generation)? != query_generation.retained_digest {
+                    return Err("source message cache retained generation digest is invalid".into());
+                }
+                visit_codex_ids(&transaction,&query_generation,&mut |_: &str| Ok(()))?;
+            } else {
+                validate_stored_generation(&transaction,&query_generation)?;
+            }
             if writer.cacheable {
                 if let Some(legacy) = legacy.as_ref() {delete_source(&transaction,legacy)?;}
             }
@@ -1369,11 +1426,16 @@ pub(crate) struct SourceRowWriter<'a> {
     prefix: Option<(u64, Option<i64>)>,
     next_ordinal: u64,
     codex_incremental: Option<CodexIncrementalCache>,
+    pi_incremental: Option<sessions::pi::PiIncrementalCache>,
     cacheable: bool,
     fallback_timestamp: i64,
 }
 
 impl SourceRowWriter<'_> {
+    pub(crate) fn set_pi_incremental(&mut self, state: sessions::pi::PiIncrementalCache) {
+        self.pi_incremental = Some(state);
+    }
+
     fn ensure_owned_rows(&mut self) -> Result<(), String> {
         if self.row_generation == self.generation {
             self.prefix = None;
@@ -1819,6 +1881,7 @@ fn publish_generation(
         retained_count,
         fallback_count,
         codex_incremental: resume.cloned(),
+        pi_incremental: None,
         legacy_history: None,
     })
 }
@@ -1856,13 +1919,25 @@ fn visit_stored_rows<S>(
 where
     S: FnMut(&UnifiedMessage, bool, bool) -> Result<(), String> + ?Sized,
 {
+    visit_stored_rows_after(connection, stored, None, sink)
+}
+
+fn visit_stored_rows_after<S>(
+    connection: &Connection,
+    stored: &StoredMetadata,
+    prefix: Option<&CachedSourceMetadata>,
+    sink: &mut S,
+) -> Result<(), String>
+where
+    S: FnMut(&UnifiedMessage, bool, bool) -> Result<(), String> + ?Sized,
+{
     install_logical_views_on(connection)?;
-    let mut count = 0;
-    let mut retained_count = 0;
-    let mut fallback_count = 0;
-    let mut statement = connection.prepare("SELECT ordinal,retained,fallback,message,digest,timestamp,format_version FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 ORDER BY ordinal").map_err(sql_error)?;
+    let mut count = prefix.map_or(0, |base| base.message_count);
+    let mut retained_count = prefix.map_or(0, |base| base.retained_count);
+    let mut fallback_count = prefix.map_or(0, |base| base.fallback_count);
+    let mut statement = connection.prepare("SELECT ordinal,retained,fallback,message,digest,timestamp,format_version FROM mc_logical_rows WHERE source_id=?1 AND generation=?2 AND ordinal>=?3 ORDER BY ordinal").map_err(sql_error)?;
     let mut rows = statement
-        .query(params![stored.id, stored.metadata.generation])
+        .query(params![stored.id, stored.metadata.generation, count])
         .map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
         let ordinal: u64 = row.get(0).map_err(sql_error)?;
@@ -2613,6 +2688,7 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
             prefix: None,
             next_ordinal: 0,
             codex_incremental: None,
+            pi_incremental: None,
             cacheable: true,
             fallback_timestamp: (fingerprint.modified_ns / 1_000_000) as i64,
         };
@@ -2721,6 +2797,7 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
                     retained_count: 0,
                     fallback_count: 0,
                     codex_incremental: writer.codex_incremental.clone(),
+                    pi_incremental: None,
                     legacy_history: None,
                 },
             };
@@ -2756,6 +2833,7 @@ impl<'de> Visitor<'de> for LegacyEntry<'_> {
                 prefix: None,
                 next_ordinal: old.metadata.message_count,
                 codex_incremental: old.metadata.codex_incremental.clone(),
+                pi_incremental: None,
                 cacheable: old.metadata.cacheable,
                 fallback_timestamp: (old.metadata.fingerprint.modified_ns / 1_000_000) as i64,
             };
