@@ -1,3 +1,21 @@
+// A legacy fixture needs the old physical layout, not only its version marker.
+fn legacy_source_registry(db: &Connection) {
+    db.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE legacy_scope_sources(scope_generation INTEGER NOT NULL,kind TEXT NOT NULL,lane TEXT NOT NULL,source_order INTEGER NOT NULL,path BLOB NOT NULL,cache_source_id INTEGER,cache_generation INTEGER,generation INTEGER,tag INTEGER NOT NULL,headless INTEGER NOT NULL,workspace BLOB,workspace_label BLOB,phase INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scope_generation,kind,lane,source_order)) WITHOUT ROWID;
+         INSERT INTO legacy_scope_sources SELECT * FROM sq_scope_sources;
+         DROP VIEW sq_scope_sources;
+         DROP TRIGGER sq_scope_source_evict;
+         DROP TABLE sq_scope_source_current;
+         DROP TABLE sq_scope_source_pins;
+         ALTER TABLE legacy_scope_sources RENAME TO sq_scope_sources;
+         CREATE INDEX sq_scope_cache_versions ON sq_scope_sources(cache_source_id,cache_generation);
+         CREATE INDEX sq_scope_opencode_versions ON sq_scope_sources(kind,path,generation);
+         COMMIT;",
+    )
+    .unwrap();
+}
+
 #[cfg(not(unix))]
 #[test]
 fn recent_queries_without_inode_admission_remain_fresh_and_disposable() {
@@ -159,13 +177,13 @@ fn seeded_cache_descriptors_pin_reuse_prune_and_preserve_registration_semantics(
     partial.seed_cache_descriptors().unwrap();
     // An observed cohort cannot be mistaken for an unchanged live descriptor.
     partial.db.execute(
-        "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+        "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
          SELECT scope_generation,'observed',lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase
          FROM sq_scope_sources WHERE scope_generation=?1 AND source_order=0",
         [reduced.generation],
     ).unwrap();
     partial.db.execute(
-        "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+        "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
          SELECT scope_generation,'observed-legacy',lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase
          FROM sq_scope_sources WHERE scope_generation=?1 AND kind='cache' AND source_order=0",
         [reduced.generation],
@@ -3203,6 +3221,7 @@ fn compact_and_legacy_indexed_metadata_match_without_sources() {
         assert_eq!(consumer_inputs(&snapshot), vec![11]);
         // Recreate the pre-metadata-only LocalClients index. Both expanded
         // and compact legacy metadata must migrate without raw source access.
+        legacy_source_registry(&publisher.db);
         publisher.db.execute(
             "INSERT INTO sq_decisions(scope_generation,rank,lane,timestamp,cache_source_id,cache_generation,cache_ordinal,cache_format,workspace,workspace_label,model)
              SELECT s.scope_generation,1,s.lane,r.timestamp,s.cache_source_id,s.cache_generation,r.ordinal,v.format_version,r.workspace,r.workspace_label,r.model_id
@@ -3337,7 +3356,7 @@ fn local_metadata_publication_hydrates_changed_facts_and_rejects_corrupt_winners
     publisher.replay_snapshot(&second).unwrap();
     // Reuse the exact canonical source descriptors, not a fresh live parse.
     publisher.db.execute(
-        "INSERT INTO sq_scope_sources SELECT ?1,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase FROM sq_scope_sources WHERE scope_generation=?2",
+        "INSERT INTO sq_scope_source_pins SELECT ?1,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase FROM sq_scope_sources WHERE scope_generation=?2",
         params![prepared.generation, second.generation],
     ).unwrap();
     publisher.publish_prepared(&mut prepared).unwrap();
@@ -3457,6 +3476,7 @@ fn range_queries_preserve_legacy_and_rank_only_scope_facts() {
         None,
     );
     for version in [3, 4] {
+        legacy_source_registry(&publisher.db);
         publisher
             .db
             .execute(

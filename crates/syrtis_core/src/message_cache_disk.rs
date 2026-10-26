@@ -3137,7 +3137,7 @@ pub(crate) fn collect_unreferenced_versions_on(connection: &Connection) -> Resul
         return Err("source message cache collection requires a scope transaction".to_string());
     }
     let scopes: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sq_scope_sources')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='sq_scope_sources')",
         [],|row| row.get(0),
     ).map_err(sql_error)?;
     connection.execute_batch(

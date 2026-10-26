@@ -831,10 +831,66 @@ fn managed_readonly_admits_production_fresh_groups_and_absent_optional_groups() 
 }
 
 #[test]
+fn managed_scope_six_inspection_preserves_source_free_facts_without_writes() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join(DATABASE);
+    let conn = Connection::open(&path).unwrap();
+    let descriptors = legacy(&conn);
+    admit_schema(&conn).unwrap();
+    drop(conn);
+    drop(crate::store_query::QueryState::open(root.path()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(conn.query_row(
+        "SELECT value FROM sq_meta WHERE key='schema_version'", [],
+        |r| r.get::<_, i64>(0),
+    ).unwrap(), 6);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+    let before = fs::read(&path).unwrap();
+    inspect_managed_readonly(&path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(conn.query_row(
+        "SELECT count(*) FROM oc_generations g JOIN oc_messages m ON m.source=g.generation WHERE g.descriptor=?1 AND NOT EXISTS(SELECT 1 FROM oc_sources s WHERE s.generation=g.generation)",
+        [&descriptors[2]], |r| r.get::<_, i64>(0),
+    ).unwrap(), 1);
+}
+
+#[test]
+fn managed_scope_six_rejects_broken_registry_without_repair() {
+    for mutation in [
+        "DROP TABLE sq_scope_source_current",
+        "DROP TABLE sq_scope_source_pins",
+        "ALTER TABLE sq_scope_source_pins RENAME COLUMN phase TO invalid_phase",
+        "DROP VIEW sq_scope_sources; CREATE VIEW sq_scope_sources AS SELECT * FROM sq_scope_source_pins",
+        "PRAGMA user_version=1",
+        "UPDATE sq_meta SET value=7 WHERE key='schema_version'",
+    ] {
+        let root = TempDir::new().unwrap();
+        drop(crate::store_query::QueryState::open(root.path()).unwrap());
+        let path = root.path().join(DATABASE);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(mutation).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+        let before = fs::read(&path).unwrap();
+        assert!(inspect_managed_readonly(&path).is_err(), "accepted {mutation}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        if mutation != "PRAGMA user_version=1" {
+            assert!(
+                crate::store_query::QueryState::open(root.path()).is_err(),
+                "query admission accepted {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn managed_readonly_rejects_incomplete_and_future_groups_without_repair() {
     for current in [false, true] {
         for mutation in [
             "DROP TABLE oc_aliases",
+            "DROP TABLE oc_aliases; CREATE VIEW oc_aliases AS SELECT * FROM oc_messages",
             "DROP TABLE sq_decisions",
             "DROP TABLE sq_indexes",
             "ALTER TABLE sq_decisions DROP COLUMN oc_ordinal",

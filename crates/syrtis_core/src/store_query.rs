@@ -465,7 +465,7 @@ impl QueryState {
 
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         let db = crate::usage_store::open_database(root)?;
-        let existing:i64=db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sq_meta','sq_scopes','sq_scope_generations','sq_scope_sources')",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        let existing:i64=db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name IN ('sq_meta','sq_scopes','sq_scope_generations')) OR (type IN ('table','view') AND name='sq_scope_sources')",[],|row|row.get(0)).map_err(|error|error.to_string())?;
         if existing != 0 && existing != 4 {
             return Err("usage scope schema is incomplete; previous generations retained".into());
         }
@@ -490,7 +490,7 @@ impl QueryState {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if !matches!(version, 3..=5) {
+        if !matches!(version, 3..=6) {
             return Err("usage scope schema is unsupported; previous generations retained".into());
         }
         db.prepare("SELECT g.id,g.scope_id,g.complete,g.selection,s.id,s.scope_key,s.current_generation,x.scope_generation,x.kind,x.lane,x.source_order,x.path,x.cache_source_id,x.cache_generation,x.generation,x.tag,x.headless,x.workspace,x.workspace_label,x.phase FROM sq_scope_generations g LEFT JOIN sq_scopes s ON s.id=g.scope_id LEFT JOIN sq_scope_sources x ON x.scope_generation=g.id LIMIT 0").map_err(|error|error.to_string())?;
@@ -559,7 +559,7 @@ impl QueryState {
             }
             transaction.commit().map_err(|error| error.to_string())?;
         }
-        if version != 5 {
+        if version < 5 {
             let transaction =
                 rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
                     .map_err(|error| error.to_string())?;
@@ -594,7 +594,7 @@ impl QueryState {
                          UPDATE sq_meta SET value=5 WHERE key='schema_version';",
                     ).map_err(|error| error.to_string())?;
                 }
-                5 => {}
+                5 | 6 => {}
                 _ => {
                     return Err(
                         "usage scope schema is unsupported; previous generations retained".into(),
@@ -605,6 +605,7 @@ impl QueryState {
         }
         db.prepare("SELECT decision_generation FROM sq_indexes LIMIT 0")
             .map_err(|error| error.to_string())?;
+        crate::store_query_sources::ensure_source_registry(&db)?;
         // ponytail: scan rank-clustered reference metadata for recent bounds;
         // bulk-build a time lookup only if measured read CPU requires it.
         // 64 KiB TEMP budget, aligned with the durable-store TEMP budget; RAM over sort latency.
@@ -719,9 +720,9 @@ impl QueryState {
             .map_err(|error| error.to_string())?;
         transaction.execute("INSERT INTO sq_scope_generations(scope_id,selection) SELECT id,?2 FROM sq_scopes WHERE scope_key=?1",params![scope,mode as i32]).map_err(|error|error.to_string())?;
         let generation = transaction.last_insert_rowid();
-        transaction.execute_batch("DELETE FROM sq_scope_sources WHERE scope_generation IN (SELECT id FROM sq_scope_generations WHERE complete=0 ORDER BY id DESC LIMIT -1 OFFSET 32);
+        transaction.execute_batch("DELETE FROM sq_scope_source_pins WHERE scope_generation IN (SELECT id FROM sq_scope_generations WHERE complete=0 ORDER BY id DESC LIMIT -1 OFFSET 32);
             DELETE FROM sq_scope_generations WHERE complete=0 AND id NOT IN (SELECT id FROM sq_scope_generations WHERE complete=0 ORDER BY id DESC LIMIT 32);
-            DELETE FROM sq_scope_sources WHERE NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.id=sq_scope_sources.scope_generation);
+            DELETE FROM sq_scope_source_pins WHERE NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.id=sq_scope_source_pins.scope_generation);
             DELETE FROM sq_scopes WHERE current_generation IS NULL AND NOT EXISTS(SELECT 1 FROM sq_scope_generations g WHERE g.scope_id=sq_scopes.id);").map_err(|error|error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         self.pending_scope.set(Some(generation));
@@ -853,7 +854,7 @@ impl QueryState {
         self.admit_staging(&transaction)?;
         transaction
             .execute(
-                "INSERT INTO sq_scope_sources
+                "INSERT INTO sq_scope_source_pins
              SELECT ?1,s.kind,s.lane,s.source_order,s.path,s.cache_source_id,s.cache_generation,
                     s.generation,s.tag,s.headless,s.workspace,s.workspace_label,
                     CASE WHEN ?3 AND s.kind='cache' AND s.phase=1
@@ -890,7 +891,7 @@ impl QueryState {
             )
             .map_err(|error| error.to_string())?;
         transaction.execute(
-            "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase)
+            "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,generation,tag,headless,workspace,workspace_label,phase)
              SELECT ?1,s.kind,s.lane,s.source_order,s.path,s.cache_source_id,s.cache_generation,s.generation,s.tag,s.headless,s.workspace,s.workspace_label,s.phase
              FROM sq_scope_sources s
              JOIN sq_scopes owner ON owner.current_generation=s.scope_generation
@@ -931,7 +932,7 @@ impl QueryState {
         let generation = self.admit_staging(&transaction)?;
         transaction
             .execute(
-                "DELETE FROM sq_scope_sources AS s WHERE s.scope_generation=?1 AND s.kind='cache'
+                "DELETE FROM sq_scope_source_pins AS s WHERE s.scope_generation=?1 AND s.kind='cache'
              AND NOT EXISTS(SELECT 1 FROM sq_sources seen WHERE seen.lane=s.lane
                             AND seen.source_order=s.source_order AND seen.seeded_seen=1)",
                 [generation],
@@ -1047,17 +1048,17 @@ impl QueryState {
             );
         }
         db.prepare_cached(
-            "DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind='cache' AND lane=?2 AND source_order=?3",
+            "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1 AND kind='cache' AND lane=?2 AND source_order=?3",
         ).map_err(|error| error.to_string())?
             .execute(params![generation,lane,index as i64])
             .map_err(|error| error.to_string())?;
         db.prepare_cached(
-            "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+            "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
              VALUES(?1,'cache',?2,?3,?4,?5,?6,?7,?8,?9)",
         ).map_err(|error| error.to_string())?
             .execute(params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,tag,headless,phase])
             .map_err(|error| error.to_string())?;
-        db.execute("DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind IN ('observed','observed-legacy') AND lane=?2 AND source_order=?3",params![generation,lane,index as i64]).map_err(|error|error.to_string())?;
+        db.execute("DELETE FROM sq_scope_source_pins WHERE scope_generation=?1 AND kind IN ('observed','observed-legacy') AND lane=?2 AND source_order=?3",params![generation,lane,index as i64]).map_err(|error|error.to_string())?;
         self.mark_cache_seen(lane, index)?;
         Ok(())
     }
@@ -1119,13 +1120,13 @@ impl QueryState {
                 "observed-legacy"
             };
             db.prepare_cached(
-                "DELETE FROM sq_scope_sources WHERE scope_generation=?1 AND kind=?2 AND lane=?3 AND source_order=?4",
+                "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1 AND kind=?2 AND lane=?3 AND source_order=?4",
             ).map_err(|error| error.to_string())?
                 .execute(params![generation,kind,lane,index as i64])
                 .map_err(|error| error.to_string())?;
             db.prepare_cached(
-                "INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless)
-                 VALUES(?1,?7,?2,?3,?4,?5,?6,?8,0)",
+                "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase)
+                 VALUES(?1,?7,?2,?3,?4,?5,?6,?8,0,0)",
             ).map_err(|error| error.to_string())?
                 .execute(params![generation,lane,index as i64,path,metadata.source_id,metadata.generation,kind,tag])
                 .map_err(|error| error.to_string())?;
@@ -1149,7 +1150,7 @@ impl QueryState {
         let path = bincode::options()
             .serialize(&crate::message_cache::CachedPath::from_path(path))
             .map_err(|error| error.to_string())?;
-        db.execute("INSERT INTO sq_scope_sources(scope_generation,kind,lane,source_order,path,generation,tag,headless) VALUES(?1,?2,'opencode',?3,?4,?5,0,0)",params![generation,if sqlite {"opencode-sqlite"}else{"opencode-json"},index as i64,path,key]).map(|_|()).map_err(|error|error.to_string())
+        db.execute("INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,generation,tag,headless,phase) VALUES(?1,?2,'opencode',?3,?4,?5,0,0,0)",params![generation,if sqlite {"opencode-sqlite"}else{"opencode-json"},index as i64,path,key]).map(|_|()).map_err(|error|error.to_string())
     }
 
     pub(crate) fn set_workspace_reference(
@@ -1160,7 +1161,7 @@ impl QueryState {
         label: &Option<String>,
     ) -> Result<(), String> {
         if let Some(generation) = self.pending_scope.get() {
-            self.db.execute("UPDATE sq_scope_sources SET workspace=?4,workspace_label=?5 WHERE scope_generation=?1 AND lane=?2 AND source_order=?3",params![generation,lane,index as i64,bincode::serialize(key).map_err(|error|error.to_string())?,bincode::serialize(label).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;
+            self.db.execute("UPDATE sq_scope_source_pins SET workspace=?4,workspace_label=?5 WHERE scope_generation=?1 AND lane=?2 AND source_order=?3",params![generation,lane,index as i64,bincode::serialize(key).map_err(|error|error.to_string())?,bincode::serialize(label).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;
         }
         Ok(())
     }
@@ -1207,7 +1208,7 @@ impl QueryState {
                 if same {
                     self.db
                         .execute(
-                            "DELETE FROM sq_scope_sources WHERE scope_generation=?1",
+                            "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1",
                             [snapshot.generation],
                         )
                         .map_err(|error| error.to_string())?;
@@ -1239,6 +1240,7 @@ impl QueryState {
                         [snapshot.generation],
                     )
                     .map_err(|error| error.to_string())?;
+                crate::store_query_sources::publish_sources_on(&self.db, snapshot.generation)?;
                 self.db
                     .execute(
                         "UPDATE sq_scopes SET current_generation=?2 WHERE scope_key=?1",
@@ -1277,7 +1279,7 @@ impl QueryState {
                     .map_err(|error| error.to_string())?;
                 for sql in [
                     "DELETE FROM sq_indexes WHERE scope_generation=?1",
-                    "DELETE FROM sq_scope_sources WHERE scope_generation=?1",
+                    "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1",
                     "DELETE FROM sq_scope_generations WHERE id=?1",
                 ] {
                     self.db
@@ -2265,7 +2267,7 @@ impl Drop for QueryState {
     fn drop(&mut self) {
         if let Some(generation) = self.pending_scope.get() {
             let _ = self.db.execute(
-                "DELETE FROM sq_scope_sources WHERE scope_generation=?1",
+                "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1",
                 [generation],
             );
             let _ = self.db.execute(
@@ -5180,7 +5182,7 @@ mod tests {
             .unwrap();
         stage_claude(&invalid, &mut cache, &source, &home, 0).unwrap();
         invalid.db.execute(
-            "UPDATE sq_scope_sources SET cache_generation=-1 WHERE scope_generation=?1 AND kind='cache'",
+            "UPDATE sq_scope_source_pins SET cache_generation=-1 WHERE scope_generation=?1 AND kind='cache'",
             [rejected.generation],
         ).unwrap();
         assert!(invalid.publish(&mut rejected).is_err());

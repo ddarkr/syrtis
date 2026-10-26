@@ -17,13 +17,13 @@ thread_local! {
 
 fn group(conn: &Connection, names: &[&str]) -> Result<bool, String> {
     let placeholders = vec!["?"; names.len()].join(",");
-    let count: usize = sql(conn.query_row(
+    let (count, objects): (usize, usize) = sql(conn.query_row(
         &format!(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({placeholders})"
+            "SELECT count(CASE WHEN type='table' THEN 1 END),count(*) FROM sqlite_master WHERE name IN ({placeholders})"
         ),
         rusqlite::params_from_iter(names),
         |r| {
-            let count = r.get(0)?;
+            let count = (r.get(0)?, r.get(1)?);
             #[cfg(test)]
             {
                 let hook = GROUP_PROBE_HOOK.with(|slot| slot.borrow_mut().take());
@@ -34,10 +34,38 @@ fn group(conn: &Connection, names: &[&str]) -> Result<bool, String> {
             Ok(count)
         },
     ))?;
-    if count != 0 && count != names.len() {
+    if count != objects || (count != 0 && count != names.len()) {
         return Err("usage store managed schema is incomplete; existing data preserved".into());
     }
     Ok(count != 0)
+}
+
+// Read-only inspection checks schema metadata before validating retained facts.
+fn scope_version(conn: &Connection, outer: i64) -> Result<Option<i64>, String> {
+    if !group(conn, &["sq_meta", "sq_scopes", "sq_scope_generations"])? {
+        if sql(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('sq_scope_sources','sq_scope_source_current','sq_scope_source_pins'))",
+            [], |r| r.get::<_, bool>(0),
+        ))? {
+            return Err("usage store managed schema is incomplete; existing data preserved".into());
+        }
+        return Ok(None);
+    }
+    columns(conn, "sq_meta", "key:TEXT value:INTEGER")?;
+    let version: Option<i64> = sql(conn.query_row(
+        "SELECT CASE WHEN count(*)=1 THEN min(value) END FROM sq_meta WHERE key='schema_version'",
+        [], |r| r.get(0),
+    ))?;
+    let version = version.ok_or("usage scope schema is unsupported")?;
+    if !matches!((outer, version), (1, 2) | (2, 3..=6)) {
+        return Err("usage scope schema is unsupported".into());
+    }
+    if version == 6 {
+        crate::store_query_sources::validate_source_registry(conn)?;
+    } else if !group(conn, &["sq_scope_sources"])? {
+        return Err("usage store managed schema is incomplete; existing data preserved".into());
+    }
+    Ok(Some(version))
 }
 
 // Maintenance only: no transaction, migration, or main-database writes. Keep
@@ -50,15 +78,8 @@ pub(super) fn validate_readonly(conn: &Connection) -> Result<(), String> {
     }
     let reference = if outer == 1 { "BLOB" } else { "INTEGER" };
     let oc = group(conn, &OC_TABLES)?;
-    let sq = group(
-        conn,
-        &[
-            "sq_meta",
-            "sq_scopes",
-            "sq_scope_generations",
-            "sq_scope_sources",
-        ],
-    )?;
+    let scope_version = scope_version(conn, outer)?;
+    let sq = scope_version.is_some();
     let decisions = group(conn, &["sq_indexes", "sq_decisions"])?;
     if decisions && !sq {
         return Err("usage store decision schema is incomplete".into());
@@ -112,17 +133,7 @@ pub(super) fn validate_readonly(conn: &Connection) -> Result<(), String> {
         }
     }
     if sq {
-        columns(conn, "sq_meta", "key:TEXT value:INTEGER")?;
-        // Later scope versions change only derived indexes, not fact references.
-        let versions = if outer == 1 { [2, 2] } else { [3, 5] };
-        let valid: bool = sql(conn.query_row(
-            "SELECT count(*)=1 AND min(value) BETWEEN ?1 AND ?2 FROM sq_meta WHERE key='schema_version'",
-            versions,
-            |r| r.get(0),
-        ))?;
-        if !valid {
-            return Err("usage scope schema is unsupported".into());
-        }
+        // Scope version and physical registry are admitted above.
         for (table, spec) in [
             ("sq_scopes", "id:INTEGER scope_key:BLOB current_generation:INTEGER"),
             ("sq_scope_generations", "id:INTEGER scope_id:INTEGER complete:INTEGER selection:INTEGER"),
@@ -143,11 +154,7 @@ pub(super) fn validate_readonly(conn: &Connection) -> Result<(), String> {
             "sq_indexes",
             "scope_generation:INTEGER version:INTEGER",
         )?;
-        let shared_decisions: bool = sql(conn.query_row(
-            "SELECT value=5 FROM sq_meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        ))?;
+        let shared_decisions = scope_version.is_some_and(|version| version >= 5);
         if shared_decisions {
             columns(conn, "sq_indexes", "decision_generation:INTEGER")?;
         }

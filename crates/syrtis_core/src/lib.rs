@@ -18,6 +18,7 @@ pub mod sessions;
 mod source_context;
 mod source_watch;
 mod store_query;
+mod store_query_sources;
 mod usage_migration;
 mod usage_store;
 pub use store_query::{

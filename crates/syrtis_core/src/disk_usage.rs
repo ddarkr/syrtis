@@ -354,6 +354,8 @@ fn reset(db: &Connection, root: &Path) -> Result<(), String> {
         "sq_decisions",
         "sq_indexes",
         "sq_scope_sources",
+        "sq_scope_source_current",
+        "sq_scope_source_pins",
         "sq_scope_generations",
         "sq_scopes",
         "sq_durable_origins",
@@ -402,10 +404,10 @@ mod tests {
     fn compaction_preserves_epoch_and_facts_and_refreshes_smaller_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("usage");
+        drop(crate::store_query::QueryState::open(&root).unwrap());
         let db = crate::usage_store::open_database(&root).unwrap();
         db.execute_batch(
-            "CREATE TABLE sq_meta(key TEXT PRIMARY KEY,value);
-            INSERT INTO sq_meta VALUES('store_epoch',x'010203');
+            "UPDATE sq_meta SET value=x'010203' WHERE key='store_epoch';
             CREATE TABLE retained_fact(value BLOB);
             INSERT INTO retained_fact VALUES(x'1234');
             CREATE TABLE disposable_padding(value BLOB);
@@ -626,9 +628,33 @@ mod tests {
                 crate::LocalUsageSelection::Report,
             )
             .unwrap();
+        let db = query.connection();
+        // begin_scope leaves an unpublished generation. Make this synthetic
+        // registry a complete published scope before validating its references.
+        db.execute_batch(
+            "UPDATE sq_scope_generations SET complete=1;
+             UPDATE sq_scopes SET current_generation=(
+                 SELECT id FROM sq_scope_generations WHERE scope_id=sq_scopes.id LIMIT 1
+             );"
+        ).unwrap();
+        for (table, key, owner) in [
+            ("sq_scope_source_current", "scope_id", "SELECT id FROM sq_scopes LIMIT 1"),
+            ("sq_scope_source_pins", "scope_generation", "SELECT id FROM sq_scope_generations LIMIT 1"),
+        ] {
+            db.execute_batch(&format!(
+                "INSERT INTO {table}({key},kind,lane,source_order,path,tag,headless,phase)
+                 SELECT ({owner}),'synthetic','claude',0,x'01',0,0,0"
+            )).unwrap();
+        }
+        crate::usage_store::validate_managed_schema_readonly(db).unwrap();
         crate::usage_store::refresh_retained_recovery(query.connection(), &root).unwrap();
         let old_backup = fs::read(root.join(RECOVERY)).unwrap();
         reset(query.connection(), &root).unwrap();
+        for table in ["sq_scope_source_current", "sq_scope_source_pins", "sq_scope_sources"] {
+            assert_eq!(query.connection().query_row(
+                &format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0),
+            ).unwrap(), 0);
+        }
         let fresh = crate::store_query::QueryState::open(&root).unwrap();
         assert!(fresh.pin(&snapshot).unwrap_err().contains("replaced store"));
         drop(fresh);
