@@ -40,9 +40,9 @@ tracing = "0.1"
 sha2 = "0.10"
 libc = "0.2"
 fs2 = "0.4"
-jiff = { version = "=0.2.32", default-features = false, features = ["std"] }
-jiff-tzdb = "=0.1.8"
-unicode-normalization = { version = "=0.1.25", default-features = false, features = ["std"] }
+jiff = { version = "=0.2.38", default-features = false, features = ["std"] }
+jiff-tzdb = "=0.1.9"
+unicode-normalization = { version = "=0.1.26", default-features = false, features = ["std"] }
 
 # Keep existing SHA-256 checks while using runtime-detected Apple Silicon instructions.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
