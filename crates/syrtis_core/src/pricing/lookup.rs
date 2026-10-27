@@ -81,8 +81,8 @@ const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
 const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
 const TIERED_PRICING_THRESHOLD_272K_TOKENS: f64 = 272_000.0;
 
-// Only these identities document one long-context rate tier for the whole
-// request. Other catalog `*_above_*` fields retain marginal semantics.
+// Only these version-normalized identities document one long-context rate tier
+// for the whole request. Other catalog `*_above_*` fields retain marginal semantics.
 const FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS: &[&str] = &[
     "gpt-5.4",
     "gpt-5.4-2026-03-05",
@@ -1471,7 +1471,8 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
     result: &LookupResult,
     usage: &TokenBreakdown,
 ) -> CostEstimate {
-    let cost = if uses_full_session_long_context_tier(result) {
+    let full_session_tier = uses_full_session_long_context_tier(result);
+    let cost = if full_session_tier {
         compute_full_session_long_context_cost(
             &result.pricing,
             usage.input,
@@ -1495,7 +1496,7 @@ pub(crate) fn compute_cost_and_coverage_for_lookup_result(
 
     CostEstimate {
         cost,
-        coverage: coverage_for_lookup_result(result, usage),
+        coverage: coverage_for_lookup_result(result, usage, full_session_tier),
     }
 }
 
@@ -1609,7 +1610,11 @@ fn selected_long_context_bucket_coverage(
     })
 }
 
-fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> EstimateCoverage {
+fn coverage_for_lookup_result(
+    result: &LookupResult,
+    usage: &TokenBreakdown,
+    full_session_tier: bool,
+) -> EstimateCoverage {
     let input_clamped = usage.input.max(0) as f64;
     let output_clamped = usage.output.max(0).saturating_add(usage.reasoning.max(0)) as f64;
     let cache_read_clamped = usage.cache_read.max(0) as f64;
@@ -1618,7 +1623,7 @@ fn coverage_for_lookup_result(result: &LookupResult, usage: &TokenBreakdown) -> 
     let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
     let mut fold = CoverageFold::default();
 
-    if uses_full_session_long_context_tier(result) {
+    if full_session_tier {
         let use_long_context_rates =
             input_clamped + cache_read_clamped > TIERED_PRICING_THRESHOLD_272K_TOKENS;
         fold.observe(selected_long_context_bucket_coverage(
@@ -2913,9 +2918,7 @@ fn backfill_cache_costs(mut winner: LookupResult, donor: &ModelPricing) -> Looku
 /// Whether a version-normalized model id is one of the identities whose 272K
 /// tier OpenAI documents as request-wide.
 fn is_request_wide_identity(id: &str) -> bool {
-    FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS
-        .iter()
-        .any(|key| normalize_version_separator(key).as_deref().unwrap_or(key) == id)
+    FULL_SESSION_LONG_CONTEXT_LITELLM_KEYS.contains(&id)
 }
 
 /// Give `row` the donor's 272K tier rates, all at once or not at all. Every
@@ -5552,7 +5555,7 @@ mod tests {
             source: "LiteLLM".to_string(),
         };
         assert_ne!(
-            coverage_for_lookup_result(&result, &usage),
+            compute_cost_and_coverage_for_lookup_result(&result, &usage).coverage,
             EstimateCoverage::Complete,
             "an unpriced 1h half must not be reported as fully covered"
         );
@@ -5593,7 +5596,7 @@ mod tests {
             "every token is priced"
         );
         assert_eq!(
-            coverage_for_lookup_result(&result, &usage),
+            compute_cost_and_coverage_for_lookup_result(&result, &usage).coverage,
             EstimateCoverage::Complete,
             "an empty 5m bucket must not be observed against a missing rate"
         );
@@ -6954,6 +6957,9 @@ mod tests {
             .cost
         };
         for key in [
+            "gpt-5.4-2026-03-05",
+            "openai/gpt-5-4-2026-03-05",
+            "openai/GPT-5-6",
             "gpt-5.6",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
