@@ -770,6 +770,107 @@ fn pure_priced_reports_use_only_exact_report_snapshot() {
     .is_err());
 }
 
+#[test]
+fn report_replay_preserves_tied_current_and_pinned_sources() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let mut snapshot = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into()],
+            None,
+            SelectionMode::Report,
+        )
+        .unwrap();
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    let current = home.join("current");
+    std::fs::write(&current, b"current").unwrap();
+    cache
+        .write_source(
+            CacheIdentity::for_client(ClientId::Amp),
+            &current,
+            SourceFingerprint::from_path_samples_only(&current).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |db, metadata| {
+                publisher.register_cache_on(db, &current, metadata, "amp", 0, 0, false, false)
+            },
+            |writer| {
+                writer.push(
+                    &message("amp", "session", 100, Some("shared"), 10),
+                    false,
+                    false,
+                )
+            },
+        )
+        .unwrap();
+    publisher.publish(&mut snapshot).unwrap();
+
+    let observed = home.join("observed");
+    std::fs::write(&observed, b"observed").unwrap();
+    let metadata = cache
+        .write_source(
+            CacheIdentity::for_client(ClientId::Amp),
+            &observed,
+            SourceFingerprint::from_path_samples_only(&observed).unwrap(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            &mut |_, _| Ok(()),
+            |writer| {
+                writer.push(
+                    &message("amp", "session", 100, Some("shared"), 20),
+                    false,
+                    false,
+                )?;
+                writer.push(
+                    &message("amp", "session", 100, Some("other"), 30),
+                    false,
+                    false,
+                )
+            },
+        )
+        .unwrap();
+    let path = bincode::options()
+        .serialize(&crate::message_cache::CachedPath::from_path(&observed))
+        .unwrap();
+    publisher.db.execute(
+        "INSERT INTO sq_scope_source_pins(scope_generation,kind,lane,source_order,path,cache_source_id,cache_generation,tag,headless,phase) VALUES(?1,'observed','amp',0,?2,?3,?4,0,0,0)",
+        params![snapshot.generation, path, metadata.source_id, metadata.generation],
+    ).unwrap();
+    assert_eq!(report_inputs(&snapshot), vec![10, 30]);
+
+    publisher.db.execute(
+        "INSERT INTO sq_scope_source_current SELECT s.id,p.kind,p.lane,p.source_order,p.path,p.cache_source_id,p.cache_generation,p.generation,p.tag,p.headless,p.workspace,p.workspace_label,p.phase FROM sq_scope_source_pins p JOIN sq_scopes s ON s.scope_key=?2 AND s.current_generation=p.scope_generation WHERE p.scope_generation=?1",
+        params![snapshot.generation, &snapshot.scope],
+    ).unwrap();
+    publisher
+        .db
+        .execute(
+            "DELETE FROM sq_scope_source_pins WHERE scope_generation=?1",
+            [snapshot.generation],
+        )
+        .unwrap();
+    assert_eq!(report_inputs(&snapshot), vec![10, 30]);
+    publisher
+        .db
+        .execute_batch("DROP INDEX sq_source_replay_current")
+        .unwrap();
+    assert_eq!(report_inputs(&snapshot), vec![10, 30]);
+}
+
 fn local_fixture(path: &std::path::Path, rows: &[(&str, i64)]) {
     let source = Connection::open(path).unwrap();
     source.execute_batch("CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,data TEXT); CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT); INSERT INTO session VALUES('session','/fixture');").unwrap();

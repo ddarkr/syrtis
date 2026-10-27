@@ -1728,13 +1728,50 @@ impl QueryState {
         only_cc: bool,
     ) -> Result<(), String> {
         self.check_report_side_complete(snapshot, only_cc)?;
-        self.db
-            .execute(
-                "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
-                SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.message END,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version
-                FROM sq_scope_sources s JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation WHERE s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal",
-                params![snapshot.generation, only_cc, self.canonical_payloads.get()],
+        // The current-source index follows replay order; retain the union view
+        // whenever this generation also owns pinned descriptors.
+        let current_scope = self
+            .db
+            .prepare_cached(
+                "SELECT id FROM sq_scopes WHERE scope_key=?1 AND current_generation=?2
+                 AND NOT EXISTS(SELECT 1 FROM sq_scope_source_pins WHERE scope_generation=?2)",
             )
+            .map_err(|error| error.to_string())?
+            .query_row(params![&snapshot.scope, snapshot.generation], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        macro_rules! replay_sql {
+            ($from:literal, $predicate:literal) => {
+                concat!(
+                    "INSERT INTO sq_rows(lane,source_order,phase,retained,global_storage,session,workspace,dedup,model,workspace_label,timestamp,payload,payload_digest,client,provider,headless,cache_source_id,cache_generation,cache_ordinal,cache_format)
+                     SELECT s.lane,s.source_order,CASE WHEN r.retained!=0 THEN 2 ELSE s.phase END,r.retained,s.tag,r.session_id,COALESCE(s.workspace,r.workspace),r.dedup_key,r.model_id,COALESCE(s.workspace_label,r.workspace_label),r.timestamp,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.message END,CASE WHEN ?2 OR ?3 THEN NULL ELSE r.digest END,r.client,r.provider_id,s.headless,r.source_id,r.generation,r.ordinal,r.format_version FROM ",
+                    $from,
+                    " WHERE ",
+                    $predicate,
+                    " AND s.kind IN ('cache','observed','observed-legacy') AND (s.lane IN ('claude','codex'))=?2 ORDER BY s.lane,s.phase,s.source_order,r.ordinal"
+                )
+            };
+        }
+        let (sql, source) = match current_scope {
+            Some(scope) => (
+                replay_sql!(
+                    "sq_scope_source_current s CROSS JOIN mc_logical_rows r",
+                    "s.scope_id=?1 AND r.source_id=s.cache_source_id AND r.generation=s.cache_generation"
+                ),
+                scope,
+            ),
+            None => (
+                replay_sql!(
+                    "sq_scope_sources s JOIN mc_logical_rows r ON r.source_id=s.cache_source_id AND r.generation=s.cache_generation",
+                    "s.scope_generation=?1"
+                ),
+                snapshot.generation,
+            ),
+        };
+        self.db
+            .execute(sql, params![source, only_cc, self.canonical_payloads.get()])
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
