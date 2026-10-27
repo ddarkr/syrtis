@@ -1472,14 +1472,22 @@ impl QueryState {
                AND (s.tag!=0 OR s.lane IN ('claude','codex','hermes','gjc'))",
             [snapshot.generation],
         ).map_err(|error| error.to_string())?;
+        // Materialize only matching row references before joining the scope
+        // union; otherwise SQLite can rescan every source for each recent key.
         self.db.execute(
-            "INSERT OR IGNORE INTO sq_recent_rows
-             SELECT s.kind,s.lane,s.source_order,r.ordinal
-             FROM sq_recent_keys k CROSS JOIN mc_rows r CROSS JOIN sq_scope_sources s CROSS JOIN mc_logical_storage st
-             WHERE r.dedup_key=k.dedup AND s.scope_generation=?1 AND s.kind IN ('cache','observed','observed-legacy')
-               AND s.lane=k.lane AND s.cache_source_id=r.source_id
-               AND st.source_id=s.cache_source_id AND st.generation=s.cache_generation
-               AND r.generation=st.row_generation AND r.ordinal<st.row_count",
+            "WITH matches AS MATERIALIZED (
+                 SELECT k.lane,r.source_id,r.generation,r.ordinal
+                 FROM sq_recent_keys k CROSS JOIN mc_rows r
+                 WHERE r.dedup_key=k.dedup
+             )
+             INSERT OR IGNORE INTO sq_recent_rows
+             SELECT s.kind,s.lane,s.source_order,m.ordinal
+             FROM matches m
+             JOIN sq_scope_sources s ON s.scope_generation=?1
+                 AND s.kind IN ('cache','observed','observed-legacy')
+                 AND s.lane=m.lane AND s.cache_source_id=m.source_id
+             JOIN mc_logical_storage st ON st.source_id=s.cache_source_id AND st.generation=s.cache_generation
+             WHERE m.generation=st.row_generation AND m.ordinal<st.row_count",
             [snapshot.generation],
         ).map_err(|error| error.to_string())?;
         // ponytail: rare cross-row authority lanes replay whole only when
@@ -2108,6 +2116,33 @@ impl QueryState {
             return Ok(());
         }
         self.set_client_eligibility_without_grok(clients)
+    }
+
+    /// Non-retained rows replayed for a Report are already in
+    /// (phase, source_order, id) order. Keep the general arbitration whenever
+    /// retention can move a row to a later phase.
+    fn select_ordered_simple_report_lane(&self, lane: &str) -> Result<bool, String> {
+        let has_retained: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sq_rows WHERE lane=?1 AND retained!=0)",
+            [lane],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if has_retained {
+            return Ok(false);
+        }
+        self.db.execute(
+            "WITH picked(id) AS (
+                 SELECT MIN(id) FROM sq_rows
+                 WHERE lane=?1 AND eligible=1 AND dedup IS NOT NULL AND dedup!=''
+                 GROUP BY dedup
+                 UNION ALL
+                 SELECT id FROM sq_rows
+                 WHERE lane=?1 AND eligible=1 AND (dedup IS NULL OR dedup='')
+             )
+             INSERT OR IGNORE INTO sq_selected(id) SELECT id FROM picked ORDER BY id",
+            [lane],
+        ).map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub(crate) fn select_lane(
@@ -2824,10 +2859,38 @@ pub(crate) fn pi_source_fingerprint(
     identity: CacheIdentity,
     path: &Path,
 ) -> Result<Option<SourceFingerprint>, String> {
+    pi_source_fingerprint_for_scan(cache, identity, path, false)
+}
+
+fn pi_source_fingerprint_for_scan(
+    cache: &SourceMessageCache,
+    identity: CacheIdentity,
+    path: &Path,
+    classify_only: bool,
+) -> Result<Option<SourceFingerprint>, String> {
     let cached = cache.metadata(identity, path)?.filter(|metadata| metadata.message_count != 0);
-    Ok(match SourceFingerprint::check_path(path, cached.as_ref().map(|metadata| &metadata.fingerprint)) {
+    let previous = cached.as_ref().map(|metadata| &metadata.fingerprint);
+    let status = if classify_only {
+        SourceFingerprint::check_path_samples_only(path, previous)
+    } else {
+        SourceFingerprint::check_path(path, previous)
+    };
+    Ok(match status {
         Some(crate::message_cache::FingerprintStatus::Unchanged) => cached.map(|metadata| metadata.fingerprint),
-        Some(crate::message_cache::FingerprintStatus::Changed(fingerprint)) => Some(fingerprint),
+        Some(crate::message_cache::FingerprintStatus::Changed(fingerprint)) => {
+            // If the source reverted between the initial check and sampling,
+            // classification needs the full hash to preserve warm-hit order.
+            if classify_only && previous.is_some_and(|old|
+                old.size == fingerprint.size
+                    && old.modified_ns == fingerprint.modified_ns
+                    && old.sample_hashes == fingerprint.sample_hashes
+                    && old.related_files == fingerprint.related_files
+            ) {
+                SourceFingerprint::from_path(path)
+            } else {
+                Some(fingerprint)
+            }
+        },
         None => None,
     })
 }
@@ -2840,7 +2903,7 @@ pub(crate) fn ingest_pi_sources(
     mode: SelectionMode,
 ) -> Result<(), String> {
     ingest_sources_inner(query, cache, identity, paths, identity.namespace, mode,
-        &|cache, path| pi_source_fingerprint(cache, identity, path), &|_| true, false,
+        &|cache, path, classify_only| pi_source_fingerprint_for_scan(cache, identity, path, classify_only), &|_| true, false,
         |query, cache, path, before, index, phase, tag| {
             stage_pi_source(query, cache, identity, path, before, index, phase, tag)
         })
@@ -3288,7 +3351,7 @@ fn ingest_sources_inner<F, T, S>(
     mut stage_cold: S,
 ) -> Result<(), String>
 where
-    F: Fn(&SourceMessageCache, &Path) -> Result<Option<SourceFingerprint>, String>,
+    F: Fn(&SourceMessageCache, &Path, bool) -> Result<Option<SourceFingerprint>, String>,
     T: Fn(&Path) -> bool,
     S: FnMut(
         &QueryState,
@@ -3317,7 +3380,9 @@ where
                 | "crush"
         );
     for (index, path) in paths.iter().enumerate() {
-        let before = fingerprint(cache, path)?;
+        // Report misses are re-observed before their cold pass; classification
+        // must not hash a whole changed Pi-family source only to discard it.
+        let before = fingerprint(cache, path, hit_first)?;
         let hit = cache_hit(cache, identity, path, before.as_ref(), allow_empty)?;
         query.classify(lane, index, hit.is_none())?;
         if let Some(metadata) = hit {
@@ -3357,7 +3422,7 @@ where
             if !query.is_miss(lane, index)? {
                 continue;
             }
-            let before = fingerprint(cache, path)?;
+            let before = fingerprint(cache, path, false)?;
             if carry_absent_source(
                 query,
                 cache,
@@ -3398,7 +3463,7 @@ pub(crate) fn ingest_sources(
         paths,
         lane,
         mode,
-        &|_, path| Ok(fingerprint(path)),
+        &|_, path, _| Ok(fingerprint(path)),
         &tag,
         allow_empty,
         |query, cache, path, before, index, phase, tag| {
@@ -3448,7 +3513,7 @@ pub(crate) fn ingest_sources_streamed(
         paths,
         lane,
         mode,
-        &|_, path| Ok(fingerprint(path)),
+        &|_, path, _| Ok(fingerprint(path)),
         &tag,
         allow_empty,
         |query, cache, path, before, index, phase, tag| {
@@ -3543,7 +3608,15 @@ impl QueryState {
         ).map_err(|error| error.to_string())?;
         crate::for_each_usage_lane(SelectionMode::Report, &mut |lane, _, simple, guarded| {
             if !reused || !matches!(lane, "claude" | "codex") {
-                self.select_lane(lane, SelectionMode::Report, simple)?;
+                // Only the replayed simple lanes have both ordered IDs and
+                // no cross-row authority gate.
+                let ordered = reused
+                    && simple
+                    && !matches!(lane, "copilot" | "grok")
+                    && self.select_ordered_simple_report_lane(lane)?;
+                if !ordered {
+                    self.select_lane(lane, SelectionMode::Report, simple)?;
+                }
             }
             // INTEGER PRIMARY KEY assigns the next position in selected-rank
             // order, without a second ROW_NUMBER window and its TEMP stream.
