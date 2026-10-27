@@ -388,6 +388,120 @@ fn recent_completeness_witness_rechecks_external_and_own_missing_history() {
 }
 
 #[test]
+fn recent_global_dedup_keeps_cross_source_winners_and_lane_boundaries() {
+    let root = TempDir::new().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let context = ResolvedLocalSourceContext::capture(
+        Some(home.clone()),
+        false,
+        crate::scanner::ScannerSettings::default(),
+    )
+    .unwrap();
+    let publisher = query(root.path());
+    let mut snapshot = publisher
+        .begin_scope(
+            root.path(),
+            &context,
+            &["amp".into(), "omp".into()],
+            None,
+            SelectionMode::LocalClients,
+        )
+        .unwrap();
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    for (index, client, rows) in [
+        (
+            0,
+            ClientId::Amp,
+            vec![(100, "shared", 3), (200, "amp-only", 5)],
+        ),
+        (1, ClientId::Amp, vec![(200, "shared", 99)]),
+        (2, ClientId::Omp, vec![(200, "shared", 7)]),
+    ] {
+        let source = home.join(format!("source-{index}"));
+        std::fs::write(&source, b"usage-fixture").unwrap();
+        cache
+            .write_source(
+                CacheIdentity::for_client(client),
+                &source,
+                SourceFingerprint::from_path_samples_only(&source).unwrap(),
+                None,
+                None,
+                None,
+                &mut |_| {},
+                &mut |db, metadata| {
+                    publisher.register_cache_on(
+                        db,
+                        &source,
+                        metadata,
+                        client.as_str(),
+                        index,
+                        0,
+                        true,
+                        false,
+                    )
+                },
+                |writer| {
+                    for (timestamp, key, input) in &rows {
+                        writer.push(
+                            &message(client.as_str(), "session", *timestamp, Some(key), *input),
+                            false,
+                            false,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+    publisher.publish(&mut snapshot).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    let assert_ranges = || {
+        for (from, until, expected) in [
+            (100, 200, vec![("amp", 3)]),
+            (200, 201, vec![("amp", 5), ("omp", 7)]),
+            (201, 300, vec![]),
+        ] {
+            let mut actual = Vec::new();
+            crate::visit_local_usage_snapshot(
+                &snapshot,
+                UsageQuery {
+                    from_ms: Some(from),
+                    until_ms: Some(until),
+                    ..Default::default()
+                },
+                &|_| true,
+                &mut |message| actual.push((message.client.clone(), message.tokens.input)),
+            )
+            .unwrap();
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(client, input)| (client.to_string(), input))
+                    .collect::<Vec<_>>()
+            );
+        }
+    };
+    assert_ranges();
+    // Exercise the same source-free consumer against the union view's pin arm.
+    publisher.db.execute(
+        "INSERT INTO sq_scope_source_pins
+         SELECT ?1,c.kind,c.lane,c.source_order,c.path,c.cache_source_id,c.cache_generation,c.generation,c.tag,c.headless,c.workspace,c.workspace_label,c.phase
+         FROM sq_scope_source_current c JOIN sq_scopes s ON s.id=c.scope_id
+         WHERE s.scope_key=?2 AND s.current_generation=?1",
+        params![snapshot.generation, &snapshot.scope],
+    ).unwrap();
+    publisher.db.execute(
+        "DELETE FROM sq_scope_source_current WHERE scope_id IN
+         (SELECT id FROM sq_scopes WHERE scope_key=?2 AND current_generation=?1)",
+        params![snapshot.generation, &snapshot.scope],
+    ).unwrap();
+    assert_ranges();
+}
+
+#[test]
 fn repeated_indexed_ranges_preserve_cohorts_aliases_and_callback_publication() {
     let root = TempDir::new().unwrap();
     let home = root.path().join("home");
@@ -768,6 +882,99 @@ fn pure_priced_reports_use_only_exact_report_snapshot() {
         crate::GraphPricingMode::BestEffort
     )
     .is_err());
+}
+
+#[test]
+fn simple_report_replay_preserves_order_duplicates_and_retained_precedence() {
+    for retained in [false, true] {
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let context = ResolvedLocalSourceContext::capture(
+            Some(home.clone()),
+            false,
+            crate::scanner::ScannerSettings::default(),
+        )
+        .unwrap();
+        let publisher = query(root.path());
+        let mut snapshot = publisher
+            .begin_scope(
+                root.path(),
+                &context,
+                &["amp".into()],
+                None,
+                SelectionMode::Report,
+            )
+            .unwrap();
+        let cache = SourceMessageCache::open_from_root(Some(root.path()));
+        for index in 0..2 {
+            let source = home.join(format!("source-{index}"));
+            std::fs::write(&source, b"usage-fixture").unwrap();
+            cache
+                .write_source(
+                    CacheIdentity::for_client(ClientId::Amp),
+                    &source,
+                    SourceFingerprint::from_path_samples_only(&source).unwrap(),
+                    None,
+                    None,
+                    None,
+                    &mut |_| {},
+                    &mut |db, metadata| {
+                        publisher.register_cache_on(
+                            db,
+                            &source,
+                            metadata,
+                            "amp",
+                            index,
+                            index as i32,
+                            true,
+                            false,
+                        )
+                    },
+                    |writer| {
+                        if index == 0 {
+                            writer.push(
+                                &message("amp", "session", 1_767_225_600_000, Some("shared"), 10),
+                                retained,
+                                false,
+                            )?;
+                            for (key, input) in [(None, 1), (None, 2), (Some(""), 3), (Some(""), 4)] {
+                                writer.push(
+                                    &message("amp", "session", 1_767_225_600_000, key, input),
+                                    false,
+                                    false,
+                                )?;
+                            }
+                        } else {
+                            writer.push(
+                                &message("amp", "other", 1_767_225_600_001, Some("shared"), 20),
+                                false,
+                                false,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        publisher.publish(&mut snapshot).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(
+            report_inputs(&snapshot),
+            if retained { vec![1, 2, 3, 4, 20] } else { vec![10, 1, 2, 3, 4] }
+        );
+        let options = crate::ReportOptions {
+            clients: Some(vec!["amp".into()]),
+            ..Default::default()
+        };
+        for kind in ["graph-best-effort", "models", "hourly", "agents"] {
+            assert_eq!(
+                historical_payload(&snapshot, &options, None, kind, true),
+                historical_payload(&snapshot, &options, None, kind, false),
+                "{kind}, retained={retained}"
+            );
+        }
+    }
 }
 
 #[test]

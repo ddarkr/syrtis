@@ -144,8 +144,8 @@ pub(crate) enum FingerprintStatus {
     /// sidecar, and their bounded samples still match. No full-file SHA-256 was
     /// computed, so a warm scan reads at most 20 KiB per watched file.
     Unchanged,
-    /// Metadata changed, so a complete fingerprint was rebuilt to distinguish
-    /// a real content change from a metadata-only touch.
+    /// Metadata changed, so the fingerprint was rebuilt in the requested hash mode.
+    /// Sample-only classification must be followed by a full cold fingerprint.
     Changed(SourceFingerprint),
 }
 
@@ -289,6 +289,18 @@ impl SourceFingerprint {
 
     pub(crate) fn check_path(path: &Path, cached: Option<&Self>) -> Option<FingerprintStatus> {
         Self::check_path_with_related(path, std::iter::empty(), cached)
+    }
+
+    pub(crate) fn check_path_samples_only(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        Self::check_path_with_related_mode(
+            path,
+            std::iter::empty(),
+            cached,
+            ContentHashMode::SamplesOnly,
+        )
     }
 
     #[cfg(test)]
