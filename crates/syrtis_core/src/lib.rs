@@ -6286,7 +6286,6 @@ mod tests {
             .tokens
             .output = 999;
         cache.insert(replacement);
-        cache.save_if_dirty();
 
         let replacement_token =
             local_source_change_token_with_source_context(&context, &local_options()).unwrap();
@@ -7337,7 +7336,6 @@ mod tests {
             }
         }
         cache.insert(entry);
-        cache.save_if_dirty();
         assert_eq!(
             total_output(),
             999 + 50,
@@ -7653,7 +7651,6 @@ mod tests {
         );
         target_message.date = "1999-01-01".to_string();
         cache.insert(entry);
-        cache.save_if_dirty();
 
         // A since/until-style filter, exactly like `get_hourly_report`'s,
         // that only a correctly-refreshed `date` can pass.
@@ -8245,7 +8242,6 @@ mod tests {
             Vec::new(),
             None,
         ));
-        cache.save_if_dirty();
 
         let writer = rusqlite::Connection::open(&db_path).unwrap();
         writer.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -11559,7 +11555,6 @@ mod tests {
                 Vec::new(),
                 None,
             ));
-            cache.save_if_dirty();
 
             let messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
@@ -12871,7 +12866,6 @@ mod tests {
                 Vec::new(),
                 None,
             ));
-            cache.save_if_dirty();
         });
 
         let mut streamed = Vec::new();
@@ -13876,7 +13870,6 @@ mod tests {
                 vec![0],
                 None,
             ));
-            cache.save_if_dirty();
 
             let messages = parse_all_messages_with_pricing(
                 source_home.path().to_str().unwrap(),
@@ -17749,7 +17742,6 @@ mod tests {
             Vec::new(),
             None,
         ));
-        cache.save_if_dirty();
 
         let clients = vec!["grok".to_string()];
         let mut streamed = Vec::new();
@@ -19778,7 +19770,6 @@ mod tests {
                 message.message_count = 1;
             }
             cache.insert(entry);
-            cache.save_if_dirty();
             message_cache::set_parser_version_for_test(identity, 1);
         };
 
@@ -20737,7 +20728,6 @@ mod tests {
                     None,
                 ));
             }
-            cache.save_if_dirty();
         });
 
         // Separate the two ways a seeded hit can fail to replay, so a red run

@@ -67,6 +67,31 @@ fn publish(
 }
 
 #[test]
+fn ingestion_preserves_existing_recovery_without_creating_one() {
+    let sources = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let path = source(sources.path(), "session.jsonl");
+    let identity = CacheIdentity::for_client(ClientId::Claude);
+    let cache = SourceMessageCache::open_from_root(Some(root.path()));
+    publish(&cache, identity, &path, &[message("retained:req", 777)]);
+    let recovery = root.path().join("source-message-cache.recovery.sqlite3");
+    assert!(!recovery.exists());
+    cache.with_database(None, |db| {
+        crate::usage_store::refresh_retained_recovery(db, root.path())
+    }).unwrap();
+    let original = fs::read(&recovery).unwrap();
+    fs::write(&path, b"compacted\n").unwrap();
+    let latest = publish(&cache, identity, &path, &[message("new:req", 42)]);
+    assert_eq!(fs::read(&recovery).unwrap(), original);
+    fs::remove_file(&path).unwrap();
+    drop(cache);
+    let reopened = SourceMessageCache::open_from_root(Some(root.path()));
+    let persisted = rows(&reopened, &latest);
+    assert_eq!(persisted.iter().map(|row| row.0.tokens.input).sum::<i64>(), 819);
+    assert_eq!(fs::read(&recovery).unwrap(), original);
+}
+
+#[test]
 fn pi_resume_metadata_is_source_free_and_checksums_parser_state() {
     let root = TempDir::new().unwrap();
     let path = source(root.path(), "pi.jsonl");
@@ -493,7 +518,7 @@ fn sqlite_full_rolls_back_without_erasing_unique_retained_history() {
     let kept = rows(&cache, &good);
     assert_eq!(kept[0].0.tokens.input, 777);
     assert!(kept[0].1);
-    assert!(root
+    assert!(!root
         .path()
         .join("source-message-cache.recovery.sqlite3")
         .is_file());
@@ -632,7 +657,7 @@ fn legacy_codex_resume_membership_migrates_as_streamed_disk_rows() {
     let shard = seed_legacy(root.path(), identity, &path, &[entry]);
     let cache = SourceMessageCache::open_from_root(Some(root.path()));
     let metadata = cache.metadata(identity, &path).unwrap().unwrap();
-    assert!(!shard.exists());
+    assert!(shard.exists());
     assert!(metadata
         .codex_incremental
         .as_ref()
@@ -790,7 +815,7 @@ fn later_legacy_writer_is_detected_and_scoped_history_is_not_lost() {
         cache.metadata(scoped, &path).unwrap().is_none(),
         "an unchanged raw fingerprint cannot hide new legacy history"
     );
-    assert!(!shard.exists());
+    assert!(shard.exists());
     let observed = cache.retention_metadata(scoped, &path).unwrap().unwrap();
     assert!(observed.legacy_history.is_some());
     let query = publish(&cache, scoped, &path, &[]);
@@ -822,6 +847,9 @@ fn corruption_requires_explicit_offline_recovery_and_preserves_last_backup() {
     drop(cache);
     let database = root.path().join("source-message-cache.sqlite3");
     let recovery = root.path().join("source-message-cache.recovery.sqlite3");
+    let original = Connection::open(&database).unwrap();
+    crate::usage_store::refresh_retained_recovery(&original, root.path()).unwrap();
+    drop(original);
     let backup = fs::read(&recovery).unwrap();
     fs::write(&database, b"invalid canonical database").unwrap();
     let broken = SourceMessageCache::open_from_root(Some(root.path()));
@@ -1052,7 +1080,7 @@ fn oversized_single_compact_row_is_preserved_instead_of_dropped() {
 }
 
 #[test]
-fn failed_retained_recovery_does_not_retire_a_transferred_legacy_shard() {
+fn migration_preserves_original_shard_without_touching_existing_recovery() {
     let sources = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
     let path = source(sources.path(), "session.jsonl");
@@ -1071,15 +1099,15 @@ fn failed_retained_recovery_does_not_retire_a_transferred_legacy_shard() {
     let recovery = root.path().join("source-message-cache.recovery.sqlite3");
     fs::create_dir(&recovery).unwrap();
     let cache = SourceMessageCache::open_from_root(Some(root.path()));
-    assert!(cache.metadata(identity, &path).is_err());
-    assert_eq!(fs::read(&shard).unwrap(), original);
-    fs::remove_dir(&recovery).unwrap();
     let transferred = cache.metadata(identity, &path).unwrap().unwrap();
     assert_eq!(rows(&cache, &transferred)[0].0.tokens.input, 777);
-    assert!(
-        !shard.exists(),
-        "retirement resumes only after verified retained recovery succeeds"
-    );
+    assert_eq!(fs::read(&shard).unwrap(), original);
+    assert!(recovery.is_dir());
+    drop(cache);
+    let reopened = SourceMessageCache::open_from_root(Some(root.path()));
+    let transferred = reopened.metadata(identity, &path).unwrap().unwrap();
+    assert_eq!(rows(&reopened, &transferred)[0].0.tokens.input, 777);
+    assert_eq!(fs::read(&shard).unwrap(), original);
 }
 
 #[test]
@@ -1156,6 +1184,9 @@ fn corrupted_observed_and_save_generations_never_normalize_retained_history() {
     publish(&cache, identity, &path, &[message("shared:req", 50)]);
     let latest = cache.metadata(identity, &path).unwrap().unwrap();
     let backup_path = root.path().join("source-message-cache.recovery.sqlite3");
+    cache.with_database(None, |db| {
+        crate::usage_store::refresh_retained_recovery(db, root.path())
+    }).unwrap();
     let backup = fs::read(&backup_path).unwrap();
     cache
         .with_database(None, |db| {
@@ -1272,7 +1303,7 @@ fn codex_append_rejects_missing_or_corrupt_prefix_rows() {
 }
 
 #[test]
-fn resumed_migration_revalidates_transferred_rows_before_backup_or_unlink() {
+fn resumed_migration_revalidates_transferred_rows_and_preserves_originals() {
     for corrupt_payload in [false, true] {
         let sources = TempDir::new().unwrap();
         let root = TempDir::new().unwrap();
@@ -1294,10 +1325,10 @@ fn resumed_migration_revalidates_transferred_rows_before_backup_or_unlink() {
         cache.check().unwrap();
         let old_scope = cache.metadata(identity, &kept_path).unwrap().unwrap();
         let recovery = root.path().join("source-message-cache.recovery.sqlite3");
-        let preserved = root.path().join("last-good-recovery.sqlite3");
+        cache.with_database(None, |db| {
+            crate::usage_store::refresh_retained_recovery(db, root.path())
+        }).unwrap();
         let old_backup = fs::read(&recovery).unwrap();
-        fs::rename(&recovery, &preserved).unwrap();
-        fs::create_dir(&recovery).unwrap();
         let entry = CachedSourceEntry::new(
             identity,
             &imported_path,
@@ -1309,10 +1340,7 @@ fn resumed_migration_revalidates_transferred_rows_before_backup_or_unlink() {
         .with_retained_keys(HashSet::from(["imported:req".to_string()]));
         let shard = seed_legacy(root.path(), identity, &imported_path, &[entry]);
         let legacy_bytes = fs::read(&shard).unwrap();
-        assert!(
-            cache.metadata(identity, &imported_path).is_err(),
-            "backup failure keeps the intact shard after committed transfer"
-        );
+        assert!(cache.metadata(identity, &imported_path).unwrap().is_some());
         let imported = cache
             .with_database(None, |db| {
                 Ok(read_metadata(db, identity, &imported_path)?
@@ -1330,11 +1358,11 @@ fn resumed_migration_revalidates_transferred_rows_before_backup_or_unlink() {
                 };
                 db.execute(sql, params![imported.source_id, imported.generation])
                     .map_err(sql_error)?;
+                db.execute("DELETE FROM mc_namespaces WHERE namespace=?1", [identity.namespace])
+                    .map_err(sql_error)?;
                 Ok(())
             })
             .unwrap();
-        fs::remove_dir(&recovery).unwrap();
-        fs::rename(&preserved, &recovery).unwrap();
         assert!(
             cache.metadata(identity, &imported_path).is_err(),
             "a marker cannot prove that transferred rows still exist"
@@ -1584,8 +1612,8 @@ fn legacy_format4_shard_migrates_with_unknown_provenance() {
     // Trigger migration through a fresh write, then read the retained history.
     publish(&cache, identity, &path, &[]);
     assert!(
-        !shard.exists(),
-        "a migrated format-4 shard retires like format-3"
+        shard.exists(),
+        "a migrated format-4 shard remains an independent original"
     );
     let found = cache
         .retainable_history(identity, &path)
@@ -3115,6 +3143,11 @@ fn shared_current_and_observed_history_still_fail_before_production_on_corruptio
     let observed = cache.retention_metadata(identity, &path).unwrap().unwrap();
     assert_eq!(current.generation, observed.generation);
     let recovery = root.path().join("source-message-cache.recovery.sqlite3");
+    cache
+        .with_database(None, |db| {
+            crate::usage_store::refresh_retained_recovery(db, root.path())
+        })
+        .unwrap();
     let previous_recovery = fs::read(&recovery).unwrap();
     cache
         .with_database(None, |db| {

@@ -1966,7 +1966,6 @@ mod tests {
 
         let mut cache = SourceMessageCache::load_from_root(Some(cache_root.path()));
         cache.insert(retained_entry.clone());
-        cache.save_if_dirty();
 
         let run_overlapping = |root: &Path, source: &Path| {
             let barrier = Arc::new(Barrier::new(3));
@@ -1999,7 +1998,6 @@ mod tests {
         let mut replacement = retained_entry;
         replacement.messages[0].tokens.output = 999_999;
         cache.insert(replacement);
-        cache.save_if_dirty();
 
         let changed_tokens = run_overlapping(cache_root.path(), &source);
         assert_ne!(first_tokens[0], changed_tokens[0]);
@@ -2910,7 +2908,6 @@ mod tests {
         let mut cache = SourceMessageCache::default();
         cache.insert(test_entry(identity, &path_one, "session-1"));
         cache.insert(test_entry(identity, &path_two, "session-2"));
-        cache.save_if_dirty();
 
         cache.check().unwrap();
         assert!(cache_dir()
@@ -2942,7 +2939,6 @@ mod tests {
         let mut cache = SourceMessageCache::default();
         cache.insert(entry_one);
         cache.insert(entry_two);
-        cache.save_if_dirty();
         cache.check().unwrap();
 
         let loaded = SourceMessageCache::load();
@@ -3021,7 +3017,6 @@ mod tests {
             Vec::new(),
             None,
         ));
-        cache.save_if_dirty();
 
         let loaded = SourceMessageCache::load();
         assert_eq!(
@@ -3332,8 +3327,8 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert!(
-            !path.exists(),
-            "only a verified transferred shard is retired"
+            path.exists(),
+            "verified migration preserves the original legacy shard"
         );
 
         restore_cache_env(prev_env);
@@ -3503,7 +3498,6 @@ mod tests {
         // A scan that never reaches this path: load, then save.
         let mut cache = SourceMessageCache::load();
         cache.check().unwrap();
-        cache.save_if_dirty();
 
         let reloaded = SourceMessageCache::load();
         assert_eq!(
@@ -3596,7 +3590,6 @@ mod tests {
             Vec::new(),
             None,
         ));
-        cache.save_if_dirty();
 
         let loaded = SourceMessageCache::load();
         assert_eq!(
@@ -3660,7 +3653,6 @@ mod tests {
         let mut seed = SourceMessageCache::load();
         seed.insert(entry_with_messages(current, &source, vec![stale_message]));
         seed.check().unwrap();
-        seed.save_if_dirty();
         set_parser_version_for_test(current, 5);
 
         assert_eq!(
@@ -3681,7 +3673,6 @@ mod tests {
             "the cold rebuild is what carries the correction to an existing user"
         );
         cache.insert(entry_with_messages(current, &source, rebuilt.clone()));
-        cache.save_if_dirty();
         cache.check().unwrap();
 
         let loaded = SourceMessageCache::load();
@@ -3701,7 +3692,6 @@ mod tests {
 
         let mut seed = SourceMessageCache::default();
         seed.insert(test_entry(identity, &valid_path, "format-two-session"));
-        seed.save_if_dirty();
 
         let stale_key = CacheShardKey {
             namespace: codex.namespace.to_string(),
@@ -3729,7 +3719,6 @@ mod tests {
         let mut loaded = SourceMessageCache::load();
         assert!(loaded.get(identity, &valid_path).is_some());
 
-        loaded.save_if_dirty();
         assert!(matches!(
             read_shard(&stale_path, codex),
             ShardReadStatus::Stale
@@ -3751,14 +3740,12 @@ mod tests {
 
         let mut seed = SourceMessageCache::default();
         seed.insert(test_entry(identity, source.path(), "session-1"));
-        seed.save_if_dirty();
         assert!(SourceMessageCache::load()
             .get(identity, source.path())
             .is_some());
 
         let mut cache = SourceMessageCache::load();
         cache.remove(identity, source.path());
-        cache.save_if_dirty();
 
         assert!(
             source.path().is_file(),
@@ -3784,7 +3771,6 @@ mod tests {
 
         let mut seed = SourceMessageCache::default();
         seed.insert(test_entry(identity, &path, "old-session"));
-        seed.save_if_dirty();
 
         let mut stale_invalidator = SourceMessageCache::load();
         stale_invalidator.remove(identity, &path);
@@ -3792,9 +3778,7 @@ mod tests {
         std::fs::write(&path, b"fresh-content\n").unwrap();
         let mut fresh_writer = SourceMessageCache::load();
         fresh_writer.insert(test_entry(identity, &path, "fresh-session"));
-        fresh_writer.save_if_dirty();
 
-        stale_invalidator.save_if_dirty();
 
         let loaded = SourceMessageCache::load();
         assert_eq!(
@@ -3807,7 +3791,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_merges_concurrent_writers() {
+    fn test_insert_merges_concurrent_writers() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -3822,8 +3806,6 @@ mod tests {
             writer_one.insert(test_entry(identity, &path_one, "session-1"));
             writer_two.insert(test_entry(identity, &path_two, "session-2"));
 
-            writer_one.save_if_dirty();
-            writer_two.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             assert!(loaded.get(identity, &path_one).is_some());
@@ -3835,7 +3817,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_preserves_recreated_path_from_concurrent_writer() {
+    fn test_insert_preserves_recreated_path_from_concurrent_writer() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -3847,7 +3829,6 @@ mod tests {
 
             let mut seed = SourceMessageCache::default();
             seed.insert(test_entry(identity, &path, "old-session"));
-            seed.save_if_dirty();
 
             let mut stale_deleter = SourceMessageCache::load();
             std::fs::remove_file(&path).unwrap();
@@ -3856,9 +3837,7 @@ mod tests {
             std::fs::write(&path, b"{\"id\":\"fresh\"}\n").unwrap();
             let mut fresh_writer = SourceMessageCache::load();
             fresh_writer.insert(test_entry(identity, &path, "fresh-session"));
-            fresh_writer.save_if_dirty();
 
-            stale_deleter.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded
@@ -3883,7 +3862,7 @@ mod tests {
     /// entirely and always labeled an absorbed key live.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_unions_retained_history_for_the_same_path() {
+    fn test_insert_unions_retained_history_for_the_same_path() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -3901,11 +3880,9 @@ mod tests {
                 entry_with_messages(identity, &path, vec![shared.clone(), dropped])
                     .with_retained_keys(HashSet::from(["msg_dropped:req_dropped".to_string()])),
             );
-            first.save_if_dirty();
 
             let mut second = SourceMessageCache::load();
             second.insert(entry_with_messages(identity, &path, vec![shared]));
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -3937,7 +3914,7 @@ mod tests {
     /// authoritative over a carried-forward retained copy of the same key.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_prefers_live_over_retained_for_a_key_both_writers_describe() {
+    fn test_insert_prefers_live_over_retained_for_a_key_both_writers_describe() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -3956,11 +3933,9 @@ mod tests {
                 entry_with_messages(identity, &path, vec![shared.clone()])
                     .with_retained_keys(HashSet::from(["msg_shared:req_shared".to_string()])),
             );
-            first.save_if_dirty();
 
             let mut second = SourceMessageCache::load();
             second.insert(entry_with_messages(identity, &path, vec![shared]));
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -3994,14 +3969,12 @@ mod tests {
             // entry) saw it live.
             let mut first = SourceMessageCache::load();
             first.insert(entry_with_messages(identity, &path, vec![shared.clone()]));
-            first.save_if_dirty();
 
             let mut second = SourceMessageCache::load();
             second.insert(
                 entry_with_messages(identity, &path, vec![shared])
                     .with_retained_keys(HashSet::from(["msg_shared:req_shared".to_string()])),
             );
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4030,7 +4003,7 @@ mod tests {
     /// again.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_refreshes_absorbed_message_metadata_against_current_variant() {
+    fn test_insert_refreshes_absorbed_message_metadata_against_current_variant() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4078,7 +4051,6 @@ mod tests {
                 entry_with_messages(identity, &path, vec![stale_message])
                     .with_retained_keys(HashSet::from([absorbed_key.to_string()])),
             );
-            first.save_if_dirty();
 
             // The rewrite lands (dropping the turn from the live file), and a
             // related-metadata edit — a variant provider switch — lands
@@ -4100,7 +4072,6 @@ mod tests {
             // saved and absorbs the retained turn from `first` on merge.
             let mut second = SourceMessageCache::load();
             second.insert(entry_with_messages(identity, &path, Vec::new()));
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4131,7 +4102,7 @@ mod tests {
     /// cache-hit scan would then treat as authoritative.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_prefers_live_message_content_not_just_the_cleared_label() {
+    fn test_insert_prefers_live_message_content_not_just_the_cleared_label() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4177,14 +4148,12 @@ mod tests {
             // the same key.
             let mut first = SourceMessageCache::load();
             first.insert(entry_with_messages(identity, &path, vec![completed_live]));
-            first.save_if_dirty();
 
             let mut second = SourceMessageCache::load();
             second.insert(
                 entry_with_messages(identity, &path, vec![retained_partial])
                     .with_retained_keys(HashSet::from([key.to_string()])),
             );
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4222,7 +4191,7 @@ mod tests {
     /// relative to this (the second writer's) generation.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_rescues_history_across_a_straddled_rewrite_fingerprint_mismatch() {
+    fn test_insert_rescues_history_across_a_straddled_rewrite_fingerprint_mismatch() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4255,14 +4224,12 @@ mod tests {
                 &path,
                 vec![dropped.clone(), kept.clone()],
             ));
-            full_writer.save_if_dirty();
 
             // Compaction changes the fingerprint and drops `dropped`'s turn.
             // Writer COMPACTED's own parse never saw it and saves last.
             std::fs::write(&path, b"{\"id\":\"compacted\"}\n").unwrap();
             let mut compacted_writer = SourceMessageCache::load();
             compacted_writer.insert(entry_with_messages(identity, &path, vec![kept]));
-            compacted_writer.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4301,7 +4268,7 @@ mod tests {
     /// neither copy alone carries every field's true maximum.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_reconciles_token_counts_across_a_fingerprint_mismatch() {
+    fn test_insert_reconciles_token_counts_across_a_fingerprint_mismatch() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4370,7 +4337,6 @@ mod tests {
             std::fs::write(&path, b"{\"id\":\"generation-b\"}\n").unwrap();
             let mut writer_b = SourceMessageCache::load();
             writer_b.insert(entry_with_messages(identity, &path, vec![completed]));
-            writer_b.save_if_dirty();
 
             // The file changes generation again (a straddled rewrite), and
             // writer A — which had already parsed a stalled partial of the
@@ -4378,7 +4344,6 @@ mod tests {
             std::fs::write(&path, b"{\"id\":\"generation-a\"}\n").unwrap();
             let mut writer_a = SourceMessageCache::load();
             writer_a.insert(entry_with_messages(identity, &path, vec![partial]));
-            writer_a.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4434,7 +4399,7 @@ mod tests {
     /// way the cross-fingerprint case did.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_reconciles_two_retained_copies_under_one_fingerprint() {
+    fn test_insert_reconciles_two_retained_copies_under_one_fingerprint() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
         {
@@ -4464,14 +4429,12 @@ mod tests {
                 entry_with_messages(identity, &path, vec![completed])
                     .with_retained_keys(retained.clone()),
             );
-            writer_b.save_if_dirty();
 
             let mut writer_a = SourceMessageCache::load();
             writer_a.insert(
                 entry_with_messages(identity, &path, vec![partial])
                     .with_retained_keys(retained.clone()),
             );
-            writer_a.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4507,7 +4470,7 @@ mod tests {
     /// saved last.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_reconciles_two_live_copies_under_one_fingerprint() {
+    fn test_insert_reconciles_two_live_copies_under_one_fingerprint() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
         {
@@ -4540,11 +4503,9 @@ mod tests {
             // merge fails to pull across from the stored copy is gone.
             let mut writer_completed = SourceMessageCache::load();
             writer_completed.insert(entry_with_messages(identity, &path, vec![completed]));
-            writer_completed.save_if_dirty();
 
             let mut writer_partial = SourceMessageCache::load();
             writer_partial.insert(entry_with_messages(identity, &path, vec![partial]));
-            writer_partial.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4586,7 +4547,7 @@ mod tests {
     /// leave it behind even though assistant history is unioned.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_does_not_union_path_scoped_keys() {
+    fn test_insert_does_not_union_path_scoped_keys() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4609,11 +4570,9 @@ mod tests {
                 &path,
                 vec![shared.clone(), tool_result],
             ));
-            first.save_if_dirty();
 
             let mut second = SourceMessageCache::load();
             second.insert(entry_with_messages(identity, &path, vec![shared]));
-            second.save_if_dirty();
 
             let loaded = SourceMessageCache::load();
             let entry = loaded.get(identity, &path).expect("entry should survive");
@@ -4627,7 +4586,7 @@ mod tests {
     /// disturb the Codex entry for that same path.
     #[test]
     #[serial_test::serial]
-    fn test_save_if_dirty_still_replaces_entries_for_non_retaining_clients() {
+    fn test_insert_still_replaces_entries_for_non_retaining_clients() {
         let temp_home = TempDir::new().unwrap();
         let prev_env = sandbox_cache_env(temp_home.path());
 
@@ -4644,7 +4603,6 @@ mod tests {
                 &path,
                 vec![keyed_message(namespace, "session", "codex-key-a")],
             ));
-            first.save_if_dirty();
 
             let claude = CacheIdentity::for_client(ClientId::Claude);
             let mut isolated = SourceMessageCache::load();
@@ -4695,7 +4653,6 @@ mod tests {
             source.path(),
             "cold",
         ));
-        cache.save_if_dirty();
 
         assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
         let after = std::fs::metadata(&legacy).unwrap();
@@ -4719,14 +4676,12 @@ mod tests {
         let mut cache = SourceMessageCache::default();
         cache.insert(test_entry(identity, &first, "first"));
         cache.insert(test_entry(identity, &second, "second"));
-        cache.save_if_dirty();
         let second_generation = cache
             .metadata(identity, &second)
             .unwrap()
             .unwrap()
             .generation;
         cache.insert(test_entry(identity, &first, "first-updated"));
-        cache.save_if_dirty();
         cache.check().unwrap();
         assert_eq!(
             cache

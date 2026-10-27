@@ -311,18 +311,18 @@ fn checkpoint(db: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn compact(db: &Connection, root: &Path, available: u64) -> Result<(), String> {
+pub(crate) fn compact(db: &Connection, _root: &Path, available: u64) -> Result<(), String> {
     let pages: u64 = db
         .pragma_query_value(None, "page_count", |r| r.get(0))
         .map_err(error)?;
     let page_size: u64 = db
         .pragma_query_value(None, "page_size", |r| r.get(0))
         .map_err(error)?;
-    // VACUUM's temporary copy and rewritten WAL may coexist with a fresh
-    // recovery snapshot. Existing recovery remains intact until publication.
+    // VACUUM's temporary copy and rewritten WAL may coexist. Existing
+    // recovery files are left untouched and require no additional space.
     let required = pages
         .saturating_mul(page_size)
-        .saturating_mul(3)
+        .saturating_mul(2)
         .saturating_add(16 * 1024 * 1024);
     if available < required {
         return Err(format!("Disk usage: insufficient free space for compaction (need {required}, available {available}); maintenance not completed"));
@@ -334,13 +334,11 @@ pub(crate) fn compact(db: &Connection, root: &Path, available: u64) -> Result<()
         .map_err(|e| format!("{e}; compaction maintenance not completed"))?;
     db.execute_batch("PRAGMA optimize; VACUUM;")
         .map_err(|e| format!("{}; compaction maintenance not completed", error(e)))?;
-    checkpoint(db).map_err(|e| format!("{e}; database compacted but recovery not refreshed"))?;
-    crate::usage_store::refresh_retained_recovery(db, root)
-        .map_err(|e| format!("Disk usage: database compacted but recovery refresh failed: {e}"))
+    checkpoint(db).map_err(|e| format!("{e}; database compacted but checkpoint incomplete"))
 }
 fn reset(db: &Connection, root: &Path) -> Result<(), String> {
-    // Persist a fail-closed recovery barrier before committing deletion. If a
-    // backup fails, offline recovery must not revive the pre-reset snapshot.
+    // Persist a fail-closed recovery barrier before committing deletion so
+    // offline recovery cannot revive an existing pre-reset snapshot.
     let epoch: Vec<u8> = db
         .query_row("SELECT randomblob(16)", [], |r| r.get(0))
         .map_err(error)?;
@@ -393,7 +391,6 @@ fn reset(db: &Connection, root: &Path) -> Result<(), String> {
     tx.execute("INSERT INTO du_reset VALUES(?1)", [&epoch])
         .map_err(error)?;
     tx.commit().map_err(error)?;
-    crate::usage_store::refresh_retained_recovery(db, root)?;
     Ok(())
 }
 
@@ -401,7 +398,7 @@ fn reset(db: &Connection, root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn compaction_preserves_epoch_and_facts_and_refreshes_smaller_recovery() {
+    fn compaction_preserves_epoch_and_facts_without_changing_existing_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("usage");
         drop(crate::store_query::QueryState::open(&root).unwrap());
@@ -416,7 +413,6 @@ mod tests {
         .unwrap();
         checkpoint(&db).unwrap();
         crate::usage_store::refresh_retained_recovery(&db, &root).unwrap();
-        let old_recovery = fs::metadata(root.join(RECOVERY)).unwrap().len();
         db.execute_batch("DROP TABLE disposable_padding").unwrap();
         let before = fs::metadata(root.join(DATABASE)).unwrap().len();
         let recovery_bytes = fs::read(root.join(RECOVERY)).unwrap();
@@ -424,9 +420,17 @@ mod tests {
             .unwrap_err()
             .contains("insufficient free space"));
         assert_eq!(fs::read(root.join(RECOVERY)).unwrap(), recovery_bytes);
-        compact(&db, &root, u64::MAX).unwrap();
+        let pages: u64 = db
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
+        let page_size: u64 = db
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .unwrap();
+        let required = pages * page_size * 2 + 16 * 1024 * 1024;
+        assert!(compact(&db, &root, required - 1).is_err());
+        compact(&db, &root, required).unwrap();
         assert!(fs::metadata(root.join(DATABASE)).unwrap().len() < before);
-        assert!(fs::metadata(root.join(RECOVERY)).unwrap().len() < old_recovery);
+        assert_eq!(fs::read(root.join(RECOVERY)).unwrap(), recovery_bytes);
         let recovery = Connection::open(root.join(RECOVERY)).unwrap();
         for connection in [&db, &recovery] {
             assert_eq!(
@@ -565,6 +569,8 @@ mod tests {
             assert_eq!(report.clients[0].record_count, 2);
             assert_eq!(report.clients[0].first_timestamp_ms, Some(100));
             assert!(report.usage_bytes > 0);
+            assert_eq!(report.recovery_bytes, 0);
+            assert!(!root.join(RECOVERY).exists());
         }
         assert!(!cache.join(PRICING[0]).exists());
         assert_eq!(
@@ -573,6 +579,8 @@ mod tests {
         );
         let report = disk_usage_paths(&root, &cache, DiskUsageAction::ResetUsage).unwrap();
         assert!(report.clients.is_empty());
+        assert_eq!(report.recovery_bytes, 0);
+        assert!(!root.join(RECOVERY).exists());
         let next: Vec<u8> = db
             .query_row(
                 "SELECT value FROM sq_meta WHERE key='store_epoch'",
@@ -592,20 +600,12 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(table(&db, "du_reset").unwrap());
         drop(db);
         assert!(disk_usage_paths(&root, &cache, DiskUsageAction::Inspect)
             .unwrap()
             .clients
             .is_empty());
-        let backup = Connection::open(root.join(RECOVERY)).unwrap();
-        assert_eq!(
-            backup
-                .query_row("SELECT count(*) FROM oc_messages", [], |r| r
-                    .get::<_, u64>(0))
-                .unwrap(),
-            0
-        );
-        assert!(table(&backup, "du_reset").unwrap());
     }
 
     #[test]
@@ -650,6 +650,7 @@ mod tests {
         crate::usage_store::refresh_retained_recovery(query.connection(), &root).unwrap();
         let old_backup = fs::read(root.join(RECOVERY)).unwrap();
         reset(query.connection(), &root).unwrap();
+        assert_eq!(fs::read(root.join(RECOVERY)).unwrap(), old_backup);
         for table in ["sq_scope_source_current", "sq_scope_source_pins", "sq_scope_sources"] {
             assert_eq!(query.connection().query_row(
                 &format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0),
@@ -659,7 +660,6 @@ mod tests {
         assert!(fresh.pin(&snapshot).unwrap_err().contains("replaced store"));
         drop(fresh);
         drop(query);
-        fs::write(root.join(RECOVERY), old_backup).unwrap();
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let path = root.join(format!("{DATABASE}{suffix}"));
             if path.exists() {

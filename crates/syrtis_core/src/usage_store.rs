@@ -584,9 +584,8 @@ pub(crate) fn write_reset_barrier(root: &Path, epoch: &[u8]) -> Result<(), Strin
     Ok(())
 }
 
-/// Called only after retained-history semantic changes, never on warm queries.
-/// SQLite's destination transaction preserves the previous recovery snapshot if
-/// the backup fails. It is never queried as a second report source.
+#[cfg(test)]
+/// Create a legacy recovery snapshot for compatibility tests only.
 pub(crate) fn refresh_retained_recovery(
     conn: &Connection,
     cache_root: &Path,

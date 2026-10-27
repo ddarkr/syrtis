@@ -1084,7 +1084,6 @@ impl SourceMessageCache {
             }
             publish(&transaction,&metadata)?;
             transaction.commit().map_err(sql_error)?;
-            flush_recovery(connection,self.root()?)?;
             Ok(metadata)
         })
     }
@@ -1201,8 +1200,7 @@ impl SourceMessageCache {
                     .execute("DELETE FROM mc_observed WHERE source_id=?1", [stored.id])
                     .map_err(sql_error)?;
             }
-            transaction.commit().map_err(sql_error)?;
-            flush_recovery(connection, self.root()?)
+            transaction.commit().map_err(sql_error)
         });
         if let Err(error) = result {
             self.record_failure(error);
@@ -1252,24 +1250,13 @@ impl SourceMessageCache {
             }
             drop(rows);
             drop(statement);
-            transaction.commit().map_err(sql_error)?;
-            flush_recovery(connection, self.root()?)
+            transaction.commit().map_err(sql_error)
         });
         if let Err(error) = result {
             self.record_failure(error);
         }
     }
 
-    #[cfg(test)]
-    /// All source writes are already committed. This retries a pending retained
-    /// recovery snapshot, never serializes dirty native history.
-    pub(crate) fn save_if_dirty(&mut self) {
-        let result =
-            self.with_database(None, |connection| flush_recovery(connection, self.root()?));
-        if let Err(error) = result {
-            self.record_failure(error);
-        }
-    }
 
     #[cfg(test)]
     pub(crate) fn visit_source_metadata<S>(
@@ -1886,23 +1873,6 @@ fn publish_generation(
     })
 }
 
-fn flush_recovery(connection: &Connection, root: &Path) -> Result<(), String> {
-    let (revision,recovered): (i64,i64) = connection.query_row(
-        "SELECT (SELECT value FROM mc_meta WHERE key='retained_revision'),(SELECT value FROM mc_meta WHERE key='recovery_revision')",
-        [],|row| Ok((row.get(0)?,row.get(1)?)),
-    ).map_err(sql_error)?;
-    if revision == recovered {
-        return Ok(());
-    }
-    crate::usage_store::refresh_retained_recovery(connection, root)?;
-    connection
-        .execute(
-            "UPDATE mc_meta SET value=?1 WHERE key='recovery_revision' AND value<?1",
-            [revision],
-        )
-        .map_err(sql_error)?;
-    Ok(())
-}
 
 fn verify_digest(bytes: &[u8], digest: &[u8]) -> Result<(), String> {
     if digest != Sha256::digest(bytes).as_slice() {
@@ -2291,11 +2261,11 @@ fn migrate_namespace(
             let Some(index) = parse_shard_filename(&entry.file_name()) else {
                 continue;
             };
-            migrate_shard(connection, root, identity, index, &entry.path())?;
+            migrate_shard(connection, identity, index, &entry.path())?;
         }
         release_missing_shard_pins(connection, &directory)?;
-        // Sample after our own retirements, while the legacy writer lock still
-        // excludes replacement. A later old writer changes this token again.
+        // Sample under the legacy writer lock. A later old writer changes
+        // this token again; original shards remain available for recovery.
         let signature = legacy_directory_signature(&directory)?;
         connection
             .execute(
@@ -2392,7 +2362,6 @@ pub(crate) fn import_legacy_shards_on(
 
 fn migrate_shard(
     connection: &Connection,
-    root: &Path,
     identity: CacheIdentity,
     index: usize,
     path: &Path,
@@ -2402,7 +2371,7 @@ fn migrate_shard(
     else {
         return Ok(());
     };
-    retire_verified_shard(connection, root, path, &before, &digest, source_count)
+    verify_preserved_shard(connection, path, &before, &digest, source_count)
 }
 
 fn transfer_shard_rows(
@@ -3389,23 +3358,16 @@ fn verify_migration_transfer(
     Ok(())
 }
 
-fn retire_verified_shard(
+fn verify_preserved_shard(
     connection: &Connection,
-    root: &Path,
     path: &Path,
     before: &SourceFingerprint,
     digest: &[u8; 32],
     source_count: u64,
 ) -> Result<(), String> {
     let encoded_path = encode_path(path)?;
-    // A successful old transfer marker is not proof that its immutable rows
-    // still exist. Validate before replacing the only last-good recovery copy.
-    {
-        let snapshot = connection.unchecked_transaction().map_err(sql_error)?;
-        verify_migration_transfer(&snapshot, &encoded_path, digest, source_count)?;
-        snapshot.commit().map_err(sql_error)?;
-    }
-    flush_recovery(connection, root)?;
+    // Keep the original shard now that migration no longer creates a second
+    // recovery copy. Its transfer evidence still pins the imported history.
     let transaction = connection.unchecked_transaction().map_err(sql_error)?;
     transaction
         .execute(
@@ -3417,9 +3379,6 @@ fn retire_verified_shard(
     if !fingerprint_is_current(path, before) || hash_prefix(path, before.size) != Some(*digest) {
         return Err("source message cache legacy shard changed during migration".to_string());
     }
-    fs::remove_file(path)
-        .map_err(|_| "source message cache migrated shard could not be retired".to_string())?;
-    clear_migration_pin(&transaction, &encoded_path)?;
     transaction.commit().map_err(sql_error)
 }
 

@@ -507,7 +507,7 @@ fn sqlite_full_migration_rolls_back_all_legacy_data_and_retries() {
 }
 
 #[test]
-fn optimize_compacts_existing_v2_decisions_and_refreshes_recovery() {
+fn optimize_compacts_existing_v2_decisions_without_creating_recovery() {
     let root = TempDir::new().unwrap();
     let usage = root.path();
     secure_directory(usage).unwrap();
@@ -524,8 +524,9 @@ fn optimize_compacts_existing_v2_decisions_and_refreshes_recovery() {
     let none = encode(&Option::<String>::None).unwrap();
     conn.execute("UPDATE sq_decisions SET workspace=?1,workspace_label=?1,model='model' WHERE cache_source_id=4", [&none]).unwrap();
     crate::disk_usage::compact(&conn, usage, u64::MAX).unwrap();
-    for name in [DATABASE, RECOVERY] {
-        let db = Connection::open(usage.join(name)).unwrap();
+    assert!(!usage.join(RECOVERY).exists());
+    {
+        let db = Connection::open(usage.join(DATABASE)).unwrap();
         let mut candidates = db
             .prepare("SELECT candidate FROM oc_rows ORDER BY source,ordinal")
             .unwrap();
@@ -1078,6 +1079,7 @@ fn old_candidate_recovery_upgrades_without_sources_or_changed_selection() {
         .execute_batch("DROP TRIGGER reject_candidate_compaction")
         .unwrap();
     crate::disk_usage::compact(&restored, &cache, u64::MAX).unwrap();
+    assert_eq!(fs::read(cache.join(RECOVERY)).unwrap(), previous_recovery);
     for (ordinal, original) in originals.iter().enumerate() {
         let compact: Vec<u8> = restored
             .query_row(
@@ -1107,8 +1109,7 @@ fn old_candidate_recovery_upgrades_without_sources_or_changed_selection() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(compact.starts_with(CANDIDATE_FRAME));
-        assert!(compact.len() < original.len());
+        assert_eq!(&compact, original);
         assert_eq!(
             encode(&decode_candidate(&compact).unwrap()).unwrap(),
             *original
